@@ -333,7 +333,7 @@ export async function zohoCliqRequest(
       (data as { message?: string } | null)?.message ??
       `Zoho Cliq API ${res.status}: ${text.slice(0, 200)}`;
     console.error(
-      `[zohoCliq] ${method.toUpperCase()} ${path} -> ${res.status} error=${msg} grantedScope="${t.grantedScope ?? "(unknown)"}"`
+      `[zohoCliq] ${method.toUpperCase()} ${path} body=${JSON.stringify(opts?.body ?? null)} -> ${res.status} error=${msg} grantedScope="${t.grantedScope ?? "(unknown)"}"`
     );
     return { ok: false, status: res.status, data, error: msg };
   }
@@ -353,10 +353,17 @@ export const ZOHO_CLIQ_ACTIONS: Record<string, string> = {
   ZOHOCLIQ_LIST_CHATS: "List the user's chats. Args: {limit?}",
   ZOHOCLIQ_GET_CHAT: "Get one chat. Args: {chat_id}",
   ZOHOCLIQ_CREATE_CHAT:
-    "Create (or reuse) a 1:1 or group chat. Args: {user_id} for a direct chat with one Cliq user_id " +
-    "(NOT a name/email — if you don't already know their numeric Cliq user_id from a prior ZOHOCLIQ_LIST_CHATS " +
-    "result, ask the user for it, there is no name/email lookup action), or {user_ids: string[], title} " +
-    "(2-50 ids) for a group chat. Returns the new/existing chat's chat_id to use with ZOHOCLIQ_SEND_MESSAGE.",
+    "Create a 1:1 or group chat. Args: {user_id} (a REAL numeric Cliq user_id, digits only) for a direct " +
+    "chat, or {user_ids: string[], title} (2-50 real numeric ids) for a group chat. " +
+    "HARD REQUIREMENT: Zoho has NO endpoint anywhere to look up a user by name or email — this is not a " +
+    "temporary limitation, it does not exist. If you only have a person's NAME (e.g. 'message John'), you " +
+    "do NOT have enough information to call this action. Do not invent, guess, or construct a plausible-" +
+    "looking numeric id under any circumstance — a fabricated id will get REJECTED by validation before " +
+    "any API call, since a wrong-but-real-looking id creates a broken chat that fails every later send with " +
+    "a confusing, unrelated-looking error. The ONLY valid sources for a user_id: (1) it already appears in " +
+    "a ZOHOCLIQ_LIST_CHATS result for an existing chat with that person, or (2) the human user states the " +
+    "literal numeric id in the conversation. If neither is true, STOP and ask the human for the numeric " +
+    "Cliq user_id — do not attempt this action speculatively.",
   ZOHOCLIQ_LIST_MESSAGES:
     "List messages in a chat. Args: {chat_id, limit?, fromtime? (epoch ms), totime? (epoch ms)}",
   ZOHOCLIQ_SEND_MESSAGE: "Send a message. Args: {chat_id, text}",
@@ -399,11 +406,38 @@ export async function executeZohoCliqAction(
         const userIds = Array.isArray(args.user_ids)
           ? (args.user_ids as unknown[]).map(str).filter(Boolean)
           : [];
+        const singleUserId = str(args.user_id ?? args.userId);
+        // Zoho has no name/email-to-user_id lookup endpoint at all (confirmed
+        // against Zoho's own v3 API changelog) — a non-numeric value here can
+        // only be a guessed/invented id (e.g. a person's name), never a real
+        // one. Creating a chat against a fake id still returns ok:true with a
+        // real-looking chat_id, but every subsequent send to it 401s with a
+        // misleading scope error instead of a clean "not found" — this
+        // rejects the bad input before it can produce that confusing failure.
+        const idsToCheck = userIds.length > 0 ? userIds : [singleUserId];
+        const nonNumeric = idsToCheck.filter((id) => !/^\d+$/.test(id));
+        if (nonNumeric.length > 0) {
+          return {
+            ok: false,
+            error:
+              `"${nonNumeric.join(", ")}" is not a valid Zoho Cliq user_id (must be numeric digits only). ` +
+              `There is no name/email lookup — you must have the real numeric id, not a guess. ` +
+              `Ask the user for it directly, or check ZOHOCLIQ_LIST_CHATS for an existing chat with this person.`,
+          };
+        }
         const body =
           userIds.length > 0
             ? { chat_type: "group_chat", user_ids: userIds, title: str(args.title) }
-            : { chat_type: "direct_message", user_id: str(args.user_id ?? args.userId) };
-        return norm(await zohoCliqRequest(tenantId, "POST", "/chats", { body }));
+            : { chat_type: "direct_message", user_id: singleUserId };
+        const result = norm(await zohoCliqRequest(tenantId, "POST", "/chats", { body }));
+        // Diagnostic: a chat created against a bogus/guessed user_id can
+        // still return ok:true with a real-looking chat_id, but be an
+        // orphaned resource nothing can post to. Logging the exact
+        // requested user_id(s) alongside the result makes that visible.
+        console.error(
+          `[zohoCliq] CREATE_CHAT requested body=${JSON.stringify(body)} -> ok=${result.ok} data=${JSON.stringify(result.data)}`
+        );
+        return result;
       }
       case "ZOHOCLIQ_LIST_MESSAGES":
         return norm(

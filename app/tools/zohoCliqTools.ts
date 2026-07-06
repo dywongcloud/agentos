@@ -34,14 +34,13 @@ export function makeZohoCliqConnectTool(ctx: ZohoToolContext) {
       "you will not see the URL and must NEVER write or guess a Zoho link",
       "yourself. Use when zoho_cliq_status shows not connected, or a",
       "zoho_cliq_action returns status===401 with an error that is NOT about",
-      "scope (a genuinely dead/revoked token). Do NOT use this for a 401 whose",
-      "error mentions 'scope' — that means the Zoho API Console app",
-      "registration itself isn't configured to allow that scope, which is an",
-      "account-configuration problem on api-console.zoho.com; reconnecting",
-      "issues the same under-scoped grant again and will not fix it. Also do",
-      "not use this for any non-401 status — those are real action problems",
-      "(bad chat_id, etc), not connection problems. If the user says the link",
-      "expired, call this again for a fresh one.",
+      "scope (a genuinely dead/revoked token). Do NOT use this for a scope-",
+      "shaped 401 on a send/message action — that almost always means the",
+      "chat_id refers to a chat created against an invalid/fabricated user_id,",
+      "not a connection problem; reconnecting will not fix a bad chat_id. Also",
+      "do not use this for any other non-401 status — those are real action",
+      "problems (bad chat_id, etc), not connection problems. If the user says",
+      "the link expired, call this again for a fresh one.",
     ].join("\n"),
     inputSchema: z.object({}),
     execute: async () => {
@@ -86,15 +85,11 @@ export function makeZohoCliqStatusTool(ctx: ZohoToolContext) {
     description:
       "Check whether Zoho Cliq is connected for this user/workspace. Returns " +
       "connected:true/false — if false, use zoho_cliq_connect. `granted_scope` " +
-      "(when present) is what Zoho's OAuth server actually granted, which can " +
-      "be NARROWER than what was requested if the app's registration on " +
-      "Zoho's own API Console isn't configured to allow every requested " +
-      "scope — that is an account-configuration gap on api-console.zoho.com, " +
-      "not something zoho_cliq_connect can fix by itself; reconnecting will " +
-      "not widen it. If a zoho_cliq_action later 401s with a scope error, " +
-      "check this field and tell the user plainly which scope is missing " +
-      "from their Zoho API Console app configuration rather than looping " +
-      "reconnect attempts.",
+      "(when present) is what Zoho's OAuth server actually granted — normally " +
+      "this matches what was requested. If a zoho_cliq_action later 401s with " +
+      "a scope-shaped error on a send/message action, that is almost always a " +
+      "bad chat_id (created against a fabricated user_id), not a scope gap — " +
+      "reconnecting will not help.",
     inputSchema: z.object({}),
     execute: async () => {
       const s = await zohoCliqConnected(ctx.tenantId);
@@ -118,22 +113,25 @@ export function makeZohoCliqActionTool(ctx: ZohoToolContext) {
       ...Object.entries(ZOHO_CLIQ_ACTIONS).map(([k, v]) => `  ${k} — ${v}`),
       "ERROR HANDLING — read both `status` and `error` before deciding what to",
       "do next:",
-      "  status===401 AND error mentions 'scope' → the Zoho API Console app",
-      "  registration isn't configured to allow that scope. Call zoho_cliq_status",
-      "  and read granted_scope, then tell the user PLAINLY which scope is",
-      "  missing so they can add it in api-console.zoho.com — zoho_cliq_connect",
-      "  will NOT fix this (it just re-grants the same restricted scope set),",
-      "  do not loop it.",
+      "  status===401 on ZOHOCLIQ_SEND_MESSAGE/SEND_THREAD_MESSAGE with a",
+      "  scope-shaped error → the chat_id almost certainly refers to a chat",
+      "  created against an invalid/fabricated user_id. Do NOT call",
+      "  zoho_cliq_connect — tell the user the chat_id looks invalid and you",
+      "  need their real numeric Cliq user_id.",
       "  status===401 WITHOUT a scope-shaped error → genuinely dead/revoked",
       "  connection, use zoho_cliq_connect.",
       "  status is 400/403/404/anything else → this is a REAL problem with the",
       "  action itself (e.g. an invalid/unknown chat_id, missing permission on",
       "  that specific chat, bad args) — do NOT call zoho_cliq_connect, it will",
       "  NOT fix this. Tell the user the actual error instead.",
-      "To message someone you have no existing chat_id for: there is no",
-      "name/email lookup action. Try ZOHOCLIQ_LIST_CHATS first — it may already",
-      "list an existing chat with them. If not, you need their numeric Zoho",
-      "Cliq user_id from the user to call ZOHOCLIQ_CREATE_CHAT — do not guess one.",
+      "ZOHO HAS NO NAME/EMAIL LOOKUP FOR USERS ANYWHERE — this is a permanent",
+      "platform limitation, not something to route around. To message someone:",
+      "try ZOHOCLIQ_LIST_CHATS first for an existing chat with them. If none",
+      "exists, you need their REAL numeric Cliq user_id stated by the human in",
+      "the conversation — if you don't have it, STOP and ask, do not call",
+      "ZOHOCLIQ_CREATE_CHAT speculatively. ZOHOCLIQ_CREATE_CHAT rejects",
+      "obviously-non-numeric input, but a fabricated numeric-looking id will",
+      "pass that check and silently create a broken, unusable chat.",
     ].join("\n"),
     inputSchema: z.object({
       action: z
