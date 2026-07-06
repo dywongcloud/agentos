@@ -39,6 +39,10 @@ export type ZohoCliqTokens = {
   accountsServer: string; // e.g. https://accounts.zoho.com
   apiBase: string; // e.g. https://cliq.zoho.com/api/v3
   connectedAt: number;
+  // What Zoho's token response actually said it granted — can be narrower
+  // than DEFAULT_SCOPES if the app's Zoho API Console registration hasn't
+  // been configured to allow every requested scope (see handleZohoCallback).
+  grantedScope?: string;
 };
 
 type PendingState = {
@@ -160,6 +164,20 @@ export async function handleZohoCallback(params: {
     };
   }
 
+  // Zoho's token response's `scope` field is what was ACTUALLY granted — this
+  // can be narrower than what the authorization URL requested if the app's
+  // registration on Zoho's own API Console (api-console.zoho.com) hasn't been
+  // configured to allow every requested scope; Zoho silently drops
+  // unconfigured scopes rather than erroring at the authorize step, and the
+  // gap only surfaces later as a per-call "oauthtoken_scope_invalid" 401.
+  // Logged so a scope mismatch is diagnosable from production logs instead of
+  // reverse-engineered from a user's bug report after the fact.
+  const grantedScope = typeof json.scope === "string" ? json.scope : undefined;
+  console.error(
+    `[zohoCliq] token exchange granted scope="${grantedScope ?? "(not returned)"}" ` +
+      `requested="${scopes()}"`
+  );
+
   const tokens: ZohoCliqTokens = {
     accessToken: String(json.access_token),
     refreshToken: json.refresh_token ? String(json.refresh_token) : undefined,
@@ -167,6 +185,7 @@ export async function handleZohoCallback(params: {
     accountsServer,
     apiBase: apiBaseFor(accountsServer),
     connectedAt: Date.now(),
+    grantedScope,
   };
   // Preserve an earlier refresh_token if Zoho omitted one on re-consent.
   if (!tokens.refreshToken) {
@@ -186,10 +205,10 @@ export async function handleZohoCallback(params: {
 
 export async function zohoCliqConnected(
   tenantId: string
-): Promise<{ connected: boolean; apiBase?: string; connectedAt?: number }> {
+): Promise<{ connected: boolean; apiBase?: string; connectedAt?: number; grantedScope?: string }> {
   const t = await getStore().get<ZohoCliqTokens>(tokensKey(tenantId));
   if (!t) return { connected: false };
-  return { connected: true, apiBase: t.apiBase, connectedAt: t.connectedAt };
+  return { connected: true, apiBase: t.apiBase, connectedAt: t.connectedAt, grantedScope: t.grantedScope };
 }
 
 export async function disconnectZohoCliq(tenantId: string): Promise<void> {

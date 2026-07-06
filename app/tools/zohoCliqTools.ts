@@ -33,10 +33,15 @@ export function makeZohoCliqConnectTool(ctx: ZohoToolContext) {
       "mints a fresh single-use link and SENDS it to the user's chat itself —",
       "you will not see the URL and must NEVER write or guess a Zoho link",
       "yourself. Use when zoho_cliq_status shows not connected, or a",
-      "zoho_cliq_action returns status===401 specifically (any other error",
-      "status is a real action problem, not a connection problem — do not",
-      "reconnect for those). If the user says the link expired, call this",
-      "again for a fresh one.",
+      "zoho_cliq_action returns status===401 with an error that is NOT about",
+      "scope (a genuinely dead/revoked token). Do NOT use this for a 401 whose",
+      "error mentions 'scope' — that means the Zoho API Console app",
+      "registration itself isn't configured to allow that scope, which is an",
+      "account-configuration problem on api-console.zoho.com; reconnecting",
+      "issues the same under-scoped grant again and will not fix it. Also do",
+      "not use this for any non-401 status — those are real action problems",
+      "(bad chat_id, etc), not connection problems. If the user says the link",
+      "expired, call this again for a fresh one.",
     ].join("\n"),
     inputSchema: z.object({}),
     execute: async () => {
@@ -80,7 +85,16 @@ export function makeZohoCliqStatusTool(ctx: ZohoToolContext) {
   return tool({
     description:
       "Check whether Zoho Cliq is connected for this user/workspace. Returns " +
-      "connected:true/false — if false, use zoho_cliq_connect.",
+      "connected:true/false — if false, use zoho_cliq_connect. `granted_scope` " +
+      "(when present) is what Zoho's OAuth server actually granted, which can " +
+      "be NARROWER than what was requested if the app's registration on " +
+      "Zoho's own API Console isn't configured to allow every requested " +
+      "scope — that is an account-configuration gap on api-console.zoho.com, " +
+      "not something zoho_cliq_connect can fix by itself; reconnecting will " +
+      "not widen it. If a zoho_cliq_action later 401s with a scope error, " +
+      "check this field and tell the user plainly which scope is missing " +
+      "from their Zoho API Console app configuration rather than looping " +
+      "reconnect attempts.",
     inputSchema: z.object({}),
     execute: async () => {
       const s = await zohoCliqConnected(ctx.tenantId);
@@ -89,6 +103,7 @@ export function makeZohoCliqStatusTool(ctx: ZohoToolContext) {
         connected: s.connected,
         ...(s.apiBase ? { api_region: s.apiBase } : {}),
         ...(s.connectedAt ? { connected_at: new Date(s.connectedAt).toISOString() } : {}),
+        ...(s.grantedScope ? { granted_scope: s.grantedScope } : {}),
       };
     },
   });
@@ -101,9 +116,16 @@ export function makeZohoCliqActionTool(ctx: ZohoToolContext) {
       "integration, NOT available through COMPOSIO_EXECUTE_TOOL — always use",
       "this tool for Cliq). Actions and their args:",
       ...Object.entries(ZOHO_CLIQ_ACTIONS).map(([k, v]) => `  ${k} — ${v}`),
-      "ERROR HANDLING — use the numeric `status` field, never the `error` text,",
-      "to decide what to do next (Zoho's error prose is not a reliable signal):",
-      "  status===401 → the connection is genuinely gone, use zoho_cliq_connect.",
+      "ERROR HANDLING — read both `status` and `error` before deciding what to",
+      "do next:",
+      "  status===401 AND error mentions 'scope' → the Zoho API Console app",
+      "  registration isn't configured to allow that scope. Call zoho_cliq_status",
+      "  and read granted_scope, then tell the user PLAINLY which scope is",
+      "  missing so they can add it in api-console.zoho.com — zoho_cliq_connect",
+      "  will NOT fix this (it just re-grants the same restricted scope set),",
+      "  do not loop it.",
+      "  status===401 WITHOUT a scope-shaped error → genuinely dead/revoked",
+      "  connection, use zoho_cliq_connect.",
       "  status is 400/403/404/anything else → this is a REAL problem with the",
       "  action itself (e.g. an invalid/unknown chat_id, missing permission on",
       "  that specific chat, bad args) — do NOT call zoho_cliq_connect, it will",
