@@ -1,19 +1,28 @@
 import { sleep } from "workflow";
 import { agentTurn } from "@/app/steps/agentTurn";
-import { sendOutboundRuntime } from "@/app/lib/outbound";
-import { getPrimary, isAutopilotEnabled, getIntervalSeconds } from "@/app/lib/autopilotState";
+import {
+  isAutopilotEnabledStep,
+  getPrimaryStep,
+  getIntervalSecondsStep,
+  sendOutboundRuntimeStep,
+} from "@/app/steps/autopilotSteps";
 
 export async function autopilotWorkflow() {
   "use workflow";
 
   while (true) {
-    const enabled = await isAutopilotEnabled();
+    // Stepped: isAutopilotEnabled/getPrimary/getIntervalSeconds/
+    // sendOutboundRuntime all do a real Redis (or Telegram) fetch, which WDK
+    // forbids directly in a "use workflow" body — the un-stepped calls
+    // crashed this workflow with "Global fetch is unavailable in workflow
+    // functions" on its very first statement, every invocation.
+    const enabled = await isAutopilotEnabledStep();
     if (!enabled) {
       await sleep("5s");
       continue;
     }
 
-    const primary = await getPrimary();
+    const primary = await getPrimaryStep();
     if (!primary) {
       // no destination yet; wait
       await sleep("10s");
@@ -38,16 +47,16 @@ export async function autopilotWorkflow() {
 
     const text = (result.text ?? "").trim();
 
-    // If model decides “nothing”, it should return empty — honor that.
+    // If model decides "nothing", it should return empty — honor that.
     if (text.length > 0 && text.toLowerCase() !== "no updates") {
-      await sendOutboundRuntime({
+      await sendOutboundRuntimeStep({
         channel: primary.channel,
         sessionId: primary.sessionId,
         text,
       });
     }
 
-    const interval = await getIntervalSeconds();
+    const interval = await getIntervalSecondsStep();
     await sleep(`${interval}s`);
   }
 }

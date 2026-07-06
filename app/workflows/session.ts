@@ -9,11 +9,12 @@ import {
   resolveReplyContextStep,
   saveHistoryStep,
   captureChatOutcomeStep,
+  chatModelNameForLearnedStep,
+  isChatStoppedStep,
 } from "@/app/steps/sessionStateSteps";
 import { chatModelNameFor } from "@/app/lib/modelRouting";
-import { chatModelNameForLearned, type ChatRouteDecision } from "@/app/lib/learn/routerBias";
+import type { ChatRouteDecision } from "@/app/lib/learn/routerBias";
 import { maybeAutoLearnChatStep } from "@/app/steps/autoLearnStep";
-import { isChatStopped } from "@/app/lib/chatControl";
 
 // -----------------------------
 // Helpers: multimodal user msg
@@ -161,12 +162,15 @@ export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
       replyToTgMessageId: (msg as any).replyToTgMessageId,
       text: msg.text ?? "",
     }),
-    // chatModelNameForLearned is internally guarded end-to-end, but it must
-    // never be allowed to reject THIS Promise.all — doing so would also
+    // chatModelNameForLearnedStep is internally guarded end-to-end, but it
+    // must never be allowed to reject THIS Promise.all — doing so would also
     // discard the (independently successful) history/reply-context results
     // and fail the whole turn over what should be, at worst, a routing
-    // no-op. Fall back to the deterministic resolver directly.
-    chatModelNameForLearned(msg.text ?? "").catch(fallbackChatRoute),
+    // no-op. Fall back to the deterministic resolver directly. Wrapped as a
+    // step (not calling chatModelNameForLearned directly): it does a real
+    // Redis read past its early guards, and raw fetch is forbidden in
+    // sessionWorkflow's un-stepped body — see isChatStoppedStep's comment.
+    chatModelNameForLearnedStep(msg.text ?? "").catch(fallbackChatRoute),
   ]);
 
   let history = Array.isArray(historyRaw) ? historyRaw : [];
@@ -223,9 +227,14 @@ export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
 
   // If the user issued /stop while this turn was still running, suppress the
   // final reply — the halt should feel immediate, not "it answered anyway".
-  if (await isChatStopped(msg.channel, msg.sessionId)) return;
+  // Stepped (not calling isChatStopped directly): this Redis read uses raw
+  // fetch under the hood, which WDK forbids in a "use workflow" body — the
+  // unstepped call threw "Global fetch is unavailable in workflow functions"
+  // on EVERY turn in production, aborting the workflow run before it ever
+  // reached sendOutbound/maybeAutoLearnChatStep below.
+  if (await isChatStoppedStep(msg.channel, msg.sessionId)) return;
 
-  // ✅ Avoid duplicates: if Telegram streaming already delivered, do not send again
+  // Avoid duplicates: if Telegram streaming already delivered, do not send again
   if (!(result as any).delivered) {
     await sendOutbound({
       channel: msg.channel,

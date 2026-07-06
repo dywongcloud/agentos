@@ -3,7 +3,8 @@ import type { ModelMessage } from "ai";
 import { loadTgMessage, saveTgMessage } from "@/app/lib/tgMessageMap";
 import { getStore } from "@/app/lib/store";
 import { captureChatOutcome, stashTurnAttribution } from "@/app/lib/learn/outcomeSignal";
-import type { ChatRouteDecision } from "@/app/lib/learn/routerBias";
+import { chatModelNameForLearned, type ChatRouteDecision } from "@/app/lib/learn/routerBias";
+import { isChatStopped } from "@/app/lib/chatControl";
 
 const historyKey = (sessionId: string) => `sess:${sessionId}:history`;
 
@@ -119,6 +120,27 @@ export async function captureChatOutcomeStep(args: {
       // never break the turn
     }
   }
+}
+
+// WDK forbids the global fetch inside a "use workflow" function body — all
+// I/O there must go through a "use step" call. isChatStopped() reads Redis
+// (via UpstashStore, which uses raw fetch), so calling it directly in
+// sessionWorkflow's body crashes the ENTIRE workflow run with "Global fetch
+// is unavailable in workflow functions" (confirmed in production logs, every
+// invocation, since the check runs unconditionally on every turn) — silently
+// skipping sendOutbound/maybeAutoLearnChatStep for any turn that reaches it.
+export async function isChatStoppedStep(channel: string, sessionId: string): Promise<boolean> {
+  "use step";
+  return isChatStopped(channel, sessionId);
+}
+
+// Same class of bug as isChatStoppedStep above: chatModelNameForLearned does
+// a real Redis read (store.pipelineMany, raw fetch under the hood) once past
+// its early guards — calling it directly inside sessionWorkflow's
+// Promise.all (workflow body, not a step) would crash the same way.
+export async function chatModelNameForLearnedStep(text: string): Promise<ChatRouteDecision> {
+  "use step";
+  return chatModelNameForLearned(text);
 }
 
 export async function saveHistoryStep(sessionId: string, history: ModelMessage[]) {
