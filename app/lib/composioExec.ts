@@ -16,6 +16,62 @@ export type ComposioExecResult = {
   error?: string;
 };
 
+// ---------------------------------------------------------------------------
+// Module-level singleton cache
+// ---------------------------------------------------------------------------
+
+type ComposioTools = {
+  execute: (
+    slug: string,
+    body: Record<string, unknown>
+  ) => Promise<{ data?: unknown; successful?: boolean; error?: unknown }>;
+};
+
+type ComposioClientCache = {
+  apiKey: string;
+  composio: unknown;
+  tools: ComposioTools;
+};
+
+let _clientCache: ComposioClientCache | null = null;
+
+async function getComposioClient(apiKey: string): Promise<ComposioTools> {
+  if (_clientCache && _clientCache.apiKey === apiKey) {
+    return _clientCache.tools;
+  }
+  const { Composio } = await import("@composio/core");
+  const composio = new Composio({ apiKey });
+  const tools = composio.tools as unknown as ComposioTools;
+  _clientCache = { apiKey, composio, tools };
+  return tools;
+}
+
+// ---------------------------------------------------------------------------
+// Retry helpers
+// ---------------------------------------------------------------------------
+
+const RETRY_DELAYS_MS = [500, 1500, 4500];
+const NON_RETRYABLE_PATTERNS = [
+  "not found",
+  "invalid",
+  "unauthorized",
+  "forbidden",
+  "bad request",
+];
+
+function isRetryable(message: string): boolean {
+  const lower = message.toLowerCase();
+  return !NON_RETRYABLE_PATTERNS.some((p) => lower.includes(p));
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Main executor
+// ---------------------------------------------------------------------------
+
 export async function executeComposioAction(
   tenantId: string,
   action: string,
@@ -25,25 +81,39 @@ export async function executeComposioAction(
   const apiKey = env("COMPOSIO_API_KEY");
   if (!apiKey) return { ok: false, error: "COMPOSIO_API_KEY not configured" };
 
-  try {
-    const { Composio } = await import("@composio/core");
-    const composio = new Composio({ apiKey });
-    const resp = await (composio.tools as unknown as {
-      execute: (
-        slug: string,
-        body: Record<string, unknown>
-      ) => Promise<{ data?: unknown; successful?: boolean; error?: unknown }>;
-    }).execute(action, {
-      userId: tenantId,
-      arguments: args,
-      dangerouslySkipVersionCheck: true,
-      ...(connectedAccountId ? { connectedAccountId } : {}),
-    });
-    if (resp && resp.successful === false) {
-      return { ok: false, error: String(resp.error ?? "action failed"), data: resp.data };
+  const maxAttempts = 3;
+  let lastError = "";
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      await sleep(RETRY_DELAYS_MS[attempt - 1]);
     }
-    return { ok: true, data: resp?.data ?? resp };
-  } catch (err: any) {
-    return { ok: false, error: err?.message ?? String(err) };
+
+    try {
+      const tools = await getComposioClient(apiKey);
+      const resp = await tools.execute(action, {
+        userId: tenantId,
+        arguments: args,
+        dangerouslySkipVersionCheck: true,
+        ...(connectedAccountId ? { connectedAccountId } : {}),
+      });
+      if (resp && resp.successful === false) {
+        const errMsg = String(resp.error ?? "action failed");
+        if (!isRetryable(errMsg) || attempt === maxAttempts - 1) {
+          return { ok: false, error: errMsg, data: resp.data };
+        }
+        lastError = errMsg;
+        continue;
+      }
+      return { ok: true, data: resp?.data ?? null };
+    } catch (err: any) {
+      const errMsg: string = err?.message ?? String(err);
+      if (!isRetryable(errMsg) || attempt === maxAttempts - 1) {
+        return { ok: false, error: errMsg };
+      }
+      lastError = errMsg;
+    }
   }
+
+  return { ok: false, error: lastError };
 }

@@ -330,6 +330,65 @@ function shouldRetryWithoutHtml(error: unknown): boolean {
   return TELEGRAM_ENTITY_ERROR_RE.test(message);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const TELEGRAM_RETRY_FATAL_CODES = new Set([401, 403, 404]);
+const TELEGRAM_RETRY_SERVER_CODES = new Set([500, 502, 503, 504]);
+const TELEGRAM_RETRY_SERVER_DELAYS_MS = [500, 1000, 2000];
+const TELEGRAM_MAX_RETRIES = 3;
+
+/**
+ * Execute `attempt` up to TELEGRAM_MAX_RETRIES+1 times, applying retry logic:
+ *   - HTTP 429: respect Retry-After header (default 1 s), retry up to 3 times.
+ *   - HTTP 500/502/503/504: exponential backoff (500 ms / 1 s / 2 s), up to 3 retries.
+ *   - HTTP 401/403/404: throw immediately, no retry.
+ *
+ * `attempt` must return a { status, retryAfterHeader } descriptor so this helper
+ * can decide without re-running the fetch, then call `extract` to get the final value.
+ */
+async function telegramWithRetry<T>(
+  attempt: () => Promise<{ status: number; retryAfterHeader: string | null; extract: () => Promise<T> }>
+): Promise<T> {
+  let lastError: unknown;
+
+  for (let retry = 0; retry <= TELEGRAM_MAX_RETRIES; retry++) {
+    const probe = await attempt();
+
+    if (TELEGRAM_RETRY_FATAL_CODES.has(probe.status)) {
+      // Throw immediately — extract() will produce the right error message.
+      return probe.extract();
+    }
+
+    if (probe.status === 429) {
+      if (retry >= TELEGRAM_MAX_RETRIES) {
+        lastError = new Error(`Telegram rate-limited (HTTP 429) after ${TELEGRAM_MAX_RETRIES} retries`);
+        break;
+      }
+      const retryAfterSec = Number(probe.retryAfterHeader ?? "1");
+      const delayMs = (Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec : 1) * 1000;
+      await sleep(delayMs);
+      continue;
+    }
+
+    if (TELEGRAM_RETRY_SERVER_CODES.has(probe.status)) {
+      if (retry >= TELEGRAM_MAX_RETRIES) {
+        lastError = new Error(`Telegram server error (HTTP ${probe.status}) after ${TELEGRAM_MAX_RETRIES} retries`);
+        break;
+      }
+      const delayMs = TELEGRAM_RETRY_SERVER_DELAYS_MS[retry] ?? 2000;
+      await sleep(delayMs);
+      continue;
+    }
+
+    // Success path (2xx) or application-level errors (ok:false) — let extract() handle it.
+    return probe.extract();
+  }
+
+  throw lastError ?? new Error("Telegram request failed after retries");
+}
+
 function appendTelegramFormValue(form: FormData, key: string, value: unknown): void {
   if (value === undefined || value === null) return;
   form.append(key, typeof value === "string" ? value : String(value));
@@ -355,63 +414,81 @@ async function telegramApiCallFormData<T>(method: string, form: FormData, token?
   const tok = token ?? envRequired("TELEGRAM_BOT_TOKEN");
   const url = `https://api.telegram.org/bot${tok}/${method}`;
 
-  const res = await fetch(url, {
-    method: "POST",
-    body: form,
+  return telegramWithRetry(async () => {
+    const res = await fetch(url, {
+      method: "POST",
+      body: form,
+    });
+
+    const retryAfterHeader = res.headers.get("Retry-After");
+    const status = res.status;
+
+    const extract = async (): Promise<T> => {
+      const raw = await res.text();
+
+      let parsed: TelegramApiOk<T> | TelegramApiErr | null = null;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        // ignore
+      }
+
+      if (parsed && (parsed as any).ok === false) {
+        const err = parsed as TelegramApiErr;
+        const code = err.error_code ?? res.status;
+        const desc = err.description ?? raw;
+        throw new Error(`Telegram ${method} failed: ${code} ${desc}`);
+      }
+
+      if (!res.ok) throw new Error(`Telegram ${method} HTTP ${res.status}: ${raw}`);
+      if (!parsed || (parsed as any).ok !== true) throw new Error(`Telegram ${method} bad response: ${raw}`);
+
+      return (parsed as TelegramApiOk<T>).result;
+    };
+
+    return { status, retryAfterHeader, extract };
   });
-
-  const raw = await res.text();
-
-  let parsed: TelegramApiOk<T> | TelegramApiErr | null = null;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // ignore
-  }
-
-  if (parsed && (parsed as any).ok === false) {
-    const err = parsed as TelegramApiErr;
-    const code = err.error_code ?? res.status;
-    const desc = err.description ?? raw;
-    throw new Error(`Telegram ${method} failed: ${code} ${desc}`);
-  }
-
-  if (!res.ok) throw new Error(`Telegram ${method} HTTP ${res.status}: ${raw}`);
-  if (!parsed || (parsed as any).ok !== true) throw new Error(`Telegram ${method} bad response: ${raw}`);
-
-  return (parsed as TelegramApiOk<T>).result;
 }
 
 async function telegramApiCall<T>(method: string, payload: Record<string, unknown>, token?: string): Promise<T> {
   const tok = token ?? envRequired("TELEGRAM_BOT_TOKEN");
   const url = `https://api.telegram.org/bot${tok}/${method}`;
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
+  return telegramWithRetry(async () => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const retryAfterHeader = res.headers.get("Retry-After");
+    const status = res.status;
+
+    const extract = async (): Promise<T> => {
+      const raw = await res.text();
+
+      let parsed: TelegramApiOk<T> | TelegramApiErr | null = null;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        // ignore
+      }
+
+      if (parsed && (parsed as any).ok === false) {
+        const err = parsed as TelegramApiErr;
+        const code = err.error_code ?? res.status;
+        const desc = err.description ?? raw;
+        throw new Error(`Telegram ${method} failed: ${code} ${desc}`);
+      }
+
+      if (!res.ok) throw new Error(`Telegram ${method} HTTP ${res.status}: ${raw}`);
+      if (!parsed || (parsed as any).ok !== true) throw new Error(`Telegram ${method} bad response: ${raw}`);
+
+      return (parsed as TelegramApiOk<T>).result;
+    };
+
+    return { status, retryAfterHeader, extract };
   });
-
-  const raw = await res.text();
-
-  let parsed: TelegramApiOk<T> | TelegramApiErr | null = null;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    // ignore
-  }
-
-  if (parsed && (parsed as any).ok === false) {
-    const err = parsed as TelegramApiErr;
-    const code = err.error_code ?? res.status;
-    const desc = err.description ?? raw;
-    throw new Error(`Telegram ${method} failed: ${code} ${desc}`);
-  }
-
-  if (!res.ok) throw new Error(`Telegram ${method} HTTP ${res.status}: ${raw}`);
-  if (!parsed || (parsed as any).ok !== true) throw new Error(`Telegram ${method} bad response: ${raw}`);
-
-  return (parsed as TelegramApiOk<T>).result;
 }
 
 // --- Teams support: bot identity + group invite links -----------------------

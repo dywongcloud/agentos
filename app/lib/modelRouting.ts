@@ -134,10 +134,28 @@ export function chatModelName(): string {
 }
 
 // Deterministic "does this plain-language message look like complex multi-tool
-// agentic work?" gate. Zero tokens — pure heuristics over the text: several
-// distinct apps/data nouns, several distinct action verbs, sequencing language
-// ("then", "for each row"), or sheer instruction length. Used to escalate the
-// chat turn to Fable 5; simple chat stays on the cheap chat model.
+// agentic work?" gate. Zero tokens — pure heuristics over the text. Three
+// signal categories are evaluated independently; escalation requires AT LEAST
+// 2 of the 3 to fire so that a single incidental keyword never triggers the
+// escalation alone:
+//
+//   Signal A — multi-app:      2+ distinct app/data-noun mentions
+//                              (gmail+sheets, slack+notion, …)
+//   Signal B — action verb:    any tool-invocation verb present
+//                              (send, create, schedule, automate, sync, …)
+//   Signal C — multi-step:     any sequencing connector present
+//                              (then, after that, for each, first … then, …)
+//
+// Two-signal minimum: both (A+B), (A+C), or (B+C) must be present to return
+// true. A single signal in isolation always returns false.
+//
+// Test cases (signal counts shown):
+//   "hi there"                                     → 0 signals → false
+//   "send an email"                                → B only    → false
+//   "then update the sheet"                        → B+C       → true  ✓
+//   "send email via gmail then update sheet"       → A+B+C     → true  ✓
+//   "gmail and notion"                             → A only    → false
+//   "schedule a meeting then send a slack message" → A+B+C     → true  ✓
 const COMPLEX_APP_WORDS =
   /(gmail|e-?mail|inbox|sheet|spreadsheet|slack|calendar|notion|github|drive|docs?\b|monday|hubspot|salesforce|linear|jira|airtable|contacts?|crm|webhook|database|csv)/gi;
 const COMPLEX_ACTION_VERBS =
@@ -147,13 +165,21 @@ const COMPLEX_SEQUENCE =
 
 export function looksComplexAgentic(text: string | null | undefined): boolean {
   const t = (text ?? "").trim();
-  if (!t || t.startsWith("/") || t.length < 40) return false;
-  const apps = new Set((t.match(COMPLEX_APP_WORDS) ?? []).map((s) => s.toLowerCase())).size;
-  const verbs = new Set((t.match(COMPLEX_ACTION_VERBS) ?? []).map((s) => s.toLowerCase())).size;
-  let score = Math.min(apps, 3) + Math.min(verbs, 3);
-  if (COMPLEX_SEQUENCE.test(t)) score += 2;
-  if (t.length > 240) score += 1;
-  return score >= 4;
+  if (!t || t.startsWith("/")) return false;
+
+  // Count distinct app/data-noun matches (lowercased to deduplicate variants).
+  const appCount = new Set((t.match(COMPLEX_APP_WORDS) ?? []).map((s) => s.toLowerCase())).size;
+  const verbCount = new Set((t.match(COMPLEX_ACTION_VERBS) ?? []).map((s) => s.toLowerCase())).size;
+
+  // Signal A fires only when 2+ distinct apps are mentioned (multi-app).
+  const hasMultiApp = appCount >= 2;
+  // Signal B fires on any tool-invocation verb.
+  const hasActionVerb = verbCount >= 1;
+  // Signal C fires on any multi-step sequencing connector.
+  const hasSequence = COMPLEX_SEQUENCE.test(t);
+
+  const signals = [hasMultiApp, hasActionVerb, hasSequence].filter(Boolean).length;
+  return signals >= 2;
 }
 
 // Chat model for a SPECIFIC inbound message: complex plain-language agentic

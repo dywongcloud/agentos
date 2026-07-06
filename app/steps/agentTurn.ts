@@ -16,6 +16,7 @@ import { VercelProvider } from "@composio/vercel";
 import { z } from "zod/v4";
 
 import { env } from "@/app/lib/env";
+import { getStore, type Store } from "@/app/lib/store";
 import type { Channel } from "@/app/lib/identity";
 import type { SubAgentScope } from "@/app/lib/agents";
 import { createSendTask } from "@/app/lib/tasks";
@@ -101,8 +102,6 @@ type AgentTurnComposioConfig = {
 // ============================================================
 // Upstash Redis-backed VFS
 // ============================================================
-type RedisClient = any;
-
 type VfsNode =
   | {
       type: "file";
@@ -123,26 +122,8 @@ type VirtualRuntime = {
   sessionId: string;
   userId: string;
   channel: Channel;
-  redis: RedisClient;
+  redis: Store;
 };
-
-let redisClientPromise: Promise<RedisClient | null> | null = null;
-
-async function getRedisClient(): Promise<RedisClient | null> {
-  if (!redisClientPromise) {
-    redisClientPromise = (async () => {
-      const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
-      const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
-
-      if (!url || !token) return null;
-
-      const { Redis } = await import("@upstash/redis");
-      return new Redis({ url, token });
-    })().catch(() => null);
-  }
-
-  return redisClientPromise;
-}
 
 function vfsNamespace(userId: string, sessionId: string): string {
   return `vfs:${userId}:${sessionId}`;
@@ -1533,95 +1514,124 @@ async function createVirtualRuntime(args: {
   history: ModelMessage[];
   sessionAssets?: SessionAsset[];
 }): Promise<VirtualRuntime> {
-  const redis = await getRedisClient();
-  if (!redis) {
-    throw new Error(
-      "Upstash Redis is not configured. Set KV_REST_API_URL/KV_REST_API_TOKEN or UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN."
-    );
-  }
+  const store = getStore();
 
   const rt: VirtualRuntime = {
     cwd: "/workspace",
     sessionId: args.sessionId,
     userId: args.userId,
     channel: args.channel,
-    redis,
+    redis: store,
   };
 
-  await vfsEnsureDir(rt, "/");
-  await vfsEnsureDir(rt, "/workspace");
-  await vfsEnsureDir(rt, "/workspace/context");
-  await vfsEnsureDir(rt, "/workspace/skills");
-  await vfsEnsureDir(rt, "/workspace/assets");
-
-  await rt.redis.set(vfsMetaKey(args.userId, args.sessionId), {
-    sessionId: args.sessionId,
-    userId: args.userId,
-    channel: args.channel,
-    cwd: "/workspace",
-    updatedAt: nowIso(),
-  });
-
-  await vfsWriteFile(
-    rt,
-    "/workspace/README.agent.txt",
-    [
-      "Virtual agent workspace.",
-      "",
-      "This filesystem is persisted in Upstash Redis and scoped to the current user + session.",
-      "Use it for scratch files, reports, payloads, drafts, and analysis artifacts.",
-      "",
-      `sessionId=${args.sessionId}`,
-      `userId=${args.userId}`,
-      `channel=${args.channel}`,
-      `updatedAt=${nowIso()}`,
-    ].join("\n")
+  // Guard: only run VFS setup writes on the first turn for this session.
+  // SET NX returns true when the key was newly created (first turn) and
+  // false when it already existed (subsequent turn).
+  const isFirstTurn = await store.set(
+    `vfs:setup:${args.sessionId}`,
+    "1",
+    { nx: true, exSeconds: 3600 }
   );
 
-  await vfsWriteFile(
-    rt,
-    "/workspace/context/request.json",
-    toSafeJson({
+  if (!isFirstTurn) {
+    // Subsequent turn — update meta to reflect the latest turn context,
+    // then skip all the expensive setup writes.
+    await rt.redis.set(vfsMetaKey(args.userId, args.sessionId), {
       sessionId: args.sessionId,
       userId: args.userId,
       channel: args.channel,
-      userText: truncateText(args.userText, 4000),
-      historyCount: args.history.length,
-      sessionAssetCount: args.sessionAssets?.length ?? 0,
-      createdAt: nowIso(),
-    })
-  );
-
-  await vfsWriteFile(
-    rt,
-    "/workspace/context/skills.index.json",
-    toSafeJson({
-      skills: Object.keys(INLINE_SKILLS),
-    })
-  );
-
-  await vfsWriteFile(
-    rt,
-    "/workspace/context/session_assets.index.json",
-    toSafeJson({
-      assets:
-        args.sessionAssets?.map((asset) => ({
-          id: asset.id,
-          kind: asset.kind,
-          role: asset.role,
-          filename: asset.filename,
-          mimeType: asset.mimeType,
-          source: asset.source,
-          sizeBytes: asset.sizeBytes ?? null,
-          hasUrl: Boolean(asset.url),
-          hasInlineData: Boolean(asset.base64 || asset.dataUrl || asset.text),
-        })) ?? [],
-    })
-  );
-
-  for (const skill of Object.values(INLINE_SKILLS)) {
-    await vfsWriteFile(rt, `/workspace/skills/${skill.name}.md`, renderSingleSkill(skill));
+      cwd: "/workspace",
+      updatedAt: nowIso(),
+    });
+    return rt;
   }
+
+  // First turn — batch all workspace setup writes into a single pipeline call.
+  // Since we know the workspace is fresh (nx:true guard above confirmed no
+  // prior key), we skip read-before-write and build all SET + SADD commands
+  // upfront, replacing ~40 sequential Redis calls with one /pipeline POST.
+  const now = nowIso();
+  const pathsKey = vfsPathsKey(args.userId, args.sessionId);
+  const nodeK = (p: string) => vfsNodeKey(args.userId, args.sessionId, p);
+  const encodeNode = (n: object) => JSON.stringify(n);
+
+  const fixedDirs = ["/", "/workspace", "/workspace/context", "/workspace/skills", "/workspace/assets"];
+  const fixedFiles: { path: string; content: string }[] = [
+    {
+      path: "/workspace/README.agent.txt",
+      content: [
+        "Virtual agent workspace.",
+        "",
+        "This filesystem is persisted in Upstash Redis and scoped to the current user + session.",
+        "Use it for scratch files, reports, payloads, drafts, and analysis artifacts.",
+        "",
+        `sessionId=${args.sessionId}`,
+        `userId=${args.userId}`,
+        `channel=${args.channel}`,
+        `updatedAt=${now}`,
+      ].join("\n"),
+    },
+    {
+      path: "/workspace/context/request.json",
+      content: toSafeJson({
+        sessionId: args.sessionId,
+        userId: args.userId,
+        channel: args.channel,
+        userText: truncateText(args.userText, 4000),
+        historyCount: args.history.length,
+        sessionAssetCount: args.sessionAssets?.length ?? 0,
+        createdAt: now,
+      }),
+    },
+    {
+      path: "/workspace/context/skills.index.json",
+      content: toSafeJson({ skills: Object.keys(INLINE_SKILLS) }),
+    },
+    {
+      path: "/workspace/context/session_assets.index.json",
+      content: toSafeJson({
+        assets:
+          args.sessionAssets?.map((asset) => ({
+            id: asset.id,
+            kind: asset.kind,
+            role: asset.role,
+            filename: asset.filename,
+            mimeType: asset.mimeType,
+            source: asset.source,
+            sizeBytes: asset.sizeBytes ?? null,
+            hasUrl: Boolean(asset.url),
+            hasInlineData: Boolean(asset.base64 || asset.dataUrl || asset.text),
+          })) ?? [],
+      }),
+    },
+    ...Object.values(INLINE_SKILLS).map((skill) => ({
+      path: `/workspace/skills/${skill.name}.md`,
+      content: renderSingleSkill(skill),
+    })),
+  ];
+
+  const pipeline: (string | number)[][] = [
+    // VFS meta
+    ["SET", vfsMetaKey(args.userId, args.sessionId), encodeNode({
+      sessionId: args.sessionId,
+      userId: args.userId,
+      channel: args.channel,
+      cwd: "/workspace",
+      updatedAt: now,
+    })],
+    // Fixed directories
+    ...fixedDirs.flatMap((p) => [
+      ["SET", nodeK(p), encodeNode({ type: "dir", path: p, createdAt: now, updatedAt: now })],
+      ["SADD", pathsKey, p],
+    ]),
+    // Fixed + skill files
+    ...fixedFiles.flatMap(({ path: p, content }) => [
+      ["SET", nodeK(p), encodeNode({ type: "file", path: p, content, createdAt: now, updatedAt: now })],
+      ["SADD", pathsKey, p],
+    ]),
+  ];
+
+  await rt.redis.pipelineMany(pipeline);
 
   return rt;
 }

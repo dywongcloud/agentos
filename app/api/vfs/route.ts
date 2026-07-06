@@ -1,10 +1,9 @@
 import type { NextRequest } from "next/server";
+import { getStore } from "@/app/lib/store";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
-
-type RedisClient = any;
 
 type VfsNode =
   | {
@@ -24,26 +23,6 @@ type VfsNode =
 type RouteParams = {
   path?: string[];
 };
-
-let redisClientPromise: Promise<RedisClient | null> | null = null;
-
-async function getRedisClient(): Promise<RedisClient | null> {
-  if (!redisClientPromise) {
-    redisClientPromise = (async () => {
-      const url =
-        process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL ?? "";
-      const token =
-        process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN ?? "";
-
-      if (!url || !token) return null;
-
-      const { Redis } = await import("@upstash/redis");
-      return new Redis({ url, token });
-    })().catch(() => null);
-  }
-
-  return redisClientPromise;
-}
 
 function utf8ToBytes(text: string): Uint8Array {
   return new TextEncoder().encode(String(text ?? ""));
@@ -180,15 +159,14 @@ function vfsNodeKey(userId: string, sessionId: string, path: string): string {
 }
 
 async function vfsGetNode(
-  redis: RedisClient,
   userId: string,
   sessionId: string,
   path: string
 ): Promise<VfsNode | undefined> {
   const p = sanitizePath(path);
-  const node = await redis.get(vfsNodeKey(userId, sessionId, p));
+  const node = await getStore().get<VfsNode>(vfsNodeKey(userId, sessionId, p));
   if (!node) return undefined;
-  return node as VfsNode;
+  return node;
 }
 
 function buildSignedVfsPayload(args: {
@@ -240,14 +218,6 @@ async function handle(
   if (!secret) {
     return new Response(
       "Missing VFS_URL_SIGNING_SECRET (or ASSET_URL_SIGNING_SECRET / SESSION_ASSET_SIGNING_SECRET)",
-      { status: 500 }
-    );
-  }
-
-  const redis = await getRedisClient();
-  if (!redis) {
-    return new Response(
-      "Upstash Redis is not configured. Set KV_REST_API_URL and KV_REST_API_TOKEN.",
       { status: 500 }
     );
   }
@@ -306,7 +276,7 @@ async function handle(
     return forbidden("Invalid signature");
   }
 
-  const node = await vfsGetNode(redis, userId, sessionId, requestedPath);
+  const node = await vfsGetNode(userId, sessionId, requestedPath);
   if (!node) {
     return notFound(`No such file: ${requestedPath}`);
   }

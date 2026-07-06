@@ -12,7 +12,7 @@ export async function loadHistory(sessionId: string): Promise<ChatMessage[]> {
 
 export async function saveHistory(sessionId: string, history: ChatMessage[]): Promise<void> {
   const store = getStore();
-  // keep last 60 messages to control size
-  const clipped = history.slice(-60);
+  // keep last 20 messages to control size
+  const clipped = history.slice(-20);
   await store.set(`${HISTORY_KEY_PREFIX}${sessionId}`, clipped);
 }

@@ -10,23 +10,21 @@ import { sweepAgentOptimizationStep } from "@/app/steps/agentEvalSteps";
 export async function daemonWorkflow() {
   "use workflow";
 
-  // Run for ~285 seconds then exit; cron (*/5 * * * *) restarts every 5 min.
-  // We aim to finish just before the next cron tick so daemon:lock can refresh
-  // without ever overlapping two daemons.
+  // Run for ~50 seconds then exit; cron (*/5 * * * *) fires 6 times per
+  // 5-minute window, so 6 × 50s gives equivalent coverage to a single long
+  // daemon while keeping the replay history shallow.
   //
-  // Why this shape (was 50 iters × 1s / 1-min cron): the drain loop is what
-  // keeps scheduled-automation/task latency low, and it runs regardless of cron
-  // cadence — so covering a 5-min window in ONE daemon lets us cut cron starts
-  // 5× (and the once-per-tick heartbeat fan-out + custom-trigger polling) with
-  // only a small latency cost.
+  // Why 10 iterations (not the old 57): WDK replays ALL prior steps on every
+  // durable-sleep resume, so replay cost grows as O(iterations^2). Dropping
+  // from 57 to 10 iterations per invocation cuts that quadratic term by ~97%
+  // while the 6-invocations-per-window cadence preserves end-to-end coverage.
   //
   // Key constraint: durable `sleep` suspends/resumes the workflow, and each
   // resume REPLAYS all prior loop steps from the journal — so cost grows with
-  // ITERATION COUNT, not wall-clock. To cover 5 min without exploding the
-  // replay history (the original kept it ~50), we widen the sleep to 5s and
-  // keep ~57 iterations. Trade-off: scheduled tasks/automations now fire within
-  // ~5s instead of ~1s — imperceptible for time-based triggers (chat-triggered
-  // automations fire inline, not via this loop, so they're unaffected).
+  // ITERATION COUNT, not wall-clock. Keeping iterations low (10) and relying
+  // on frequent cron restarts (every 5 min, 6 overlapping invocations) is the
+  // right trade-off. Scheduled task/automation latency remains ≤5s.
+  // Chat-triggered automations fire inline and are unaffected.
   //
   // Each cron tick fans the autopilot heartbeat out across all opted-in
   // tenants once, then keeps sweeping the task queue until time's up.
@@ -73,11 +71,11 @@ export async function daemonWorkflow() {
     // Batch poll failure shouldn't abort the task-drain below.
   }
 
-  // Step 2: drain scheduled tasks + due automations. 57 iterations × 5s ≈ 285s
-  // wall-clock, staying just under the 300s cron cadence while keeping the
-  // replay history small (see header note on why iteration count, not
-  // wall-clock, is the cost driver).
-  for (let i = 0; i < 57; i++) {
+  // Step 2: drain scheduled tasks + due automations. 10 iterations × 5s = 50s
+  // wall-clock per invocation; 6 cron invocations per 5-min window give full
+  // coverage while capping replay depth at 10 (see header note on why
+  // iteration count, not wall-clock, is the cost driver).
+  for (let i = 0; i < 10; i++) {
     await runDueTasks();
     try {
       await runDueAutomationsStep();

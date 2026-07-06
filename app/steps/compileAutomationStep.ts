@@ -301,6 +301,28 @@ function requiredKeysOf(schema: unknown): string[] {
   return Array.isArray(req) ? req.filter((k): k is string => typeof k === "string") : [];
 }
 
+// ---------------------------------------------------------------------------
+// Trigger-slug resolution cache
+// ---------------------------------------------------------------------------
+// Keyed by the concatenation of toolkit + query + guess inputs (pipe-separated
+// so that e.g. "github" + "pull" + "" never collides with "" + "github" + "pull").
+// Each entry stores the resolved result plus an expiry timestamp; stale entries
+// are evicted on the next read rather than on a timer, which is fine for a
+// process-scoped cache with low cardinality.
+
+const TRIGGER_SLUG_CACHE_TTL_MS = 10 * 60 * 1_000; // 10 minutes
+
+type CachedResolution = { value: ResolvedTrigger; expiresAt: number };
+const triggerSlugCache = new Map<string, CachedResolution>();
+
+function triggerSlugCacheKey(
+  toolkit: string | undefined,
+  query: string | undefined,
+  guess: string
+): string {
+  return [toolkit ?? "", query ?? "", guess].join("|");
+}
+
 // Resolve the concrete Composio trigger slug DYNAMICALLY from the live catalog
 // instead of a hardcoded list. Merges native Composio trigger types with our
 // custom polling types (monday.com built-ins + agent-registered ones), ranks by
@@ -315,6 +337,13 @@ export async function resolveComposioTriggerSlug(args: {
   const toolkit = args.toolkit?.trim() || undefined;
   const query = args.query?.trim() || undefined;
   const guess = args.guess?.trim() || "";
+
+  // Check the module-level cache before hitting the API.
+  const cacheKey = triggerSlugCacheKey(toolkit, query, guess);
+  const cached = triggerSlugCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
 
   try {
     // Fetch ALL custom types (there are few) and filter leniently ourselves so
@@ -369,18 +398,27 @@ export async function resolveComposioTriggerSlug(args: {
         s.toUpperCase()
       )
     );
-    if (guess && known.has(guess.toUpperCase())) return pick(guess);
+    if (guess && known.has(guess.toUpperCase())) return cache(pick(guess));
 
     // Otherwise take the best-ranked candidate. listTriggerTypes already ranks
     // natives by the keyword; prefer a native match, then a custom (polling) one.
     if (query || !guess) {
-      if (native.length) return pick(native[0].slug);
-      if (custom.length) return pick(custom[0].slug);
+      if (native.length) return cache(pick(native[0].slug));
+      if (custom.length) return cache(pick(custom[0].slug));
     }
   } catch {
     // discovery unavailable (e.g. no COMPOSIO_API_KEY) — fall back to the guess
   }
-  return { slug: guess, requiredConfig: [] };
+  return cache({ slug: guess, requiredConfig: [] });
+
+  // Write result to cache and return it.
+  function cache(result: ResolvedTrigger): ResolvedTrigger {
+    triggerSlugCache.set(cacheKey, {
+      value: result,
+      expiresAt: Date.now() + TRIGGER_SLUG_CACHE_TTL_MS,
+    });
+    return result;
+  }
 }
 
 export function narrowTrigger(o: FlatTriggerFields): CompiledTrigger {

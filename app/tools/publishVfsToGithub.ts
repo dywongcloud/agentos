@@ -11,9 +11,8 @@
 
 import { tool } from "ai";
 import { z } from "zod";
-import { Redis } from "@upstash/redis";
 
-import { env } from "@/app/lib/env";
+import { getStore } from "@/app/lib/store";
 import { getGithubTokenForTenant } from "@/app/lib/composioGithub";
 import { recordAudit } from "@/app/lib/auditLog";
 
@@ -21,21 +20,6 @@ export type PublishVfsToGithubContext = {
   tenantId: string;
   sessionId: string;
 };
-
-type RedisClient = InstanceType<typeof Redis>;
-
-let redisClientPromise: Promise<RedisClient | null> | null = null;
-async function getRedis(): Promise<RedisClient | null> {
-  if (redisClientPromise) return redisClientPromise;
-  redisClientPromise = (async () => {
-    const url = env("KV_REST_API_URL") ?? env("UPSTASH_REDIS_REST_URL");
-    const token =
-      env("KV_REST_API_TOKEN") ?? env("UPSTASH_REDIS_REST_TOKEN");
-    if (!url || !token) return null;
-    return new Redis({ url, token });
-  })();
-  return redisClientPromise;
-}
 
 type VfsFileNode = {
   type: "file";
@@ -70,16 +54,14 @@ async function resolvePaths(args: {
   paths?: string[];
   prefix?: string;
 }): Promise<string[]> {
-  const redis = await getRedis();
-  if (!redis) return [];
   if (Array.isArray(args.paths) && args.paths.length > 0) {
     return args.paths.map(sanitizePath);
   }
   if (typeof args.prefix === "string" && args.prefix) {
     const prefix = sanitizePath(args.prefix);
-    const all = (await redis.smembers(
+    const all = await getStore().smembers(
       `vfs:${args.tenantId}:${args.sessionId}:paths`
-    )) as string[];
+    );
     return all.filter((p) => p === prefix || p.startsWith(prefix + "/"));
   }
   return [];
@@ -90,9 +72,7 @@ async function readVfsFile(args: {
   sessionId: string;
   path: string;
 }): Promise<VfsFileNode | null> {
-  const redis = await getRedis();
-  if (!redis) return null;
-  const node = await redis.get<VfsFileNode | { type: "dir" }>(
+  const node = await getStore().get<VfsFileNode | { type: "dir" }>(
     `vfs:${args.tenantId}:${args.sessionId}:node:${sanitizePath(args.path)}`
   );
   if (!node || node.type !== "file") return null;

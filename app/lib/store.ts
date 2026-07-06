@@ -41,6 +41,12 @@ export interface Store {
   sismember(key: string, member: string): Promise<boolean>;
   srem(key: string, member: string): Promise<void>;
   scard(key: string): Promise<number>;
+
+  // Pipeline helper: batch multiple Redis commands in a single HTTP round-trip.
+  // Each element of cmds is a Redis command array (e.g. ["GET", "mykey"]).
+  // Returns an array of decoded results in the same order as cmds.
+  // Throws if any slot comes back with an error.
+  pipelineMany(cmds: (string | number)[][]): Promise<unknown[]>;
 }
 
 function ensureEventTargetPolyfill() {
@@ -186,7 +192,57 @@ class MemoryStore implements Store {
   async scard(key: string): Promise<number> {
     return (this.smap.get(key) ?? new Set()).size;
   }
+
+  // Sequential fallback: MemoryStore has no network, so run each cmd in order.
+  async pipelineMany(cmds: (string | number)[][]): Promise<unknown[]> {
+    const results: unknown[] = [];
+    for (const cmd of cmds) {
+      const [op, ...rest] = cmd;
+      // Dispatch to the appropriate typed helper by command name.
+      switch (String(op).toUpperCase()) {
+        case "GET":        results.push(await this.get(String(rest[0]))); break;
+        case "SET": {
+          const [k, v, ...flags] = rest;
+          const opts: { exSeconds?: number; nx?: boolean } = {};
+          for (let i = 0; i < flags.length; i++) {
+            if (String(flags[i]).toUpperCase() === "EX") opts.exSeconds = Number(flags[++i]);
+            if (String(flags[i]).toUpperCase() === "NX") opts.nx = true;
+          }
+          results.push(await this.set(String(k), v, opts));
+          break;
+        }
+        case "DEL":        await this.del(String(rest[0])); results.push(null); break;
+        case "HSET":       await this.hset(String(rest[0]), String(rest[1]), rest[2]); results.push(null); break;
+        case "HSETNX":     results.push(await this.hsetnx(String(rest[0]), String(rest[1]), rest[2])); break;
+        case "HGET":       results.push(await this.hget(String(rest[0]), String(rest[1]))); break;
+        case "HGETALL":    results.push(await this.hgetall(String(rest[0]))); break;
+        case "HDEL":       await this.hdel(String(rest[0]), String(rest[1])); results.push(null); break;
+        case "ZADD":       await this.zadd(String(rest[0]), Number(rest[1]), String(rest[2])); results.push(null); break;
+        case "ZRANGEBYSCORE": results.push(await this.zrangebyscore(String(rest[0]), Number(rest[1]), Number(rest[2]))); break;
+        case "ZREM":       await this.zrem(String(rest[0]), String(rest[1])); results.push(null); break;
+        case "LPUSH":      results.push(await this.lpush(String(rest[0]), String(rest[1]))); break;
+        case "LRANGE":     results.push(await this.lrange(String(rest[0]), Number(rest[1]), Number(rest[2]))); break;
+        case "LLEN":       results.push(await this.llen(String(rest[0]))); break;
+        case "LTRIM":      await this.ltrim(String(rest[0]), Number(rest[1]), Number(rest[2])); results.push(null); break;
+        case "SADD":       await this.sadd(String(rest[0]), String(rest[1])); results.push(null); break;
+        case "SMEMBERS":   results.push(await this.smembers(String(rest[0]))); break;
+        case "SISMEMBER":  results.push(await this.sismember(String(rest[0]), String(rest[1]))); break;
+        case "SREM":       await this.srem(String(rest[0]), String(rest[1])); results.push(null); break;
+        case "SCARD":      results.push(await this.scard(String(rest[0]))); break;
+        default:
+          throw new Error(`MemoryStore.pipelineMany: unsupported command "${op}"`);
+      }
+    }
+    return results;
+  }
 }
+
+// Statuses that are transient infrastructure failures and worth retrying.
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+// Max attempts = 1 initial + 3 retries.
+const MAX_ATTEMPTS = 4;
+// Base backoff in ms; delay = BASE * 4^attempt (100ms, 400ms, 1600ms).
+const BACKOFF_BASE_MS = 100;
 
 /**
  * Direct-REST Upstash store.
@@ -219,27 +275,50 @@ class UpstashStore implements Store {
   // /pipeline returns the response as a JSON ARRAY of { result } / { error },
   // NOT wrapped in an outer { result }. Don't try to share a generic envelope
   // helper with the path-style endpoints — they have a different shape.
+  //
+  // Retries up to 3 times (4 total attempts) on HTTP 429/500/502/503/504 with
+  // exponential backoff: 100ms, 400ms, 1600ms. Does not retry on 401/403/404.
   private async cmd<T = unknown>(args: (string | number)[]): Promise<T> {
-    const res = await fetch(`${this.url}/pipeline`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify([args]),
-    });
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(
-        `Upstash /pipeline ${args[0]} → ${res.status} ${body.slice(0, 200)}`
-      );
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        // Exponential backoff: 100ms * 4^(attempt-1)
+        const delay = BACKOFF_BASE_MS * Math.pow(4, attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+
+      const res = await fetch(`${this.url}/pipeline`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "Content-Type": "application/json",
+          Connection: "keep-alive",
+        },
+        body: JSON.stringify([args]),
+      });
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        const err = new Error(
+          `Upstash /pipeline ${args[0]} → ${res.status} ${body.slice(0, 200)}`
+        );
+        if (RETRYABLE_STATUSES.has(res.status)) {
+          lastError = err;
+          continue; // retry
+        }
+        throw err; // non-retryable (e.g. 401, 403, 404)
+      }
+
+      const json = (await res.json()) as Array<{ result?: T; error?: string }>;
+      const first = Array.isArray(json) ? json[0] : (json as any);
+      if (first?.error) {
+        throw new Error(`Upstash cmd ${args[0]} → ${first.error}`);
+      }
+      return (first?.result ?? undefined) as T;
     }
-    const json = (await res.json()) as Array<{ result?: T; error?: string }>;
-    const first = Array.isArray(json) ? json[0] : (json as any);
-    if (first?.error) {
-      throw new Error(`Upstash cmd ${args[0]} → ${first.error}`);
-    }
-    return (first?.result ?? undefined) as T;
+
+    throw lastError ?? new Error(`Upstash /pipeline ${args[0]} failed after ${MAX_ATTEMPTS} attempts`);
   }
 
   // Encoding rule: strings are stored as-is (no JSON quoting), everything
@@ -384,6 +463,59 @@ class UpstashStore implements Store {
   }
   async scard(key: string): Promise<number> {
     return (await this.cmd<number>(["SCARD", key])) ?? 0;
+  }
+
+  // Batch multiple Redis commands in a single HTTP POST to /pipeline.
+  // Returns decoded results in slot order; throws on any per-slot error.
+  async pipelineMany(cmds: (string | number)[][]): Promise<unknown[]> {
+    if (cmds.length === 0) return [];
+
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) {
+        const delay = BACKOFF_BASE_MS * Math.pow(4, attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+
+      const res = await fetch(`${this.url}/pipeline`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          "Content-Type": "application/json",
+          Connection: "keep-alive",
+        },
+        body: JSON.stringify(cmds),
+      });
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        const err = new Error(
+          `Upstash /pipeline (batch ${cmds.length}) → ${res.status} ${body.slice(0, 200)}`
+        );
+        if (RETRYABLE_STATUSES.has(res.status)) {
+          lastError = err;
+          continue;
+        }
+        throw err;
+      }
+
+      const json = (await res.json()) as Array<{ result?: unknown; error?: string }>;
+
+      // Check every slot for errors before returning anything.
+      for (let i = 0; i < json.length; i++) {
+        const slot = json[i];
+        if (slot?.error) {
+          throw new Error(
+            `Upstash pipelineMany slot ${i} (${cmds[i]?.[0]}) → ${slot.error}`
+          );
+        }
+      }
+
+      return json.map((slot) => this.decode(slot?.result ?? null));
+    }
+
+    throw lastError ?? new Error(`Upstash /pipeline batch failed after ${MAX_ATTEMPTS} attempts`);
   }
 }
 

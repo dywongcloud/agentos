@@ -130,8 +130,8 @@ export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
 
   let history = Array.isArray(historyRaw) ? historyRaw : [];
 
-  const max = Number(process.env.HISTORY_MAX_MESSAGES ?? "30");
-  history = trimHistory(history, Number.isFinite(max) ? max : 30);
+  const max = Number(process.env.HISTORY_MAX_MESSAGES ?? "20");
+  history = trimHistory(history, Number.isFinite(max) ? max : 20);
 
   const { groundingTag } = replyCtx;
   const groundedMsg: InboundMessage = groundingTag

@@ -71,22 +71,24 @@ const historyKey = (sessionId: string) => `sess:${sessionId}:history`;
 // Record a group message the bot chose not to answer, speaker-labeled, so the
 // conversation context is intact when the bot is addressed later. Mirrors the
 // session workflow's history shape (ModelMessage[]) and trim cap.
+//
+// Storage: the history key is a Redis LIST (lpush + ltrim). Index 0 is the
+// newest entry. Readers use lrange(key, 0, -1) and reverse to get
+// chronological order. This is consistent with how recentTranscript reads
+// history below.
 export async function recordSilentGroupMessage(msg: InboundMessage): Promise<void> {
   try {
     const store = getStore();
-    const history =
-      ((await store.get<Array<{ role: string; content: unknown }>>(
-        historyKey(msg.sessionId)
-      )) as Array<{ role: string; content: unknown }>) ?? [];
     const who = msg.senderUsername ? `@${msg.senderUsername}` : `user ${msg.senderId}`;
-    history.push({
+    const entry = JSON.stringify({
       role: "user",
       content: `[${who}, not addressed to you — you stayed silent]: ${msg.text ?? ""}`,
     });
+    const key = historyKey(msg.sessionId);
     const max = Number(process.env.HISTORY_MAX_MESSAGES ?? "30");
-    const trimmed =
-      history.length > max ? history.slice(history.length - max) : history;
-    await store.set(historyKey(msg.sessionId), trimmed);
+    // lpush prepends (index 0 = newest). ltrim keeps [0, max-1], dropping oldest.
+    await store.lpush(key, entry);
+    await store.ltrim(key, 0, max - 1);
   } catch {
     // best-effort — losing one silent message is better than failing ingress
   }
@@ -100,14 +102,24 @@ const chimeSchema = z.object({
 });
 
 // Flatten recent history into a compact transcript for the gate prompt.
+// The history key is a Redis LIST (index 0 = newest). lrange(key, 0, take-1)
+// returns the `take` most-recent entries newest-first; reverse to get
+// chronological order for the transcript.
 async function recentTranscript(sessionId: string, take = 8): Promise<string> {
   try {
-    const history =
-      ((await getStore().get<Array<{ role: string; content: unknown }>>(
-        historyKey(sessionId)
-      )) as Array<{ role: string; content: unknown }>) ?? [];
+    const raw = await getStore().lrange(historyKey(sessionId), 0, take - 1);
+    // raw is newest-first; reverse for chronological order in the transcript.
+    const history = raw
+      .map((s) => {
+        try {
+          return JSON.parse(s) as { role: string; content: unknown };
+        } catch {
+          return null;
+        }
+      })
+      .filter((m): m is { role: string; content: unknown } => m !== null)
+      .reverse();
     return history
-      .slice(-take)
       .map((m) => {
         const c = m.content;
         const t =

@@ -64,27 +64,20 @@ export async function sendOutboundRuntime(args: { channel: Channel; sessionId: s
       // webhook handler can recover the exact text they're replying to.
       // Best-effort: storage failures here must NOT block delivery.
       try {
-        const { saveTgMessage } = await import("@/app/lib/tgMessageMap");
-        await saveTgMessage({
-          sessionId,
-          messageId,
-          role: "assistant",
-          text: chunks[i],
-        });
+        import("@/app/lib/tgMessageMap").then(({ saveTgMessage }) =>
+          saveTgMessage({
+            sessionId,
+            messageId,
+            role: "assistant",
+            text: chunks[i],
+          })
+        );
       } catch {
         // ignore
       }
     }
     return;
   }
-/*
-  if (channel === "whatsapp") {
-    const to = whatsappSessionToTo(sessionId);
-    if (!to) throw new Error(`Invalid whatsapp sessionId: ${sessionId}`);
-    await whatsappSendMessage(to, text);
-    return;
-  }
-*/
 
   if (channel === "sms") {
     const to = sessionId.split(":")[1] ?? "";

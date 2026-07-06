@@ -1,6 +1,7 @@
 // app/steps/sessionStateSteps.ts
 import type { ModelMessage } from "ai";
 import { loadTgMessage, saveTgMessage } from "@/app/lib/tgMessageMap";
+import { getStore } from "@/app/lib/store";
 
 const historyKey = (sessionId: string) => `sess:${sessionId}:history`;
 
@@ -54,27 +55,52 @@ export async function resolveReplyContextStep(args: {
 export async function loadHistoryStep(sessionId: string): Promise<ModelMessage[]> {
   "use step";
 
-  const { Redis } = await import("@upstash/redis");
-
-  const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
-
-  if (!url || !token) return [];
-
-  const redis = new Redis({ url, token });
-  return (await redis.get(historyKey(sessionId))) ?? [];
+  // History is stored as a Redis LIST (lpush + ltrim), index 0 = newest.
+  // lrange(key, 0, -1) returns all entries newest-first; reverse for
+  // chronological order expected by the session workflow (oldest first).
+  //
+  // Migration: before the LIST format was introduced, history was stored as a
+  // JSON-array string (GET/SET). If lrange returns a WRONGTYPE error (the key
+  // exists as a STRING), fall back to store.get() to read the old format and
+  // return it. On the next saveHistoryStep call the key will be deleted and
+  // rewritten as a LIST, completing the one-time per-session migration.
+  const store = getStore();
+  let raw: string[] = [];
+  try {
+    raw = await store.lrange(historyKey(sessionId), 0, -1);
+  } catch (err: any) {
+    if (String(err?.message ?? "").includes("WRONGTYPE")) {
+      const old = await store.get<ModelMessage[]>(historyKey(sessionId)).catch(() => null);
+      return Array.isArray(old) ? old : [];
+    }
+    return [];
+  }
+  if (raw.length === 0) return [];
+  return raw
+    .map((s) => {
+      try {
+        return JSON.parse(s) as ModelMessage;
+      } catch {
+        return null;
+      }
+    })
+    .filter((m): m is ModelMessage => m !== null)
+    .reverse();
 }
 
 export async function saveHistoryStep(sessionId: string, history: ModelMessage[]) {
   "use step";
 
-  const { Redis } = await import("@upstash/redis");
-
-  const url = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN;
-
-  if (!url || !token) return;
-
-  const redis = new Redis({ url, token });
-  await redis.set(historyKey(sessionId), history);
+  // Rewrite the list atomically: delete the old key and lpush all entries
+  // in reverse order (oldest first in the push loop → index 0 ends up as
+  // newest after all pushes, consistent with lpush + ltrim convention).
+  const store = getStore();
+  const key = historyKey(sessionId);
+  const max = Number(process.env.HISTORY_MAX_MESSAGES ?? "30");
+  const trimmed = history.length > max ? history.slice(history.length - max) : history;
+  await store.del(key);
+  // Push oldest-first so after all lpushes index 0 is the newest entry.
+  for (const msg of trimmed) {
+    await store.lpush(key, JSON.stringify(msg));
+  }
 }

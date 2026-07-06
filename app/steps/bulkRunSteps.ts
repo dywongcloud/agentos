@@ -63,6 +63,20 @@ export async function fetchBulkItemsStep(runId: string): Promise<number> {
 const MAX_ATTEMPTS = 3;
 const BACKOFF_MS = [1000, 4000];
 
+function isRateLimitError(err: string): boolean {
+  return /429|rate.?limit|too.?many.?requests|retry.?after/i.test(err);
+}
+
+// Returns the backoff delay in milliseconds for a given error and attempt index
+// (0-based). Rate-limit errors get a 5 s minimum so: 5 s, 10 s. All other
+// errors use the standard 1 s / 4 s ladder.
+function retryDelayMs(err: string, attempt: number): number {
+  if (isRateLimitError(err)) {
+    return 5000 * (attempt + 1); // 5000, 10000, …
+  }
+  return BACKOFF_MS[attempt] ?? 4000; // 1000, 4000, …
+}
+
 function isTerminalToolError(err: string): boolean {
   return /401|403|not.?connected|no connected account|unauthoriz|permission|invalid.?grant/i.test(
     err
@@ -151,7 +165,7 @@ export async function processBulkBatchStep(args: {
       lastErr = res.error ?? "unknown error";
       if (isTerminalToolError(lastErr)) break; // auth is dead — don't grind retries
       if (attempt < MAX_ATTEMPTS - 1) {
-        await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt] ?? 4000));
+        await new Promise((r) => setTimeout(r, retryDelayMs(lastErr, attempt)));
       }
     }
 

@@ -18,7 +18,7 @@ import { getStore } from "@/app/lib/store";
 // LLM, exposing an optional `model` hint to the caller. The calling agent
 // tends to copy the schema's "gpt-4o" example into that field, so discovery /
 // tool-search planning silently runs on gpt-4o. Force our chosen search model
-// (default gpt-4.1, override via COMPOSIO_SEARCH_MODEL) on that one tool —
+// (default gpt-4.1-mini, override via COMPOSIO_SEARCH_MODEL) on that one tool —
 // `model` is only accepted by the search call, not execute/multi-execute, so
 // we never inject it into a tool that would reject the arg.
 function normalizeComposioArgs(
@@ -28,7 +28,7 @@ function normalizeComposioArgs(
 ): unknown {
   if (namespace !== "composio" || name !== "COMPOSIO_SEARCH_TOOLS") return args;
   if (!args || typeof args !== "object") return args;
-  const desired = env("COMPOSIO_SEARCH_MODEL") ?? "gpt-4.1";
+  const desired = env("COMPOSIO_SEARCH_MODEL") ?? "gpt-4.1-mini";
   if ((args as Record<string, unknown>).model === desired) return args;
   return { ...(args as Record<string, unknown>), model: desired };
 }

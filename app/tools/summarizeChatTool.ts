@@ -29,7 +29,7 @@ import { z } from "zod/v4";
 
 import { env } from "@/app/lib/env";
 import { loadHistoryStep } from "@/app/steps/sessionStateSteps";
-import { putMemory } from "@/app/lib/memoryStore";
+import { putMemory, type MemoryKind } from "@/app/lib/memoryStore";
 import { enrichMemory } from "@/app/lib/memoryEnrichment";
 
 export type SummarizeChatToolContext = {
@@ -214,10 +214,8 @@ export function makeSummarizeChatTool(ctx: SummarizeChatToolContext) {
       // Persist atomic facts as individual memories. Each item runs through
       // the regular enrichMemory pipeline so labels + kind get a final-pass
       // classification.
-      const storedAtomics: Array<{ id: string; title: string; kind: string }> =
-        [];
-      for (const item of o.atomic_facts) {
-        try {
+      const atomicResults = await Promise.allSettled(
+        o.atomic_facts.map(async (item) => {
           const enriched = await enrichMemory({
             content: item.text,
             kindHint: item.kind_hint ?? undefined,
@@ -233,15 +231,15 @@ export function makeSummarizeChatTool(ctx: SummarizeChatToolContext) {
             importance: enriched.importance,
             fields: enriched.fields,
           });
-          storedAtomics.push({
-            id: entry.id,
-            title: entry.title,
-            kind: entry.kind,
-          });
-        } catch {
-          // Drop individual failures rather than failing the whole call.
-        }
-      }
+          return { id: entry.id, title: entry.title, kind: entry.kind };
+        })
+      );
+      const storedAtomics = atomicResults
+        .filter(
+          (r): r is PromiseFulfilledResult<{ id: string; title: string; kind: MemoryKind }> =>
+            r.status === "fulfilled"
+        )
+        .map((r) => r.value);
 
       return {
         ok: true,
