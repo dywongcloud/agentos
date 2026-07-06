@@ -2,6 +2,8 @@
 import type { ModelMessage } from "ai";
 import { loadTgMessage, saveTgMessage } from "@/app/lib/tgMessageMap";
 import { getStore } from "@/app/lib/store";
+import { captureChatOutcome, stashTurnAttribution } from "@/app/lib/learn/outcomeSignal";
+import type { ChatRouteDecision } from "@/app/lib/learn/routerBias";
 
 const historyKey = (sessionId: string) => `sess:${sessionId}:history`;
 
@@ -86,6 +88,37 @@ export async function loadHistoryStep(sessionId: string): Promise<ModelMessage[]
     })
     .filter((m): m is ModelMessage => m !== null)
     .reverse();
+}
+
+// Both learn-subsystem calls perform a non-idempotent Redis write (a
+// stability-weighted stat update / a mailbox overwrite). sessionWorkflow is
+// "use workflow" (not itself a step) — WDK's crash-retry model re-executes
+// any NON-step code in the workflow body on a mid-run retry, which would
+// double-apply these writes. Wrapping both in one "use step" call makes them
+// checkpoint together: on a caller-level retry, this step either already
+// completed (cached, skipped) or re-runs cleanly from scratch — never both.
+export async function captureChatOutcomeStep(args: {
+  tenantId: string;
+  sessionId: string;
+  newUserText: string;
+  priorAssistantText: string;
+  chatRoute: ChatRouteDecision;
+}): Promise<void> {
+  "use step";
+  try {
+    await captureChatOutcome(args.tenantId, args.sessionId, args.newUserText, args.priorAssistantText);
+  } catch {
+    // never break the turn
+  }
+  if (args.chatRoute.bucket) {
+    try {
+      await stashTurnAttribution(args.tenantId, args.sessionId, {
+        chat: { arm: args.chatRoute.arm, bucket: args.chatRoute.bucket },
+      });
+    } catch {
+      // never break the turn
+    }
+  }
 }
 
 export async function saveHistoryStep(sessionId: string, history: ModelMessage[]) {

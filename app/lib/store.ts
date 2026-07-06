@@ -96,18 +96,47 @@ class MemoryStore implements Store {
   private zmap = new Map<string, Array<{ score: number; member: string }>>();
   private lmap = new Map<string, string[]>();
   private smap = new Map<string, Set<string>>();
+  // TTL emulation: absolute expiry timestamps (ms) set by SET ... EX / EXPIRE.
+  // Learn-subsystem keys (learn:attr:*, learn:graph:*) lean on TTL as their
+  // bounded-growth mechanism, so this fallback store needs to actually honor
+  // it rather than silently keeping every key forever.
+  private expiresAt = new Map<string, number>();
+
+  private prune(key: string): void {
+    const exp = this.expiresAt.get(key);
+    if (exp !== undefined && exp <= Date.now()) {
+      this.map.delete(key);
+      this.hmap.delete(key);
+      this.zmap.delete(key);
+      this.lmap.delete(key);
+      this.smap.delete(key);
+      this.expiresAt.delete(key);
+    }
+  }
 
   async get<T>(key: string): Promise<T | null> {
+    this.prune(key);
     return this.map.has(key) ? (this.map.get(key) as T) : null;
   }
-  async set<T>(key: string, value: T, _opts?: { exSeconds?: number; nx?: boolean }): Promise<boolean> {
+  async set<T>(key: string, value: T, opts?: { exSeconds?: number; nx?: boolean }): Promise<boolean> {
+    this.prune(key);
+    if (opts?.nx && this.map.has(key)) return false;
     this.map.set(key, value);
+    if (opts?.exSeconds) this.expiresAt.set(key, Date.now() + opts.exSeconds * 1000);
+    else this.expiresAt.delete(key);
     return true;
   }
   async del(key: string): Promise<void> {
     this.map.delete(key);
     this.hmap.delete(key);
     this.zmap.delete(key);
+    this.lmap.delete(key);
+    this.smap.delete(key);
+    this.expiresAt.delete(key);
+  }
+  async expire(key: string, seconds: number): Promise<void> {
+    this.prune(key);
+    this.expiresAt.set(key, Date.now() + seconds * 1000);
   }
 
   async hset<T>(key: string, field: string, value: T): Promise<void> {
@@ -123,11 +152,13 @@ class MemoryStore implements Store {
     return true;
   }
   async hget<T>(key: string, field: string): Promise<T | null> {
+    this.prune(key);
     const h = this.hmap.get(key);
     if (!h) return null;
     return h.has(field) ? (h.get(field) as T) : null;
   }
   async hgetall<T>(key: string): Promise<Record<string, T>> {
+    this.prune(key);
     const h = this.hmap.get(key);
     if (!h) return {};
     return Object.fromEntries(h.entries()) as Record<string, T>;
@@ -139,12 +170,16 @@ class MemoryStore implements Store {
   }
 
   async zadd(key: string, score: number, member: string): Promise<void> {
+    this.prune(key);
     const z = this.zmap.get(key) ?? [];
-    z.push({ score, member });
+    const existing = z.find((x) => x.member === member);
+    if (existing) existing.score = score;
+    else z.push({ score, member });
     z.sort((a, b) => a.score - b.score);
     this.zmap.set(key, z);
   }
   async zrangebyscore(key: string, min: number, max: number, opts?: { limit?: number }): Promise<string[]> {
+    this.prune(key);
     const z = this.zmap.get(key) ?? [];
     const filtered = z.filter((x) => x.score >= min && x.score <= max).map((x) => x.member);
     if (opts?.limit != null) return filtered.slice(0, opts.limit);
@@ -153,6 +188,33 @@ class MemoryStore implements Store {
   async zrem(key: string, member: string): Promise<void> {
     const z = this.zmap.get(key) ?? [];
     this.zmap.set(key, z.filter((x) => x.member !== member));
+  }
+  // Redis ZSCORE: single member's score, or null if absent.
+  async zscore(key: string, member: string): Promise<number | null> {
+    this.prune(key);
+    const z = this.zmap.get(key) ?? [];
+    const hit = z.find((x) => x.member === member);
+    return hit ? hit.score : null;
+  }
+  // Redis ZRANGE by rank (ascending score order), with optional WITHSCORES
+  // flattening ([member, score, member, score, ...]) to mirror the wire
+  // format the Upstash REST client returns.
+  async zrange(key: string, start: number, stop: number, withScores: boolean): Promise<(string | number)[]> {
+    this.prune(key);
+    const z = this.zmap.get(key) ?? [];
+    const end = stop < 0 ? z.length + stop + 1 : stop + 1;
+    const slice = z.slice(start < 0 ? Math.max(0, z.length + start) : start, end);
+    if (!withScores) return slice.map((x) => x.member);
+    return slice.flatMap((x) => [x.member, x.score]);
+  }
+  // Redis ZREMRANGEBYRANK: drop members whose ascending-score rank falls in
+  // [start, stop] (inclusive, negative indices count from the highest rank).
+  async zremrangebyrank(key: string, start: number, stop: number): Promise<void> {
+    const z = this.zmap.get(key) ?? [];
+    const end = stop < 0 ? z.length + stop + 1 : stop + 1;
+    const from = start < 0 ? Math.max(0, z.length + start) : start;
+    const kept = z.filter((_, i) => i < from || i >= end);
+    this.zmap.set(key, kept);
   }
 
   async lpush(key: string, value: string): Promise<number> {
@@ -212,6 +274,7 @@ class MemoryStore implements Store {
           break;
         }
         case "DEL":        await this.del(String(rest[0])); results.push(null); break;
+        case "EXPIRE":     await this.expire(String(rest[0]), Number(rest[1])); results.push(1); break;
         case "HSET":       await this.hset(String(rest[0]), String(rest[1]), rest[2]); results.push(null); break;
         case "HSETNX":     results.push(await this.hsetnx(String(rest[0]), String(rest[1]), rest[2])); break;
         case "HGET":       results.push(await this.hget(String(rest[0]), String(rest[1]))); break;
@@ -220,6 +283,17 @@ class MemoryStore implements Store {
         case "ZADD":       await this.zadd(String(rest[0]), Number(rest[1]), String(rest[2])); results.push(null); break;
         case "ZRANGEBYSCORE": results.push(await this.zrangebyscore(String(rest[0]), Number(rest[1]), Number(rest[2]))); break;
         case "ZREM":       await this.zrem(String(rest[0]), String(rest[1])); results.push(null); break;
+        case "ZSCORE":     results.push(await this.zscore(String(rest[0]), String(rest[1]))); break;
+        case "ZRANGE": {
+          const [k, start, stop, ...flags] = rest;
+          const withScores = flags.some((f) => String(f).toUpperCase() === "WITHSCORES");
+          results.push(await this.zrange(String(k), Number(start), Number(stop), withScores));
+          break;
+        }
+        case "ZREMRANGEBYRANK":
+          await this.zremrangebyrank(String(rest[0]), Number(rest[1]), Number(rest[2]));
+          results.push(null);
+          break;
         case "LPUSH":      results.push(await this.lpush(String(rest[0]), String(rest[1]))); break;
         case "LRANGE":     results.push(await this.lrange(String(rest[0]), Number(rest[1]), Number(rest[2]))); break;
         case "LLEN":       results.push(await this.llen(String(rest[0]))); break;

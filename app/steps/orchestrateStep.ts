@@ -22,6 +22,7 @@ import {
 import type { ModalityId } from "@/app/lib/rubrics";
 import { recordCost, deepBudgetUsd, deepEscalatedBudgetUsd } from "@/app/lib/costTracker";
 import { env } from "@/app/lib/env";
+import { maybeUpgradePurpose } from "@/app/lib/learn/routerBias";
 
 const MODALITY_IDS = [
   "code-rust",
@@ -166,7 +167,13 @@ export async function orchestrateStep(args: {
       ? "smart-pro"
       : inReviseMode || nearEnd || args.forceFinalize
         ? "meta-pro"
-        : "meta";
+        : await maybeUpgradePurpose(
+            "meta",
+            "meta-pro",
+            "orchestrator-default",
+            `iter:${args.iter < 2 ? "early" : "mid"}`,
+            args.jobId
+          ).catch(() => "meta" as const);
 
   const llm = buildLlmArgs({ purpose, temperature: 0.4 });
   // Force highest reasoning effort when escalated, regardless of the global

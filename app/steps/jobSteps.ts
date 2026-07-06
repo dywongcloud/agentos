@@ -18,6 +18,7 @@ import { agentTurn } from "@/app/steps/agentTurn";
 import type { SubAgentScope } from "@/app/lib/agents";
 import { loadHistoryStep, saveHistoryStep } from "@/app/steps/sessionStateSteps";
 import { recordSolution } from "@/app/lib/solutionMemory";
+import { captureJobOutcome } from "@/app/lib/learn/outcomeSignal";
 import { sendOutboundRuntime } from "@/app/lib/outbound";
 import type { Channel } from "@/app/lib/identity";
 import {
@@ -816,6 +817,13 @@ export async function finalizeJobStep(args: {
       // memory formation must never fail a finalized job
     }
   }
+
+  // Additive stats-only learning signal (router/memory/solution namespace
+  // weights) for a successfully finalized job. Fully separate from the
+  // deterministic recordSolution gating above — never touches it either way.
+  await captureJobOutcome(metaForEval?.tenantId ?? args.tenantId, args.jobId, "success", {
+    struggled: await isJobEscalatedStep(args.jobId).catch(() => false),
+  }).catch(() => {});
 }
 
 export async function failJobStep(args: {
@@ -860,6 +868,11 @@ export async function failJobStep(args: {
     meta: metaForEval,
     errorMessage: args.error,
   });
+
+  // Additive negative learning signal: failJobStep never calls recordSolution
+  // (that gating is untouched), but a failure should still nudge router/
+  // memory/solution namespace stats down. Best-effort, isolated.
+  await captureJobOutcome(metaForEval?.tenantId ?? "", args.jobId, "failure").catch(() => {});
 }
 
 // ----------------------------------------------------------------------------

@@ -46,6 +46,8 @@ import {
 } from "@/app/tools/memoryTools";
 import { retrieveRelevantMemories } from "@/app/lib/memoryRetrieval";
 import { recallSolutions, solutionsToPromptBlock } from "@/app/lib/solutionMemory";
+import { retrieveRelevantMemoriesLearned, recallSolutionsLearned } from "@/app/lib/learn/memoryBias";
+import { stashTurnAttribution } from "@/app/lib/learn/outcomeSignal";
 import { appendThought } from "@/app/lib/jobStore";
 import { isDebugMode } from "@/app/lib/debugMode";
 import {
@@ -5446,10 +5448,13 @@ export async function agentTurn(args: {
     const contextQuery = [userText || "", recentUserTurns, scopeHint]
       .join(" ")
       .slice(0, 800);
-    const memories = await retrieveRelevantMemories(args.userId, {
+    const memories = await retrieveRelevantMemoriesLearned(args.userId, {
       query: contextQuery,
     });
     memoryBlock = memoriesToPromptBlock(memories);
+    await stashTurnAttribution(args.userId, args.jobId ?? args.sessionId, {
+      memory: memories.map((m) => ({ id: m.id, kind: m.kind })),
+    });
   } catch {
     // Memory retrieval failure is non-fatal — agent runs without it.
   }
@@ -5467,11 +5472,17 @@ export async function agentTurn(args: {
       .join(" ");
     const solQuery = [userText || "", recentUserTurns].join(" ").slice(0, 800);
     if (solQuery.trim()) {
-      const hits = await recallSolutions({
+      const hits = await recallSolutionsLearned({
         tenantId: args.userId,
         query: solQuery,
       });
       solutionBlock = solutionsToPromptBlock(hits);
+      await stashTurnAttribution(args.userId, args.jobId ?? args.sessionId, {
+        solution: hits.map((h) => ({
+          id: h.record.id,
+          source: (h.record.meta as any)?.source ?? "manual",
+        })),
+      });
     }
   } catch {
     // Procedural recall failure is non-fatal.

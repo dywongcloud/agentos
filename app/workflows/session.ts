@@ -8,8 +8,10 @@ import {
   loadHistoryStep,
   resolveReplyContextStep,
   saveHistoryStep,
+  captureChatOutcomeStep,
 } from "@/app/steps/sessionStateSteps";
 import { chatModelNameFor } from "@/app/lib/modelRouting";
+import { chatModelNameForLearned, type ChatRouteDecision } from "@/app/lib/learn/routerBias";
 import { maybeAutoLearnChatStep } from "@/app/steps/autoLearnStep";
 import { isChatStopped } from "@/app/lib/chatControl";
 
@@ -108,17 +110,50 @@ function trimHistory(history: ModelMessage[], maxMessages: number): ModelMessage
   return history.length <= m ? history : history.slice(history.length - m);
 }
 
+// Mirrors the flattenContent pattern in app/steps/autoLearnStep.ts.
+function flattenContent(c: unknown): string {
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    return (c as Array<{ text?: string }>)
+      .map((p) => p?.text ?? "")
+      .filter(Boolean)
+      .join(" ");
+  }
+  return "";
+}
+
+function lastAssistantText(history: ModelMessage[]): string {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i] as { role?: string; content?: unknown };
+    if (m?.role === "assistant") return flattenContent(m.content);
+  }
+  return "";
+}
+
 // -----------------------------
 // The workflow (NO HOOKS)
 // -----------------------------
 export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
   "use workflow";
 
+  // Team-aware tenant: in a bound team group, handleInbound sets msg.tenantId to
+  // the shared team namespace so the chat agent's tools (VFS, memory, Composio,
+  // automations) all operate on the team's shared state. Computed up front —
+  // both the outcome-capture read (prior turn) and the routing-decision stash
+  // (this turn) below key off it.
+  const tenantId = msg.tenantId ?? `${msg.channel}:${msg.senderId}`;
+
+  const fallbackChatRoute = (): ChatRouteDecision => ({
+    model: chatModelNameFor(msg.text),
+    arm: "base",
+    bucket: "",
+  });
+
   // History load + reply-binding resolve are independent — both feed the
   // user-message composition below but neither depends on the other's
   // output. Run concurrently so chat latency is bounded by max(history,
   // reply) instead of their sum.
-  const [historyRaw, replyCtx] = await Promise.all([
+  const [historyRaw, replyCtx, chatRoute] = await Promise.all([
     loadHistoryStep(sessionId) as Promise<ModelMessage[]>,
     resolveReplyContextStep({
       sessionId,
@@ -126,6 +161,12 @@ export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
       replyToTgMessageId: (msg as any).replyToTgMessageId,
       text: msg.text ?? "",
     }),
+    // chatModelNameForLearned is internally guarded end-to-end, but it must
+    // never be allowed to reject THIS Promise.all — doing so would also
+    // discard the (independently successful) history/reply-context results
+    // and fail the whole turn over what should be, at worst, a routing
+    // no-op. Fall back to the deterministic resolver directly.
+    chatModelNameForLearned(msg.text ?? "").catch(fallbackChatRoute),
   ]);
 
   let history = Array.isArray(historyRaw) ? historyRaw : [];
@@ -138,6 +179,22 @@ export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
     ? { ...msg, text: `${groundingTag}\n${msg.text ?? ""}` }
     : msg;
 
+  // Best-effort outcome capture for the PRIOR turn (history still holds that
+  // turn's assistant reply, so this is the last point where "what we said"
+  // can be paired with "what the user says next"), plus stashing THIS turn's
+  // chat-routing decision so the NEXT invocation's capture can score it.
+  // Both non-idempotent writes are checkpointed together in one step —
+  // see captureChatOutcomeStep's comment for why this can't be plain
+  // workflow-body code. Never breaks the turn — same discipline as
+  // maybeAutoLearnChatStep below.
+  await captureChatOutcomeStep({
+    tenantId,
+    sessionId,
+    newUserText: msg.text ?? "",
+    priorAssistantText: lastAssistantText(history),
+    chatRoute,
+  });
+
   history.push(buildUserModelMessage(groundedMsg));
 
   // Plain chat (non-/job) runs through the chat model. When TokenHub is
@@ -147,13 +204,10 @@ export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
   // routing (see app/lib/modelRouting.ts). Complex plain-language agentic
   // messages (multi-app, multi-step phrasing) escalate to Claude Sonnet when
   // ANTHROPIC_API_KEY is configured (Fable is reserved for /deep pro-tier
-  // slots); without the key this is chatModelName().
-  const chatModel = chatModelNameFor(msg.text);
-
-  // Team-aware tenant: in a bound team group, handleInbound sets msg.tenantId to
-  // the shared team namespace so the chat agent's tools (VFS, memory, Composio,
-  // automations) all operate on the team's shared state.
-  const tenantId = msg.tenantId ?? `${msg.channel}:${msg.senderId}`;
+  // slots); without the key this is chatModelNameFor(msg.text) — see the
+  // parallel chatModelNameForLearned() resolution above (degrades
+  // byte-identically to chatModelNameFor whenever the learn layer has no
+  // confident opinion).
 
   const result = await agentTurn({
     sessionId,
@@ -161,7 +215,7 @@ export async function sessionWorkflow(sessionId: string, msg: InboundMessage) {
     channel: msg.channel,
     history,
     showTyping: msg.channel === "telegram",
-    modelName: chatModel,
+    modelName: chatRoute.model,
   });
 
   history.push({ role: "assistant", content: result.text });
