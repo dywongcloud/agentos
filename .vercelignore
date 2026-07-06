@@ -1,0 +1,16 @@
+node_modules
+.next
+.DS_Store
+.env
+.env.local
+*.zip
+*.rej
+*.orig
+*.png
+*.jpg
+*.jpeg
+SC*.png
+mid-century*.jpg
+
+# …but the office sprite assets must ship (they're referenced by /ui/agents).
+!public/office/**
