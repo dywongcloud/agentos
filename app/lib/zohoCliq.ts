@@ -280,12 +280,20 @@ export async function zohoCliqRequest(
 // --- action registry -------------------------------------------------------------
 
 // Composio-shaped result so callers (agent tool, custom-trigger poller) can
-// treat ZOHOCLIQ_* slugs identically to Composio slugs.
-export type ZohoExecResult = { ok: boolean; data?: unknown; error?: string };
+// treat ZOHOCLIQ_* slugs identically to Composio slugs. `status` is the raw
+// Zoho HTTP status when known — callers MUST use this (not the error string)
+// to decide whether a failure means "reconnect" (401) vs. "real action
+// problem, e.g. bad chat_id" (400/404/etc) — see zohoCliqTools.ts.
+export type ZohoExecResult = { ok: boolean; data?: unknown; error?: string; status?: number };
 
 export const ZOHO_CLIQ_ACTIONS: Record<string, string> = {
   ZOHOCLIQ_LIST_CHATS: "List the user's chats. Args: {limit?}",
   ZOHOCLIQ_GET_CHAT: "Get one chat. Args: {chat_id}",
+  ZOHOCLIQ_CREATE_CHAT:
+    "Create (or reuse) a 1:1 or group chat. Args: {user_id} for a direct chat with one Cliq user_id " +
+    "(NOT a name/email — if you don't already know their numeric Cliq user_id from a prior ZOHOCLIQ_LIST_CHATS " +
+    "result, ask the user for it, there is no name/email lookup action), or {user_ids: string[], title} " +
+    "(2-50 ids) for a group chat. Returns the new/existing chat's chat_id to use with ZOHOCLIQ_SEND_MESSAGE.",
   ZOHOCLIQ_LIST_MESSAGES:
     "List messages in a chat. Args: {chat_id, limit?, fromtime? (epoch ms), totime? (epoch ms)}",
   ZOHOCLIQ_SEND_MESSAGE: "Send a message. Args: {chat_id, text}",
@@ -324,6 +332,16 @@ export async function executeZohoCliqAction(
         }));
       case "ZOHOCLIQ_GET_CHAT":
         return norm(await zohoCliqRequest(tenantId, "GET", `/chats/${chatId}`));
+      case "ZOHOCLIQ_CREATE_CHAT": {
+        const userIds = Array.isArray(args.user_ids)
+          ? (args.user_ids as unknown[]).map(str).filter(Boolean)
+          : [];
+        const body =
+          userIds.length > 0
+            ? { chat_type: "group_chat", user_ids: userIds, title: str(args.title) }
+            : { chat_type: "direct_message", user_id: str(args.user_id ?? args.userId) };
+        return norm(await zohoCliqRequest(tenantId, "POST", "/chats", { body }));
+      }
       case "ZOHOCLIQ_LIST_MESSAGES":
         return norm(
           await zohoCliqRequest(tenantId, "GET", `/chats/${chatId}/messages`, {
@@ -415,7 +433,9 @@ export async function executeZohoCliqAction(
         };
     }
   } catch (err: any) {
-    return { ok: false, error: err?.message ?? String(err) };
+    const msg = err?.message ?? String(err);
+    console.error(`[zohoCliq] action ${action} threw: ${msg}`);
+    return { ok: false, error: msg };
   }
 }
 
@@ -423,10 +443,17 @@ export function isZohoCliqAction(action: string): boolean {
   return action.toUpperCase().startsWith("ZOHOCLIQ_");
 }
 
+// Preserves the raw HTTP status on failure — callers (zohoCliqTools.ts) key
+// their reconnect-vs-report decision off `status`, not the error string
+// (Zoho's error text isn't a reliable signal: a 400/404 real-action problem
+// and a 401 auth problem can both mention "invalid"/"error" in prose).
 function norm(r: {
   ok: boolean;
   data?: unknown;
   error?: string;
+  status?: number;
 }): ZohoExecResult {
-  return r.ok ? { ok: true, data: r.data } : { ok: false, error: r.error, data: r.data };
+  if (r.ok) return { ok: true, data: r.data };
+  console.error(`[zohoCliq] request failed status=${r.status ?? "?"} error=${r.error ?? "?"}`);
+  return { ok: false, error: r.error, data: r.data, status: r.status };
 }
