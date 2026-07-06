@@ -187,8 +187,15 @@ export async function handleZohoCallback(params: {
     connectedAt: Date.now(),
     grantedScope,
   };
-  // Preserve an earlier refresh_token if Zoho omitted one on re-consent.
+  // Preserve an earlier refresh_token if Zoho omitted one on re-consent. NOTE:
+  // a preserved refresh_token can be bound to an OLDER, narrower scope grant
+  // than this exchange's fresh access_token — if so, the access_token works
+  // until it expires, then refreshTokens() silently reverts to the old scope
+  // (see the SCOPE CHANGED ON REFRESH log in refreshTokens). Logged here so
+  // the fallback firing at all is visible, since Zoho's own docs say a fresh
+  // reconsent should normally generate a new refresh_token each time.
   if (!tokens.refreshToken) {
+    console.error(`[zohoCliq] token exchange omitted refresh_token — falling back to prior one`);
     const prior = await store.get<ZohoCliqTokens>(tokensKey(pending.tenantId));
     if (prior?.refreshToken) tokens.refreshToken = prior.refreshToken;
   }
@@ -230,10 +237,26 @@ async function refreshTokens(tenantId: string, t: ZohoCliqTokens): Promise<ZohoC
   });
   const json = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok || !json.access_token) return null;
+  // A refresh_token grant is scoped to whatever the refresh_token ITSELF was
+  // originally issued with — if that refresh_token predates a scope widening
+  // (e.g. this tenant's stored refresh_token survived across several earlier
+  // reconnects via the "preserve an earlier refresh_token" fallback in
+  // handleZohoCallback), the refreshed access_token can silently carry an
+  // OLDER, NARROWER scope than the access_token this same refresh call is
+  // replacing — invisible until the next API call 401s on a missing scope.
+  // Logged so a scope regression on refresh is directly provable, not guessed.
+  const refreshedScope = typeof json.scope === "string" ? json.scope : undefined;
+  if (refreshedScope !== t.grantedScope) {
+    console.error(
+      `[zohoCliq] SCOPE CHANGED ON REFRESH: was="${t.grantedScope ?? "(unknown)"}" ` +
+        `now="${refreshedScope ?? "(not returned)"}"`
+    );
+  }
   const next: ZohoCliqTokens = {
     ...t,
     accessToken: String(json.access_token),
     expiresAt: Date.now() + (Number(json.expires_in ?? 3600) - 60) * 1000,
+    ...(refreshedScope ? { grantedScope: refreshedScope } : {}),
   };
   await getStore().set(tokensKey(tenantId), next);
   return next;
@@ -291,6 +314,9 @@ export async function zohoCliqRequest(
     const msg =
       (data as { message?: string } | null)?.message ??
       `Zoho Cliq API ${res.status}: ${text.slice(0, 200)}`;
+    console.error(
+      `[zohoCliq] ${method.toUpperCase()} ${path} -> ${res.status} error=${msg} grantedScope="${t.grantedScope ?? "(unknown)"}"`
+    );
     return { ok: false, status: res.status, data, error: msg };
   }
   return { ok: true, status: res.status, data };
