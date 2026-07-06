@@ -158,6 +158,20 @@ export function chatModelName(): string {
 //   "schedule a meeting then send a slack message" → A+B+C     → true  ✓
 const COMPLEX_APP_WORDS =
   /(gmail|e-?mail|inbox|sheet|spreadsheet|slack|calendar|notion|github|drive|docs?\b|monday|hubspot|salesforce|linear|jira|airtable|contacts?|crm|webhook|database|csv)/gi;
+// Unambiguous named-integration references — unlike the generic words above
+// (email/sheet/etc, which can appear in vague chit-chat with no real tool
+// action implied), a mention of one of these can ONLY mean the specific
+// connected first-party integration, so a single mention is already as
+// strong a signal as 2+ generic-word mentions. This is what escalation was
+// missing for single-app first-party tool requests (e.g. "send a message on
+// zoho cliq") — DeepSeek/TokenHub (the plain chat model) is confirmed weaker
+// at tool calling and has no Composio-side context for these integrations.
+// No /g flag: this is used only via .test() below, and a global flag on a
+// shared module-level regex would make .test() stateful across calls
+// (lastIndex persists), causing intermittent true/false flips on identical
+// input — a real, easy-to-miss bug class distinct from t.match(), which
+// resets internally and is safe with /g (see COMPLEX_APP_WORDS above).
+const FIRST_PARTY_APP_WORDS = /\b(zoho|cliq)\b/i;
 const COMPLEX_ACTION_VERBS =
   /\b(send|create|update|append|schedule|draft|fetch|pull|sync|compile|generate|post|move|delete|search|find|summari[sz]e|index|log|track|remind|automate|loop|scrape|extract|merge|import|export)\b/gi;
 const COMPLEX_SEQUENCE =
@@ -171,8 +185,10 @@ export function looksComplexAgentic(text: string | null | undefined): boolean {
   const appCount = new Set((t.match(COMPLEX_APP_WORDS) ?? []).map((s) => s.toLowerCase())).size;
   const verbCount = new Set((t.match(COMPLEX_ACTION_VERBS) ?? []).map((s) => s.toLowerCase())).size;
 
-  // Signal A fires only when 2+ distinct apps are mentioned (multi-app).
-  const hasMultiApp = appCount >= 2;
+  // Signal A fires when 2+ distinct generic apps are mentioned (multi-app),
+  // OR when any unambiguous named first-party integration is mentioned even
+  // once (see FIRST_PARTY_APP_WORDS comment).
+  const hasMultiApp = appCount >= 2 || FIRST_PARTY_APP_WORDS.test(t);
   // Signal B fires on any tool-invocation verb.
   const hasActionVerb = verbCount >= 1;
   // Signal C fires on any multi-step sequencing connector.
