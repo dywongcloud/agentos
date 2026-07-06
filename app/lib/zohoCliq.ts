@@ -310,6 +310,24 @@ export async function zohoCliqRequest(
   } catch {
     // non-JSON body — return raw text
   }
+  // Zoho's v3 API wraps every response in an envelope: {url, type, data:
+  // {...actual payload...}} (confirmed against Zoho's own docs for the chat
+  // creation endpoint, and consistent with v3's documented uniform response
+  // shape). Unwrapping here means every ZOHOCLIQ_* action returns the real
+  // payload directly (e.g. chat_id at the top level), not nested one level
+  // deeper than callers would reasonably guess — the previous double-nesting
+  // (result.data.data.chat_id) is exactly the kind of thing an LLM caller
+  // misreads, e.g. grabbing creator.id (a person's id) instead of chat_id
+  // and then using it as a chat_id in a follow-up call, which Zoho rejects
+  // with a misleading "does not have the required scope" 401 rather than a
+  // clean 404 for the nonexistent resource.
+  const unwrapped =
+    data &&
+    typeof data === "object" &&
+    "data" in (data as Record<string, unknown>) &&
+    ("type" in (data as Record<string, unknown>) || "url" in (data as Record<string, unknown>))
+      ? (data as { data: unknown }).data
+      : data;
   if (!res.ok) {
     const msg =
       (data as { message?: string } | null)?.message ??
@@ -319,7 +337,7 @@ export async function zohoCliqRequest(
     );
     return { ok: false, status: res.status, data, error: msg };
   }
-  return { ok: true, status: res.status, data };
+  return { ok: true, status: res.status, data: unwrapped };
 }
 
 // --- action registry -------------------------------------------------------------
