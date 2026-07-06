@@ -1,0 +1,347 @@
+/* app/home/home.css
+ *
+ * Responsive marketing page for DylanClaw. Pairs with the theme tokens from
+ * app/ui/theme.css (which the root layout imports), so light/dark mode
+ * both look intentional with zero per-element work.
+ */
+
+.h-page {
+  min-height: 100vh;
+  /* Layered backdrop. The gold glow is the dominant warm accent — large,
+     soft, centered just above the fold so it sits behind the hero gradient
+     text and contrasts the cooler blue/green accents at the corners. */
+  background:
+    radial-gradient(1100px 700px at 50% -8%, color-mix(in oklab, #f5b740 22%, transparent) 0%, transparent 65%),
+    radial-gradient(700px 480px at 90% 20%, color-mix(in oklab, #f5b740 12%, transparent) 0%, transparent 60%),
+    radial-gradient(820px 560px at 78% -10%, color-mix(in oklab, var(--status-running) 12%, transparent) 0%, transparent 60%),
+    radial-gradient(680px 480px at -8% 110%, color-mix(in oklab, var(--status-completed) 10%, transparent) 0%, transparent 60%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  overflow-x: hidden;
+}
+
+/* Slow subtle drift on the gold layer for a touch of life in dark mode. */
+@keyframes h-glow-drift {
+  0%, 100% { transform: translate3d(0, 0, 0); opacity: 1; }
+  50% { transform: translate3d(0, -8px, 0); opacity: 0.92; }
+}
+.h-page::before {
+  content: "";
+  position: absolute;
+  inset: -20% 0 auto 0;
+  height: 90vh;
+  pointer-events: none;
+  z-index: 0;
+  background: radial-gradient(
+    700px 360px at 50% 20%,
+    color-mix(in oklab, #f5b740 18%, transparent) 0%,
+    transparent 70%
+  );
+  filter: blur(8px);
+  animation: h-glow-drift 14s ease-in-out infinite;
+}
+.h-page > .h-shell {
+  position: relative;
+  z-index: 1;
+}
+
+.h-shell {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+/* ── topbar ─────────────────────────────────────────────────────────── */
+
+.h-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 4px;
+  margin-bottom: 56px;
+}
+.h-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--foreground);
+  text-decoration: none;
+  letter-spacing: -0.01em;
+}
+.h-brand-mark {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg,
+      color-mix(in oklab, var(--foreground) 95%, transparent) 0%,
+      color-mix(in oklab, var(--foreground) 50%, var(--background)) 100%);
+  display: grid;
+  place-items: center;
+  color: var(--background);
+  font-weight: 700;
+  font-size: 13px;
+}
+.h-nav-links {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.h-nav-link {
+  font-size: 13px;
+  color: var(--muted-foreground);
+  text-decoration: none;
+  padding: 6px 12px;
+  border-radius: 7px;
+  transition: color 120ms ease, background 120ms ease;
+}
+.h-nav-link:hover {
+  color: var(--foreground);
+  background: var(--muted);
+}
+.h-nav-cta {
+  font-size: 13px;
+  color: var(--primary-foreground);
+  background: var(--primary);
+  text-decoration: none;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-weight: 500;
+  margin-left: 6px;
+  transition: transform 120ms ease, background 120ms ease;
+}
+.h-nav-cta:hover {
+  transform: translateY(-1px);
+}
+
+/* ── hero ───────────────────────────────────────────────────────────── */
+
+.h-hero {
+  padding: 60px 4px 70px;
+  text-align: left;
+  max-width: 880px;
+}
+.h-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 5px 12px 5px 8px;
+  margin-bottom: 22px;
+}
+.h-eyebrow-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 4px;
+  background: var(--status-completed);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--status-completed) 30%, transparent);
+  flex-shrink: 0;
+}
+.h-title {
+  font-size: clamp(34px, 6.2vw, 68px);
+  font-weight: 600;
+  line-height: 1.04;
+  letter-spacing: -0.035em;
+  margin: 0;
+  background: linear-gradient(
+    180deg,
+    var(--foreground) 0%,
+    color-mix(in oklab, var(--foreground) 70%, var(--background)) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.h-sub {
+  margin-top: 22px;
+  font-size: clamp(15px, 1.5vw, 18px);
+  line-height: 1.6;
+  color: var(--muted-foreground);
+  max-width: 640px;
+}
+.h-cta-row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 32px;
+}
+.h-cta {
+  font-size: 14px;
+  font-weight: 500;
+  text-decoration: none;
+  padding: 11px 20px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+.h-cta--primary {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.h-cta--primary:hover { transform: translateY(-1px); }
+.h-cta--ghost {
+  background: var(--card);
+  color: var(--foreground);
+  border: 1px solid var(--border);
+}
+.h-cta--ghost:hover { background: var(--muted); }
+.h-cta-arrow { font-size: 14px; opacity: 0.7; }
+
+/* ── feature grid ───────────────────────────────────────────────────── */
+
+.h-section { padding: 60px 4px; }
+.h-section-head {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 720px;
+  margin-bottom: 36px;
+}
+.h-section-tag {
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted-foreground);
+}
+.h-section-title {
+  font-size: clamp(26px, 3.5vw, 36px);
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.025em;
+  margin: 0;
+}
+.h-section-sub {
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--muted-foreground);
+  max-width: 580px;
+}
+
+.h-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+.h-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: transform 160ms ease, border-color 160ms ease;
+}
+.h-card:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in oklab, var(--foreground) 18%, var(--border));
+}
+.h-card-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--muted);
+  display: grid;
+  place-items: center;
+  color: var(--foreground);
+}
+.h-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+.h-card-body {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--muted-foreground);
+}
+
+/* ── command pill rail ──────────────────────────────────────────────── */
+
+.h-rail {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 26px 26px 22px;
+}
+.h-rail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.h-rail-title { font-size: 15px; font-weight: 600; margin: 0; }
+.h-rail-sub { font-size: 13px; color: var(--muted-foreground); }
+.h-rail-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.h-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--muted);
+  color: var(--foreground);
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+.h-pill-tail {
+  color: var(--muted-foreground);
+  font-family: var(--font-sans);
+}
+
+/* ── footer ─────────────────────────────────────────────────────────── */
+
+.h-footer {
+  border-top: 1px solid var(--border);
+  margin-top: 60px;
+  padding: 28px 4px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+.h-footer-links {
+  display: flex;
+  gap: 18px;
+}
+.h-footer-link {
+  color: var(--muted-foreground);
+  text-decoration: none;
+}
+.h-footer-link:hover { color: var(--foreground); }
+
+/* ── responsive ─────────────────────────────────────────────────────── */
+
+@media (max-width: 880px) {
+  .h-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  .h-shell { padding: 18px; }
+  .h-nav { margin-bottom: 24px; }
+  .h-hero { padding: 36px 0 48px; }
+  .h-grid { grid-template-columns: 1fr; }
+  .h-rail { padding: 20px; }
+  .h-nav-links .h-nav-link:not(.h-nav-cta) { display: none; }
+}

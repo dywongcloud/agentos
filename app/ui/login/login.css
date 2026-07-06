@@ -1,0 +1,281 @@
+/* app/ui/login/login.css
+ *
+ * Sign-in screen. Same theme tokens + Geist family as /home and /docs,
+ * with the gold accent carried through so the brand reads as one app.
+ */
+
+.l-page {
+  min-height: 100vh;
+  background:
+    radial-gradient(1000px 640px at 50% -10%, color-mix(in oklab, #f5b740 22%, transparent) 0%, transparent 65%),
+    radial-gradient(620px 420px at 88% 90%, color-mix(in oklab, #f5b740 10%, transparent) 0%, transparent 60%),
+    radial-gradient(640px 460px at 6% 90%, color-mix(in oklab, var(--status-running) 8%, transparent) 0%, transparent 60%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Subtle drifting top glow — matches the home page's motion. */
+@keyframes l-glow-drift {
+  0%, 100% { transform: translate3d(0, 0, 0); opacity: 1; }
+  50% { transform: translate3d(0, -6px, 0); opacity: 0.9; }
+}
+.l-page::before {
+  content: "";
+  position: absolute;
+  inset: -20% 0 auto 0;
+  height: 80vh;
+  pointer-events: none;
+  z-index: 0;
+  background: radial-gradient(
+    640px 320px at 50% 18%,
+    color-mix(in oklab, #f5b740 16%, transparent) 0%,
+    transparent 70%
+  );
+  filter: blur(8px);
+  animation: l-glow-drift 14s ease-in-out infinite;
+}
+
+/* ── topbar ─────────────────────────────────────────────────────────── */
+
+.l-nav {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 24px;
+  max-width: 1180px;
+  margin: 0 auto;
+  width: 100%;
+}
+.l-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--foreground);
+  text-decoration: none;
+  letter-spacing: -0.01em;
+}
+.l-brand-mark {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, #f5b740 0%, #b97f10 100%);
+  display: grid;
+  place-items: center;
+  color: #2a1a02;
+  font-weight: 700;
+  font-size: 13px;
+  box-shadow: 0 4px 18px -6px color-mix(in oklab, #f5b740 60%, transparent);
+}
+.l-nav-link {
+  font-size: 13px;
+  color: var(--muted-foreground);
+  text-decoration: none;
+  padding: 6px 12px;
+  border-radius: 7px;
+  transition: color 120ms ease, background 120ms ease;
+}
+.l-nav-link:hover { color: var(--foreground); background: var(--muted); }
+
+/* ── card ───────────────────────────────────────────────────────────── */
+
+.l-shell {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  display: grid;
+  place-items: center;
+  padding: 32px 20px 80px;
+}
+
+.l-card {
+  width: 100%;
+  max-width: 420px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 32px;
+  position: relative;
+  overflow: hidden;
+  box-shadow:
+    0 20px 60px -30px rgba(0, 0, 0, 0.55),
+    0 0 0 1px color-mix(in oklab, #f5b740 18%, transparent),
+    0 0 80px -30px color-mix(in oklab, #f5b740 45%, transparent);
+}
+/* Top inner highlight on the card edge — gives the gold accent a subtle
+   reflection across the surface. */
+.l-card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(
+    480px 200px at 50% -20%,
+    color-mix(in oklab, #f5b740 18%, transparent) 0%,
+    transparent 60%
+  );
+}
+
+.l-card-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 26px;
+  position: relative;
+  z-index: 1;
+}
+.l-card-mark {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background:
+    linear-gradient(135deg, #f5b740 0%, #b97f10 100%);
+  display: grid;
+  place-items: center;
+  color: #2a1a02;
+  font-weight: 700;
+  font-size: 20px;
+  box-shadow:
+    0 14px 34px -10px color-mix(in oklab, #f5b740 55%, transparent),
+    inset 0 1px 0 color-mix(in oklab, #fff 45%, transparent);
+}
+.l-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--foreground);
+  text-align: center;
+}
+.l-sub {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted-foreground);
+  text-align: center;
+  max-width: 32ch;
+  line-height: 1.55;
+}
+
+/* ── form ───────────────────────────────────────────────────────────── */
+
+.l-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  position: relative;
+  z-index: 1;
+}
+.l-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.l-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  letter-spacing: 0.01em;
+}
+.l-input {
+  appearance: none;
+  width: 100%;
+  background: var(--background);
+  border: 1px solid var(--border);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  padding: 11px 13px;
+  border-radius: 9px;
+  outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
+}
+.l-input::placeholder { color: var(--muted-foreground); opacity: 0.7; }
+.l-input:focus {
+  border-color: color-mix(in oklab, #f5b740 60%, var(--border));
+  box-shadow: 0 0 0 4px color-mix(in oklab, #f5b740 18%, transparent);
+}
+
+.l-submit {
+  margin-top: 4px;
+  appearance: none;
+  width: 100%;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 600;
+  color: #2a1a02;
+  padding: 11px 14px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in oklab, #f5b740 80%, transparent);
+  background: linear-gradient(180deg, #fbcb55 0%, #e29b16 100%);
+  box-shadow:
+    0 10px 28px -10px color-mix(in oklab, #f5b740 60%, transparent),
+    inset 0 1px 0 color-mix(in oklab, #fff 35%, transparent);
+  transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
+}
+.l-submit:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.04);
+}
+.l-submit:active {
+  transform: translateY(0);
+  filter: brightness(0.98);
+}
+
+.l-error {
+  font-size: 12.5px;
+  color: #ff6b6b;
+  background: color-mix(in oklab, #ff6b6b 12%, var(--card));
+  border: 1px solid color-mix(in oklab, #ff6b6b 30%, var(--border));
+  padding: 8px 10px;
+  border-radius: 8px;
+  line-height: 1.45;
+}
+
+.l-foot {
+  margin-top: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  position: relative;
+  z-index: 1;
+}
+.l-foot code {
+  font-family: var(--font-mono);
+  background: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-size: 11.5px;
+  color: var(--foreground);
+}
+.l-foot-link {
+  color: var(--muted-foreground);
+  text-decoration: none;
+  border-bottom: 1px dashed color-mix(in oklab, var(--muted-foreground) 50%, transparent);
+}
+.l-foot-link:hover { color: var(--foreground); border-bottom-color: var(--foreground); }
+
+/* ── responsive ─────────────────────────────────────────────────────── */
+
+@media (max-width: 460px) {
+  .l-nav { padding: 14px 18px; }
+  .l-shell { padding: 18px 16px 60px; }
+  .l-card { padding: 26px 20px; border-radius: 14px; }
+  .l-foot { flex-direction: column; align-items: flex-start; gap: 6px; }
+}

@@ -1,0 +1,17 @@
+node_modules
+.next
+.vercel
+.env.local
+.env
+.DS_Store
+yarn.lock
+.gm/pw-sock-*/
+guardian-db/
+*.log
+ngrok.log
+encrypted_secrets.json
+*.orig
+*.rej
+.gm/witness/
+.turbo/
+coverage/

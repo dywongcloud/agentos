@@ -1,0 +1,310 @@
+/* app/docs/docs.css
+ *
+ * Documentation page styles. Sticky sidebar TOC + readable column for prose.
+ * All tokens flow through app/ui/theme.css so dark mode just works.
+ */
+
+.d-page {
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+.d-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: color-mix(in oklab, var(--background) 85%, transparent);
+  backdrop-filter: saturate(150%) blur(10px);
+  -webkit-backdrop-filter: saturate(150%) blur(10px);
+  border-bottom: 1px solid var(--border);
+}
+.d-topbar-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.d-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--foreground);
+  text-decoration: none;
+}
+.d-brand-mark {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 12px;
+}
+.d-brand-tag {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  background: var(--muted);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border-radius: 999px;
+  margin-left: 4px;
+}
+.d-top-links {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.d-top-link {
+  font-size: 13px;
+  color: var(--muted-foreground);
+  text-decoration: none;
+  padding: 6px 10px;
+  border-radius: 6px;
+}
+.d-top-link:hover { color: var(--foreground); background: var(--muted); }
+
+/* ── layout ─────────────────────────────────────────────────────────── */
+
+.d-layout {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 36px 24px 80px;
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr);
+  gap: 56px;
+}
+
+.d-toc {
+  position: sticky;
+  top: 80px;
+  align-self: start;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  padding-right: 8px;
+}
+.d-toc-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted-foreground);
+  margin: 0 0 14px;
+}
+.d-toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.d-toc-list a {
+  display: block;
+  font-size: 13px;
+  color: var(--muted-foreground);
+  text-decoration: none;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border-left: 2px solid transparent;
+  transition: color 100ms ease, background 100ms ease, border-color 100ms ease;
+}
+.d-toc-list a:hover {
+  color: var(--foreground);
+  background: var(--muted);
+}
+.d-toc-sub {
+  font-size: 12px !important;
+  padding-left: 22px !important;
+  color: var(--muted-foreground) !important;
+}
+
+.d-main {
+  min-width: 0;
+}
+
+/* ── prose ──────────────────────────────────────────────────────────── */
+
+.d-hero {
+  margin-bottom: 48px;
+}
+.d-eyebrow {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  margin-bottom: 12px;
+}
+.d-h1 {
+  font-size: clamp(32px, 4vw, 44px);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.025em;
+  margin: 0;
+}
+.d-lede {
+  font-size: 17px;
+  line-height: 1.6;
+  color: var(--muted-foreground);
+  margin-top: 14px;
+  max-width: 64ch;
+}
+
+.d-section {
+  scroll-margin-top: 80px;
+  margin-top: 56px;
+}
+.d-section:first-of-type { margin-top: 0; }
+
+.d-h2 {
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin: 0 0 8px;
+  padding-bottom: 8px;
+}
+.d-h3 {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 28px 0 8px;
+  letter-spacing: -0.01em;
+}
+.d-p {
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--foreground);
+  margin: 12px 0;
+  max-width: 68ch;
+}
+.d-p code,
+.d-li code,
+.d-td code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: var(--muted);
+  padding: 1.5px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+}
+.d-ul {
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--foreground);
+  margin: 12px 0;
+  padding-left: 22px;
+  max-width: 68ch;
+}
+.d-li { margin: 4px 0; }
+.d-li::marker { color: var(--muted-foreground); }
+.d-strong {
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.d-callout {
+  background: color-mix(in oklab, var(--status-running) 8%, var(--card));
+  border: 1px solid color-mix(in oklab, var(--status-running) 25%, var(--border));
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin: 18px 0;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.d-callout-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--status-running);
+}
+.d-callout-text { font-size: 14px; line-height: 1.6; }
+
+/* ── code blocks ────────────────────────────────────────────────────── */
+
+.d-code {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 18px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--foreground);
+  overflow-x: auto;
+  margin: 14px 0;
+  white-space: pre;
+}
+.d-code-cmd { color: var(--status-running); }
+.d-code-comment { color: var(--muted-foreground); }
+
+/* ── command reference table ────────────────────────────────────────── */
+
+.d-table-wrap {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin: 16px 0;
+  background: var(--card);
+}
+.d-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+.d-table thead th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted-foreground);
+  padding: 10px 14px;
+  background: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.d-table tbody td {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  color: var(--foreground);
+}
+.d-table tbody tr:last-child td { border-bottom: none; }
+.d-cmd-cell {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--foreground);
+  white-space: nowrap;
+}
+.d-flag-cell {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+/* ── responsive ─────────────────────────────────────────────────────── */
+
+@media (max-width: 900px) {
+  .d-layout {
+    grid-template-columns: 1fr;
+    gap: 30px;
+    padding: 28px 18px 60px;
+  }
+  .d-toc {
+    position: static;
+    max-height: none;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    background: var(--card);
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "name": "zeroclaw-vercel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "node scripts/patch-workflow-web.mjs && next build && node scripts/enrich-workflow-manifest.mjs",
+    "start": "next start -H 0.0.0.0 -p ${PORT:-3000}",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "workflow:web": "npx workflow web",
+    "postinstall": "node scripts/patch-workflow-web.mjs --reinstall"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.92",
+    "@ai-sdk/google": "^3.0.80",
+    "@ai-sdk/openai": "latest",
+    "@composio/core": "latest",
+    "@composio/vercel": "latest",
+    "@upstash/redis": "latest",
+    "@vercel/sandbox": "^2.0.0",
+    "@xyflow/react": "^12.11.0",
+    "ai": "latest",
+    "geist": "^1.7.2",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "ssh2": "latest",
+    "workflow": "latest",
+    "xstate": "5.30.0",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/ssh2": "^1.15.5",
+    "eslint": "latest",
+    "eslint-config-next": "latest",
+    "just-bash": "latest",
+    "typescript": "latest"
+  }
+}

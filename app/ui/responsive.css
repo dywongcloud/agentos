@@ -1,0 +1,28 @@
+/* app/ui/responsive.css
+ *
+ * The few responsive rules inline CSSProperties can't express. Most layout
+ * responsiveness is handled inline (clamp() spacing, repeat(auto-fit) grids);
+ * this file is only for scrollbar hiding and true media-query collapses.
+ */
+
+/* Tab bar scrolls horizontally on narrow screens without showing a scrollbar. */
+.tabbar-scroll {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* old Edge */
+}
+.tabbar-scroll::-webkit-scrollbar {
+  display: none; /* WebKit */
+}
+
+/* Phone-width collapses that need a media query. */
+@media (max-width: 640px) {
+  /* Hide the desktop-only quick links; the tab bar still covers navigation. */
+  .topbar-links a {
+    display: none;
+  }
+
+  /* Stack the hero (avatar/title and the action button) vertically. */
+  .hero-row {
+    align-items: flex-start;
+  }
+}

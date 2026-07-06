@@ -1,0 +1,201 @@
+/* app/ui/theme.css
+ *
+ * Design tokens for the DylanClaw dashboard, aligned 1:1 with the upstream
+ * Vercel Workflow DevKit dashboard so the surrounding chrome and the
+ * embedded workflow UI share an identical palette. Token names follow the
+ * shadcn convention (—background, —foreground, —card, —border, —muted,
+ * —primary, —destructive, —ring, plus sidebar variants); values use
+ * `oklch` to match the upstream's color science exactly.
+ *
+ * `.dark` class flips to dark; `[data-theme="dark"]` is also honored so any
+ * third-party widget that toggles the data attribute keeps in sync.
+ */
+
+:root {
+  --font-sans: var(--font-geist-sans, "Geist Sans"), ui-sans-serif, system-ui,
+    -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: var(--font-geist-mono, "Geist Mono"), ui-monospace, "SF Mono",
+    Menlo, Consolas, monospace;
+
+  --radius: 0.625rem;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* ── light surface stack — matches upstream globals.css ──────────── */
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+
+  /* Sidebar (used by the upstream's Sidebar component; alias these to the
+     same neutrals so any rendered upstream nav sits flush against ours). */
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+
+  /* Status dot colors — Tailwind 500-weight values, the same ones the
+     upstream's StatusBadge uses (bg-blue-500, bg-emerald-500, bg-red-500,
+     bg-yellow-500, bg-gray-400). Held as CSS vars so our inline-styled
+     /ui surfaces stay token-driven without a Tailwind dep. */
+  --status-running: #3b82f6;
+  --status-completed: #10b981;
+  --status-failed: #ef4444;
+  --status-cancelled: #eab308;
+  --status-pending: #9ca3af;
+
+  /* Workforce canvas wire color. Mid-gray on the light canvas; pure white
+     in dark so the connection lines read crisply against the near-black
+     ReactFlow background. */
+  --canvas-edge: #4b5563;
+}
+
+/* ── dark mode — matches upstream `.dark` block exactly ────────────── */
+
+html.dark,
+html[data-theme="dark"] {
+  /* Pure-black surface stack. Background is true #000; cards/elevated
+     surfaces sit a hair above it for tactile depth without a visible
+     border. Foreground + muted text stay near-white off-white so the
+     contrast against #000 reads clean. */
+  --background: #000000;
+  --foreground: #fafafa;
+
+  --card: #0a0a0a;
+  --card-foreground: #fafafa;
+
+  --popover: #0a0a0a;
+  --popover-foreground: #fafafa;
+
+  --primary: #fafafa;
+  --primary-foreground: #0a0a0a;
+
+  --secondary: #141414;
+  --secondary-foreground: #fafafa;
+
+  --muted: #141414;
+  --muted-foreground: #8c8c95;
+
+  --accent: #1a1a1a;
+  --accent-foreground: #fafafa;
+
+  --destructive: #ef4444;
+  --destructive-foreground: #fafafa;
+
+  --border: #1f1f1f;
+  --input: #1f1f1f;
+  --ring: #404040;
+
+  --sidebar: #0a0a0a;
+  --sidebar-foreground: #fafafa;
+  --sidebar-primary: #fafafa;
+  --sidebar-primary-foreground: #0a0a0a;
+  --sidebar-accent: #1a1a1a;
+  --sidebar-accent-foreground: #fafafa;
+  --sidebar-border: #1f1f1f;
+  --sidebar-ring: #404040;
+
+  /* Status colors are theme-agnostic in the upstream — keep them constant
+     so a "running" dot reads the same blue in both modes. */
+  --status-running: #3b82f6;
+  --status-completed: #10b981;
+  --status-failed: #ef4444;
+  --status-cancelled: #eab308;
+  --status-pending: #9ca3af;
+
+  --canvas-edge: #ffffff;
+}
+
+/* When the operator hasn't explicitly chosen, follow the OS — same
+   `:root:not(.light)` clause the upstream uses, so an unlabelled visit on
+   a dark-mode OS lands in the dark variant. */
+@media (prefers-color-scheme: dark) {
+  :root:not(.light):not(.dark) {
+    --background: #000000;
+    --foreground: #fafafa;
+    --card: #0a0a0a;
+    --card-foreground: #fafafa;
+    --popover: #0a0a0a;
+    --popover-foreground: #fafafa;
+    --primary: #fafafa;
+    --primary-foreground: #0a0a0a;
+    --secondary: #141414;
+    --secondary-foreground: #fafafa;
+    --muted: #141414;
+    --muted-foreground: #8c8c95;
+    --accent: #1a1a1a;
+    --accent-foreground: #fafafa;
+    --destructive: #ef4444;
+    --destructive-foreground: #fafafa;
+    --border: #1f1f1f;
+    --input: #1f1f1f;
+    --ring: #404040;
+    --sidebar: #0a0a0a;
+    --sidebar-foreground: #fafafa;
+    --sidebar-primary: #fafafa;
+    --sidebar-primary-foreground: #0a0a0a;
+    --sidebar-accent: #1a1a1a;
+    --sidebar-accent-foreground: #fafafa;
+    --sidebar-border: #1f1f1f;
+    --sidebar-ring: #404040;
+    --canvas-edge: #ffffff;
+  }
+}
+
+/* ── baseline ──────────────────────────────────────────────────────── */
+
+html,
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overscroll-behavior: none;
+}
+
+/* The upstream uses Tailwind's `outline-ring/50` everywhere; mirror that
+   for native form controls in /ui so focus rings match exactly. */
+*:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--ring) 50%, transparent);
+  outline-offset: 1px;
+}
+
+html,
+html * {
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    box-shadow 120ms ease;
+}
