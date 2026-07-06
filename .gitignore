@@ -26,6 +26,7 @@ encrypted_secrets.json
 .gm/prd.yml
 .gm/next-step.md
 .gm/instructions/
+.gm/residual-check-fired
 .turbo/
 coverage/
 tsconfig.tsbuildinfo
