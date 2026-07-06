@@ -51,8 +51,14 @@ type PendingState = {
 const tokensKey = (tenantId: string) => `zoho:cliq:tokens:${tenantId}`;
 const stateKey = (nonce: string) => `zoho:cliq:state:${nonce}`;
 
+// Zoho Cliq scopes only exist as <Resource>.<CREATE|READ|UPDATE|DELETE> — there
+// is no ".ALL" suffix for Chats/Channels/Messages, and Threads/ScheduledMessages/
+// PinMessages/MyPins are NOT their own scope categories (Zoho rejects the whole
+// auth request if any single scope in the list is unrecognized). Those features
+// are exposed through the Chats/Messages REST resources, so full CRUD on Chats +
+// Messages (+ Channels, for the generic API_REQUEST escape hatch) covers them.
 const DEFAULT_SCOPES =
-  "ZohoCliq.Chats.ALL,ZohoCliq.Channels.ALL,ZohoCliq.Messages.ALL,ZohoCliq.Threads.ALL,ZohoCliq.ScheduledMessages.ALL,ZohoCliq.PinMessages.ALL,ZohoCliq.MyPins.ALL";
+  "ZohoCliq.Chats.CREATE,ZohoCliq.Chats.READ,ZohoCliq.Chats.UPDATE,ZohoCliq.Chats.DELETE,ZohoCliq.Channels.CREATE,ZohoCliq.Channels.READ,ZohoCliq.Channels.UPDATE,ZohoCliq.Channels.DELETE,ZohoCliq.Messages.CREATE,ZohoCliq.Messages.READ,ZohoCliq.Messages.UPDATE,ZohoCliq.Messages.DELETE";
 
 function scopes(): string {
   return env("ZOHO_CLIQ_SCOPES") ?? DEFAULT_SCOPES;
