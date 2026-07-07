@@ -83,6 +83,9 @@ function redirectUri(): string {
 }
 
 // Cliq API base for a Zoho accounts DC: accounts.zoho.eu → https://cliq.zoho.eu.
+// Fallback only — apiBaseForApiDomain (below) is the authoritative source per
+// Zoho's own multi-DC docs and should be preferred whenever the token
+// exchange actually returns api_domain.
 function apiBaseFor(accountsServer: string): string {
   try {
     const host = new URL(accountsServer).host; // accounts.zoho.eu
@@ -90,6 +93,28 @@ function apiBaseFor(accountsServer: string): string {
     return `https://cliq.${suffix}/api/v3`;
   } catch {
     return "https://cliq.zoho.com/api/v3";
+  }
+}
+
+// Zoho's multi-DC OAuth guide is explicit: "Make request calls to the service
+// you want to access through the api_domain you get from the response" — NOT
+// a value derived from the accounts-server hostname. The token exchange
+// response's api_domain (e.g. https://www.zohoapis.in) is per-DC but generic
+// across Zoho products; Cliq's own REST docs use a product-specific
+// subdomain (cliq.zoho.<dc>), so this extracts the DC suffix from the
+// authoritative api_domain and applies it to Cliq's documented host pattern,
+// rather than trusting a same-looking-but-independently-derived guess from
+// the accounts/login redirect host (accounts.zoho.<dc> and a user's actual
+// Cliq data home region are not guaranteed to be the same value).
+function apiBaseForApiDomain(apiDomain: string | undefined): string | null {
+  if (!apiDomain) return null;
+  try {
+    const host = new URL(apiDomain).host; // www.zohoapis.in
+    const suffix = host.replace(/^www\.zohoapis\./, "").replace(/^zohoapis\./, "");
+    if (!suffix || suffix === host) return null;
+    return `https://cliq.${suffix}/api/v3`;
+  } catch {
+    return null;
   }
 }
 
@@ -173,12 +198,25 @@ export async function handleZohoCallback(params: {
   // Logged so a scope mismatch is diagnosable from production logs instead of
   // reverse-engineered from a user's bug report after the fact.
   const grantedScope = typeof json.scope === "string" ? json.scope : undefined;
-  const resolvedApiBase = apiBaseFor(accountsServer);
+  const apiDomain = typeof json.api_domain === "string" ? json.api_domain : undefined;
+  const derivedFromAccountsServer = apiBaseFor(accountsServer);
+  const derivedFromApiDomain = apiBaseForApiDomain(apiDomain);
+  // Prefer api_domain (Zoho's documented authoritative source for where a
+  // token's actual resources live) over the accounts-server-derived guess —
+  // a user's login/accounts host and their data's home region are not
+  // guaranteed to match, which is exactly the failure mode under
+  // investigation (writes 401 with a scope error on a token confirmed to
+  // have that scope, using a Cliq host derived from accounts-server alone).
+  const resolvedApiBase = derivedFromApiDomain ?? derivedFromAccountsServer;
   console.error(
     `[zohoCliq] token exchange granted scope="${grantedScope ?? "(not returned)"}" ` +
       `requested="${scopes()}" ` +
       `accountsServerParam="${params.accountsServer ?? "(none — used default)"}" ` +
-      `resolvedAccountsServer="${accountsServer}" resolvedApiBase="${resolvedApiBase}"`
+      `resolvedAccountsServer="${accountsServer}" ` +
+      `apiDomain="${apiDomain ?? "(not returned)"}" ` +
+      `derivedFromAccountsServer="${derivedFromAccountsServer}" ` +
+      `derivedFromApiDomain="${derivedFromApiDomain ?? "(n/a)"}" ` +
+      `resolvedApiBase="${resolvedApiBase}"`
   );
 
   const tokens: ZohoCliqTokens = {
@@ -255,11 +293,24 @@ async function refreshTokens(tenantId: string, t: ZohoCliqTokens): Promise<ZohoC
         `now="${refreshedScope ?? "(not returned)"}"`
     );
   }
+  // Same api_domain preference as the initial exchange (handleZohoCallback) —
+  // a refresh response can also carry the authoritative api_domain, and
+  // re-deriving from it here keeps apiBase correct even if the original
+  // connect predates this fix or never got a usable api_domain.
+  const refreshedApiDomain = typeof json.api_domain === "string" ? json.api_domain : undefined;
+  const refreshedApiBase = apiBaseForApiDomain(refreshedApiDomain);
+  if (refreshedApiBase && refreshedApiBase !== t.apiBase) {
+    console.error(
+      `[zohoCliq] API BASE CHANGED ON REFRESH: was="${t.apiBase}" now="${refreshedApiBase}" ` +
+        `apiDomain="${refreshedApiDomain}"`
+    );
+  }
   const next: ZohoCliqTokens = {
     ...t,
     accessToken: String(json.access_token),
     expiresAt: Date.now() + (Number(json.expires_in ?? 3600) - 60) * 1000,
     ...(refreshedScope ? { grantedScope: refreshedScope } : {}),
+    ...(refreshedApiBase ? { apiBase: refreshedApiBase } : {}),
   };
   await getStore().set(tokensKey(tenantId), next);
   return next;
