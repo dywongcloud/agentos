@@ -173,9 +173,12 @@ export async function handleZohoCallback(params: {
   // Logged so a scope mismatch is diagnosable from production logs instead of
   // reverse-engineered from a user's bug report after the fact.
   const grantedScope = typeof json.scope === "string" ? json.scope : undefined;
+  const resolvedApiBase = apiBaseFor(accountsServer);
   console.error(
     `[zohoCliq] token exchange granted scope="${grantedScope ?? "(not returned)"}" ` +
-      `requested="${scopes()}"`
+      `requested="${scopes()}" ` +
+      `accountsServerParam="${params.accountsServer ?? "(none — used default)"}" ` +
+      `resolvedAccountsServer="${accountsServer}" resolvedApiBase="${resolvedApiBase}"`
   );
 
   const tokens: ZohoCliqTokens = {
@@ -183,7 +186,7 @@ export async function handleZohoCallback(params: {
     refreshToken: json.refresh_token ? String(json.refresh_token) : undefined,
     expiresAt: Date.now() + (Number(json.expires_in ?? 3600) - 60) * 1000,
     accountsServer,
-    apiBase: apiBaseFor(accountsServer),
+    apiBase: resolvedApiBase,
     connectedAt: Date.now(),
     grantedScope,
   };
@@ -280,12 +283,14 @@ export async function zohoCliqRequest(
   if (!t) {
     return { ok: false, status: 401, error: "Zoho Cliq is not connected for this account" };
   }
+  let requestUrl = "";
   const doFetch = async (tok: ZohoCliqTokens) => {
     const u = new URL(`${tok.apiBase}${path.startsWith("/") ? path : `/${path}`}`);
     for (const [k, v] of Object.entries(opts?.query ?? {})) {
       if (v !== undefined && v !== null && String(v) !== "") u.searchParams.set(k, String(v));
     }
-    return fetch(u.toString(), {
+    requestUrl = u.toString();
+    return fetch(requestUrl, {
       method: method.toUpperCase(),
       headers: {
         Authorization: `Zoho-oauthtoken ${tok.accessToken}`,
@@ -334,6 +339,28 @@ export async function zohoCliqRequest(
       `Zoho Cliq API ${res.status}: ${text.slice(0, 200)}`;
     console.error(
       `[zohoCliq] ${method.toUpperCase()} ${path} body=${JSON.stringify(opts?.body ?? null)} -> ${res.status} error=${msg} grantedScope="${t.grantedScope ?? "(unknown)"}"`
+    );
+    // Extra diagnostics: Zoho sometimes returns fields beyond `.message`
+    // (e.g. error_code, a docs link, a request-id) that never surface above —
+    // dump everything available about the response and the exact request that
+    // produced it so a "scope confirmed granted but write still rejected"
+    // mystery is diagnosable from logs alone.
+    const responseHeaders: Record<string, string> = {};
+    res.headers.forEach((value, key) => {
+      responseHeaders[key] = value;
+    });
+    const authHeaderPresent = !!t.accessToken;
+    const authHeaderPreview = t.accessToken
+      ? `${t.accessToken.slice(0, 8)}...[REDACTED]`
+      : "(none)";
+    console.error(
+      `[zohoCliq] FAILURE DIAGNOSTICS ` +
+        `rawResponseText=${text} ` +
+        `responseHeaders=${JSON.stringify(responseHeaders)} ` +
+        `request={method=${method.toUpperCase()}, url=${requestUrl}, ` +
+        `bodySent=${opts?.body !== undefined}, ` +
+        `bodyJson=${opts?.body !== undefined ? JSON.stringify(opts.body) : "(none)"}, ` +
+        `authHeaderPresent=${authHeaderPresent}, authHeaderPreview=${authHeaderPreview}}`
     );
     return { ok: false, status: res.status, data, error: msg };
   }
