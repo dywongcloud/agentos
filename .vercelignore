@@ -11,6 +11,11 @@ node_modules
 *.jpeg
 SC*.png
 mid-century*.jpg
+# gm dev-tooling state (codesearch index, exec-spool, etc) — 1800+ small
+# files with zero runtime purpose, purely local dev infra. Grew throughout
+# a long session and correlates with deploys starting to fail at the
+# "downloading deployment files" stage.
+.gm
 
 # …but the office sprite assets must ship (they're referenced by /ui/agents).
 !public/office/**
