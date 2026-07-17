@@ -1,0 +1,10 @@
+---
+key: mem-c21db89a6ce4dfb9-429
+ns: default
+created: 1783299950192
+updated: 1783299950192
+---
+
+## Resolved mutable: history-format-migration
+
+app/steps/sessionStateSteps.ts:68-76 — lrange wrapped in try/catch; on WRONGTYPE error falls back to store.get<ModelMessage[]>() returning old JSON-array format; next saveHistoryStep deletes+rewrites as LIST, completing one-time per-session migration; groupGate.ts recordSilentGroupMessage and recentTranscript already in try/catch (best-effort semantics cover WRONGTYPE silently)
