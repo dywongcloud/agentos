@@ -1,0 +1,26 @@
+[target.aarch64-apple-darwin]
+# Without this, binaries that transitively link Apple-platform capture crates
+# (moq-media's capture-apple feature chain: objc2-av-foundation, cpal, etc.)
+# fail to launch with:
+#   dyld: Library not loaded: @rpath/libswift_Concurrency.dylib
+#     Reason: no LC_RPATH's found
+# because the binary references libswift_Concurrency.dylib via @rpath but
+# ships no LC_RPATH pointing at where dyld can resolve it (the system Swift
+# runtime, served from the dyld shared cache under /usr/lib/swift/ -- these
+# entries have no on-disk file, `find`/`ls` won't show them, but dyld
+# resolves them at runtime once told to search that path).
+#
+# Copied from upstream iroh-live's own .cargo/config.toml: our `holoiroh`
+# workspace is a *separate* Cargo workspace root from the iroh-live git
+# dependency's source tree, so it never inherits iroh-live's own cargo
+# config (git-dependency source trees never contribute .cargo/config.toml
+# to the consuming workspace) -- this has to be duplicated here explicitly.
+#
+# Verified: adding any *additional* rpath alongside this one (e.g. an
+# Xcode/CommandLineTools toolchain's versioned swift-5.5/macosx dir, as a
+# naive `DYLD_LIBRARY_PATH` workaround would) causes dyld to load
+# libswift_Concurrency.dylib from BOTH the shared cache and the toolchain
+# copy simultaneously, producing spurious
+# "Class ... is implemented in both ..." objc warnings at every startup.
+# `/usr/lib/swift` alone is the correct and sufficient fix.
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
