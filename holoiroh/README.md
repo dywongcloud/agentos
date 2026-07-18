@@ -16,12 +16,23 @@ capture only -- no audio yet), selectable via a `--display <index>` CLI
 flag (defaults to the primary display), and runs a working bidirectional
 control channel (`control_channel.rs`, ALPN `holoiroh/control/1`) bridged
 to `holo serve` (`holo_bridge/`) -- see [`PROTOCOL.md`](./PROTOCOL.md) for
-the control channel's wire schema. The control channel's accept path now
-enforces a PIN + persisted device-allowlist auth gate on unrecognized
-devices (real, tested, see [`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md))
--- a QR rendering of the ticket and a ticket-rotation flag are designed in
-that same doc but not yet implemented. System/mic audio capture is still
-not wired up. `ios/` is now a real multi-screen SwiftUI app skeleton that
+the control channel's wire schema. Every control-channel message (except
+the pre-session PIN handshake) is wrapped in a `TaskEnvelope`, matching the
+Project Aro PRD's authoritative task-envelope shape (`protocol_version`,
+`message_id`, `session_id`, `task_id`, `message_type`, `sent_at`,
+`expires_at`, `sequence_number`, `payload`, `signature`) -- inbound
+envelopes are rejected (not forwarded to the bridge) if expired (default
+30s), if their `message_id` repeats one already seen on the connection, or
+if their `sequence_number` doesn't strictly increase; see `PROTOCOL.md`'s
+"Envelope" and "Rejection rules" sections for the full contract. The PRD
+names six logical streams (`control`, `pairing`, `media`, `manual_input`,
+`snapshot_fallback`, `telemetry`) -- only `control` is implemented here; see
+`PROTOCOL.md`'s "Project Aro PRD context" section. The control channel's
+accept path now enforces a PIN + persisted device-allowlist auth gate on
+unrecognized devices (real, tested, see
+[`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md)) -- a QR rendering of the
+ticket and a ticket-rotation flag are designed in that same doc but not yet
+implemented. System/mic audio capture is still not wired up. `ios/` is now a real multi-screen SwiftUI app skeleton that
 builds for iOS 17: `ContentView` hosts a `NavigationStack` moving from
 `PairingView` (paste an iroh ticket, plus a placeholder "Scan QR" button)
 to `MainView` on "connect" (video preview placeholder, prompt text field
@@ -40,13 +51,13 @@ See "Build status" below for exact, witnessed build results.
 ```
 holoiroh/
 ├── Cargo.toml                     # Rust workspace manifest (members = ["mac-daemon", "ios-bridge"])
-├── PROTOCOL.md                    # control-channel wire schema (ClientMessage/ServerMessage)
+├── PROTOCOL.md                    # control-channel wire schema (TaskEnvelope<ClientMessage/ServerMessage>)
 ├── mac-daemon/                    # Rust binary crate: the Mac-side daemon
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs                # entrypoint: Live + Router + capture + control channel + holo_bridge
 │       ├── capture.rs             # macOS ScreenCaptureKit video source (--display <index> selection)
-│       ├── control_channel.rs     # iroh ALPN transport for PROTOCOL.md's ClientMessage/ServerMessage
+│       ├── control_channel.rs     # iroh ALPN transport + TaskEnvelope wrapping for PROTOCOL.md's ClientMessage/ServerMessage
 │       └── holo_bridge/           # bridges control messages to `holo serve`'s A2A endpoint
 │           ├── mod.rs
 │           ├── a2a_client.rs
@@ -145,7 +156,9 @@ and [MoQ](https://quic.video/) for media framing):
    means in `iroh`'s one-`Connection`-per-ALPN model (`iroh` does not
    multiplex distinct app protocols inside a single `Connection` object).
    The wire schema (`ClientMessage`/`ServerMessage`, newline-delimited
-   JSON) is specified in [`PROTOCOL.md`](./PROTOCOL.md).
+   JSON, each wrapped in a Project Aro PRD-shaped `TaskEnvelope` after the
+   pre-session PIN handshake) is specified in
+   [`PROTOCOL.md`](./PROTOCOL.md).
 5. **Holo bridge.** Prompts arriving on the control channel are handed to
    `holo-desktop-cli` — [H Company](https://www.hcompany.ai/)'s Holo3
    computer-use agent — which interprets them and drives the Mac (mouse,
@@ -290,34 +303,51 @@ witness (both pre-existing in the working tree, not introduced by the
   — a separate Cargo workspace (ours) never inherits a git dependency's
   `.cargo/config.toml`, so this has to be duplicated explicitly.
 
-**Control channel (`control_channel.rs` + `holo_bridge/`): `cargo build`
-and `cargo test -p holoiroh-daemon` both succeed, including the `[lib]`
-target added so `examples/control_probe.rs` can dial the control channel
-as an external `iroh` peer.**
+**Control channel (`control_channel.rs` + `holo_bridge/`): `cargo build
+--all-targets` succeeds with zero warnings**, including the `[lib]` target
+so `examples/control_probe.rs` can dial the control channel as an external
+`iroh` peer. Per this repo's no-unit-tests rule, wire-schema/envelope
+behavior is witnessed via real `cargo run --example` binaries rather than
+`cargo test` (see `examples/`):
 
 ```
-$ cargo test -p holoiroh-daemon
-running 11 tests
-test control_channel::tests::client_message_prompt_round_trips ... ok
-test control_channel::tests::client_message_voice_transcript_round_trips ... ok
-test control_channel::tests::client_message_stop_has_no_text_field ... ok
-test control_channel::tests::server_message_ack_omits_null_text ... ok
-test control_channel::tests::server_message_status_round_trips_with_text ... ok
-test control_channel::tests::server_message_task_progress_round_trips ... ok
-test control_channel::tests::server_message_error_round_trips ... ok
-test control_channel::tests::malformed_json_is_a_deserialize_error_not_a_panic ... ok
-test control_channel::tests::unknown_type_is_a_deserialize_error_not_a_panic ... ok
-test control_channel::tests::control_event_ack_maps_to_server_message_ack ... ok
-test control_channel::tests::control_event_error_maps_to_server_message_error ... ok
+$ cargo run --example control_channel_probe
+=== bare ClientMessage round-trips (pre-session PIN handshake wire shape) ===
+...
+=== TaskEnvelope<ClientMessage> round-trip (post-session wire shape) ===
+serialize -> {"protocol_version":1,"message_id":"...","session_id":"session-abc123",
+"task_id":"task-xyz789","message_type":"prompt","sent_at":...,"expires_at":...,
+"sequence_number":0,"payload":{"type":"prompt","text":"open safari and check my calendar"}}
+...
+control_channel_probe: OK -- all wire-schema cases witnessed via real execution
 
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+$ cargo run --example envelope_probe
+=== rejects an expired envelope (now > expires_at) ===
+result -> Err(Expired { expires_at: ..., now: ... })
+=== rejects a duplicate message_id on the same connection ===
+replay send -> Err(DuplicateMessageId { message_id: "msg-dup" })
+=== rejects a REGRESSING sequence_number ===
+sequence_number=3 (regression) -> Err(SequenceNotMonotonic { got: 3, last_seen: 10 })
+...
+envelope_probe: OK -- all envelope validation cases witnessed via real execution
+
+$ cargo run --example auth_gate_probe
+=== gate accepts unknown device with correct PIN, allowlists it ===
+result -> Ok(()), now_allowlisted -> true
+...
+auth_gate_probe: OK -- all authenticate() gate cases witnessed via real execution
 ```
 
 These exercise real `serde_json::to_string`/`from_str` round-trips for
-every `ClientMessage`/`ServerMessage` variant against the exact JSON
-[`PROTOCOL.md`](./PROTOCOL.md) specifies (optional `text` present/omitted,
-malformed/unknown-`type` input producing a `serde_json::Error` rather than
-a panic), plus the `ControlEvent` → `ServerMessage` translation.
+every `ClientMessage`/`ServerMessage` variant (both bare, for the
+pre-session PIN handshake, and `TaskEnvelope`-wrapped, for everything
+after — see [`PROTOCOL.md`](./PROTOCOL.md)'s "Envelope" section) against
+the exact JSON `PROTOCOL.md` specifies, the `ControlEvent` →
+`ServerMessage` translation, and the envelope-level expiry/duplicate-
+`message_id`/non-monotonic-`sequence_number` rejection rules -- all
+witnessed via real execution, not simulated/predicted output, and the
+PIN/allowlist auth gate remains fully passing and unmodified by the
+envelope-wrapping work.
 
 Running the binary end-to-end was also witnessed, in two configurations:
 

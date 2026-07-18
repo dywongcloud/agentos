@@ -1,17 +1,21 @@
 //! Manual, run-by-hand probe: exercises the real `ClientMessage`/`ServerMessage` JSON
-//! serialize/deserialize round-trips and `ServerMessage::from_control_event` mapping from
-//! `control_channel.rs`, printing real output. Witnesses the pure wire-schema logic that used
-//! to live in `control_channel.rs`'s `#[cfg(test)] mod tests` (removed per this repo's
-//! no-unit-tests rule).
+//! serialize/deserialize round-trips (both bare, for the pre-session PIN handshake, and
+//! envelope-wrapped via `TaskEnvelope<T>`, for every message after it -- see
+//! `PROTOCOL.md`'s "Envelope" section for exactly where that line falls) and
+//! `ServerMessage::from_control_event` mapping from `control_channel.rs`, printing real
+//! output. Witnesses the pure wire-schema logic that used to live in `control_channel.rs`'s
+//! `#[cfg(test)] mod tests` (removed per this repo's no-unit-tests rule).
 //!
-//! This probe deliberately does NOT cover `ControlChannel::authenticate`'s PIN/allowlist gate --
-//! that logic is witnessed live against a real running daemon over a real `iroh` connection by
-//! `examples/control_probe.rs` (see its own module doc), which is the more faithful live
-//! witness for that stateful, async, network-facing behavior.
+//! This probe deliberately does NOT cover `ControlChannel::authenticate`'s PIN/allowlist gate,
+//! nor the envelope-validation logic in `TaskEnvelope`/`InboundEnvelopeState`
+//! (expiry/dedup/sequence rejection) -- the former is witnessed live against a real running
+//! daemon over a real `iroh` connection by `examples/control_probe.rs` (see its own module
+//! doc), and the latter by `examples/envelope_probe.rs`, both more faithful witnesses for that
+//! stateful behavior than a pure serde round-trip probe would be.
 //!
 //! Run with `cargo run --example control_channel_probe`.
 
-use holoiroh_daemon::control_channel::{ClientMessage, ServerMessage};
+use holoiroh_daemon::control_channel::{ClientMessage, ServerMessage, TaskEnvelope};
 use holoiroh_daemon::holo_bridge::ControlEvent;
 
 fn round_trip_client(label: &str, msg: ClientMessage, expected_json: &str) {
@@ -33,7 +37,7 @@ fn round_trip_server(label: &str, msg: ServerMessage, expected_json: &str) {
 }
 
 fn main() {
-    println!("=== ClientMessage round-trips ===");
+    println!("=== bare ClientMessage round-trips (pre-session PIN handshake wire shape) ===");
     round_trip_client(
         "prompt",
         ClientMessage::Prompt {
@@ -58,7 +62,7 @@ fn main() {
     );
 
     println!();
-    println!("=== ServerMessage round-trips ===");
+    println!("=== bare ServerMessage round-trips (pre-session auth_rejected wire shape) ===");
     round_trip_server("ack", ServerMessage::ack(), r#"{"type":"ack"}"#);
     round_trip_server(
         "status",
@@ -92,6 +96,77 @@ fn main() {
         unknown.is_err()
     );
     assert!(unknown.is_err());
+
+    println!();
+    println!("=== TaskEnvelope<ClientMessage> round-trip (post-session wire shape) ===");
+    let client_envelope = TaskEnvelope::<ClientMessage>::wrap(
+        "session-abc123".to_string(),
+        Some("task-xyz789".to_string()),
+        0,
+        ClientMessage::Prompt {
+            text: "open safari and check my calendar".to_string(),
+        },
+    );
+    let json = serde_json::to_string(&client_envelope).unwrap();
+    println!("serialize -> {json}");
+    assert!(json.contains(r#""protocol_version":1"#));
+    assert!(json.contains(r#""session_id":"session-abc123""#));
+    assert!(json.contains(r#""task_id":"task-xyz789""#));
+    assert!(json.contains(r#""message_type":"prompt""#));
+    assert!(json.contains(r#""sequence_number":0"#));
+    assert!(json.contains(r#""payload":{"type":"prompt","text":"open safari and check my calendar"}"#));
+    assert!(!json.contains("\"signature\":"), "signature must be omitted when None, not emitted as null");
+    let back: TaskEnvelope<ClientMessage> = serde_json::from_str(&json).unwrap();
+    println!("deserialize -> {back:?}");
+    assert_eq!(back, client_envelope, "envelope round-trip mismatch");
+    assert_eq!(back.payload, ClientMessage::Prompt { text: "open safari and check my calendar".to_string() });
+
+    println!();
+    println!("=== TaskEnvelope<ServerMessage> round-trip (post-session wire shape) ===");
+    let server_envelope = TaskEnvelope::<ServerMessage>::wrap(
+        "session-abc123".to_string(),
+        Some("task-xyz789".to_string()),
+        1,
+        ServerMessage::task_progress("clicked Safari icon in the Dock"),
+    );
+    let json = serde_json::to_string(&server_envelope).unwrap();
+    println!("serialize -> {json}");
+    assert!(json.contains(r#""message_type":"task_progress""#));
+    assert!(json.contains(r#""sequence_number":1"#));
+    let back: TaskEnvelope<ServerMessage> = serde_json::from_str(&json).unwrap();
+    println!("deserialize -> {back:?}");
+    assert_eq!(back, server_envelope, "envelope round-trip mismatch");
+
+    println!();
+    println!("=== TaskEnvelope omits task_id/signature when None (not emitted as null) ===");
+    let no_task_id_envelope = TaskEnvelope::<ServerMessage>::wrap(
+        "session-abc123".to_string(),
+        None,
+        0,
+        ServerMessage::status("control channel ready"),
+    );
+    let json = serde_json::to_string(&no_task_id_envelope).unwrap();
+    println!("serialize -> {json}");
+    assert!(!json.contains("\"task_id\":"), "task_id must be omitted when None, not emitted as null");
+    assert!(!json.contains("\"signature\":"), "signature must be omitted when None, not emitted as null");
+
+    println!();
+    println!("=== TaskEnvelope::is_expired_at ===");
+    let envelope = TaskEnvelope::<ServerMessage>::wrap(
+        "session-abc123".to_string(),
+        None,
+        0,
+        ServerMessage::ack(),
+    );
+    println!(
+        "sent_at={} expires_at={} (default 30s window)",
+        envelope.sent_at, envelope.expires_at
+    );
+    assert_eq!(envelope.expires_at - envelope.sent_at, 30_000, "default expiry window must be 30s");
+    assert!(!envelope.is_expired_at(envelope.sent_at), "must not be expired at sent_at");
+    assert!(!envelope.is_expired_at(envelope.expires_at), "must not be expired exactly at expires_at (only strictly after)");
+    assert!(envelope.is_expired_at(envelope.expires_at + 1), "must be expired 1ms past expires_at");
+    println!("is_expired_at checks: OK");
 
     println!();
     println!("=== ServerMessage::from_control_event mapping ===");
