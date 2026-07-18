@@ -193,6 +193,9 @@ holoiroh/
 │   │   ├── audit_log.rs            # PRD P0-12 metadata-only local audit log (real AuditLogger; not yet called from the live request path)
 │   │   ├── task_state.rs          # PRD task lifecycle state machine (16 flow + 4 interactive + 10 terminal states; not wired to a live event source yet)
 │   │   ├── local_model.rs         # PRD P0-11 Aro Private mode: manages a local llama.cpp `llama-server` subprocess (Holo3.1 Q4 GGUF, 127.0.0.1 only); holo serve is pointed at it via --base-url / HAI_AGENT_RUNTIME_BASE_URL
+│   │   ├── executor.rs            # PRD 7.3 ComputerUseExecutor trait + HoloDesktopExecutor abstraction seam (lib-only; live daemon path not yet routed through it)
+│   │   ├── policy.rs              # PRD 7.3/9/P0-7 Aro policy wrapper: 6-class action taxonomy + decision table (real interception logic; not yet wired to a live tool-call boundary)
+│   │   ├── registry.rs           # PRD 8/P0-4 app registry: alias->deterministic-launch routes (~/.holoiroh/registry.*), resolve()->Single/Ambiguous/NotFound, `open -b` launch (plaintext for now; not yet on a live voice path)
 │   │   └── holo_bridge/           # bridges control messages to `holo serve`'s A2A endpoint
 │   │       ├── mod.rs
 │   │       ├── a2a_client.rs
@@ -214,7 +217,10 @@ holoiroh/
 │       ├── audit_log_probe.rs             # AuditLogger append/round-trip + PRD P0-12 acceptance test (no dictated text on disk)
 │       ├── task_state_probe.rs            # TaskState serde round-trips + is_valid_transition, full lifecycle diagram
 │       ├── holo_bridge_queue_probe.rs     # HoloControlBridge concurrent-prompt-queueing races
-│       └── local_model_probe.rs           # builds the exact llama-server + holo serve commands and verifies the local-inference env wiring, WITHOUT spawning the 21 GB model
+│       ├── local_model_probe.rs           # builds the exact llama-server + holo serve commands and verifies the local-inference env wiring, WITHOUT spawning the 21 GB model
+│       ├── executor_probe.rs              # every ComputerUseExecutor trait method against the real HoloDesktopExecutor (unreachable A2A backend)
+│       ├── policy_probe.rs                # policy 6-class taxonomy + decision table incl. the PRD 16a adversarial zero-send acceptance test
+│       └── registry_probe.rs              # registry round-trip + Single/Ambiguous/NotFound resolution + `open -b` deterministic launch
 ├── ios-bridge/                    # Rust staticlib crate: extern "C" FFI bridge for iOS
 │   ├── Cargo.toml                 # crate-type = ["staticlib", "lib"]
 │   └── src/lib.rs                 # ticket-connect/subscribe/poll-next-frame extern "C" fns (stub bodies)
