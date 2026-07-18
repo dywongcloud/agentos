@@ -310,7 +310,7 @@ fn to_control_message(request_id: String, msg: ClientMessage) -> Option<ControlM
 /// lock, so a std lock is both correct and cheaper than an async one here --
 /// the same reasoning `HoloControlBridge::events_tx` uses for its own
 /// `std::sync::RwLock` (see that type's doc comment).
-struct AuthState {
+pub struct AuthState {
     allowlist: Allowlist,
     allowlist_path: std::path::PathBuf,
     /// The PIN this daemon process generated at startup. `None` means PIN
@@ -321,6 +321,39 @@ struct AuthState {
     /// connections": with no PIN configured, there is no correct PIN to
     /// enter, so unknown devices are simply rejected).
     expected_pin: Option<String>,
+}
+
+impl AuthState {
+    /// Constructs an `AuthState` directly, bypassing the real `~/.holoiroh/allowlist.json`
+    /// load `ControlChannel::new`/`with_auth` normally perform. `pub` (rather than only
+    /// reachable via those constructors) specifically so `examples/auth_gate_probe.rs` -- a
+    /// real, run-by-hand live witness for [`ControlChannel::authenticate`]'s PIN/allowlist gate
+    /// logic (see this repo's no-unit-tests rule) -- can exercise the actual gate function
+    /// against a real in-memory `AuthState` and a real `tokio::io::Lines` reader, the same seam
+    /// the removed `#[tokio::test]` async tests used, just driven by `cargo run` instead of
+    /// `cargo test`. Not called from `main.rs`'s binary target (which builds real `AuthState`
+    /// only via `ControlChannel::new`/`with_auth`'s real allowlist load) -- `#[allow(dead_code)]`
+    /// there, same status as `allowlist.rs`'s own probe-only convenience methods.
+    #[allow(dead_code)]
+    pub fn for_probing(expected_pin: Option<&str>, pre_allowed: &[&str], allowlist_path: std::path::PathBuf) -> Self {
+        let mut allowlist = Allowlist::default();
+        for device in pre_allowed {
+            allowlist.add_entry(device.to_string(), None);
+        }
+        AuthState {
+            allowlist,
+            allowlist_path,
+            expected_pin: expected_pin.map(|p| p.to_string()),
+        }
+    }
+
+    /// True if `device_id` is currently allowlisted -- used by the probe to confirm
+    /// `authenticate`'s side effect (adding a newly PIN-verified device) actually happened.
+    /// Same not-called-from-`main.rs` status as [`Self::for_probing`].
+    #[allow(dead_code)]
+    pub fn contains_key(&self, device_id: &str) -> bool {
+        self.allowlist.contains_key(device_id)
+    }
 }
 
 /// Handle to the control channel: mounts [`CONTROL_ALPN`] on the shared
@@ -423,12 +456,15 @@ impl ControlChannel {
     /// via [`Allowlist::save`] so future connections skip the PIN step.
     ///
     /// Free function taking `auth` explicitly (rather than a `&self`
-    /// method reaching for `self.auth`) so unit tests below can exercise
-    /// this exact gate logic directly, without needing a real
-    /// `Arc<HoloBridge>` (which requires a live `holo serve` subprocess) to
-    /// construct a full `ControlChannel` -- [`ControlChannel::accept`]
-    /// simply calls `authenticate(&self.auth, ...)`.
-    async fn authenticate<R>(
+    /// method reaching for `self.auth`) so it can be exercised directly --
+    /// live, via `examples/auth_gate_probe.rs` (`cargo run --example
+    /// auth_gate_probe`) -- without needing a real `Arc<HoloBridge>` (which
+    /// requires a live `holo serve` subprocess) to construct a full
+    /// `ControlChannel`. [`ControlChannel::accept`] simply calls
+    /// `authenticate(&self.auth, ...)`. `pub` (rather than private) so that
+    /// probe, a real run-by-hand live witness for this gate (see this
+    /// repo's no-unit-tests rule), can call the actual function.
+    pub async fn authenticate<R>(
         auth: &Arc<std::sync::Mutex<AuthState>>,
         remote: &str,
         lines: &mut tokio::io::Lines<R>,
@@ -702,314 +738,3 @@ impl ProtocolHandler for ControlChannel {
 /// daemon state).
 #[allow(dead_code)]
 pub type SharedControlChannel = Arc<ControlChannel>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn client_message_prompt_round_trips() {
-        let msg = ClientMessage::Prompt {
-            text: "open safari and check my calendar".to_string(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"prompt","text":"open safari and check my calendar"}"#
-        );
-        let back: ClientMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn client_message_voice_transcript_round_trips() {
-        let msg = ClientMessage::VoiceTranscript {
-            text: "what's on my screen right now".to_string(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"voice_transcript","text":"what's on my screen right now"}"#
-        );
-        let back: ClientMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn client_message_stop_has_no_text_field() {
-        let msg = ClientMessage::Stop;
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"stop"}"#);
-        let back: ClientMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn server_message_ack_omits_null_text() {
-        let msg = ServerMessage::ack();
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"ack"}"#);
-        let back: ServerMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn server_message_status_round_trips_with_text() {
-        let msg = ServerMessage::status("connected to holo-desktop-cli");
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"status","text":"connected to holo-desktop-cli"}"#
-        );
-        let back: ServerMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn server_message_task_progress_round_trips() {
-        let msg = ServerMessage::task_progress("clicked Safari icon in the Dock");
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"task_progress","text":"clicked Safari icon in the Dock"}"#
-        );
-        let back: ServerMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn server_message_error_round_trips() {
-        let msg = ServerMessage::error("holo-desktop-cli exited unexpectedly (code 1)");
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(
-            json,
-            r#"{"type":"error","text":"holo-desktop-cli exited unexpectedly (code 1)"}"#
-        );
-        let back: ServerMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn malformed_json_is_a_deserialize_error_not_a_panic() {
-        let result: std::result::Result<ClientMessage, _> = serde_json::from_str("not json");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn unknown_type_is_a_deserialize_error_not_a_panic() {
-        let result: std::result::Result<ClientMessage, _> =
-            serde_json::from_str(r#"{"type":"unknown_variant"}"#);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn control_event_ack_maps_to_server_message_ack() {
-        let event = ControlEvent::Ack {
-            request_id: "r1".into(),
-        };
-        assert_eq!(ServerMessage::from_control_event(event), ServerMessage::ack());
-    }
-
-    #[test]
-    fn control_event_error_maps_to_server_message_error() {
-        let event = ControlEvent::Error {
-            request_id: "r1".into(),
-            message: "boom".into(),
-        };
-        assert_eq!(
-            ServerMessage::from_control_event(event),
-            ServerMessage::error("boom")
-        );
-    }
-
-    #[test]
-    fn control_event_queued_maps_to_status_with_ahead_count() {
-        let event = ControlEvent::Queued {
-            request_id: "r1".into(),
-            ahead: 2,
-        };
-        assert_eq!(
-            ServerMessage::from_control_event(event),
-            ServerMessage::status("queued, 2 ahead")
-        );
-        let json = serde_json::to_string(&ServerMessage::status("queued, 2 ahead")).unwrap();
-        assert_eq!(json, r#"{"type":"status","text":"queued, 2 ahead"}"#);
-    }
-
-    #[test]
-    fn control_event_queued_zero_ahead_still_reads_correctly() {
-        let event = ControlEvent::Queued {
-            request_id: "r1".into(),
-            ahead: 0,
-        };
-        assert_eq!(
-            ServerMessage::from_control_event(event),
-            ServerMessage::status("queued, 0 ahead")
-        );
-    }
-
-    #[test]
-    fn client_message_pin_round_trips() {
-        let msg = ClientMessage::Pin {
-            pin: "123456".to_string(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"pin","pin":"123456"}"#);
-        let back: ClientMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn server_message_auth_rejected_round_trips_with_text() {
-        let msg = ServerMessage::auth_rejected("incorrect PIN");
-        let json = serde_json::to_string(&msg).unwrap();
-        assert_eq!(json, r#"{"type":"auth_rejected","text":"incorrect PIN"}"#);
-        let back: ServerMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, msg);
-    }
-
-    #[test]
-    fn to_control_message_returns_none_for_pin() {
-        let result = to_control_message(
-            "r1".to_string(),
-            ClientMessage::Pin {
-                pin: "123456".to_string(),
-            },
-        );
-        assert!(
-            result.is_none(),
-            "Pin has no HoloBridge equivalent -- must be consumed by the auth gate, never forwarded"
-        );
-    }
-
-    #[test]
-    fn to_control_message_returns_some_for_every_other_variant() {
-        assert!(to_control_message(
-            "r1".into(),
-            ClientMessage::Prompt { text: "hi".into() }
-        )
-        .is_some());
-        assert!(to_control_message(
-            "r1".into(),
-            ClientMessage::VoiceTranscript { text: "hi".into() }
-        )
-        .is_some());
-        assert!(to_control_message("r1".into(), ClientMessage::Stop).is_some());
-    }
-
-    // --- authenticate() gate tests: real execution of
-    // `ControlChannel::authenticate` itself (not a re-implementation of its
-    // logic) against a real in-memory `AuthState` and a real
-    // `tokio::io::Lines` reader over an in-memory byte buffer standing in
-    // for the iroh `RecvStream` -- `authenticate` is a free function taking
-    // `&Arc<Mutex<AuthState>>` explicitly (see its doc comment) specifically
-    // so these tests can call it directly without needing a real
-    // `Arc<HoloBridge>` (which would require a live `holo serve`
-    // subprocess, unavailable in a unit-test sandbox).
-
-    fn auth_state_with_pin(
-        pin: Option<&str>,
-        pre_allowed: &[&str],
-    ) -> Arc<std::sync::Mutex<AuthState>> {
-        let mut allowlist = Allowlist::default();
-        for device in pre_allowed {
-            allowlist.add_entry(device.to_string(), None);
-        }
-        Arc::new(std::sync::Mutex::new(AuthState {
-            allowlist,
-            allowlist_path: std::env::temp_dir().join(format!(
-                "holoiroh-test-allowlist-{}-{}.json",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )),
-            expected_pin: pin.map(|p| p.to_string()),
-        }))
-    }
-
-    fn lines_from(input: &'static str) -> tokio::io::Lines<std::io::Cursor<&'static [u8]>> {
-        tokio::io::AsyncBufReadExt::lines(std::io::Cursor::new(input.as_bytes()))
-    }
-
-    #[tokio::test]
-    async fn gate_allows_already_allowlisted_device_without_reading_any_input() {
-        let auth = auth_state_with_pin(Some("123456"), &["node-known"]);
-        // Empty input: if the gate incorrectly tried to read a PIN line for
-        // an already-allowlisted device, this would return the "connection
-        // closed before PIN was presented" error instead of Ok(()).
-        let mut lines = lines_from("");
-        let result = ControlChannel::authenticate(&auth, "node-known", &mut lines).await;
-        assert!(result.is_ok(), "known device must pass without needing a PIN: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn gate_allows_any_device_when_pin_auth_disabled() {
-        let auth = auth_state_with_pin(None, &[]);
-        let mut lines = lines_from("");
-        let result = ControlChannel::authenticate(&auth, "node-totally-unknown", &mut lines).await;
-        assert!(result.is_ok(), "auth disabled must let any device through: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn gate_accepts_unknown_device_with_correct_pin_and_allowlists_it() {
-        let auth = auth_state_with_pin(Some("123456"), &[]);
-        let mut lines = lines_from("{\"type\":\"pin\",\"pin\":\"123456\"}\n");
-        let result = ControlChannel::authenticate(&auth, "node-new", &mut lines).await;
-        assert!(result.is_ok(), "correct PIN must be accepted: {result:?}");
-        assert!(
-            auth.lock().unwrap().allowlist.contains_key("node-new"),
-            "device must be added to the allowlist after a correct PIN"
-        );
-    }
-
-    #[tokio::test]
-    async fn gate_rejects_unknown_device_with_wrong_pin() {
-        let auth = auth_state_with_pin(Some("123456"), &[]);
-        let mut lines = lines_from("{\"type\":\"pin\",\"pin\":\"000000\"}\n");
-        let result = ControlChannel::authenticate(&auth, "node-attacker", &mut lines).await;
-        assert_eq!(result, Err("incorrect PIN".to_string()));
-        assert!(
-            !auth.lock().unwrap().allowlist.contains_key("node-attacker"),
-            "a wrong-PIN device must never be added to the allowlist"
-        );
-    }
-
-    #[tokio::test]
-    async fn gate_rejects_unknown_device_sending_a_non_pin_message_first() {
-        let auth = auth_state_with_pin(Some("123456"), &[]);
-        let mut lines = lines_from("{\"type\":\"prompt\",\"text\":\"do something\"}\n");
-        let result = ControlChannel::authenticate(&auth, "node-skipping-pin", &mut lines).await;
-        assert!(result.is_err(), "a prompt sent before PIN auth must be rejected, not queued/processed");
-        assert!(!auth.lock().unwrap().allowlist.contains_key("node-skipping-pin"));
-    }
-
-    #[tokio::test]
-    async fn gate_rejects_unknown_device_that_closes_before_sending_pin() {
-        let auth = auth_state_with_pin(Some("123456"), &[]);
-        let mut lines = lines_from(""); // EOF immediately
-        let result = ControlChannel::authenticate(&auth, "node-ghost", &mut lines).await;
-        assert_eq!(
-            result,
-            Err("connection closed before PIN was presented".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn gate_rejects_unknown_device_sending_malformed_json_as_pin() {
-        let auth = auth_state_with_pin(Some("123456"), &[]);
-        let mut lines = lines_from("not json at all\n");
-        let result = ControlChannel::authenticate(&auth, "node-garbage", &mut lines).await;
-        assert!(result.is_err());
-        assert!(!auth.lock().unwrap().allowlist.contains_key("node-garbage"));
-    }
-
-    #[tokio::test]
-    async fn gate_rejects_unknown_device_sending_empty_pin() {
-        let auth = auth_state_with_pin(Some("123456"), &[]);
-        let mut lines = lines_from("{\"type\":\"pin\",\"pin\":\"\"}\n");
-        let result = ControlChannel::authenticate(&auth, "node-empty-pin", &mut lines).await;
-        assert!(result.is_err(), "empty PIN must never satisfy verify_pin");
-    }
-}

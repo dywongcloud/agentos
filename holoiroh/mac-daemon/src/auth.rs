@@ -89,6 +89,14 @@ pub struct HoloToken {
 }
 
 impl HoloToken {
+    /// The resolved key value. Not yet called from `main.rs` (`holo serve` inherits
+    /// `HAI_API_KEY` from the parent process's environment directly -- see
+    /// `holo_bridge::process` and this crate's `Cargo.toml` comment on `dotenvy` -- so nothing
+    /// today needs the parsed value threaded through explicitly). Kept as the natural accessor
+    /// a future caller that must pass the key explicitly (rather than relying on inherited env)
+    /// would need, same status as the `#[allow(dead_code)]` convenience methods in
+    /// `allowlist.rs`.
+    #[allow(dead_code)]
     pub fn api_key(&self) -> &str {
         &self.api_key
     }
@@ -119,7 +127,12 @@ fn token_file_path(home: &std::path::Path) -> PathBuf {
 /// `.env` conventions this file is documented to use: `KEY=value` lines,
 /// optional surrounding whitespace, `#`-prefixed comment lines, and
 /// optional matching single/double quotes around the value.
-fn extract_api_key(contents: &str) -> Option<String> {
+///
+/// `pub` (rather than private) so `examples/auth_probe.rs` -- a real,
+/// run-by-hand live witness for this parsing logic (see this repo's
+/// no-unit-tests rule) -- can call the actual function instead of a
+/// reimplemented copy of it.
+pub fn extract_api_key(contents: &str) -> Option<String> {
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -197,98 +210,4 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extract_api_key_basic() {
-        let contents = "HAI_API_KEY=hk-abc123\n";
-        assert_eq!(extract_api_key(contents).as_deref(), Some("hk-abc123"));
-    }
-
-    #[test]
-    fn extract_api_key_quoted() {
-        let contents = "HAI_API_KEY=\"hk-abc123\"\n";
-        assert_eq!(extract_api_key(contents).as_deref(), Some("hk-abc123"));
-    }
-
-    #[test]
-    fn extract_api_key_with_comments_and_blank_lines() {
-        let contents = "# comment\n\nHAI_API_KEY=hk-xyz\n";
-        assert_eq!(extract_api_key(contents).as_deref(), Some("hk-xyz"));
-    }
-
-    #[test]
-    fn extract_api_key_missing() {
-        let contents = "SOME_OTHER_VAR=1\n";
-        assert_eq!(extract_api_key(contents), None);
-    }
-
-    #[test]
-    fn extract_api_key_empty_value() {
-        let contents = "HAI_API_KEY=\n";
-        assert_eq!(extract_api_key(contents), Some(String::new()));
-    }
-
-    #[test]
-    fn missing_home_dir_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "holoiroh-auth-test-missing-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let err = check_holo_token_in(&tmp).unwrap_err();
-        assert!(matches!(err, AuthCheckError::MissingTokenFile { .. }));
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn happy_path_valid_token() {
-        let tmp = std::env::temp_dir().join(format!(
-            "holoiroh-auth-test-happy-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let holo_dir = tmp.join(".holo");
-        std::fs::create_dir_all(&holo_dir).unwrap();
-        std::fs::write(holo_dir.join(".env"), "HAI_API_KEY=hk-test-token\n").unwrap();
-
-        let token = check_holo_token_in(&tmp).expect("token should parse");
-        assert_eq!(token.api_key(), "hk-test-token");
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn empty_file_missing_key() {
-        let tmp = std::env::temp_dir().join(format!(
-            "holoiroh-auth-test-empty-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let holo_dir = tmp.join(".holo");
-        std::fs::create_dir_all(&holo_dir).unwrap();
-        std::fs::write(holo_dir.join(".env"), "").unwrap();
-
-        let err = check_holo_token_in(&tmp).unwrap_err();
-        assert!(matches!(err, AuthCheckError::MissingApiKey { .. }));
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn unset_home_env_no_panic() {
-        // Directly exercise the NoHomeDir path via home_dir() with a
-        // simulated empty value, without mutating the real process env
-        // (which would race other tests running in parallel).
-        let empty = std::ffi::OsString::from("");
-        let filtered: Option<PathBuf> = Some(empty)
-            .filter(|v: &std::ffi::OsString| !v.is_empty())
-            .map(PathBuf::from);
-        assert!(filtered.is_none());
-    }
 }
