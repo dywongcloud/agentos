@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for holoiroh-daemon (holoiroh/mac-daemon).
+
+  Runs the built release binary at login and keeps it alive if it exits.
+  See holoiroh/README.md, "Running as a background service", for install
+  steps. This file uses a literal /Users/YOUR_USERNAME/... path because
+  launchd plists do NOT expand `~` or `$HOME` in <string> values, so the
+  paths below MUST be edited to match wherever this repo actually lives
+  on disk before installing.
+
+  Note for editors: XML comments may not contain two consecutive hyphen
+  characters anywhere in their body (illegal per the XML spec, rejected
+  by strict parsers even though Apple's own plutil tolerates it). Avoid
+  writing that sequence, or an em dash meant to stand in for it, inside
+  any comment block in this file.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.holoiroh.daemon</string>
+
+  <!--
+    EDIT THIS PATH before installing: replace
+    /Users/YOUR_USERNAME/Documents/agentOS with the actual absolute path
+    to this checkout, and confirm the binary has been built in release
+    mode first (cargo build with the release flag, run from holoiroh/,
+    which produces the binary at the workspace root's
+    target/release/holoiroh-daemon; see holoiroh/README.md "Build status"
+    for why it lands at the workspace root, not mac-daemon/target/).
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOUR_USERNAME/Documents/agentOS/holoiroh/target/release/holoiroh-daemon</string>
+  </array>
+
+  <!-- Run at login (login window / user session start). -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!--
+    Restart automatically if the daemon exits for any reason, whether a
+    crash or a clean exit: launchd treats KeepAlive=true as "always keep
+    this job running," relaunching it immediately after it stops.
+  -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!--
+    stdout/stderr redirected to per-service log files under
+    ~/Library/Logs/holoiroh/ (launchd creates the files but NOT missing
+    parent directories; create the directory once before loading, see
+    README install steps).
+  -->
+  <key>StandardOutPath</key>
+  <string>/Users/YOUR_USERNAME/Library/Logs/holoiroh/daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/YOUR_USERNAME/Library/Logs/holoiroh/daemon.err.log</string>
+
+  <!--
+    Working directory the daemon starts in: mac-daemon/, so any relative
+    paths (e.g. loading mac-daemon/.env) resolve the same way they do when
+    run manually via `cargo run` from that directory.
+  -->
+  <key>WorkingDirectory</key>
+  <string>/Users/YOUR_USERNAME/Documents/agentOS/holoiroh/mac-daemon</string>
+
+  <!--
+    ProcessType Interactive keeps launchd from throttling CPU/IO priority
+    the way it would for a background batch job: this daemon is
+    latency-sensitive (screen capture plus P2P streaming), not a batch
+    task.
+  -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>

@@ -66,6 +66,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::allowlist::{Allowlist, verify_pin};
 use crate::holo_bridge::{ControlEvent, ControlMessage, HoloBridge};
 
 /// ALPN identifying the control-channel protocol on the shared `iroh`
@@ -90,6 +91,16 @@ pub enum ClientMessage {
     },
     /// Cancel/interrupt whatever is currently running.
     Stop,
+    /// Presents a PIN for first-connection auth (see `holoiroh/PAIRING.md`'s
+    /// "Auth beyond ticket possession" section and [`ControlChannel::accept`]'s
+    /// gate). Added additive-only per `PROTOCOL.md`'s extension policy: an
+    /// older client that never sends this variant is simply never let past
+    /// the gate for an unrecognized device -- existing `prompt`/
+    /// `voice_transcript`/`stop` semantics are unchanged for already-
+    /// allowlisted devices, which don't need to send `Pin` at all.
+    Pin {
+        pin: String,
+    },
 }
 
 /// A message sent from the Mac daemon to the iOS app over the control
@@ -116,6 +127,16 @@ pub enum ServerMessage {
     },
     /// An in-progress update from the `holo-desktop-cli` bridge.
     TaskProgress {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        text: Option<String>,
+    },
+    /// Sent immediately before the daemon closes the connection because the
+    /// peer failed the auth gate in [`ControlChannel::accept`] (unknown
+    /// device id and no/wrong PIN, or auth is required but not yet
+    /// configured for this session). Distinct from [`ServerMessage::Error`]
+    /// so a client can special-case "show the pairing/PIN screen again"
+    /// versus "show a generic error toast".
+    AuthRejected {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         text: Option<String>,
     },
@@ -148,6 +169,13 @@ impl ServerMessage {
         }
     }
 
+    /// Convenience constructor for an `auth_rejected` message with text.
+    pub fn auth_rejected(text: impl Into<String>) -> Self {
+        ServerMessage::AuthRejected {
+            text: Some(text.into()),
+        }
+    }
+
     /// Translates a [`crate::holo_bridge::control::ControlEvent`] (the
     /// internal, `request_id`/`context_id`-correlated bridge schema) down
     /// to the minimal wire [`ServerMessage`] schema this module's
@@ -170,6 +198,12 @@ impl ServerMessage {
                 ServerMessage::status(text)
             }
             ControlEvent::Error { message, .. } => ServerMessage::error(message),
+            // Wire shape required verbatim: `{"type":"status","text":"queued, N ahead"}`.
+            // `ahead == 0` still reads correctly ("queued, 0 ahead" = next to run once the
+            // current turn finishes) rather than needing a separate zero-case message.
+            ControlEvent::Queued { ahead, .. } => {
+                ServerMessage::status(format!("queued, {ahead} ahead"))
+            }
         }
     }
 }
@@ -236,38 +270,71 @@ where
 /// conversation continuity can be layered on later by threading a
 /// connection-scoped `context_id` through here without any wire-format
 /// change.
-fn to_control_message(request_id: String, msg: ClientMessage) -> ControlMessage {
+///
+/// Returns `None` for [`ClientMessage::Pin`] -- that variant is consumed
+/// entirely by [`ControlChannel::authenticate`]'s gate before the main
+/// accept loop (below) ever calls this function; a `Pin` arriving mid-
+/// stream (after auth already succeeded) has no `HoloBridge` equivalent to
+/// translate to, so the accept loop acks it locally instead of forwarding
+/// it (see the `Ok(ClientMessage::Pin { .. })` arm in
+/// [`ProtocolHandler::accept`]).
+fn to_control_message(request_id: String, msg: ClientMessage) -> Option<ControlMessage> {
     match msg {
-        ClientMessage::Prompt { text } => ControlMessage::Prompt {
+        ClientMessage::Prompt { text } => Some(ControlMessage::Prompt {
             request_id,
             text,
             context_id: None,
-        },
-        ClientMessage::VoiceTranscript { text } => ControlMessage::VoiceTranscript {
+        }),
+        ClientMessage::VoiceTranscript { text } => Some(ControlMessage::VoiceTranscript {
             request_id,
             text,
             context_id: None,
             confidence: None,
-        },
-        ClientMessage::Stop => ControlMessage::Stop {
+        }),
+        ClientMessage::Stop => Some(ControlMessage::Stop {
             request_id,
             context_id: None,
             force: false,
-        },
+        }),
+        ClientMessage::Pin { .. } => None,
     }
+}
+
+/// Shared auth state consulted by [`ControlChannel::accept`]'s gate: the
+/// persisted device allowlist plus the PIN generated for this daemon run.
+///
+/// Held behind `std::sync::Mutex` (not `tokio::sync::Mutex`): every access
+/// is a short, synchronous critical section (a `HashSet`/`Vec` lookup, or a
+/// JSON file write on the rare add-device path) with no `.await` inside the
+/// lock, so a std lock is both correct and cheaper than an async one here --
+/// the same reasoning `HoloControlBridge::events_tx` uses for its own
+/// `std::sync::RwLock` (see that type's doc comment).
+struct AuthState {
+    allowlist: Allowlist,
+    allowlist_path: std::path::PathBuf,
+    /// The PIN this daemon process generated at startup. `None` means PIN
+    /// auth is disabled for this run (see [`ControlChannel::new`] /
+    /// [`ControlChannel::with_auth`]) -- every connection is then gated on
+    /// the allowlist alone, and an unknown device is rejected outright with
+    /// no PIN-entry path offered (matching "reject unknown/wrong-PIN
+    /// connections": with no PIN configured, there is no correct PIN to
+    /// enter, so unknown devices are simply rejected).
+    expected_pin: Option<String>,
 }
 
 /// Handle to the control channel: mounts [`CONTROL_ALPN`] on the shared
 /// `iroh` `Endpoint`/`Router` (accept side) and lets the daemon open the
 /// matching stream when dialing a peer (dial side).
 ///
-/// Each accepted connection forwards incoming [`ClientMessage`]s into the
-/// shared [`HoloBridge`] and streams the resulting
-/// [`crate::holo_bridge::control::ControlEvent`]s back out as
-/// [`ServerMessage`]s on the same stream.
+/// Each accepted connection is first run through the auth gate documented
+/// on [`ProtocolHandler::accept`] below (allowlist + first-connection PIN);
+/// only a connection that passes is forwarded into the shared [`HoloBridge`]
+/// and gets its [`crate::holo_bridge::control::ControlEvent`]s streamed back
+/// out as [`ServerMessage`]s on the same stream.
 #[derive(Clone)]
 pub struct ControlChannel {
     bridge: Arc<HoloBridge>,
+    auth: Arc<std::sync::Mutex<AuthState>>,
 }
 
 impl std::fmt::Debug for ControlChannel {
@@ -278,9 +345,145 @@ impl std::fmt::Debug for ControlChannel {
 
 impl ControlChannel {
     /// Creates a new control channel wrapping an already-started
-    /// [`HoloBridge`].
+    /// [`HoloBridge`], with **no auth enforced**: the allowlist is loaded
+    /// from [`Allowlist::default_path`] (best-effort -- a load failure logs
+    /// a warning and starts from an empty in-memory allowlist rather than
+    /// failing daemon startup) but every device is treated as effectively
+    /// allowlisted (no PIN, no rejection) until [`Self::with_auth`] is used
+    /// instead. Kept as the zero-friction default for local dev/testing
+    /// (matches this crate's existing "best-effort, degrade don't crash"
+    /// posture -- see `main.rs`'s `holo_bridge` startup handling) --
+    /// **not** what a real deployment should call; see `PAIRING.md`'s
+    /// "Exact remaining wiring step" for what `main.rs` would need to
+    /// change to actually enable enforcement by default.
     pub fn new(bridge: Arc<HoloBridge>) -> Self {
-        Self { bridge }
+        let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
+        Self {
+            bridge,
+            auth: Arc::new(std::sync::Mutex::new(AuthState {
+                allowlist,
+                allowlist_path,
+                expected_pin: None,
+            })),
+        }
+    }
+
+    /// Creates a new control channel with auth **enforced**: `expected_pin`
+    /// (typically [`crate::allowlist::generate_default_pin`]'s output,
+    /// displayed to the user alongside the ticket/QR at startup) is
+    /// required from any device not already in the persisted allowlist;
+    /// devices that pass the PIN check are added to the allowlist and
+    /// persisted immediately (so they don't need the PIN again on the next
+    /// connection). This is the constructor `PAIRING.md` designs `main.rs`
+    /// around, but `main.rs` does not call it yet -- see that file's
+    /// "Exact remaining wiring step" section.
+    pub fn with_auth(bridge: Arc<HoloBridge>, expected_pin: String) -> Self {
+        let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
+        Self {
+            bridge,
+            auth: Arc::new(std::sync::Mutex::new(AuthState {
+                allowlist,
+                allowlist_path,
+                expected_pin: Some(expected_pin),
+            })),
+        }
+    }
+
+    fn load_allowlist_best_effort() -> (Allowlist, std::path::PathBuf) {
+        match Allowlist::default_path() {
+            Ok(path) => match Allowlist::load(&path) {
+                Ok(list) => (list, path),
+                Err(err) => {
+                    warn!(error = %err, path = %path.display(), "control channel: failed to load allowlist, starting empty in-memory (not persisted until a successful pairing)");
+                    (Allowlist::default(), path)
+                }
+            },
+            Err(err) => {
+                warn!(error = %err, "control channel: could not resolve allowlist path (HOME unset?), auth allowlist is in-memory-only this run");
+                (Allowlist::default(), std::path::PathBuf::from(".holoiroh-allowlist-fallback.json"))
+            }
+        }
+    }
+
+    /// Runs the auth gate for a newly-accepted `connection`'s peer.
+    ///
+    /// Returns `Ok(())` if the connection may proceed (device was already
+    /// allowlisted, or auth is disabled via [`Self::new`]). Returns
+    /// `Err(reason)` if the connection must be rejected -- `reason` is
+    /// meant to be sent back as a [`ServerMessage::auth_rejected`] before
+    /// closing.
+    ///
+    /// For an unknown device with PIN auth enabled, this reads exactly one
+    /// line off `lines` expecting `{"type":"pin","pin":"..."}` (the very
+    /// first line the peer must send before anything else is processed --
+    /// a `Prompt`/`VoiceTranscript`/`Stop` sent before a successful `Pin`
+    /// from an unknown device is rejected, not queued or buffered). On a
+    /// correct PIN, the device id is persisted to the allowlist immediately
+    /// via [`Allowlist::save`] so future connections skip the PIN step.
+    async fn authenticate<R>(
+        &self,
+        remote: &str,
+        lines: &mut tokio::io::Lines<R>,
+    ) -> std::result::Result<(), String>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        // Fast path: already allowlisted (or PIN auth disabled entirely) --
+        // no need to consume any input off the stream at all.
+        {
+            let state = self.auth.lock().expect("auth lock poisoned");
+            if state.expected_pin.is_none() || state.allowlist.contains_key(remote) {
+                return Ok(());
+            }
+        }
+
+        // Unknown device, PIN auth enabled: the first line on the stream
+        // must be a valid Pin message with the correct PIN.
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => return Err("connection closed before PIN was presented".to_string()),
+            Err(err) => return Err(format!("read error waiting for PIN: {err}")),
+        };
+
+        let msg: ClientMessage = match serde_json::from_str(&line) {
+            Ok(msg) => msg,
+            Err(err) => return Err(format!("expected a PIN message first, got unparseable input: {err}")),
+        };
+
+        let candidate = match msg {
+            ClientMessage::Pin { pin } => pin,
+            other => {
+                return Err(format!(
+                    "expected a PIN message first from an unrecognized device, got {other:?} instead"
+                ));
+            }
+        };
+
+        let mut state = self.auth.lock().expect("auth lock poisoned");
+        let expected = state
+            .expected_pin
+            .clone()
+            .expect("checked Some above; not mutated between the two locks on this task-local path");
+
+        if !verify_pin(&candidate, &expected) {
+            return Err("incorrect PIN".to_string());
+        }
+
+        // Correct PIN: allowlist this device so it skips the PIN step on
+        // every subsequent connection, and persist immediately -- a crash
+        // between here and the next connection must not lose the pairing.
+        state.allowlist.add_entry(remote.to_string(), None);
+        if let Err(err) = state.allowlist.save(&state.allowlist_path) {
+            // Persist failure doesn't revoke the in-memory grant for *this*
+            // process's lifetime (the PIN was genuinely correct -- failing
+            // the connection now would be punishing the user for a disk
+            // error, not an auth failure), but it does mean the device will
+            // have to re-enter the PIN after a daemon restart. Logged, not
+            // silently swallowed.
+            warn!(peer = %remote, error = %err, "control channel: PIN accepted but failed to persist allowlist -- device will need to re-pair after daemon restart");
+        }
+        info!(peer = %remote, "control channel: new device paired via PIN, added to allowlist");
+        Ok(())
     }
 
     /// Mounts this control channel's [`ProtocolHandler`] onto `router`
@@ -326,6 +529,21 @@ impl ProtocolHandler for ControlChannel {
             .await
             .map_err(AcceptError::from_err)?;
 
+        let mut lines = BufReader::new(recv).lines();
+
+        // Auth gate: allowlisted devices pass through immediately; unknown
+        // devices (with PIN auth enabled via `ControlChannel::with_auth`)
+        // must present the correct PIN as their first line before anything
+        // else on this stream is processed. See `authenticate`'s doc and
+        // `holoiroh/PAIRING.md`'s "Auth beyond ticket possession" section.
+        if let Err(reason) = self.authenticate(&remote.to_string(), &mut lines).await {
+            warn!(peer = %remote, reason = %reason, "control channel: rejecting connection, auth failed");
+            let _ = write_line(&mut send, &ServerMessage::auth_rejected(reason)).await;
+            let _ = send.finish();
+            connection.close(0u32.into(), b"auth rejected");
+            return Ok(());
+        }
+
         // Greet the peer so it knows the control channel is live -- this
         // also exercises the write path immediately, surfacing transport
         // errors early rather than only on the first real reply.
@@ -370,7 +588,6 @@ impl ProtocolHandler for ControlChannel {
             }
         });
 
-        let mut lines = BufReader::new(recv).lines();
         loop {
             let line = tokio::select! {
                 line = lines.next_line() => line,
@@ -397,10 +614,25 @@ impl ProtocolHandler for ControlChannel {
             }
 
             match serde_json::from_str::<ClientMessage>(&line) {
+                Ok(ClientMessage::Pin { .. }) => {
+                    // A Pin sent after auth already passed (e.g. an already-
+                    // allowlisted device, or a second Pin from a device that
+                    // just paired) is redundant, not an error -- ack it and
+                    // keep reading rather than tearing down the connection.
+                    debug!(peer = %remote, "control channel: redundant Pin message after auth, acking");
+                    if events_tx.send(ControlEvent::Ack { request_id: String::new() }).is_err() {
+                        break;
+                    }
+                }
                 Ok(msg) => {
                     debug!(peer = %remote, ?msg, "control channel: received message");
                     let request_id = uuid::Uuid::new_v4().to_string();
-                    let control_message = to_control_message(request_id, msg);
+                    // Only `Pin` maps to `None`, and that variant is
+                    // handled entirely by the arm above -- every other
+                    // `ClientMessage` variant always produces `Some`.
+                    let Some(control_message) = to_control_message(request_id, msg) else {
+                        continue;
+                    };
                     // Register this connection's event sink for the
                     // duration of this call. `handle_message` drives the
                     // whole turn (streaming progress) and returns once

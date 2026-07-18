@@ -9,21 +9,29 @@
 //! `Endpoint`/`Router`, and -- best-effort -- starts the `holo serve`
 //! bridge ([`holo_bridge`]) that the control channel forwards prompts to.
 //!
-//! Capture (screen/audio) is not wired up yet -- this binary proves out the
-//! P2P publish/ticket half of the pipeline plus the full control-channel
-//! path. Other mac-daemon modules build on the `Live` + `LocalBroadcast`
-//! handles constructed here.
+//! Screen capture (via [`capture::setup_screen_video`], macOS
+//! ScreenCaptureKit, `--display <index>` selectable) is wired up as the
+//! broadcast's video source before publish. System/mic audio capture is not
+//! wired up yet.
 
+mod allowlist;
+mod capture;
 mod control_channel;
 mod holo_bridge;
 
 use std::sync::Arc;
 
+use clap::Parser;
 use iroh::protocol::Router;
-use iroh_live::{Live, media::publish::LocalBroadcast, ticket::LiveTicket};
+use iroh_live::{
+    Live,
+    media::{codec::VideoCodec, format::VideoPreset, publish::LocalBroadcast},
+    ticket::LiveTicket,
+};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use allowlist::generate_default_pin;
 use control_channel::ControlChannel;
 use holo_bridge::HoloBridge;
 
@@ -32,6 +40,28 @@ use holo_bridge::HoloBridge;
 /// broadcasts); a single well-known name is sufficient for one daemon
 /// publishing one stream today.
 const BROADCAST_NAME: &str = "holoiroh";
+
+/// CLI arguments for `holoiroh-daemon`.
+#[derive(Parser, Debug)]
+#[command(name = "holoiroh-daemon", about = "Mac-side holoiroh P2P daemon")]
+struct Cli {
+    /// Which display to capture when multiple are connected, by index into
+    /// the list `iroh_live::media::capture::ScreenCapturer::list_all()`
+    /// returns (same ordering `capture::list_displays()` exposes). Omit to
+    /// use the primary display.
+    #[arg(long)]
+    display: Option<usize>,
+
+    /// Disable the first-connection PIN gate (see `allowlist.rs` and
+    /// `holoiroh/PAIRING.md`'s "Auth beyond ticket possession" section) --
+    /// every connection is accepted immediately with no PIN and no
+    /// allowlist enforcement, matching this daemon's pre-auth behavior.
+    /// Intended for local dev/testing against a same-machine or trusted-LAN
+    /// peer only; a real deployment should leave PIN auth enabled (the
+    /// default).
+    #[arg(long)]
+    no_pin_auth: bool,
+}
 
 /// `holo` CLI executable used to spawn `holo serve` (see
 /// `holo_bridge::process`). Overridable so a dev machine can point at a
@@ -52,6 +82,8 @@ fn holo_serve_port() -> u16 {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("holoiroh-daemon starting");
+
+    let cli = Cli::parse();
 
     // --- iroh endpoint (reads IROH_SECRET if set, otherwise generates a
     // fresh key each run). Built *without* `.with_router()` because we own
@@ -81,6 +113,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // --- first-connection PIN, generated fresh every daemon run (never
+    // persisted -- only the resulting allowlist entry is). `--no-pin-auth`
+    // disables this entirely for local dev/testing (see Cli::no_pin_auth's
+    // doc); real usage leaves it on by default so a leaked ticket alone
+    // does not grant control, per README.md's "Security model" section and
+    // `holoiroh/PAIRING.md`. ---
+    let pin = if cli.no_pin_auth {
+        None
+    } else {
+        Some(generate_default_pin())
+    };
+
     // --- build the shared Router: Live's own protocols (MoQ, gossip if
     // enabled) plus the control channel's ALPN, all on `live.endpoint()`.
     // See control_channel.rs's module doc for why this is "a second
@@ -90,7 +134,10 @@ async fn main() -> anyhow::Result<()> {
     let router_builder = live.register_protocols(router_builder);
     let router_builder = match bridge.clone() {
         Some(bridge) => {
-            let control = ControlChannel::new(bridge);
+            let control = match pin.clone() {
+                Some(pin) => ControlChannel::with_auth(bridge, pin),
+                None => ControlChannel::new(bridge),
+            };
             control.register_protocols(router_builder)
         }
         None => {
@@ -100,16 +147,32 @@ async fn main() -> anyhow::Result<()> {
     };
     let router = router_builder.spawn();
 
-    // Empty broadcast: no video/audio source attached yet. `LocalBroadcast`
-    // is immediately consumable/publishable with zero tracks -- callers
-    // (this binary's future capture code) attach sources via
-    // `broadcast.video()` / `broadcast.audio()` once capture lands.
+    // Broadcast with the ScreenCaptureKit video source attached -- no audio
+    // source yet. `capture::setup_screen_video` resolves `--display` (or the
+    // primary display when omitted) and calls `broadcast.video().set_source(..)`
+    // on our behalf.
     let broadcast = LocalBroadcast::new();
+    capture::setup_screen_video(
+        &broadcast,
+        cli.display,
+        VideoCodec::H264,
+        &[VideoPreset::P720],
+    )?;
 
     // --- publish and print the shareable ticket ---
     live.publish(BROADCAST_NAME, &broadcast).await?;
     let ticket = LiveTicket::new(live.endpoint().addr(), BROADCAST_NAME);
     println!("{ticket}");
+    // PIN is printed as plain text alongside the ticket -- this is the
+    // real, reachable slice of the pairing UX `PAIRING.md` designs (a QR
+    // rendering of `ticket` above it is documented there but not yet
+    // implemented in this binary; see that file's "Implementation status"
+    // table for exactly what's real vs designed-only).
+    if let Some(pin) = &pin {
+        println!("pairing PIN (first connection only): {pin}");
+    } else {
+        println!("PIN auth disabled (--no-pin-auth): any device with the ticket can connect");
+    }
     info!(name = %BROADCAST_NAME, "publishing");
 
     // --- wait for shutdown ---
