@@ -68,6 +68,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::allowlist::{Allowlist, verify_pin};
+use crate::audit_log::{
+    ActionClass, AppCategory, AuditEntry, AuditLogger, ConnectionPath, FinalStatus,
+    InferenceMode, RemoteViewState, now_ms,
+};
 use crate::holo_bridge::{ControlEvent, ControlMessage, HoloBridge};
 
 /// ALPN identifying the control-channel protocol on the shared `iroh`
@@ -674,6 +678,79 @@ fn to_control_message(request_id: String, msg: ClientMessage) -> Option<ControlM
     }
 }
 
+/// Audit-log start metadata for one in-flight task, recorded by the main [`ProtocolHandler::accept`]
+/// loop at dispatch time and consumed by the `send_task` spawned in that same function when the
+/// matching [`ControlEvent::Done`] arrives -- see the audit-log bookkeeping comment where
+/// `audit_starts` is constructed in `accept` for why this is split across the two tasks.
+struct AuditTaskStart {
+    started_at_ms: u64,
+    action_class: ActionClass,
+}
+
+/// Applies one [`ControlEvent`] to the running audit-log bookkeeping for its connection: tallies
+/// `Progress` events into `action_counts`, and on `Done`, looks up (and removes) the matching
+/// [`AuditTaskStart`] recorded at dispatch time to build and [`AuditLogger::append`] a complete
+/// [`AuditEntry`] -- the "one entry when a task completes" half of this module's P0-12 wiring (the
+/// "one entry when a task starts" half is the `audit_starts.lock()...insert(..)` call in `accept`
+/// itself). A `request_id` with no matching `audit_starts` entry (i.e. not a `Prompt`/
+/// `VoiceTranscript` -- see that insert's own doc for which `ClientMessage` kinds get a start
+/// record) is silently skipped: nothing to close out, not an error.
+///
+/// Free function (rather than a `ControlChannel` method) because it needs to run inside
+/// `send_task`'s spawned `async move` block, which does not hold `&self` -- taking every piece of
+/// state it needs as an explicit parameter instead.
+fn audit_on_control_event(
+    audit: &AuditLogger,
+    connection_path: &ConnectionPath,
+    audit_starts: &Arc<std::sync::Mutex<std::collections::HashMap<String, AuditTaskStart>>>,
+    action_counts: &mut std::collections::HashMap<String, u32>,
+    event: &ControlEvent,
+) {
+    match event {
+        ControlEvent::Progress { request_id, .. } => {
+            *action_counts.entry(request_id.clone()).or_insert(0) += 1;
+        }
+        ControlEvent::Done {
+            request_id, status, ..
+        } => {
+            let start = audit_starts
+                .lock()
+                .expect("audit_starts lock poisoned")
+                .remove(request_id);
+            let Some(start) = start else {
+                // No start record (e.g. this `Done` closed out a queued prompt dropped by
+                // `Stop`, or `Stop`'s own `Done` -- see `HoloControlBridge::handle_stop`; `Stop`
+                // itself is intentionally not audit-started, see `accept`'s dispatch-time
+                // comment) -- nothing to close out.
+                return;
+            };
+            let action_count = action_counts.remove(request_id).unwrap_or(0);
+            let completed_at_ms = now_ms();
+            let entry = AuditEntry {
+                task_id: request_id.clone(),
+                started_at_ms: start.started_at_ms,
+                completed_at_ms,
+                app_category: AppCategory::Desktop,
+                action_class: start.action_class,
+                inference_mode: InferenceMode::Cloud,
+                remote_view_state: RemoteViewState::Streaming,
+                connection_path: *connection_path,
+                final_status: FinalStatus::from(*status),
+                latency_ms: completed_at_ms.saturating_sub(start.started_at_ms),
+                action_count,
+            };
+            if let Err(err) = audit.append(&entry) {
+                // Best-effort, matching `holo_bridge`'s own degrade-don't-crash posture (see
+                // `main.rs`'s handling of `HoloBridge::start` failing): a disk/permissions
+                // problem writing the audit log must never tear down the control-channel turn
+                // that already completed successfully from the user's point of view.
+                warn!(task_id = %request_id, error = %err, "audit log: failed to append entry");
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Shared auth state consulted by [`ControlChannel::accept`]'s gate: the
 /// persisted device allowlist plus the PIN generated for this daemon run.
 ///
@@ -742,6 +819,11 @@ impl AuthState {
 pub struct ControlChannel {
     bridge: Arc<HoloBridge>,
     auth: Arc<std::sync::Mutex<AuthState>>,
+    /// Metadata-only local audit log (Project Aro PRD row P0-12) -- see `crate::audit_log`'s
+    /// module doc for exactly what is and isn't recorded. `Arc` (not owned) because
+    /// `ControlChannel` is itself cheaply `Clone`d per accepted connection (see this struct's own
+    /// existing `bridge`/`auth` fields) and every clone must append to the same underlying file.
+    audit: Arc<AuditLogger>,
 }
 
 impl std::fmt::Debug for ControlChannel {
@@ -763,7 +845,7 @@ impl ControlChannel {
     /// **not** what a real deployment should call; see `PAIRING.md`'s
     /// "Exact remaining wiring step" for what `main.rs` would need to
     /// change to actually enable enforcement by default.
-    pub fn new(bridge: Arc<HoloBridge>) -> Self {
+    pub fn new(bridge: Arc<HoloBridge>, audit: Arc<AuditLogger>) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
         Self {
             bridge,
@@ -772,6 +854,7 @@ impl ControlChannel {
                 allowlist_path,
                 expected_pin: None,
             })),
+            audit,
         }
     }
 
@@ -784,7 +867,7 @@ impl ControlChannel {
     /// connection). This is the constructor `PAIRING.md` designs `main.rs`
     /// around, but `main.rs` does not call it yet -- see that file's
     /// "Exact remaining wiring step" section.
-    pub fn with_auth(bridge: Arc<HoloBridge>, expected_pin: String) -> Self {
+    pub fn with_auth(bridge: Arc<HoloBridge>, expected_pin: String, audit: Arc<AuditLogger>) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
         Self {
             bridge,
@@ -793,6 +876,7 @@ impl ControlChannel {
                 allowlist_path,
                 expected_pin: Some(expected_pin),
             })),
+            audit,
         }
     }
 
@@ -999,6 +1083,13 @@ impl ProtocolHandler for ControlChannel {
             write_line(send, &envelope).await
         }
 
+        // Metadata-only audit log (Project Aro PRD row P0-12, see `crate::audit_log`'s module
+        // doc): the connection's direct-vs-relay path is determined once, here, from the live
+        // `Connection` -- it cannot change for the lifetime of this accepted connection (a new
+        // path renegotiation would be a new `Connection`), so every task audited on this
+        // connection shares one `ConnectionPath` value rather than re-deriving it per task.
+        let connection_path = ConnectionPath::from_connection(&connection);
+
         // Greet the peer so it knows the control channel is live -- this
         // also exercises the write path immediately, surfacing transport
         // errors early rather than only on the first real reply.
@@ -1070,6 +1161,17 @@ impl ProtocolHandler for ControlChannel {
         let current_task_id: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
 
+        // Audit-log bookkeeping (Project Aro PRD row P0-12): `request_id` -> the task's start
+        // metadata, recorded by the main accept loop below at the moment it dispatches a
+        // `Prompt`/`VoiceTranscript` (the only point `ActionClass` is known -- `ControlEvent`
+        // itself carries no action-class field), and consumed by `send_task` below when that
+        // same `request_id`'s terminal `ControlEvent::Done` arrives. `std::sync::Mutex` (not
+        // `tokio::sync::Mutex`): every critical section is a plain `HashMap` insert/remove with
+        // no `.await` inside the lock, matching the same reasoning `AuthState`'s own doc comment
+        // gives for its std lock.
+        let audit_starts: Arc<std::sync::Mutex<std::collections::HashMap<String, AuditTaskStart>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
         // Forward ControlEvents -> ServerMessage envelopes on this stream,
         // on its own task so a slow/stalled write to `send` doesn't block
         // the bridge from making progress on other connections' events (the
@@ -1094,9 +1196,24 @@ impl ProtocolHandler for ControlChannel {
             let remote = remote.clone();
             let session_id = session_id.clone();
             let current_task_id = current_task_id.clone();
+            let audit = self.audit.clone();
+            let audit_starts = audit_starts.clone();
             async move {
                 let mut outbound_state = outbound_state;
+                // Per-connection action-step tally: incremented on every `Progress` event,
+                // consumed (and removed) when that `request_id`'s `Done` arrives. Never touches
+                // event content -- only counts how many `Progress` events were seen.
+                let mut action_counts: std::collections::HashMap<String, u32> =
+                    std::collections::HashMap::new();
+
                 while let Some(event) = events_rx.recv().await {
+                    audit_on_control_event(
+                        &audit,
+                        &connection_path,
+                        &audit_starts,
+                        &mut action_counts,
+                        &event,
+                    );
                     let msg = ServerMessage::from_control_event(event);
                     let task_id = current_task_id
                         .lock()
@@ -1254,6 +1371,29 @@ impl ProtocolHandler for ControlChannel {
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                     *current_task_id.lock().expect("current_task_id lock poisoned") =
                         Some(request_id.clone());
+
+                    // Audit-log task start (Project Aro PRD row P0-12): only `Prompt`/
+                    // `VoiceTranscript` are tasks with a start/end lifecycle worth auditing --
+                    // `Stop` has no `Done` terminal event of its own kind to close the loop on
+                    // (see `HoloControlBridge::handle_stop`, which emits `Done{Canceled}` for
+                    // dropped queued prompts using *their own* `request_id`s, not `Stop`'s), so
+                    // it is intentionally not given a start record here. Recorded from `msg`
+                    // itself, before it's consumed into `to_control_message` below -- this is
+                    // the only point in this whole turn where `ActionClass` (which wire message
+                    // kind arrived) is known; `ControlEvent`/`ControlMessage` never carry it.
+                    if let Some(action_class) = match &msg {
+                        ClientMessage::Prompt { .. } => Some(ActionClass::Prompt),
+                        ClientMessage::VoiceTranscript { .. } => Some(ActionClass::VoiceTranscript),
+                        ClientMessage::Stop | ClientMessage::Pin { .. } => None,
+                    } {
+                        audit_starts.lock().expect("audit_starts lock poisoned").insert(
+                            request_id.clone(),
+                            AuditTaskStart {
+                                started_at_ms: now_ms(),
+                                action_class,
+                            },
+                        );
+                    }
                     // Only `Pin` maps to `None`, and that variant is
                     // handled entirely by the arm above -- every other
                     // `ClientMessage` variant always produces `Some`.

@@ -15,6 +15,7 @@
 //! wired up yet.
 
 mod allowlist;
+mod audit_log;
 mod auth;
 mod capture;
 mod control_channel;
@@ -140,6 +141,36 @@ async fn main() -> anyhow::Result<()> {
     let live = Live::from_env().await?.spawn();
     info!(id = %live.endpoint().id(), "endpoint ready");
 
+    // --- metadata-only local audit log (Project Aro PRD row P0-12; see `audit_log`'s module
+    // doc). Best-effort, matching `holo_bridge`'s own degrade-don't-crash posture: a disk/
+    // permissions problem creating `~/.holoiroh/` must not prevent the daemon from publishing
+    // its broadcast or accepting control-channel connections -- those still work (minus audit
+    // logging) even if this fails. Constructed once here and shared (via `Arc`) into whichever
+    // `ControlChannel` constructor runs below. ---
+    let audit_logger = match audit_log::AuditLogger::from_env() {
+        Ok(logger) => {
+            info!(path = %logger.path().display(), "audit log ready");
+            Arc::new(logger)
+        }
+        Err(err) => {
+            warn!(error = %err, "audit log failed to initialize -- control channel will run without task audit logging");
+            // Falls back to an in-memory-only path resolution failure state: `AuditLogger::new`
+            // only fails on `create_dir_all`, so retrying the same path on every `append` call
+            // would fail identically every time. Rather than making every downstream call site
+            // handle an `Option<Arc<AuditLogger>>`, construct a logger pointed at a path under
+            // the OS temp dir as a last-resort fallback so `append`'s own per-call error handling
+            // (already required for real disk-full/permissions races) is the only error path
+            // anything downstream needs to handle -- this is strictly a "logging is
+            // best-effort, never load-bearing" daemon, so a temp-dir fallback location is an
+            // acceptable degradation, not a silent data-integrity issue.
+            let fallback = std::env::temp_dir().join("holoiroh-audit-fallback.log");
+            Arc::new(
+                audit_log::AuditLogger::new(&fallback)
+                    .unwrap_or_else(|_| panic!("audit log fallback path {} must be constructible", fallback.display())),
+            )
+        }
+    };
+
     // --- best-effort holo_bridge startup. A missing/unhealthy `holo`
     // binary must not prevent the daemon from publishing its broadcast or
     // accepting control-channel connections (which still work for
@@ -190,8 +221,8 @@ async fn main() -> anyhow::Result<()> {
     let router_builder = match bridge.clone() {
         Some(bridge) => {
             let control = match pin.clone() {
-                Some(pin) => ControlChannel::with_auth(bridge, pin),
-                None => ControlChannel::new(bridge),
+                Some(pin) => ControlChannel::with_auth(bridge, pin, audit_logger.clone()),
+                None => ControlChannel::new(bridge, audit_logger.clone()),
             };
             control.register_protocols(router_builder)
         }
