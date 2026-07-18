@@ -20,6 +20,7 @@ pub mod capture;
 pub mod control_channel;
 pub mod holo_bridge;
 pub mod limits;
+pub mod local_model;
 pub mod permissions;
 pub mod sensitive_categories;
 pub mod task_state;

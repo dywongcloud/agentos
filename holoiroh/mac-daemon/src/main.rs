@@ -21,6 +21,7 @@ mod capture;
 mod control_channel;
 mod holo_bridge;
 mod limits;
+mod local_model;
 mod permissions;
 mod sensitive_categories;
 mod task_state;
@@ -83,6 +84,18 @@ fn holo_serve_port() -> u16 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8765)
+}
+
+/// Whether the daemon should run its own local `llama-server` (Aro Private mode) and point
+/// `holo serve` at it, versus leaving `holo serve` on whatever backend the environment already
+/// configures. Local is the **default** because the alpha build is local-only (Project Aro PRD
+/// P0-11: no cloud inference path). Set `HOLOIROH_LOCAL_MODEL=0` (or `false`/`no`) to opt out --
+/// e.g. a dev pointing `holo serve` at an already-running inference server by hand.
+fn local_model_enabled() -> bool {
+    match std::env::var("HOLOIROH_LOCAL_MODEL") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"),
+        Err(_) => true,
+    }
 }
 
 #[tokio::main]
@@ -172,6 +185,57 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // --- Aro Private mode: local on-device inference via a `llama-server`
+    // (llama.cpp) subprocess serving the Holo3.1 vision model, bound to
+    // 127.0.0.1 only. This is the alpha's ONLY inference backend -- the
+    // build carries no cloud inference code path (Project Aro PRD P0-11) --
+    // and `holo serve` (started just below) is pointed at it via
+    // `--base-url` + `HAI_AGENT_RUNTIME_BASE_URL` (see `local_model` and
+    // `holo_bridge::process` module docs for why that env var, not
+    // `HAI_BASE_URL`, is the one that redirects inference and drops the
+    // hosted API key).
+    //
+    // Best-effort + degrade-don't-crash, matching `holo_bridge`'s posture:
+    // spawning `llama-server` loads the ~21 GB GGUF and can take minutes, so
+    // a failure here (binary missing, model not cached, RAM pressure) is
+    // logged and the daemon still publishes its broadcast; the control
+    // channel then surfaces "inference unavailable" rather than the process
+    // dying. The local server, when it comes up, is held for the daemon's
+    // lifetime and shut down in the cleanup sequence below. ---
+    let local_model_server = if local_model_enabled() {
+        let config = local_model::LocalModelConfig::from_env();
+        if config.port == holo_serve_port() {
+            warn!(
+                port = config.port,
+                "local model port equals holo serve port; they must differ (two distinct listeners) -- set HOLOIROH_LOCAL_MODEL_PORT or HOLOIROH_HOLO_PORT"
+            );
+        }
+        info!(
+            base_url = %config.base_url(),
+            model = %config.model_hf_repo,
+            "starting local llama-server (Aro Private mode; loading the model can take minutes)"
+        );
+        match local_model::LocalModelServer::spawn(config).await {
+            Ok(server) => {
+                info!(pid = ?server.pid(), base_url = %server.base_url(), "local llama-server ready");
+                Some(server)
+            }
+            Err(err) => {
+                warn!(error = %err, "local llama-server failed to start -- holo serve will have no local inference backend");
+                None
+            }
+        }
+    } else {
+        info!("HOLOIROH_LOCAL_MODEL disabled -- not starting a local llama-server; holo serve uses its configured backend");
+        None
+    };
+    // The base URL to hand `holo serve`: the local server's when it came up,
+    // else `None` (holo serve keeps its own configured backend, which in a
+    // correctly-configured local-only alpha means it will fail to reach a
+    // model and the control channel reports that, rather than silently
+    // reaching a cloud endpoint).
+    let local_base_url = local_model_server.as_ref().map(|s| s.base_url());
+
     // --- best-effort holo_bridge startup. A missing/unhealthy `holo`
     // binary must not prevent the daemon from publishing its broadcast or
     // accepting control-channel connections (which still work for
@@ -180,7 +244,14 @@ async fn main() -> anyhow::Result<()> {
     // propagated with `?`. ---
     let (bridge_events_tx, _bridge_events_rx) = mpsc::unbounded_channel();
     let health_check_shutdown = tokio_util::sync::CancellationToken::new();
-    let bridge = match HoloBridge::start(holo_bin(), holo_serve_port(), bridge_events_tx).await {
+    let bridge = match HoloBridge::start(
+        holo_bin(),
+        holo_serve_port(),
+        local_base_url,
+        bridge_events_tx,
+    )
+    .await
+    {
         Ok(bridge) => {
             info!(pid = ?bridge.holo_serve_pid().await, "holo_bridge started");
             let bridge = Arc::new(bridge);
@@ -310,6 +381,16 @@ async fn main() -> anyhow::Result<()> {
                     "holo_bridge still has other Arc references at shutdown; falling back to Drop-based cleanup instead of graceful shutdown()"
                 );
             }
+        }
+    }
+    // Stop the local `llama-server` AFTER `holo serve` (which was pointed at it): the inference
+    // backend outliving nothing means no orphaned 21 GB process is left holding memory. Owned
+    // directly (not behind an `Arc`), so this always gets the graceful awaited SIGTERM-then-kill
+    // path; `Drop` (+ `kill_on_drop`) is only the safety net for a panic before we reach here.
+    if let Some(server) = local_model_server {
+        info!(pid = ?server.pid(), "shutting down local llama-server");
+        if let Err(err) = server.shutdown().await {
+            warn!(error = %err, "local llama-server shutdown error");
         }
     }
     live.shutdown().await;
