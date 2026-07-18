@@ -33,15 +33,38 @@ System/mic audio capture is still not wired up. `ios/` is now a real
 multi-screen SwiftUI app skeleton that builds for iOS 17: `ContentView`
 hosts a `NavigationStack` moving from
 `PairingView` (paste an iroh ticket, plus a placeholder "Scan QR" button)
-to `MainView` on "connect" (video preview placeholder, prompt text field
-+ Send, a placeholder microphone button, and a scrolling status/log list
-of `ServerMessage`-equivalent entries). None of this is wired to a real
-transport yet -- there is no iroh/FFI networking, no actual QR scanning,
-no on-device transcription, and no real video rendering; the log list is
-driven by locally-synthesized entries so the UI is demonstrably live
-rather than static mock data. The Swift side of the control channel
-(actually sending/receiving `PROTOCOL.md`'s JSON over a real connection,
-including the `pin`/`auth_rejected` messages) remains unimplemented.
+to `MainView` on "connect" (a real video render surface, prompt text
+field + Send, a placeholder microphone button, and a scrolling status/log
+list of `ServerMessage`-equivalent entries).
+
+The **video render path is now real**: `MainView`'s preview is a
+`VideoRenderView` (`ios/Sources/HoloIrohApp/Video/`), a SwiftUI
+`UIViewRepresentable` backed by an `AVSampleBufferDisplayLayer`, with
+public `enqueue(CVPixelBuffer:pts:)` / `enqueue(CMSampleBuffer)` entry
+points (thread-safe, display-immediately low-latency scheduling, and
+`.failed`-status flush-and-resume recovery) for the H.264/HEVC frames the
+Mac daemon's VideoToolbox-encoded `iroh-live` stream will decode to. The
+view binds to a small `VideoFrameSource` protocol so the concrete frame
+producer is swappable. **What is *not* wired yet is the frame *source*,
+not the renderer**: there is still no live `iroh-live` subscription
+feeding real frames in (that is the separate `ios-bridge`
+subscribe/poll-next-frame path -- see `ios/IROH_FFI.md`). To prove the
+render path works end-to-end without a network source, a
+`SyntheticVideoFrameSource` generates animated `CVPixelBuffer`s on device
+(a scrolling gradient + a sweeping bar, driven by a `CADisplayLink`) and
+pushes them through the exact same `onFrame`/`enqueue` seam a real source
+will use -- so the preview animates today and the real source drops into
+`MainView`'s single binding site later without touching the view. Read
+this honestly: **the render half is implemented and witnessed; the
+network source half is not** -- this is not "video streaming works."
+
+The rest is still not wired to a real transport: there is no iroh/FFI
+networking, no actual QR scanning, and no on-device transcription; the
+log list is driven by locally-synthesized entries so the UI is
+demonstrably live rather than static mock data. The Swift side of the
+control channel (actually sending/receiving `PROTOCOL.md`'s JSON over a
+real connection, including the `pin`/`auth_rejected` messages) remains
+unimplemented.
 
 The control channel's wire schema now wraps every message (except the bare
 pre-session PIN handshake) in a `TaskEnvelope` -- `protocol_version`,
@@ -190,7 +213,12 @@ holoiroh/
 │       ├── HoloIrohApp.swift       # @main App entry point
 │       ├── ContentView.swift       # NavigationStack: PairingView -> MainView
 │       ├── PairingView.swift       # paste ticket + Scan QR placeholder + Connect
-│       ├── MainView.swift          # video placeholder, prompts, mic, status/log list
+│       ├── MainView.swift          # VideoRenderView, prompts, mic, status/log list
+│       ├── VoiceTranscriber.swift  # on-device SFSpeechRecognizer transcription + model wrapper
+│       ├── Video/
+│       │   ├── VideoFrameSource.swift          # protocol seam: decoded-frame producer (VideoFrame = pixelBuffer | sampleBuffer)
+│       │   ├── VideoRenderView.swift           # UIViewRepresentable over AVSampleBufferDisplayLayer + enqueue(CVPixelBuffer/CMSampleBuffer)
+│       │   └── SyntheticVideoFrameSource.swift # on-device animated CVPixelBuffer generator (CADisplayLink) -- render witness, stands in for the network source
 │       └── Models/
 │           └── ServerMessage.swift # Swift mirror of PROTOCOL.md's wire schema
 └── README.md                       # this file
@@ -298,9 +326,14 @@ A thin client:
    real implementations are separate follow-on work), built into an
    `.xcframework` for the Swift side to import — not yet integrated in
    this skeleton.
-2. **Live view.** Once connected, the app subscribes to the `iroh-live`
-   broadcast and renders incoming video frames plus audio, i.e. a live
-   mirror of the Mac's screen.
+2. **Live view.** The render surface is real: `VideoRenderView`
+   (`AVSampleBufferDisplayLayer`) displays a stream of decoded frames
+   delivered through a `VideoFrameSource`. Once the `iroh-live`
+   subscription is wired (via `ios-bridge`), its decoded frames feed that
+   same surface, giving a live mirror of the Mac's screen. Until then the
+   view is bound to an on-device `SyntheticVideoFrameSource` so the render
+   path is exercised for real; the network frame source is the piece
+   that remains unbuilt, not the renderer.
 3. **Prompts.** A text field and a microphone button let the user send
    instructions. Voice input is transcribed (on-device or via a
    transcription service — TBD) before being sent as text over the

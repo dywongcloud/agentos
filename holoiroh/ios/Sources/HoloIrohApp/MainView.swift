@@ -6,8 +6,13 @@ import SwiftUI
 ///
 /// Layout mirrors the four elements called out in the iOS-side README
 /// section ("Pairing" / "Live view" / "Prompts" / "Status"):
-/// 1. A video preview area -- placeholder solid-black rectangle for now,
-///    to be replaced by real `iroh-live` frame rendering in a later task.
+/// 1. A video preview area -- now a real `VideoRenderView`
+///    (`AVSampleBufferDisplayLayer`-backed) bound to a `VideoFrameSource`.
+///    The *render* path is real; the *source* bound here is a synthetic
+///    on-device generator (`SyntheticVideoFrameSource`) standing in for
+///    the not-yet-wired `iroh-live` network source, so the preview
+///    animates today and the real source drops into the same binding
+///    later without touching this view.
 /// 2. A text field + Send button for prompts.
 /// 3. A microphone button (placeholder action -- no on-device
 ///    transcription wired up yet).
@@ -25,6 +30,14 @@ struct MainView: View {
     @State private var logEntries: [LogEntry] = [
         LogEntry(message: .status(text: "paired -- control channel not yet connected"))
     ]
+
+    /// The frame producer bound to the video surface. Held with `@State`
+    /// so it keeps a stable identity across view updates (a fresh source
+    /// on every re-render would restart the display link each time). This
+    /// is the single swap point: replacing `SyntheticVideoFrameSource()`
+    /// with the real `iroh-live` source (once `ios-bridge` is wired) is the
+    /// only change the live-view feature needs here.
+    @State private var frameSource: VideoFrameSource = SyntheticVideoFrameSource()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -62,23 +75,16 @@ struct MainView: View {
     // MARK: - Video preview
 
     private var videoPreview: some View {
-        // Placeholder for the real iroh-live video surface (later task).
-        // Fixed 16:9 aspect ratio approximates a desktop-capture frame so
-        // the rest of the layout doesn't jump once real video lands.
-        ZStack {
-            Color.black
-            VStack(spacing: 6) {
-                Image(systemName: "video.slash")
-                    .font(.title2)
-                    .foregroundStyle(.white.opacity(0.6))
-                Text("Video preview placeholder")
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.6))
-            }
-        }
-        .aspectRatio(16.0 / 9.0, contentMode: .fit)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .accessibilityLabel("Video preview placeholder, not yet connected to a live stream")
+        // Real render surface: a `VideoRenderView` (AVSampleBufferDisplayLayer)
+        // bound to `frameSource`. The synthetic source makes it animate
+        // today; the layout (fixed 16:9, rounded clip) is unchanged from
+        // the old placeholder so nothing jumps when the real iroh-live
+        // source replaces the synthetic one at `frameSource`'s init.
+        VideoRenderView(source: frameSource)
+            .background(Color.black)
+            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .accessibilityLabel("Live video preview (synthetic test frames until the network source is connected)")
     }
 
     // MARK: - Status / log panel
