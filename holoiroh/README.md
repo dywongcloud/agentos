@@ -469,6 +469,33 @@ tracked separately as this repo's `holoiroh-pairing-ticket-exchange` PRD
 row (Project Aro PRD P0-2/7.1), which supersedes this PIN+allowlist scheme
 once built.
 
+## Session & rate limits (PRD 10.4)
+
+`mac-daemon/src/limits.rs` is the single source of truth for every numeric
+limit Project Aro PRD section 10.4 specifies, each a named constant with a
+doc comment citing 10.4 directly. As with the rest of this README, the
+honest real-vs-designed breakdown matters more than a bare "implemented"
+claim, so here is the exact status of each:
+
+| PRD 10.4 limit | Value | Status |
+| --- | --- | --- |
+| Task request expiry | 30s default | Constant only. `ClientMessage` (`PROTOCOL.md`) carries no timestamp field to compute request age against; needs a wire-schema change (tracked under `holoiroh-task-envelope-protocol`). |
+| Active session lifetime | 10min max | Constant + real `SessionTimer` type (independently exercised, see `examples/limits_probe.rs`), not called from a live call site -- there is no persistent "session" object spanning multiple control-channel connections yet. |
+| Approval token | 60s TTL, one task + one action | Constant + real `ApprovalToken` type (single-use, TTL-checked, task-scoped; independently exercised), not wired to a live call site -- there is no approval-gating flow in this codebase yet. |
+| Heartbeat | every 5s while active | Constant only. `ClientMessage`/`ServerMessage` have no heartbeat message variant; the natural insertion point is documented as a doc comment on `ControlChannel::accept`'s `tokio::select!`. |
+| Disconnect handling | pause after 5s, cancel after 15s unless safely draft-complete | Constants only. Connection loss is already detected in `ControlChannel::accept`'s read loop, but it tears the connection down immediately today -- no pause-then-cancel grace period, and no "safely draft-complete" task-state concept exists yet (see `holoiroh-task-state-machine-terminal-statuses`). |
+| Max active tasks per Mac | 1 | **Really enforced.** This was already the exact behavior of `HoloControlBridge`'s pre-existing `busy`/`queue` mechanism (a second prompt while one is in flight is queued, never run concurrently) -- `limits.rs` now names that behavior explicitly and a `debug_assert!` in `handle_prompt` ties the constant to the `bool`-shaped enforcement it models. |
+| Max active controllers per Mac | 1 | **Gap found, honestly reported, not silently fixed.** `ControlChannel::accept` does not reject a second simultaneous connection from an already-allowlisted device -- it runs the same accept path independently and both connections can coexist, with only the most recent sender's connection receiving `ControlEvent`s (via the existing `replace_event_sink` reconnect-redirect mechanism, which was designed for "old connection dropped, new one takes over," not "two connections alive at once"). Not wired here because a real fix changes accept-time rejection behavior for an already-allowlisted device and needs a product decision on which connection should win; see `limits.rs`'s `MAX_ACTIVE_CONTROLLERS_PER_MAC` doc for the exact code path and the proposed fix shape. |
+| Task runtime | 45s default / 120s max | Constants + a real `clamp_task_runtime` function (independently exercised: an over-max request is actually clamped, not passed through), not wired into `HoloControlBridge::run_prompt` -- that function has no per-task deadline/timeout concept today (`send_and_stream` runs to completion with no `tokio::time::timeout` wrapper). |
+| Agent action cap | 100 default | **Really enforced.** `ActionCounter` (real, atomic, independently exercised -- refuses a 101st `try_record`) is constructed per turn in `HoloControlBridge::run_prompt` and counts every `TaskUpdate::Working` update; once the cap is hit, further progress events for that turn are suppressed and the turn ends with a `ControlEvent::Error` reporting the cap. **Documented limitation:** this does not stop `holo serve` from continuing to run the agent server-side past the 100th action -- `A2aClient::send_and_stream`'s callback has no way to signal "abort the stream," and a real `tasks/cancel` needs the resolved `context_id`, which is only available after the stream ends. A true server-side abort needs a callback-contract change out of this pass's scope. |
+| Manual input rate | 120 events/s max | Constant only, no channel to attach it to yet. This codebase's wire schema has no `manual_input` message type at all (only `Prompt`/`VoiceTranscript`/`Stop`/`Pin`); the richer 6-stream protocol PRD 7.1 describes (which includes a dedicated `manual_input` stream) is tracked separately under `holoiroh-task-envelope-protocol`. |
+
+Verification: `cargo run --example limits_probe` exercises `ActionCounter`,
+`SessionTimer`, `ApprovalToken`, and `clamp_task_runtime` directly with real
+execution (not a test file, per this repo's convention) -- all four passed
+in the witnessed run this section is based on. `cargo build` in
+`mac-daemon` stays warning-clean with all of the above in place.
+
 ## Setup (once implemented)
 
 **Mac side:**
