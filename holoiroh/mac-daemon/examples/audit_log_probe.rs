@@ -52,7 +52,17 @@ fn read_raw(path: &std::path::Path) -> String {
 fn main() {
     println!("=== AuditLogger::new creates the parent directory ===");
     let path = temp_path("basic");
-    let parent = path.parent().unwrap().join("holoiroh-audit-probe-subdir");
+    // PID + nanos in the subdir name, matching temp_path()'s own uniqueness scheme --
+    // a fixed name here left a stale dir behind across runs, making the not-exists
+    // assertion below fail on every run after the first.
+    let parent = path.parent().unwrap().join(format!(
+        "holoiroh-audit-probe-subdir-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let nested_path = parent.join("audit.log");
     assert!(!parent.exists(), "subdir must not exist yet for this to be a real test");
     let logger = AuditLogger::new(&nested_path).expect("AuditLogger::new should create parent dir");

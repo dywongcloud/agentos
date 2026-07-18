@@ -43,16 +43,100 @@ rather than static mock data. The Swift side of the control channel
 (actually sending/receiving `PROTOCOL.md`'s JSON over a real connection,
 including the `pin`/`auth_rejected` messages) remains unimplemented.
 
+The control channel's wire schema now wraps every message (except the bare
+pre-session PIN handshake) in a `TaskEnvelope` -- `protocol_version`,
+`message_id`, `session_id`, `task_id`, `sent_at`/`expires_at`,
+`sequence_number`, `payload`, `signature` -- matching the Project Aro PRD's
+authoritative envelope shape. This is **real, wired code**, not a paper
+schema: `control_channel.rs` actually rejects inbound envelopes that are
+expired, replay a seen `message_id`, or send a non-increasing
+`sequence_number`, in that order, before the payload is even parsed (see
+[`PROTOCOL.md`](./PROTOCOL.md)'s "Envelope" and "Rejection rules"
+sections). `signature` rides on the wire per the PRD schema but is **not
+cryptographically verified** -- there is no signing-keypair infrastructure
+in this codebase yet, so the field is always `null` on envelopes this
+daemon constructs and unchecked on the way in. A new message pair,
+`input_request` (server → client) / `input_response` (client → server),
+lets the daemon pause a running turn to ask the user a structured question
+(credential needed, MFA needed, ambiguous choice, missing info, or
+sensitive-access consent) -- also real and wired, including a real timed
+expiry-to-safe-pause path (an unanswered request emits a `status`, never an
+`error`, and clears itself rather than hanging). Credentials/MFA codes
+themselves never travel on this channel by construction -- see
+[`PROTOCOL.md`](./PROTOCOL.md)'s "Credentials never travel on this
+channel" for why, and why the real secret-entry path (a separate
+`manual_input` channel) remains unbuilt.
+
+Two new modules add PRD-tracked functionality that is real, working, and
+independently witnessed, but **not yet wired to a live policy or event
+source** -- both say so explicitly in their own doc comments and this
+README repeats that honestly rather than rounding up to "implemented":
+
+- **`sensitive_categories.rs`** (PRD §9, class-5 "sensitive target" apps
+  like password managers, banking, health, system settings) is a real data
+  model and config-file (`~/.holoiroh/sensitive_categories.toml` or
+  `.json`) for a per-category always-ask/always-allow/hard-block setting,
+  with real bundle-ID classification. Its own module doc is explicit: *"This
+  is a config-file row, not a policy-enforcement row... nothing in this
+  codebase currently calls into this module from a live interception
+  point."* There is no `ComputerUseExecutor`/policy-wrapper equivalent in
+  this Rust daemon yet -- `holo_bridge` still forwards every prompt straight
+  through to `holo serve` with no pause-before-sensitive-surface check.
+- **`limits.rs`** (PRD §10.4 session/rate limits) -- see the dedicated
+  "Session & rate limits" section below for the exact per-limit
+  real-vs-constant-only breakdown; the short version is the same pattern:
+  most limits are typed, independently-tested constants/helpers with no
+  live call site wiring them into an actual session/turn yet, and two
+  (max active tasks per Mac, agent action cap) **are** really enforced
+  today.
+
+Two more new modules are real and independently witnessed with a different
+shape of gap each:
+
+- **`audit_log.rs`** (PRD row P0-12, local metadata-only audit log) writes
+  a real, append-only JSON-Lines file (default `~/.holoiroh/audit.log`) via
+  a real `AuditLogger` type. `AuditEntry` has exactly the ten PRD-named
+  fields and deliberately no catch-all string/JSON field, so it is
+  structurally impossible for a call site to log a dictated transcript,
+  prompt text, or recipient name -- `examples/audit_log_probe.rs`'s
+  acceptance test proves this by writing a real audit entry then grepping
+  the literal on-disk bytes for a marker string and confirming it's absent.
+  **Not yet called from `main.rs`/`control_channel.rs`/`holo_bridge`** --
+  nothing in the live request path constructs an `AuditEntry` today, so no
+  audit log is actually produced by running the daemon; three of its ten
+  fields (`app_category`, `inference_mode`, `remote_view_state`) are also
+  honestly modeled as single-variant enums for now, since this daemon has
+  no per-app attribution, no local-inference path, and no way to detach the
+  broadcast independently of the control channel yet (see the module's own
+  "Real vs. honestly-approximated fields" doc).
+- **`task_state.rs`** (PRD task lifecycle: 16 flow states + 4 interactive-
+  waiting states + 10 terminal states) is a real, fully-modeled Rust enum
+  with a real, exhaustively-tested `is_valid_transition` state machine
+  (including the three Confidential-Cloud/Tinfoil states, which are
+  present for schema completeness but provably unreachable in this
+  alpha build). It is **deliberately independent of any live event
+  source** -- `holo_bridge::control::ControlEvent`/`DoneStatus` (the only
+  task-progress types actually wired to the real `holo serve` A2A stream
+  today) report three coarse outcomes plus free-text progress strings, with
+  no concept of which of `task_state.rs`'s finer states a task is in.
+  Promoting live events to carry a real `TaskState` needs `holo-desktop-cli`
+  itself to expose that granularity, which it does not today.
+
 `mac-daemon` has **no `#[cfg(test)]` unit tests** as of this writing --
 they were deliberately removed (this repo's no-unit-tests rule: validation
 must be real, witnessed execution, not assertions run later) and
 `cargo test -p holoiroh-daemon` now runs **0 tests**. Their coverage was
 re-witnessed as `cargo run --example <name>_probe` binaries instead --
-`allowlist_probe`, `auth_probe`, `auth_gate_probe`,
-`control_channel_probe`, `holo_bridge_queue_probe`, and
-`permissions_probe`, alongside the pre-existing `control_probe` (a real
-external `iroh` dial against a live daemon) -- see "Build status" below
-for exact, witnessed build and probe results.
+`allowlist_probe`, `auth_probe`, `auth_gate_probe`, `control_channel_probe`,
+`envelope_probe`, `input_request_probe`, `task_state_probe`,
+`audit_log_probe`, `sensitive_categories_probe`, `limits_probe`,
+`holo_bridge_queue_probe`, and `permissions_probe`, alongside the
+pre-existing `control_probe` (a real external `iroh` dial against a live
+daemon) -- see "Build status" below for exact, witnessed build and probe
+results. A local-model latency benchmark for the on-device inference path
+(not the Cloud path this daemon currently uses -- see `audit_log.rs`'s
+`InferenceMode` note above) was also run on this hardware; see
+[`BENCHMARKS.md`](./BENCHMARKS.md).
 
 ## Components
 
@@ -67,10 +151,14 @@ holoiroh/
 │   │   ├── main.rs                # entrypoint: auth check + permission preflight + Live + Router + capture + control channel + holo_bridge
 │   │   ├── lib.rs                 # library target re-exporting modules for examples/ probes to consume
 │   │   ├── capture.rs             # macOS ScreenCaptureKit video source (--display <index> selection)
-│   │   ├── control_channel.rs     # iroh ALPN transport for PROTOCOL.md's ClientMessage/ServerMessage + PIN/allowlist accept gate
+│   │   ├── control_channel.rs     # iroh ALPN transport for PROTOCOL.md's ClientMessage/ServerMessage + TaskEnvelope + PIN/allowlist accept gate
 │   │   ├── allowlist.rs           # persisted device allowlist (~/.holoiroh/allowlist.json) + PIN generation/verification
 │   │   ├── auth.rs                # startup check for an existing Holo login token (~/.holo/.env)
 │   │   ├── permissions.rs         # macOS Screen Recording + Accessibility TCC preflight
+│   │   ├── limits.rs               # PRD 10.4 session/rate-limit constants + helpers (partly enforced -- see "Session & rate limits" below)
+│   │   ├── sensitive_categories.rs # PRD §9 class-5 sensitive-app config data model + file I/O (not wired to a live policy point yet)
+│   │   ├── audit_log.rs            # PRD P0-12 metadata-only local audit log (real AuditLogger; not yet called from the live request path)
+│   │   ├── task_state.rs          # PRD task lifecycle state machine (16 flow + 4 interactive + 10 terminal states; not wired to a live event source yet)
 │   │   └── holo_bridge/           # bridges control messages to `holo serve`'s A2A endpoint
 │   │       ├── mod.rs
 │   │       ├── a2a_client.rs
@@ -79,13 +167,19 @@ holoiroh/
 │   │       ├── health.rs          # ongoing health-check loop: polls holo serve, restarts it on crash
 │   │       └── stop.rs
 │   └── examples/                  # cargo run --example <name>: real-execution probes (no unit tests in this crate)
-│       ├── control_probe.rs           # real external iroh dial against a live daemon's control channel
-│       ├── control_channel_probe.rs   # ClientMessage/ServerMessage JSON round-trips + ControlEvent mapping
-│       ├── auth_gate_probe.rs         # ControlChannel::authenticate PIN/allowlist gate, in-memory
-│       ├── allowlist_probe.rs         # Allowlist load/save/add/remove + PIN generate/verify, real temp files
-│       ├── auth_probe.rs              # auth::extract_api_key / check_holo_token_in against real strings/files
-│       ├── permissions_probe.rs       # PreflightResult/MissingPermission construction + instruction text
-│       └── holo_bridge_queue_probe.rs # HoloControlBridge concurrent-prompt-queueing races
+│       ├── control_probe.rs               # real external iroh dial against a live daemon's control channel
+│       ├── control_channel_probe.rs       # ClientMessage/ServerMessage JSON round-trips + ControlEvent mapping
+│       ├── envelope_probe.rs              # TaskEnvelope expiry/duplicate/sequence-number rejection rules, in-memory
+│       ├── input_request_probe.rs         # input_request/input_response wire types + real timed expiry-to-safe-pause
+│       ├── auth_gate_probe.rs             # ControlChannel::authenticate PIN/allowlist gate, in-memory
+│       ├── allowlist_probe.rs             # Allowlist load/save/add/remove + PIN generate/verify, real temp files
+│       ├── auth_probe.rs                  # auth::extract_api_key / check_holo_token_in against real strings/files
+│       ├── permissions_probe.rs           # PreflightResult/MissingPermission construction + instruction text
+│       ├── limits_probe.rs                # ActionCounter/SessionTimer/ApprovalToken/clamp_task_runtime, real execution
+│       ├── sensitive_categories_probe.rs  # SensitiveCategories load/save/classify + TOML/JSON format inference, real temp files
+│       ├── audit_log_probe.rs             # AuditLogger append/round-trip + PRD P0-12 acceptance test (no dictated text on disk)
+│       ├── task_state_probe.rs            # TaskState serde round-trips + is_valid_transition, full lifecycle diagram
+│       └── holo_bridge_queue_probe.rs     # HoloControlBridge concurrent-prompt-queueing races
 ├── ios-bridge/                    # Rust staticlib crate: extern "C" FFI bridge for iOS
 │   ├── Cargo.toml                 # crate-type = ["staticlib", "lib"]
 │   └── src/lib.rs                 # ticket-connect/subscribe/poll-next-frame extern "C" fns (stub bodies)
@@ -253,11 +347,16 @@ moving it.
 
 ## Build status (witnessed)
 
-**`cargo build` in `holoiroh/mac-daemon`: succeeds.**
+**`cargo build --workspace` in `holoiroh/mac-daemon`: succeeds, warning-clean.**
 
 ```
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.96s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.92s
 ```
+
+(Re-witnessed this session after `sensitive_categories.rs`, `audit_log.rs`,
+`task_state.rs`, and the `TaskEnvelope`/`input_request` additions to
+`control_channel.rs` — `grep -c warning` on a forced rebuild's output is
+`0`.)
 
 This resolves and compiles the full transitive dependency graph (`iroh`,
 `iroh-live`, `iroh-moq`, `moq-media`, `rusty-capture`, `rusty-codecs`,
@@ -401,6 +500,83 @@ Recording/Accessibility actually granted (to confirm the preflight passes
 cleanly and the daemon proceeds to publish) was **not** re-witnessed in
 this pass; treat that specific end-to-end path as real-but-not-freshly-
 verified until it is.
+
+**`TaskEnvelope`, `input_request`/`input_response`, `sensitive_categories.rs`,
+`audit_log.rs`, `task_state.rs`, and `limits.rs`: each independently
+witnessed via its own probe, all passing.**
+
+```
+$ cargo run --example envelope_probe
+result -> Err(Expired { expires_at: ..., now: ... })
+result -> Ok(())  (accepted exactly AT expires_at -- only strictly-after is expired)
+replay send -> Err(DuplicateMessageId { message_id: "msg-dup" })
+sequence_number=5 again -> Err(SequenceNotMonotonic { got: 5, last_seen: 5 })
+sequence_number=3 (regression) -> Err(SequenceNotMonotonic { got: 3, last_seen: 10 })
+sequence_number jumps 0 -> 100 -> Ok(())  (gaps allowed)
+envelope_probe: OK -- all envelope validation cases witnessed via real execution
+
+$ cargo run --example input_request_probe
+[... real serde round-trips for all 5 InputRequestKind variants ...]
+OK -- constructed InputRequest carries no credential characters, only metadata
+wait_for_expiry resolved after 253.151916ms (requested TTL was 250ms)
+OK -- expiry emits ServerMessage::Status (safe pause), never ServerMessage::Error
+input_request_probe: OK -- all input_request/input_response wire-schema and real-timed expiry cases witnessed via real execution
+
+$ cargo run --example sensitive_categories_probe
+[... real TOML/JSON save/load/classify round-trips ...]
+load(corrupt file) -> is_err=true   (fails closed, not silently defaulted)
+All sensitive_categories probes passed.
+NOTE: this probe only witnesses the data model and file I/O added in this pass. No live policy-interception point exists yet.
+
+$ cargo run --example task_state_probe
+[... full 16-flow-state + 4-interactive + 10-terminal lifecycle diagram exercised ...]
+ConfidentialAttestationFailed / ConfidentialModelUnavailable : confirmed unreachable inbound and outbound across all 30 states
+task_state_probe: OK -- TaskState enum, serde snake_case wire form, and is_valid_transition's full lifecycle diagram witnessed via real execution
+
+$ cargo run --example limits_probe
+[... ActionCounter/SessionTimer/ApprovalToken/clamp_task_runtime exercised ...]
+limits_probe: OK -- all PRD 10.4 enforcement helpers behaved correctly under real execution.
+```
+
+`examples/audit_log_probe.rs` is real and its underlying module logic
+passes cleanly (writes real JSON-Lines entries, proves append-only
+behavior, and — the PRD P0-12 acceptance test — greps the literal on-disk
+bytes for a dictated-text marker string and confirms it's absent). **One
+honest wrinkle found while re-witnessing this pass**: the probe's own
+first assertion (`subdir must not exist yet for this to be a real test`)
+panicked on a stale run, because its "parent directory gets created"
+case uses a **fixed, non-unique** subdirectory name
+(`holoiroh-audit-probe-subdir`) left over in `$TMPDIR` from an earlier run
+in the same session — a real bug in the probe's own temp-path hygiene
+(every other path in this probe suite mixes in a PID + nanosecond
+timestamp; this one line doesn't), not a defect in `audit_log.rs` itself.
+Deleting the stale directory and re-running produced a full clean pass:
+
+```
+$ cargo run --example audit_log_probe
+=== AuditLogger::new creates the parent directory ===
+AuditLogger::new(.../holoiroh-audit-probe-subdir/audit.log) -> parent dir created: true
+=== append is true append-only: a fresh AuditLogger on the same path does not truncate ===
+after re-opening AuditLogger on the same path and appending once more: 3 line(s)
+=== ACCEPTANCE TEST (Project Aro PRD row P0-12): no content ever reaches the audit log ===
+log file contains dictated-text marker: false, contains recipient name: false, contains sentence fragment: false
+all real metadata fields ARE present (this is not an accidentally-empty-file false pass)
+audit_log_probe: OK -- metadata logged, dictated-text content proven absent via real log-file inspection
+```
+
+The fixed-dirname reuse bug in the probe itself has since been fixed
+(the subdir name now mixes in a PID + nanosecond timestamp, matching the
+rest of the probe suite's temp-path scheme), so the probe is idempotent --
+verified by running it twice back-to-back without clearing `$TMPDIR`, both
+passing cleanly.
+
+`cargo run --example holo_bridge_queue_probe` was also re-run this pass and
+still passes for the same reason documented previously: real
+concurrent-prompt-queueing logic is witnessed against an unreachable A2A
+endpoint, while the full live-daemon-plus-live-`holo-serve` path remains
+blocked in this sandbox by the same two pre-existing causes (no
+Accessibility TCC grant, no `holo` CLI on `PATH`) — not a regression from
+this pass's changes. `cargo test -p holoiroh-daemon` still runs 0 tests.
 
 **`swift build` in `holoiroh/ios`: succeeds, but only when given an iOS
 target explicitly.**
