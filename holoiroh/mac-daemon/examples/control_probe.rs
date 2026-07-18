@@ -1,8 +1,9 @@
 //! Manual, run-by-hand probe: dials a running holoiroh-daemon's control
-//! channel over the real iroh transport and exchanges real ClientMessage /
-//! ServerMessage JSON, to witness control_channel.rs end-to-end (not just
-//! its serde unit tests). Not part of the crate's normal build/test surface
-//! -- run explicitly with `cargo run --example control_probe -- <ticket> [pin]`.
+//! channel over the real iroh transport and exchanges real envelope-wrapped
+//! ClientMessage / ServerMessage JSON, to witness control_channel.rs
+//! end-to-end (not just its serde unit tests). Not part of the crate's
+//! normal build/test surface -- run explicitly with `cargo run --example
+//! control_probe -- <ticket> [pin]`.
 //!
 //! With no `[pin]` argument, this probes the **rejection** path: the daemon
 //! (started without `--no-pin-auth`) requires a PIN from an unrecognized
@@ -13,9 +14,24 @@
 //! at startup as a second argument to probe the **accept** path instead
 //! (greeting + prompt/ack, as this probe originally exercised before PIN
 //! auth existed).
+//!
+//! ## PIN handshake stays unwrapped; everything after it is envelope-wrapped
+//!
+//! Per `PROTOCOL.md`'s "Envelope" section, the `pin`/`auth_rejected`
+//! exchange happens *before* a `session_id` exists (a `session_id` is only
+//! minted once the auth gate passes -- see `control_channel.rs`'s
+//! `ControlChannel::accept`), so those two messages are sent/received as
+//! bare `ClientMessage`/`ServerMessage` JSON, exactly as before this task's
+//! envelope wrapping. Every message from the "control channel ready"
+//! greeting onward is a real `TaskEnvelope<ServerMessage>` /
+//! `TaskEnvelope<ClientMessage>` on the wire, which this probe constructs
+//! and parses for real (not simulated) to witness the actual daemon
+//! behavior over a live connection.
 use std::env;
 
-use holoiroh_daemon::control_channel::{write_line, ClientMessage, ServerMessage, CONTROL_ALPN};
+use holoiroh_daemon::control_channel::{
+    write_line, ClientMessage, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+};
 use iroh::Endpoint;
 use iroh_live::ticket::LiveTicket;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -38,32 +54,68 @@ async fn main() -> anyhow::Result<()> {
     if let Some(pin) = pin {
         // PIN provided: present it first, per the auth gate's contract
         // (the first line from an unrecognized device must be a Pin
-        // message before anything else is processed).
+        // message before anything else is processed). Bare, not
+        // envelope-wrapped -- see this file's module doc.
         let pin_msg = ClientMessage::Pin { pin };
         write_line(&mut send, &pin_msg).await?;
         println!("-> {}", serde_json::to_string(&pin_msg)?);
 
-        // On success, the next line is the normal greeting.
+        // On success, the next line is the normal greeting -- now a real
+        // TaskEnvelope<ServerMessage>, carrying this connection's minted
+        // session_id.
         let greeting = lines.next_line().await?.expect("no greeting received after PIN");
         println!("<- {greeting}");
-        let greeting_msg: ServerMessage = serde_json::from_str(&greeting)?;
+        let greeting_env: TaskEnvelope<ServerMessage> = serde_json::from_str(&greeting)?;
         assert!(
-            matches!(greeting_msg, ServerMessage::Status { .. }),
-            "expected greeting after correct PIN, got {greeting_msg:?}"
+            matches!(greeting_env.payload, ServerMessage::Status { .. }),
+            "expected greeting after correct PIN, got {:?}",
+            greeting_env.payload
+        );
+        assert_eq!(greeting_env.message_type, "status");
+        assert_eq!(greeting_env.sequence_number, 0, "greeting must be this connection's first outbound envelope");
+        let session_id = greeting_env.session_id.clone();
+        println!(
+            "   (envelope: session_id={} message_id={} sequence_number={})",
+            greeting_env.session_id, greeting_env.message_id, greeting_env.sequence_number
         );
 
-        let prompt = ClientMessage::Prompt {
-            text: "control_probe: hello from a real iroh dial (post-PIN)".to_string(),
-        };
-        write_line(&mut send, &prompt).await?;
-        println!("-> {}", serde_json::to_string(&prompt)?);
+        // Every ClientMessage from here on is wrapped in a real
+        // TaskEnvelope<ClientMessage>, with an inbound sequence_number this
+        // probe tracks and increments itself (mirroring what a real client
+        // implementation must do to satisfy the daemon's monotonicity
+        // check).
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let prompt_env = TaskEnvelope::<ClientMessage>::wrap(
+            session_id.clone(),
+            Some(task_id.clone()),
+            0,
+            ClientMessage::Prompt {
+                text: "control_probe: hello from a real iroh dial (post-PIN)".to_string(),
+            },
+        );
+        write_line(&mut send, &prompt_env).await?;
+        println!("-> {}", serde_json::to_string(&prompt_env)?);
 
         let ack = lines.next_line().await?.expect("no ack received");
         println!("<- {ack}");
-        let ack_msg: ServerMessage = serde_json::from_str(&ack)?;
-        assert!(matches!(ack_msg, ServerMessage::Ack { .. }), "expected ack, got {ack_msg:?}");
+        let ack_env: TaskEnvelope<ServerMessage> = serde_json::from_str(&ack)?;
+        assert!(
+            matches!(ack_env.payload, ServerMessage::Ack { .. }),
+            "expected ack, got {:?}",
+            ack_env.payload
+        );
+        assert_eq!(ack_env.session_id, session_id, "ack must echo this connection's session_id");
+        assert_eq!(
+            ack_env.task_id,
+            Some(task_id.clone()),
+            "ack must echo the prompt's task_id"
+        );
+        println!(
+            "   (envelope: session_id={} task_id={:?} sequence_number={})",
+            ack_env.session_id, ack_env.task_id, ack_env.sequence_number
+        );
 
-        println!("control_probe: OK -- PIN accepted, greeting + ack witnessed over a real iroh connection");
+        println!("control_probe: OK -- PIN accepted, envelope-wrapped greeting + ack witnessed over a real iroh connection");
     } else {
         // No PIN provided: an unrecognized device must be rejected before
         // the greeting is ever sent. This is the real rejection path
@@ -73,7 +125,13 @@ async fn main() -> anyhow::Result<()> {
         // The daemon's `authenticate` gate blocks on reading a line before
         // sending anything -- so the greeting genuinely never arrives.
         // Send a bare Prompt (simulating a client that ignores the PIN
-        // requirement) so the gate has something to read and reject.
+        // requirement) so the gate has something to read and reject. Bare,
+        // not envelope-wrapped: no session_id exists yet at this point on
+        // either side (see this file's module doc), and the daemon's
+        // `authenticate` gate itself only ever expects a bare
+        // `ClientMessage` on this pre-session path regardless of what's
+        // sent -- an envelope-wrapped payload here would just be a
+        // different flavor of "not a Pin message", rejected the same way.
         let prompt = ClientMessage::Prompt {
             text: "control_probe: attempting without a PIN".to_string(),
         };
@@ -89,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
                     matches!(msg, ServerMessage::AuthRejected { .. }),
                     "expected auth_rejected for an unrecognized device with no PIN, got {msg:?}"
                 );
-                println!("control_probe: OK -- unrecognized device correctly rejected (auth_rejected)");
+                println!("control_probe: OK -- unrecognized device correctly rejected (auth_rejected, bare -- pre-session)");
             }
             None => {
                 // Some transports may observe rejection as a clean close
