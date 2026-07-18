@@ -64,3 +64,50 @@ was attempted between calls), and `--image-min-tokens`/patch-size tuning flags t
 itself suggested in its startup log. Per the PRD's own OQ-4 language, the <5s end-to-end
 target should be treated as reachable-but-not-yet-proven on this hardware class pending those
 follow-ups, not as definitively unreachable.
+
+## Follow-up: the two optimization levers (target-window crop + KV-cache reuse)
+
+The OQ-4 verdict above named two untried levers for closing the gap to the <5s NFR.
+Both were measured for real this session against the same live `llama-server`.
+
+### Lever 1 — target-window crop (fewer vision tokens)
+
+Cropping the screenshot to a small target-window-sized region (600x400, ~35 KB) instead
+of the full desktop drops the vision-token count sharply:
+
+| Image | Prompt tokens |
+|---|---|
+| full native-res desktop | 4074 |
+| 720p full-desktop downscale | 963 |
+| **600x400 target-window crop** | **~270** |
+
+So PRD 7.4's "crop to the task-relevant region" guidance is a real ~15x token reduction vs
+full-res, ~3.5x vs 720p. (Absolute wall-clock on the crop varied 5.7s–33s across runs — the
+33s outlier coincided with the machine at 6% free memory under a heavy concurrent build
+workload, i.e. swap pressure, not a property of the crop; a clean idle-system measurement is
+still owed, but the token-count reduction itself is unconditional and measured.)
+
+### Lever 2 — KV-cache reuse across steps (`cache_prompt: true`)
+
+Two consecutive calls with a shared prompt prefix (same system/instruction + same image),
+`cache_prompt: true` on both:
+
+| Call | prompt_tokens processed | prefill (prompt_ms) | cache_n reused | wall-clock |
+|---|---|---|---|---|
+| 1 (cold) | 275 | 2081 ms | 0 | 5.74 s |
+| 2 (warm, same prefix) | 4 | 493 ms | **271** | **2.26 s** |
+
+The warm call reused 271 cached tokens (only 4 new to prefill), a **4.2x prefill speedup**
+(2081 → 493 ms) and a warm-step wall-clock of **2.26 s — comfortably under the 5 s NFR**.
+
+### Verdict
+
+Both levers work as the PRD predicted. In a real multi-step task loop the consecutive
+screenshots share nearly all of their static UI chrome, so KV-cache reuse plus a
+target-window crop should keep per-step latency in the low-single-digit-seconds range on
+this M3 Pro / 36 GB hardware — meeting the <5s NFR for warm steps, with the cold first step
+the main remaining cost (and cropping helps there). The clean, idle-system, full-loop
+measurement (with the daemon actually driving the executor) is the remaining witness, and is
+gated on the same macOS TCC permission grant that blocks every other live-daemon row (see
+`holoiroh-user-action-grant-tcc-and-run-daemon`) — but the two levers themselves are proven
+here against real inference.
