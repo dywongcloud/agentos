@@ -31,6 +31,7 @@ mod limits;
 mod local_model;
 mod permissions;
 mod policy;
+mod registry;
 mod sensitive_categories;
 mod task_state;
 

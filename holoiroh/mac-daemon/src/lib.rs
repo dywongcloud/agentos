@@ -24,5 +24,6 @@ pub mod limits;
 pub mod local_model;
 pub mod permissions;
 pub mod policy;
+pub mod registry;
 pub mod sensitive_categories;
 pub mod task_state;
