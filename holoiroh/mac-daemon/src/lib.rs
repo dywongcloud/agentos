@@ -21,5 +21,6 @@ pub mod control_channel;
 pub mod holo_bridge;
 pub mod limits;
 pub mod permissions;
+pub mod registry;
 pub mod sensitive_categories;
 pub mod task_state;
