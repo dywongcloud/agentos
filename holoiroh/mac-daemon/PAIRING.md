@@ -27,18 +27,20 @@ see below -- but nothing calls it yet).
 | PIN generated + printed as text on startup | **Real** | `src/main.rs`, `generate_default_pin()` + `println!` |
 | `--no-pin-auth` flag to disable PIN gate | **Real** | `src/main.rs` `Cli::no_pin_auth` |
 | QR code rendering (terminal) | **Real** | `src/main.rs` `print_ticket_qr()` renders the ticket as a unicode-block QR to stdout at startup (before the raw ticket text); witnessed via `examples/qr_probe.rs` (a realistic ~180-char ticket → a well-formed 53×53 scannable QR). PNG rendering (`--qr-png`) remains designed-only. |
-| `Allowlist` struct: load/save/contains/add/remove | **Real, tested** | `src/allowlist.rs` |
-| `verify_pin()` PIN comparison | **Real, tested** | `src/allowlist.rs` |
-| `generate_pin()` / `generate_default_pin()` | **Real, tested** (weak RNG caveat below) | `src/allowlist.rs` |
-| PIN + allowlist gate wired into the control-channel accept path | **Real, wired, end-to-end tested** | `src/control_channel.rs` `ControlChannel::authenticate`, called from `ProtocolHandler::accept` |
+| `Allowlist` struct: load/save/contains/add/remove | **Real, probe-witnessed** (`examples/allowlist_probe.rs`) | `src/allowlist.rs` |
+| `verify_pin()` PIN comparison | **Real, probe-witnessed** (`examples/allowlist_probe.rs`) | `src/allowlist.rs` |
+| `generate_pin()` / `generate_default_pin()` | **Real, probe-witnessed** (`examples/allowlist_probe.rs`; weak RNG caveat below) | `src/allowlist.rs` |
+| PIN + allowlist gate wired into the control-channel accept path | **Real, wired, end-to-end witnessed** (`examples/auth_gate_probe.rs` + a live `iroh` run, see below) | `src/control_channel.rs` `ControlChannel::authenticate`, called from `ProtocolHandler::accept` |
 | `ClientMessage::Pin` / `ServerMessage::AuthRejected` wire messages | **Real** | `src/control_channel.rs`, mirrored in `PROTOCOL.md` |
 | Device revocation (`remove_entry`) | **Real function, not called from any command/UI** | `src/allowlist.rs::Allowlist::remove_entry` |
 | `--rotate-every <duration>` flag | **Real (ticket-reprint on a timer)** | `src/main.rs` `Cli::rotate_every` (parsed by `src/duration.rs::parse_rotate_duration`, accepts `30m`/`2h`/`90s`/`1h30m`) + a `tokio::select!` ticker branch that re-prints the ticket QR + verification phrase each tick via `print_pairing_block()`; witnessed via `examples/ticket_rotation_probe.rs`. **Ticket-string reprint only** — full fresh-keypair identity rotation (which would invalidate old tickets) remains designed-only, see "Open design gap" below. |
 | Full PRD P0-2/7.1 spec (mutual short-phrase, Keychain, cross-device revoke) | **Not implemented; separate, larger PRD row** | `holoiroh-pairing-ticket-exchange` |
 
 The PIN+allowlist auth gate is **not a design document standing in for
-code** -- it is real Rust, compiled, unit-tested (`cargo test -p
-holoiroh-daemon`), and was additionally verified end-to-end over a live
+code** -- it is real Rust, compiled, and witnessed by running the real code
+path via `cargo run --example auth_gate_probe` (this repo uses runnable
+`examples/*_probe.rs` witnesses, not `#[test]` files -- there are no unit
+tests in the crate). It was additionally verified end-to-end over a live
 `iroh` QUIC connection during this work (see "End-to-end witness" below).
 The QR code is real (terminal rendering). `--rotate-every` is now real too,
 but only in its **ticket-reprint** form: on each tick it re-derives and
@@ -276,14 +278,15 @@ significant blast radius for a bare string being the only credential.
    `--no-pin-auth` is passed). The PIN is never persisted to disk -- only
    the *result* of a successful PIN check (the paired device's id) is.
 2. **Persisted device allowlist at `~/.holoiroh/allowlist.json`.**
-   `allowlist::Allowlist` is a real, tested struct: `load`/`save` round-trip
+   `allowlist::Allowlist` is a real struct, its behavior witnessed by
+   `cargo run --example allowlist_probe`: `load`/`save` round-trip
    JSON, `contains_key`/`add_entry`/`remove_entry` mutate an in-memory
    `Vec<AllowlistEntry>`, each entry recording `device_id` (the connecting
    peer's iroh node id, hex string), an optional `label`, and a
    `paired_at` unix timestamp. A missing file loads as an empty allowlist
    (normal first-run state); a *corrupt* file is a hard error (**fails
-   closed**, not open -- see `allowlist.rs`'s
-   `corrupt_json_file_fails_closed_not_open` test).
+   closed**, not open -- the probe's "corrupt JSON file fails CLOSED"
+   case asserts `load(corrupt) -> is_err`).
 3. **The accept-path gate, wired for real.**
    `control_channel.rs`'s `ControlChannel::authenticate` (called from
    `ProtocolHandler::accept`, before the "control channel ready" greeting
@@ -337,9 +340,9 @@ assumed adequate forever.
 
 ### Device revocation: data structure real, no caller yet
 
-`Allowlist::remove_entry(device_id)` is real, tested code (see
-`remove_entry_revokes_a_previously_paired_device` in `allowlist.rs`'s test
-module) -- but **nothing calls it**. There is no `--revoke-device <id>`
+`Allowlist::remove_entry(device_id)` is real code, its revoke behavior
+witnessed by `allowlist_probe`'s "remove_entry revokes a previously paired
+device" case -- but **nothing calls it**. There is no `--revoke-device <id>`
 CLI flag, no control-channel message, no kill-switch integration. A
 revoked-but-still-connected device is also not force-disconnected by
 `remove_entry` alone (removing an allowlist entry doesn't touch any
@@ -348,15 +351,16 @@ already-open `iroh::endpoint::Connection` the way the gate only runs at
 need either an active-connection registry this crate doesn't have yet, or
 relying on the daemon's own kill-switch/shutdown as the blunt instrument.
 This matches the honesty requirement for this document: the *primitive*
-exists and is tested; the *feature* (an operator actually being able to
-revoke a device) does not.
+exists and is probe-witnessed; the *feature* (an operator actually being
+able to revoke a device) does not.
 
 ### End-to-end witness (real, this session)
 
-Beyond the 47 passing unit tests (`cargo test -p holoiroh-daemon`,
-including 8 new tests directly exercising `ControlChannel::authenticate`
-itself via an in-memory `tokio::io::Lines` reader -- not a
-re-implementation of its logic), the full pairing lifecycle was verified
+Beyond the runnable component probes (`cargo run --example auth_gate_probe`
+exercises `ControlChannel::authenticate`'s accept/reject decisions
+directly, and `cargo run --example control_channel_probe` the wire
+protocol -- this repo witnesses via runnable `examples/*_probe.rs`, not
+`#[test]` unit-test files), the full pairing lifecycle was verified
 over a **real, live `iroh` QUIC connection** using the existing
 `examples/control_probe.rs` (extended in this pass to speak the new `Pin`
 message), against a running `holoiroh-daemon` process with a stub `holo
@@ -410,7 +414,7 @@ specific reconnect-lifecycle verification and was not committed.
 **Rejection (`auth_rejected`), acceptance-via-correct-PIN, and
 acceptance-via-prior-allowlist-entry are all three real, witnessed
 behaviors of the actual `accept()` code path running against a real `iroh`
-connection** -- not asserted from unit tests alone and not designed-only.
+connection** -- witnessed by running the real code path, not designed-only.
 
 ## Exact remaining wiring steps, all in one place
 
@@ -429,8 +433,9 @@ For anyone picking this up next:
    subprocess lifecycle and any in-flight control-channel connection, so it
    is not a drop-in addition.
 3. **Device revocation UI**: `Allowlist::remove_entry` exists and is
-   tested; wire it to something an operator can actually invoke (a CLI
-   subcommand, a control-channel message, a signal handler) and decide how
+   probe-witnessed (`allowlist_probe`); wire it to something an operator can
+   actually invoke (a CLI subcommand, a control-channel message, a signal
+   handler) and decide how
    (if at all) to handle an already-connected revoked device.
 4. **Full PRD P0-2/7.1 spec**: mutual short-phrase verification, iOS
    Keychain storage, cross-device revocation propagation -- tracked
