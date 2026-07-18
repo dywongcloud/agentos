@@ -9,7 +9,9 @@ import SwiftUI
 /// iOS 17 minimum) keeps the door open for deeper stacks later (e.g. a
 /// settings screen) without another rewrite of the navigation wiring.
 /// There is still no real iroh/control-channel connection here: "connect"
-/// only means "the user supplied a ticket and pushed past pairing."
+/// only means "the user supplied a ticket and pushed past pairing." Voice
+/// transcription (`VoiceTranscriberModel`) is wired into `MainView`'s mic
+/// button, not here, since that's where the real prompt field lives.
 struct ContentView: View {
     private enum Route: Hashable {
         case main(ticket: String)

@@ -21,7 +21,7 @@ struct MainView: View {
     let onDisconnect: () -> Void
 
     @State private var promptText: String = ""
-    @State private var isRecording: Bool = false
+    @StateObject private var voice = VoiceTranscriberModel()
     @State private var logEntries: [LogEntry] = [
         LogEntry(message: .status(text: "paired -- control channel not yet connected"))
     ]
@@ -46,6 +46,16 @@ struct MainView: View {
                     onDisconnect()
                 }
             }
+        }
+        // Live partial + final transcript updates populate the prompt field
+        // as they arrive while a recognition session is running.
+        .onChange(of: voice.liveText) { _, newText in
+            guard voice.isRecording, !newText.isEmpty else { return }
+            promptText = newText
+        }
+        .onChange(of: voice.lastError) { _, error in
+            guard let error else { return }
+            logEntries.append(LogEntry(message: .error(text: error)))
         }
     }
 
@@ -155,11 +165,11 @@ struct MainView: View {
             Button {
                 toggleMicrophone()
             } label: {
-                Image(systemName: isRecording ? "mic.fill" : "mic")
-                    .foregroundStyle(isRecording ? Color.red : Color.accentColor)
+                Image(systemName: voice.isRecording ? "mic.fill" : "mic")
+                    .foregroundStyle(voice.isRecording ? Color.red : Color.accentColor)
             }
             .buttonStyle(.bordered)
-            .accessibilityLabel(isRecording ? "Stop recording" : "Start voice prompt")
+            .accessibilityLabel(voice.isRecording ? "Stop recording" : "Start voice prompt")
 
             Button {
                 sendPrompt()
@@ -189,12 +199,16 @@ struct MainView: View {
     }
 
     private func toggleMicrophone() {
-        // Placeholder action -- on-device transcription + ClientMessage
-        // .voiceTranscript wiring is a later task. Toggling state here
-        // only drives the button's own visual affordance.
-        isRecording.toggle()
+        // Real on-device transcription via `VoiceTranscriberModel` (Speech
+        // framework). `ClientMessage.voiceTranscript` control-channel send
+        // is still a later task -- today the final transcript just lands in
+        // `promptText`, same as if the user had typed it.
+        let wasRecording = voice.isRecording
+        Task {
+            await voice.toggle()
+        }
         logEntries.append(
-            LogEntry(message: .status(text: isRecording ? "listening… (placeholder)" : "stopped listening (placeholder)"))
+            LogEntry(message: .status(text: wasRecording ? "stopped listening" : "listening…"))
         )
     }
 }
