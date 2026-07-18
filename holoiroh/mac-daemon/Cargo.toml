@@ -63,6 +63,11 @@ tokio-util = "0.7"
 # pulls in no new crate -- it just makes them nameable from this crate's own source.
 tokio-stream = { version = "0.1", features = ["sync"] }
 thiserror = "2"
+# main.rs: render the iroh pairing ticket as a scannable terminal QR code (see PAIRING.md's
+# "QR + short-phrase pairing" design) so the iOS app can scan it instead of the operator
+# retyping a long ticket string. `default-features = false` drops the `image`/PNG feature we
+# don't use for the terminal-block rendering path -- keeps the dep light (no image codecs).
+qrcode = { version = "0.14", default-features = false }
 # Registers a synchronous SIGINT/SIGTERM handler in main.rs so the daemon's explicit shutdown
 # sequence (closing the iroh Live session + LocalBroadcast, terminating the tracked `holo serve`
 # child) runs on both signals -- `tokio::signal::ctrl_c()` alone only ever fires on SIGINT, not

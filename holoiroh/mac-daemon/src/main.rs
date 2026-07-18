@@ -95,6 +95,32 @@ fn holo_serve_port() -> u16 {
         .unwrap_or(8765)
 }
 
+/// Render `ticket` as a scannable QR code to stdout using unicode block
+/// characters, per PAIRING.md's terminal-rendering design. Best-effort: a
+/// QR-construction failure (e.g. the ticket string somehow exceeding QR
+/// capacity) is logged and skipped rather than aborting startup -- the raw
+/// ticket text printed alongside it is always the authoritative fallback.
+fn print_ticket_qr(ticket: &str) {
+    match qrcode::QrCode::new(ticket.as_bytes()) {
+        Ok(code) => {
+            // One-module-per-character rendering (the documented, API-verified
+            // baseline in PAIRING.md): ' ' background, '█' unicode full block
+            // foreground for a denser, more scannable grid than plain '#'.
+            let rendered = code
+                .render::<char>()
+                .quiet_zone(true)
+                .light_color(' ')
+                .dark_color('█')
+                .build();
+            println!("Scan this QR with the iOS app (or paste the ticket below):");
+            println!("{rendered}");
+        }
+        Err(err) => {
+            warn!(error = %err, "could not render ticket QR code; use the raw ticket text below");
+        }
+    }
+}
+
 /// Whether the daemon should run its own local `llama-server` (Aro Private mode) and point
 /// `holo serve` at it, versus leaving `holo serve` on whatever backend the environment already
 /// configures. Local is the **default** because the alpha build is local-only (Project Aro PRD
@@ -326,15 +352,15 @@ async fn main() -> anyhow::Result<()> {
         &[VideoPreset::P720],
     )?;
 
-    // --- publish and print the shareable ticket ---
+    // --- publish, then present the shareable ticket as a scannable QR code
+    // AND its raw text (per PAIRING.md's "QR + short-phrase pairing" design).
+    // The QR lets the iOS app scan the ticket instead of the operator
+    // retyping a long string; the raw text below it is the fallback for
+    // terminals whose font distorts block-character QR codes. ---
     live.publish(BROADCAST_NAME, &broadcast).await?;
     let ticket = LiveTicket::new(live.endpoint().addr(), BROADCAST_NAME);
+    print_ticket_qr(&ticket.to_string());
     println!("{ticket}");
-    // PIN is printed as plain text alongside the ticket -- this is the
-    // real, reachable slice of the pairing UX `PAIRING.md` designs (a QR
-    // rendering of `ticket` above it is documented there but not yet
-    // implemented in this binary; see that file's "Implementation status"
-    // table for exactly what's real vs designed-only).
     if let Some(pin) = &pin {
         println!("pairing PIN (first connection only): {pin}");
     } else {

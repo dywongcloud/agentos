@@ -26,7 +26,7 @@ see below -- but nothing calls it yet).
 | Ticket printed as text on startup | **Real, pre-existing** | `src/main.rs`, `println!("{ticket}")` |
 | PIN generated + printed as text on startup | **Real** | `src/main.rs`, `generate_default_pin()` + `println!` |
 | `--no-pin-auth` flag to disable PIN gate | **Real** | `src/main.rs` `Cli::no_pin_auth` |
-| QR code rendering (terminal or PNG) | **Designed only, not implemented** | see "QR code UX" below |
+| QR code rendering (terminal) | **Real** | `src/main.rs` `print_ticket_qr()` renders the ticket as a unicode-block QR to stdout at startup (before the raw ticket text); witnessed via `examples/qr_probe.rs` (a realistic ~180-char ticket → a well-formed 53×53 scannable QR). PNG rendering (`--qr-png`) remains designed-only. |
 | `Allowlist` struct: load/save/contains/add/remove | **Real, tested** | `src/allowlist.rs` |
 | `verify_pin()` PIN comparison | **Real, tested** | `src/allowlist.rs` |
 | `generate_pin()` / `generate_default_pin()` | **Real, tested** (weak RNG caveat below) | `src/allowlist.rs` |
