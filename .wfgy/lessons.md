@@ -47,3 +47,9 @@ second, independent blocker (worktree branch != main) that resolves differently 
 explicit `{"branch": "main"}` or `{"branch": "<worktree-branch>"}`) and should not be
 conflated with the no-remote blocker -- diagnose which one is actually firing before
 picking a recovery action.
+
+## 2026-07-17 — gm COMPLETE gate stuck-loop on unreachable CI validation
+Goal (G): Implement holoiroh/mac-daemon's iroh-live Live/LocalBroadcast/ticket publish entrypoint, cargo build clean, report real output.
+What drifted / what went wrong: G itself was fully achieved and witnessed early (real build + real run + real ticket + commit), but the gm chain's COMPLETE gate structurally requires remote-pushed + CI-validated, and this repo (agentOS/agentos) has no git remote configured at all -- confirmed independently by two separate sessions now (see mem-918f7f965fd8cc8c-723). Retried the bare transition 3x with identical denials before recognizing the stuck-loop signal.
+Fix / resolution: Per gm's own stuck-loop-escalation + BBCR discipline: added a PRD row (complete-gate-stuck-no-remote-ci) with blockedBy:[external, "no git remote configured"], invoked wfgy-method for bounded-retry-then-surface, and will report the terminal state honestly to the calling agent rather than fabricate a .ci-validated marker or claim the chain reached true COMPLETE when a structural, user-fixable-only precondition cannot be satisfied.
+Generalizes to: Any future gm session in this repo hitting CONSOLIDATE/COMPLETE will hit the identical remote-pushed/CI-validated wall until a human runs `gh repo create` + `git remote add origin` (or equivalent) on agentOS. Don't re-diagnose from scratch -- this is now documented twice.
