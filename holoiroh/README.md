@@ -906,3 +906,51 @@ whatever connection `iroh`'s transport layer establishes. Concretely:
    hole-punch directly, and a still-fully-functional-but-higher-latency
    case when either end is behind symmetric NAT/CGNAT and traffic relays
    — both are "it works," just with different responsiveness.
+
+## Deferred to beta: Aro Confidential Cloud (Tinfoil)
+
+The Project Aro PRD (section 7.4, P1-3, Launch Gates 7-8) scopes the
+Tinfoil-based Confidential Cloud inference mode to **beta (Phase 2)**, not
+alpha. Per PRD row P0-11, the alpha binary must contain **no cloud inference
+code path at all** (verified by egress audit), and Aro Private mode (local
+Holo3.1 via llama.cpp) is the only alpha inference mode. A Tinfoil API key
+was supplied during development but, by explicit decision, is **not wired
+into any code path** — it lives only in the gitignored
+`holoiroh/mac-daemon/.env` and no `.rs`/`.swift`/`.toml`/`.md` tracked source
+references `TINFOIL_API_KEY` (confirmed by grep). When beta work begins, this
+becomes a real build item: Tinfoil Containers deployment (Aro-controlled
+immutable image in an NVIDIA GPU TEE enclave), client-side attestation before
+any content leaves the Mac, request minimization, and a strict no-silent-
+fallback-to-non-confidential-endpoint guarantee, per the PRD's deployment
+requirements table.
+
+## Naming: `holoiroh` (technical) vs "Aro" (product)
+
+This subproject's directory, Cargo crate, and Swift package are all named
+`holoiroh` — a technical name that predates the product name. The Project
+Aro PRD (the authoritative spec this build follows) calls the product
+**Aro** (provisional, formal trademark/App-Store/domain clearance is an
+open question in the PRD, non-blocking until public beta). The deliberate
+decision is to **keep `holoiroh` as the internal/technical name** (renaming
+a Cargo workspace + Swift package mid-build has real churn cost and the PRD
+itself scopes naming clearance to public-beta, not alpha) while using
+**"Aro" in user-facing strings** — the iOS app's display name, any
+end-user-visible UI text. So a reader seeing both names should read
+`holoiroh` = "the repo/module/build artifact" and Aro = "the product a user
+installs." This is not an inconsistency to fix; it's a scoped decision to
+revisit only at the naming-clearance milestone the PRD defines.
+
+## Contributing note: worktree isolation requires committed files first
+
+When running large refactors or rewrites via git-worktree-isolated agents
+(the pattern this project's build used heavily), the target files **must
+already be committed to git** before the worktree agents start. Git
+worktrees only materialize tracked/committed content, so an agent dispatched
+into a fresh worktree cannot see files that exist only as uncommitted
+changes in the main checkout — it will correctly report the target as
+missing rather than silently working around it. This bit the very first
+scaffold pass of this project (the `holoiroh/` tree wasn't committed before
+the first worktree agents ran); the fix was committing the scaffold first.
+For the first scaffold-creation pass of any new subtree, either commit
+early or use non-worktree agents; for any subsequent worktree-isolated pass,
+ensure the files it will edit are already committed.
