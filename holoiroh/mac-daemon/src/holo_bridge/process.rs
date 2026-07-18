@@ -57,6 +57,27 @@ static HOLO_SERVE_RUNNING: AtomicBool = AtomicBool::new(false);
 /// to scrape stderr for a generated token.
 pub const HOLO_AUTH_TOKEN_ENV: &str = "HOLO_AUTH_TOKEN";
 
+/// Env var that redirects `holo`'s **model inference** to a self-hosted OpenAI-compatible
+/// endpoint. When a local base URL is configured (alpha's local-only path, Project Aro PRD
+/// P0-11), this daemon sets it -- alongside passing `holo serve --base-url <url>` -- so
+/// inference goes to the local `llama-server` instead of H Company's hosted gateway.
+///
+/// This is deliberately **not** `HAI_BASE_URL`. Verified against the installed
+/// `holo-desktop-cli` source (`~/.holo/tools/holo-desktop-cli/.../holo_desktop/`):
+///
+/// - `cli/agent_api.py` maps the `--base-url` CLI flag to `HAI_AGENT_RUNTIME_BASE_URL`
+///   (`extra["HAI_AGENT_RUNTIME_BASE_URL"] = base_url`).
+/// - `agent_client/launcher.py::runtime_child_env` propagates `HAI_AGENT_RUNTIME_BASE_URL` to the
+///   runtime child **and removes `HAI_API_KEY`** from that child's env when it is set ("a custom
+///   base URL points the runtime at a self-hosted endpoint; the portal `HAI_API_KEY` must not leak
+///   to it"). That deletion is the concrete no-cloud enforcement.
+/// - `agent_client/model_gateway.py` shows `HAI_BASE_URL` only overrides the *cloud entitlement
+///   gateway region*, **not** the inference endpoint -- so `HAI_BASE_URL` is the wrong variable
+///   for local inference and is never used here.
+///
+/// See [`crate::local_model`]'s module doc for the full citation chain.
+pub const HAI_RUNTIME_BASE_URL_ENV: &str = crate::local_model::RUNTIME_BASE_URL_ENV;
+
 /// Default A2A port per `serve.py`'s `A2A_DEFAULT_PORT`. The daemon does not have to use this
 /// default -- `main.rs` picks its own port explicitly (env-overridable, defaulting to a
 /// different value to avoid colliding with a `holo serve` an operator might run by hand
@@ -86,13 +107,51 @@ pub struct HoloServeProcess {
 }
 
 impl HoloServeProcess {
+    /// Build the exact [`Command`] the daemon would spawn for `holo serve`, **without spawning
+    /// it** and without generating a token (the token is generated per-spawn inside
+    /// [`Self::spawn`]). This is the single source of truth for the `holo serve` invocation so the
+    /// argument list and inference-redirect env can be inspected on their own -- see
+    /// `examples/local_model_probe.rs`, which calls this to witness that `--base-url` is present
+    /// and `HAI_AGENT_RUNTIME_BASE_URL` (not `HAI_BASE_URL`) is set for the local path.
+    ///
+    /// `local_base_url` is `Some(url)` when inference should go to a local OpenAI-compatible server
+    /// (alpha's local `llama-server`); `None` leaves `holo serve` on its own configured (hosted)
+    /// backend. When `Some`, this both appends `--base-url <url>` to the args **and** sets
+    /// `HAI_AGENT_RUNTIME_BASE_URL=<url>` in the child env -- either alone suffices per
+    /// `holo-desktop-cli`'s source, but setting both is belt-and-suspenders and makes the intent
+    /// obvious in the argv. `auth_token` is the bearer token to export via `HOLO_AUTH_TOKEN`.
+    pub fn build_command(
+        holo_bin: &str,
+        port: u16,
+        local_base_url: Option<&str>,
+        auth_token: &str,
+    ) -> Command {
+        let mut cmd = Command::new(holo_bin);
+        cmd.arg("serve").arg("--port").arg(port.to_string());
+        if let Some(url) = local_base_url {
+            // `holo serve`'s `serve()` accepts `--base-url` as a real tyro CLI arg (cli/serve.py),
+            // threaded to the agent runtime as HAI_AGENT_RUNTIME_BASE_URL.
+            cmd.arg("--base-url").arg(url);
+            // Belt-and-suspenders: also set the env var the flag maps to, and explicitly drop the
+            // hosted key so it can never reach the self-hosted inference path (mirroring
+            // launcher.py::runtime_child_env's own `env.pop("HAI_API_KEY")` on this branch). The
+            // no-cloud guarantee (P0-11) does not depend on the child's own popping logic firing.
+            cmd.env(HAI_RUNTIME_BASE_URL_ENV, url);
+            cmd.env_remove("HAI_API_KEY");
+        }
+        cmd.env(HOLO_AUTH_TOKEN_ENV, auth_token);
+        cmd
+    }
+
     /// Spawn `holo serve --port <port>` as a managed subprocess, generating our own bearer
     /// token and exporting it via `HOLO_AUTH_TOKEN` so no stderr-scraping is needed. Waits for
     /// `/health` to report ok before returning.
     ///
     /// `holo_bin` is the path to (or bare name of) the `holo` CLI executable; resolved via
-    /// `PATH` by `tokio::process::Command` when it's a bare name like `"holo"`.
-    pub async fn spawn(holo_bin: &str, port: u16) -> Result<Self> {
+    /// `PATH` by `tokio::process::Command` when it's a bare name like `"holo"`. `local_base_url`
+    /// points inference at a local OpenAI-compatible server when `Some` (alpha's local path);
+    /// see [`Self::build_command`].
+    pub async fn spawn(holo_bin: &str, port: u16, local_base_url: Option<&str>) -> Result<Self> {
         // Refuse to double-spawn: at most one `holo serve` child may be tracked as running by
         // this daemon at a time (see `HOLO_SERVE_RUNNING` doc). `compare_exchange` makes the
         // check-and-set atomic so two concurrent `spawn()` calls can't both observe `false` and
@@ -106,7 +165,7 @@ impl HoloServeProcess {
 
         // From here on, any early return must flip the guard back off -- wrap the rest of the
         // body so `?`/`bail!` below can't leak the guard in the "true but no child exists" state.
-        match Self::spawn_inner(holo_bin, port).await {
+        match Self::spawn_inner(holo_bin, port, local_base_url).await {
             Ok(process) => Ok(process),
             Err(err) => {
                 HOLO_SERVE_RUNNING.store(false, Ordering::SeqCst);
@@ -115,20 +174,26 @@ impl HoloServeProcess {
         }
     }
 
-    async fn spawn_inner(holo_bin: &str, port: u16) -> Result<Self> {
+    async fn spawn_inner(holo_bin: &str, port: u16, local_base_url: Option<&str>) -> Result<Self> {
         let auth_token = generate_token();
         let base_url = format!("http://127.0.0.1:{port}");
 
-        let mut cmd = Command::new(holo_bin);
-        cmd.args(["serve", "--port", &port.to_string()])
-            .env(HOLO_AUTH_TOKEN_ENV, &auth_token)
-            // Inherit the parent's env otherwise (HAI_API_KEY, HAI_BASE_URL, etc. from
+        // Build the exact command via the shared builder (also used by the verification example),
+        // then add only the stdio/kill-on-drop settings that don't affect the argv/env contract.
+        let mut cmd = Self::build_command(holo_bin, port, local_base_url, &auth_token);
+        cmd
+            // Inherit the parent's env otherwise (HAI_API_KEY when NOT local, etc. from
             // mac-daemon/.env / the launching shell) so `holo serve`'s own settings loader
-            // (settings.py) sees the same auth/gateway config the operator configured.
+            // (settings.py) sees the same auth/gateway config the operator configured. When
+            // `local_base_url` is Some, `build_command` has already removed HAI_API_KEY.
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        if let Some(url) = local_base_url {
+            tracing::info!(local_base_url = %url, "holo serve will use LOCAL inference (no cloud path)");
+        }
 
         let mut child = cmd
             .spawn()

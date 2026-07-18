@@ -107,6 +107,13 @@ pub struct HoloBridge {
     /// covers elsewhere in this crate.
     #[allow(dead_code)]
     protocol_version: Option<String>,
+    /// OpenAI-compatible base URL of the local `llama-server` inference endpoint, when the daemon
+    /// runs in local (alpha, no-cloud) inference mode. `Some(url)` makes both the initial spawn
+    /// and every crash-restart point `holo serve` at the local model via `--base-url` +
+    /// `HAI_AGENT_RUNTIME_BASE_URL`; `None` leaves `holo serve` on its configured backend. Stored
+    /// so `restart_process` re-applies the exact same inference config the initial start used --
+    /// a restart must never silently fall back from local to cloud.
+    local_base_url: Option<String>,
     pub control: HoloControlBridge,
 }
 
@@ -115,16 +122,19 @@ impl HoloBridge {
     /// and build the control bridge on top of it.
     ///
     /// `holo_bin` is the `holo` CLI executable (bare `"holo"` to resolve via `PATH`, or an
-    /// absolute path). `events_tx` is where translated [`ControlEvent`]s get sent; the
-    /// caller is expected to forward those out over the (not-yet-implemented) iroh control
-    /// stream to the iOS app.
+    /// absolute path). `local_base_url` points `holo serve`'s inference at a local
+    /// OpenAI-compatible server (alpha's local `llama-server`) when `Some`, and leaves it on its
+    /// configured backend when `None` -- see [`HoloServeProcess::build_command`]. `events_tx` is
+    /// where translated [`ControlEvent`]s get sent; the caller is expected to forward those out
+    /// over the (not-yet-implemented) iroh control stream to the iOS app.
     pub async fn start(
         holo_bin: impl Into<String>,
         port: u16,
+        local_base_url: Option<String>,
         events_tx: mpsc::UnboundedSender<ControlEvent>,
     ) -> Result<Self> {
         let holo_bin = holo_bin.into();
-        let process = HoloServeProcess::spawn(&holo_bin, port)
+        let process = HoloServeProcess::spawn(&holo_bin, port, local_base_url.as_deref())
             .await
             .context("failed to start holo serve")?;
 
@@ -147,6 +157,7 @@ impl HoloBridge {
             holo_bin,
             port,
             protocol_version,
+            local_base_url,
             control,
         })
     }
@@ -177,9 +188,12 @@ impl HoloBridge {
     /// new process. See `holo_bridge::health`'s module doc for why this can never reach the iroh
     /// P2P session (this type has no field referencing it).
     pub async fn restart_process(&self) -> Result<()> {
-        let new_process = HoloServeProcess::spawn(&self.holo_bin, self.port)
-            .await
-            .context("failed to respawn holo serve")?;
+        // Re-apply the exact same inference config the initial start used: a crash-restart must
+        // never silently drop from local (no-cloud) back to a hosted backend.
+        let new_process =
+            HoloServeProcess::spawn(&self.holo_bin, self.port, self.local_base_url.as_deref())
+                .await
+                .context("failed to respawn holo serve")?;
         let client = new_process.client();
         client
             .probe_agent_card()

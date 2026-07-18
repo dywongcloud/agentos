@@ -103,12 +103,17 @@ shape of gap each:
   the literal on-disk bytes for a marker string and confirming it's absent.
   **Not yet called from `main.rs`/`control_channel.rs`/`holo_bridge`** --
   nothing in the live request path constructs an `AuditEntry` today, so no
-  audit log is actually produced by running the daemon; three of its ten
-  fields (`app_category`, `inference_mode`, `remote_view_state`) are also
-  honestly modeled as single-variant enums for now, since this daemon has
-  no per-app attribution, no local-inference path, and no way to detach the
-  broadcast independently of the control channel yet (see the module's own
-  "Real vs. honestly-approximated fields" doc).
+  audit log is actually produced by running the daemon; two of its ten
+  fields (`app_category`, `remote_view_state`) are also honestly modeled as
+  single-variant enums for now, since this daemon has no per-app attribution
+  and no way to detach the broadcast independently of the control channel
+  yet (see the module's own "Real vs. honestly-approximated fields" doc).
+  The `inference_mode` field's `Local` variant is now the accurate value for
+  this build's actual inference path (see `local_model.rs` below and the
+  "Inference: local, on-device only" section) -- but since `audit_log` has
+  no live call site at all yet, no `AuditEntry` is constructed anywhere to
+  carry it, so nothing sets it either; the wiring gap is the missing call
+  site, not the enum.
 - **`task_state.rs`** (PRD task lifecycle: 16 flow states + 4 interactive-
   waiting states + 10 terminal states) is a real, fully-modeled Rust enum
   with a real, exhaustively-tested `is_valid_transition` state machine
@@ -130,13 +135,18 @@ re-witnessed as `cargo run --example <name>_probe` binaries instead --
 `allowlist_probe`, `auth_probe`, `auth_gate_probe`, `control_channel_probe`,
 `envelope_probe`, `input_request_probe`, `task_state_probe`,
 `audit_log_probe`, `sensitive_categories_probe`, `limits_probe`,
-`holo_bridge_queue_probe`, and `permissions_probe`, alongside the
-pre-existing `control_probe` (a real external `iroh` dial against a live
-daemon) -- see "Build status" below for exact, witnessed build and probe
-results. A local-model latency benchmark for the on-device inference path
-(not the Cloud path this daemon currently uses -- see `audit_log.rs`'s
-`InferenceMode` note above) was also run on this hardware; see
-[`BENCHMARKS.md`](./BENCHMARKS.md).
+`holo_bridge_queue_probe`, `permissions_probe`, and `local_model_probe`
+(builds the exact `llama-server` + `holo serve` subprocess commands and
+verifies the local-inference env wiring **without spawning the 21 GB
+model**), alongside the pre-existing `control_probe` (a real external `iroh`
+dial against a live daemon) -- see "Build status" below for exact, witnessed
+build and probe results. The daemon's actual inference path is the
+**on-device `llama-server` local model** (see "Inference: local, on-device
+only" below); a real end-to-end latency benchmark of that path (8.3 s/step
+@ 720p on this Mac) was run separately -- because a live model-serving run
+loads ~21 GB and takes minutes, it is documented in
+[`BENCHMARKS.md`](./BENCHMARKS.md) rather than re-run by the build/probe
+path above.
 
 ## Components
 
@@ -159,6 +169,7 @@ holoiroh/
 │   │   ├── sensitive_categories.rs # PRD §9 class-5 sensitive-app config data model + file I/O (not wired to a live policy point yet)
 │   │   ├── audit_log.rs            # PRD P0-12 metadata-only local audit log (real AuditLogger; not yet called from the live request path)
 │   │   ├── task_state.rs          # PRD task lifecycle state machine (16 flow + 4 interactive + 10 terminal states; not wired to a live event source yet)
+│   │   ├── local_model.rs         # PRD P0-11 Aro Private mode: manages a local llama.cpp `llama-server` subprocess (Holo3.1 Q4 GGUF, 127.0.0.1 only); holo serve is pointed at it via --base-url / HAI_AGENT_RUNTIME_BASE_URL
 │   │   └── holo_bridge/           # bridges control messages to `holo serve`'s A2A endpoint
 │   │       ├── mod.rs
 │   │       ├── a2a_client.rs
@@ -179,7 +190,8 @@ holoiroh/
 │       ├── sensitive_categories_probe.rs  # SensitiveCategories load/save/classify + TOML/JSON format inference, real temp files
 │       ├── audit_log_probe.rs             # AuditLogger append/round-trip + PRD P0-12 acceptance test (no dictated text on disk)
 │       ├── task_state_probe.rs            # TaskState serde round-trips + is_valid_transition, full lifecycle diagram
-│       └── holo_bridge_queue_probe.rs     # HoloControlBridge concurrent-prompt-queueing races
+│       ├── holo_bridge_queue_probe.rs     # HoloControlBridge concurrent-prompt-queueing races
+│       └── local_model_probe.rs           # builds the exact llama-server + holo serve commands and verifies the local-inference env wiring, WITHOUT spawning the 21 GB model
 ├── ios-bridge/                    # Rust staticlib crate: extern "C" FFI bridge for iOS
 │   ├── Cargo.toml                 # crate-type = ["staticlib", "lib"]
 │   └── src/lib.rs                 # ticket-connect/subscribe/poll-next-frame extern "C" fns (stub bodies)
@@ -906,6 +918,56 @@ whatever connection `iroh`'s transport layer establishes. Concretely:
    hole-punch directly, and a still-fully-functional-but-higher-latency
    case when either end is behind symmetric NAT/CGNAT and traffic relays
    — both are "it works," just with different responsiveness.
+
+## Inference: local, on-device only (Aro Private mode, PRD P0-11)
+
+The alpha's **only** inference backend is a local model served on this Mac —
+there is no cloud inference code path (Project Aro PRD row P0-11). Concretely,
+the daemon (`mac-daemon/src/local_model.rs`) manages a
+[`llama.cpp`](https://github.com/ggml-org/llama.cpp) `llama-server`
+subprocess:
+
+```text
+llama-server -hf Hcompany/Holo-3.1-35B-A3B-GGUF:Q4_K_M --host 127.0.0.1 --port 8080
+```
+
+- **`-hf …:Q4_K_M`** resolves the already-downloaded GGUF from this machine's
+  Hugging Face cache. The repo ships a vision projector (`mmproj.f16.gguf`)
+  alongside the weights, and `-hf` auto-loads it (Holo3.1 is a *vision* model
+  — desktop screenshots are the input — so the projector is load-bearing and
+  the daemon deliberately does **not** pass `--no-mmproj`).
+- **`--host 127.0.0.1`** binds loopback only; the command builder never emits
+  any other host, so the inference endpoint is unreachable off-box.
+- The OpenAI-compatible base URL is **`http://127.0.0.1:8080/v1`**
+  (port overridable via `HOLOIROH_LOCAL_MODEL_PORT`; it must differ from the
+  `holo serve` A2A port, `HOLOIROH_HOLO_PORT`, default `8765`).
+
+`holo serve` (the A2A front-end the control channel forwards prompts to) is
+pointed at that local endpoint by the daemon
+(`mac-daemon/src/holo_bridge/process.rs`), which passes
+`holo serve --base-url http://127.0.0.1:8080/v1` **and** sets the
+`HAI_AGENT_RUNTIME_BASE_URL` environment variable. That specific env var — not
+`HAI_BASE_URL` — is the one that redirects **model inference** in
+`holo-desktop-cli`: verified directly against its installed source
+(`cli/agent_api.py` maps `--base-url`→`HAI_AGENT_RUNTIME_BASE_URL`;
+`agent_client/launcher.py` propagates it to the runtime child *and removes
+`HAI_API_KEY`* so the hosted key can't leak; `agent_client/model_gateway.py`
+shows `HAI_BASE_URL` only overrides the cloud *entitlement-probe gateway
+region*, not inference). The daemon also removes `HAI_API_KEY` from the
+`holo serve` child's environment on the local path, so the no-cloud guarantee
+does not depend on the CLI's own popping logic firing.
+
+**What is verified in-repo vs. benchmarked separately.** The command
+construction and env wiring above are real and are witnessed by
+`cargo run --example local_model_probe`, which builds the exact `llama-server`
+and `holo serve` commands the daemon would spawn and prints/asserts their
+argv and env — **without spawning the model**. A full live model-serving run
+is intentionally *not* part of that verification: the GGUF is ~21 GB and takes
+minutes plus large RAM to load, so re-running it every build would be
+wasteful. The real end-to-end latency of actually serving it locally
+(**8.3 s/step at 720p** on this Apple M3 Pro / 36 GB Mac) is measured and
+discussed honestly in [`BENCHMARKS.md`](./BENCHMARKS.md), not re-derived by
+the build/probe path.
 
 ## Deferred to beta: Aro Confidential Cloud (Tinfoil)
 

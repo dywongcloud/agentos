@@ -149,7 +149,7 @@ async fn main() {
     // Build the executor the way the daemon would, but over the unreachable-backend bridge.
     // HoloBridge::start would spawn `holo serve`; with no `holo` on PATH it fails -- witness that
     // real failure, then build the executor over a bridge we assemble from public parts.
-    match holoiroh_daemon::executor::start_holo_desktop_executor("holo", 0).await {
+    match holoiroh_daemon::executor::start_holo_desktop_executor("holo", 0, None).await {
         Ok(_) => println!("  (unexpected) start_holo_desktop_executor succeeded -- a live holo serve is present"),
         Err(e) => println!("  start_holo_desktop_executor failed at backend spawn (expected in sandbox): {e}"),
     }

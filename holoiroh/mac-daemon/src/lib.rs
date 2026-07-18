@@ -21,6 +21,7 @@ pub mod control_channel;
 pub mod executor;
 pub mod holo_bridge;
 pub mod limits;
+pub mod local_model;
 pub mod permissions;
 pub mod policy;
 pub mod sensitive_categories;

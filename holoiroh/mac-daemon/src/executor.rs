@@ -858,9 +858,15 @@ impl HoloDesktopExecutor {
 pub async fn start_holo_desktop_executor(
     holo_bin: impl Into<String>,
     port: u16,
+    local_base_url: Option<String>,
 ) -> anyhow::Result<(HoloDesktopExecutor, Arc<HoloBridge>)> {
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    let bridge = Arc::new(HoloBridge::start(holo_bin, port, events_tx).await?);
+    // `local_base_url` threads the alpha's local-llama.cpp inference config (Project Aro PRD
+    // P0-11) straight through to `HoloBridge::start` -- `Some(url)` points `holo serve` at the
+    // local model, `None` leaves it on its configured backend. Kept as a parameter (rather than
+    // hardcoded `None`) so the executor seam never silently drops the no-cloud config a caller
+    // set up.
+    let bridge = Arc::new(HoloBridge::start(holo_bin, port, local_base_url, events_tx).await?);
     // HoloBridge::start verified the agent card and now retains its protocolVersion; thread it
     // through so get_capabilities() reports the real backend version on the daemon path (rather
     // than None).
