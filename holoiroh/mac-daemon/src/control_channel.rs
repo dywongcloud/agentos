@@ -880,7 +880,15 @@ where
 /// is tracking (matching `request_id` against the outstanding request and
 /// clearing its expiry timer), not something `HoloBridge`'s A2A-oriented
 /// `ControlMessage` has any equivalent shape for today.
-fn to_control_message(request_id: String, msg: ClientMessage) -> Option<ControlMessage> {
+///
+/// `pub` (rather than private) specifically so `examples/holo_stop_probe.rs`
+/// -- the run-by-hand witness for the remote kill-switch path (this repo's
+/// no-unit-tests rule) -- can assert the exact wire-[`ClientMessage::Stop`]
+/// -> internal-[`ControlMessage::Stop`] mapping directly, without spinning up
+/// a live `iroh` connection to reach it through [`ProtocolHandler::accept`].
+/// Still called internally by that accept loop, so it is not dead code from
+/// the bin target's perspective.
+pub fn to_control_message(request_id: String, msg: ClientMessage) -> Option<ControlMessage> {
     match msg {
         ClientMessage::Prompt { text } => Some(ControlMessage::Prompt {
             request_id,

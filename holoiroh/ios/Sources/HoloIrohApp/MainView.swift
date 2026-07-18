@@ -88,6 +88,27 @@ struct MainView: View {
     /// only change the live-view feature needs here.
     @State private var frameSource: VideoFrameSource = SyntheticVideoFrameSource()
 
+    /// The control-channel send seam (`ControlChannelSender.swift`). This is
+    /// the **single injection site** for the outbound message path -- most
+    /// importantly the remote kill-switch `ClientMessage.stop` the Cancel
+    /// controls send (see `sendControlMessage` / `sessionActions.cancel`).
+    /// Today it is the `LoggingControlChannelSender` stand-in, which really
+    /// encodes each message to its `PROTOCOL.md` wire bytes and surfaces it in
+    /// the status/log panel; swapping in the real `iroh`/`ios-bridge` transport
+    /// is a one-line change here and nowhere else (see the protocol's doc for
+    /// the exact remaining wiring step). Computed rather than stored so its
+    /// `report` closure can append to `logEntries` without a stored-property
+    /// initialization-order problem.
+    private var controlChannel: ControlChannelSending {
+        LoggingControlChannelSender { message, wire in
+            // Surface the sent message in the same status/log panel every other
+            // event flows through. The trailing newline is trimmed for display
+            // (it is real on the wire, noise in the UI).
+            let trimmed = wire.trimmingCharacters(in: .whitespacesAndNewlines)
+            logEntries.append(LogEntry(message: .status(text: "→ sent \(message.wireKindLabel): \(trimmed)")))
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
@@ -191,6 +212,16 @@ struct MainView: View {
                 session = .idle
             },
             cancel: {
+                // Remote kill-switch: the Cancel control (shown in the Working,
+                // Connecting, Input-needed, and Draft-ready panels) is the
+                // "Stop" the user hits to halt whatever the agent is doing on the
+                // Mac. Send the actual `ClientMessage.stop` over the control
+                // channel *before* the local transition, so the daemon's
+                // `handle_stop` -> `holo stop` kill-switch path fires (once the
+                // transport is real). The local `.idle` transition + log entry is
+                // the stand-in for the daemon's `Done { Canceled }` response until
+                // the real channel streams it back.
+                sendStop()
                 log(.status(text: "task cancelled"))
                 session = .idle
             },
@@ -396,14 +427,14 @@ struct MainView: View {
         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        // No real control-channel transport yet -- this simulates the round
-        // trip locally (an immediate ack) so the log list is demonstrably
-        // live rather than static mock data, AND advances the PRD 6.1 state
-        // machine organically: a prompt from Idle moves to Reviewing, where
-        // the Send control continues on to Connecting → Working. A future
-        // task replaces this with an actual `ClientMessage.prompt` send and
-        // real `ServerMessage` responses streamed back from the daemon.
-        logEntries.append(LogEntry(message: .status(text: "sent: \"\(trimmed)\"")))
+        // Send the prompt through the same control-channel seam the kill-switch
+        // Stop uses (`sendControlMessage`) -- so the outbound path is exercised
+        // for real (the message is JSON-encoded to its `PROTOCOL.md` wire form)
+        // rather than only logged. The transport underneath is still the
+        // `LoggingControlChannelSender` stand-in until the real `iroh` channel
+        // lands (a one-line swap at `controlChannel`), at which point the
+        // daemon's real `ServerMessage` responses replace the local ack below.
+        sendControlMessage(.prompt(text: trimmed))
         logEntries.append(LogEntry(message: .ack(text: nil)))
 
         // Organic transition: capturing a prompt puts us into Reviewing so the
@@ -423,6 +454,27 @@ struct MainView: View {
         logEntries.append(
             LogEntry(message: .status(text: wasRecording ? "stopped listening" : "listening…"))
         )
+    }
+
+    // MARK: - Control-channel send helpers
+
+    /// Sends one `ClientMessage` to the daemon through the control-channel seam
+    /// (`controlChannel`). The seam encodes it to its `PROTOCOL.md` NDJSON wire
+    /// form and (today) surfaces it in the log panel; the real `iroh` transport
+    /// drops in behind this same call later. This is the single place the UI
+    /// hands a message to the transport, so every outbound message -- the
+    /// kill-switch `.stop`, prompts, transcripts -- goes through one path.
+    private func sendControlMessage(_ message: ClientMessage) {
+        controlChannel.send(message)
+    }
+
+    /// Sends the remote kill-switch `ClientMessage.stop`. Wired to every Cancel
+    /// control (Working/Connecting/Input-needed/Draft-ready) -- see
+    /// `sessionActions.cancel`. On the daemon this maps to
+    /// `ControlMessage::Stop { context_id: None }` and engages the global
+    /// `holo stop` kill switch (`mac-daemon`'s `HoloControlBridge::handle_stop`).
+    private func sendStop() {
+        sendControlMessage(.stop)
     }
 
     // MARK: - Log helper
