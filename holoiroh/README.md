@@ -297,7 +297,16 @@ and [MoQ](https://quic.video/) for media framing):
 2. **Publish.** The captured stream is published as an `iroh-live`
    `LocalBroadcast`, which produces a shareable **iroh ticket** — a
    self-describing string that encodes the daemon's node ID and enough
-   routing info for a peer to dial it directly.
+   routing info for a peer to dial it directly. Video is encoded as
+   **H.264 using the hardware VideoToolbox encoder** on macOS: `main.rs`
+   selects the codec via `VideoCodec::best_available()` (which resolves to
+   `VtbH264` in this build, since `iroh-live`'s default features include
+   `videotoolbox`), falling back to software openh264 only if no hardware
+   encoder is available. This is the Project Aro PRD's OQ-5
+   "H.264-over-iroh" transport; the decision and its evidence — including
+   why `iroh-live`'s existing MoQ path already satisfies it and neither a
+   custom iroh QUIC video stream nor WebRTC is needed for the primary path —
+   are recorded in [`mac-daemon/TRANSPORT_ADR.md`](./mac-daemon/TRANSPORT_ADR.md).
 3. **Transport.** Connections use `iroh`'s QUIC transport: peers attempt a
    direct connection with NAT hole-punching first, falling back to an iroh
    relay server (n0's or a self-hosted one) if a direct path can't be

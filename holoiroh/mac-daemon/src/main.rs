@@ -344,11 +344,32 @@ async fn main() -> anyhow::Result<()> {
     // source yet. `capture::setup_screen_video` resolves `--display` (or the
     // primary display when omitted) and calls `broadcast.video().set_source(..)`
     // on our behalf.
+    //
+    // Encoder selection (Project Aro PRD OQ-5, "H.264-over-iroh"; see
+    // TRANSPORT_ADR.md): pick the *hardware* H.264 encoder when one is
+    // available rather than hardcoding software `VideoCodec::H264` (openh264).
+    // `VideoCodec::best_available()` prefers hardware over software and, on this
+    // macOS build (iroh-live's default features include `videotoolbox`), returns
+    // `VtbH264` -- Apple VideoToolbox producing standard H.264/AVC
+    // (`kCMVideoCodecType_H264 = 'avc1'`, decodable unchanged by the iOS
+    // `AVSampleBufferDisplayLayer` path). This is exactly the "VideoToolbox-
+    // encoded frames over iroh's QUIC/MoQ transport" OQ-5 names as the primary
+    // candidate, and matches iroh-live's own reference CLI, which defaults the
+    // codec via `VideoCodec::parse_or_best(None)` -> `best_available()`. The
+    // wire codec is H.264 either way, so the fallback to software openh264 (when
+    // no hardware encoder is compiled in / available) is a graceful CPU-cost
+    // degradation, never a format change that would break the iOS decoder.
+    let video_codec = VideoCodec::best_available().unwrap_or(VideoCodec::H264);
+    info!(
+        codec = ?video_codec,
+        hardware = video_codec.is_hardware(),
+        "selected H.264 video encoder for the iroh/MoQ broadcast (OQ-5: H.264-over-iroh)"
+    );
     let broadcast = LocalBroadcast::new();
     capture::setup_screen_video(
         &broadcast,
         cli.display,
-        VideoCodec::H264,
+        video_codec,
         &[VideoPreset::P720],
     )?;
 
