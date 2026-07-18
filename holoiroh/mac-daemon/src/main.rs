@@ -9,18 +9,24 @@
 //! `Endpoint`/`Router`, and -- best-effort -- starts the `holo serve`
 //! bridge ([`holo_bridge`]) that the control channel forwards prompts to.
 //!
-//! Capture (screen/audio) is not wired up yet -- this binary proves out the
-//! P2P publish/ticket half of the pipeline plus the full control-channel
-//! path. Other mac-daemon modules build on the `Live` + `LocalBroadcast`
-//! handles constructed here.
+//! Screen capture (via [`capture::setup_screen_video`], macOS
+//! ScreenCaptureKit, `--display <index>` selectable) is wired up as the
+//! broadcast's video source before publish. System/mic audio capture is not
+//! wired up yet.
 
+mod capture;
 mod control_channel;
 mod holo_bridge;
 
 use std::sync::Arc;
 
+use clap::Parser;
 use iroh::protocol::Router;
-use iroh_live::{Live, media::publish::LocalBroadcast, ticket::LiveTicket};
+use iroh_live::{
+    Live,
+    media::{codec::VideoCodec, format::VideoPreset, publish::LocalBroadcast},
+    ticket::LiveTicket,
+};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -32,6 +38,18 @@ use holo_bridge::HoloBridge;
 /// broadcasts); a single well-known name is sufficient for one daemon
 /// publishing one stream today.
 const BROADCAST_NAME: &str = "holoiroh";
+
+/// CLI arguments for `holoiroh-daemon`.
+#[derive(Parser, Debug)]
+#[command(name = "holoiroh-daemon", about = "Mac-side holoiroh P2P daemon")]
+struct Cli {
+    /// Which display to capture when multiple are connected, by index into
+    /// the list `iroh_live::media::capture::ScreenCapturer::list_all()`
+    /// returns (same ordering `capture::list_displays()` exposes). Omit to
+    /// use the primary display.
+    #[arg(long)]
+    display: Option<usize>,
+}
 
 /// `holo` CLI executable used to spawn `holo serve` (see
 /// `holo_bridge::process`). Overridable so a dev machine can point at a
@@ -52,6 +70,8 @@ fn holo_serve_port() -> u16 {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("holoiroh-daemon starting");
+
+    let cli = Cli::parse();
 
     // --- iroh endpoint (reads IROH_SECRET if set, otherwise generates a
     // fresh key each run). Built *without* `.with_router()` because we own
@@ -100,11 +120,17 @@ async fn main() -> anyhow::Result<()> {
     };
     let router = router_builder.spawn();
 
-    // Empty broadcast: no video/audio source attached yet. `LocalBroadcast`
-    // is immediately consumable/publishable with zero tracks -- callers
-    // (this binary's future capture code) attach sources via
-    // `broadcast.video()` / `broadcast.audio()` once capture lands.
+    // Broadcast with the ScreenCaptureKit video source attached -- no audio
+    // source yet. `capture::setup_screen_video` resolves `--display` (or the
+    // primary display when omitted) and calls `broadcast.video().set_source(..)`
+    // on our behalf.
     let broadcast = LocalBroadcast::new();
+    capture::setup_screen_video(
+        &broadcast,
+        cli.display,
+        VideoCodec::H264,
+        &[VideoPreset::P720],
+    )?;
 
     // --- publish and print the shareable ticket ---
     live.publish(BROADCAST_NAME, &broadcast).await?;

@@ -10,15 +10,18 @@ does not share code, dependencies, or deployment with it.
 
 ## Status
 
-`mac-daemon` publishes an (empty, capture not wired up yet) `iroh-live`
-broadcast and ticket, and runs a working bidirectional control channel
-(`control_channel.rs`, ALPN `holoiroh/control/1`) bridged to `holo serve`
-(`holo_bridge/`) -- see [`PROTOCOL.md`](./PROTOCOL.md) for the control
-channel's wire schema. Screen/audio capture is still not wired up. `ios/`
-is a skeleton SwiftUI app that builds for iOS 17 but has no pairing, video,
-or control-channel logic yet -- the Swift side of the control channel
-(actually sending/receiving `PROTOCOL.md`'s JSON) remains unimplemented.
-See "Build status" below for exact, witnessed build results.
+`mac-daemon` publishes an `iroh-live` broadcast and ticket with a macOS
+ScreenCaptureKit video source attached (`capture.rs`, screen/display
+capture only -- no audio yet), selectable via a `--display <index>` CLI
+flag (defaults to the primary display), and runs a working bidirectional
+control channel (`control_channel.rs`, ALPN `holoiroh/control/1`) bridged
+to `holo serve` (`holo_bridge/`) -- see [`PROTOCOL.md`](./PROTOCOL.md) for
+the control channel's wire schema. System/mic audio capture is still not
+wired up. `ios/` is a skeleton SwiftUI app that builds for iOS 17 but has
+no pairing, video, or control-channel logic yet -- the Swift side of the
+control channel (actually sending/receiving `PROTOCOL.md`'s JSON) remains
+unimplemented. See "Build status" below for exact, witnessed build
+results.
 
 ## Components
 
@@ -29,7 +32,8 @@ holoiroh/
 ├── mac-daemon/                    # Rust binary crate: the Mac-side daemon
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs                # entrypoint: Live + Router + control channel + holo_bridge
+│       ├── main.rs                # entrypoint: Live + Router + capture + control channel + holo_bridge
+│       ├── capture.rs             # macOS ScreenCaptureKit video source (--display <index> selection)
 │       ├── control_channel.rs     # iroh ALPN transport for PROTOCOL.md's ClientMessage/ServerMessage
 │       └── holo_bridge/           # bridges control messages to `holo serve`'s A2A endpoint
 │           ├── mod.rs
@@ -201,11 +205,27 @@ binary lands in the **workspace root's** `target/debug/holoiroh-daemon`
 **`mac-daemon` now does real `iroh-live` P2P publish work, not just a
 skeleton println.** `main.rs` brings up an `iroh-live::Live` session
 (`Live::from_env().await?...spawn()`, reading `IROH_SECRET` if set or else
-generating a fresh key), registers an empty `LocalBroadcast` (zero
-video/audio tracks — capture isn't wired up yet, see "Status" above),
-publishes it under the name `holoiroh`, and prints the resulting
-`iroh-live:` ticket to stdout. Running the binary and sending it `SIGINT`
-(`Ctrl-C`) shows this real, witnessed transcript:
+generating a fresh key), registers a `LocalBroadcast` with a macOS
+ScreenCaptureKit video source attached (`capture::setup_screen_video` --
+`iroh_live::media::capture::ScreenCapturer`, never `CameraCapturer`; see
+"Status" above and `capture.rs`'s own doc comment for the exact API calls
+and the `--display <index>` display-selection logic), publishes it under
+the name `holoiroh`, and prints the resulting `iroh-live:` ticket to
+stdout. `holoiroh-daemon --help` shows the new flag:
+
+```
+$ ./target/debug/holoiroh-daemon --help
+Mac-side holoiroh P2P daemon
+
+Usage: holoiroh-daemon [OPTIONS]
+
+Options:
+      --display <DISPLAY>  Which display to capture when multiple are connected, by index into the list `iroh_live::media::capture::ScreenCapturer::list_all()` returns (same ordering `capture::list_displays()` exposes). Omit to use the primary display
+  -h, --help               Print help
+```
+
+Running the binary and sending it `SIGINT` (`Ctrl-C`) shows this real,
+witnessed transcript:
 
 ```
 $ ./target/debug/holoiroh-daemon

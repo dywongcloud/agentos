@@ -13,5 +13,6 @@
 //! exact same source files -- both targets compile the same `.rs` files,
 //! just under two different crate roots).
 
+pub mod capture;
 pub mod control_channel;
 pub mod holo_bridge;
