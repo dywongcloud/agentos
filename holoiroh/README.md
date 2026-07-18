@@ -20,8 +20,24 @@ the control channel's wire schema. The control channel's accept path now
 enforces a PIN + persisted device-allowlist auth gate on unrecognized
 devices (real, tested, see [`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md))
 -- a QR rendering of the ticket and a ticket-rotation flag are designed in
-that same doc but not yet implemented. System/mic audio capture is still
-not wired up. `ios/` is now a real multi-screen SwiftUI app skeleton that
+that same doc but not yet implemented. The daemon also now keeps a real,
+local, metadata-only audit log (Project Aro PRD row P0-12, `audit_log.rs`,
+JSON Lines at a configurable path -- default `~/.holoiroh/audit.log`,
+overridable via `HOLOIROH_AUDIT_LOG_PATH`): one entry per completed
+control-channel task, recording exactly task id, start/end timestamps,
+app category, action class, inference mode, Remote View state, connection
+path (direct/relay), final status, latency, and action count -- a
+strongly-typed struct with no generic `details` field, so it is
+structurally impossible for any dictated transcript, typed prompt,
+recipient name, video frame, keystroke, or model prompt/response to reach
+the log. Wired into `control_channel.rs`'s real accept path: one entry
+starts when a `prompt`/`voice_transcript` is dispatched, one entry is
+appended when its matching `ControlEvent::Done` arrives. See
+`examples/audit_log_probe.rs` for a real, run-by-hand witness that reads
+the actual bytes written to disk and confirms a distinctive dictated-text
+string never appears in them -- the PRD's own acceptance test for this
+row. System/mic audio capture is still not wired up. `ios/` is now a real
+multi-screen SwiftUI app skeleton that
 builds for iOS 17: `ContentView` hosts a `NavigationStack` moving from
 `PairingView` (paste an iroh ticket, plus a placeholder "Scan QR" button)
 to `MainView` on "connect" (video preview placeholder, prompt text field

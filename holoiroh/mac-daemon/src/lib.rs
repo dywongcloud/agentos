@@ -14,6 +14,7 @@
 //! just under two different crate roots).
 
 pub mod allowlist;
+pub mod audit_log;
 pub mod auth;
 pub mod capture;
 pub mod control_channel;
