@@ -10,6 +10,45 @@ does not share code, dependencies, or deployment with it.
 
 ## Status
 
+### Alpha completeness, and the two things needed to run it live
+
+Nearly every alpha component is built and individually witnessed (each via a
+real `cargo run --example *_probe` and/or a real `swift build`, per this
+repo's no-unit-tests rule): the Rust daemon (iroh-live publish + ticket,
+ScreenCaptureKit capture, hardware-VideoToolbox H.264, control channel with
+signed/expiring/replay-checked `TaskEnvelope`s, PIN + device-allowlist auth,
+metadata-only audit log with a proven no-content-leak guarantee, session/rate
+limits, a `holo serve` health-restart supervisor, the local-`llama.cpp`
+no-cloud inference path, the `ComputerUseExecutor` seam + the 6-class policy
+wrapper, the app registry + deterministic launch, the remote kill-switch);
+the iOS app (pairing with QR scan + a SHA-256 short-phrase mutual
+verification that byte-matches the daemon, the full 8-state PRD-6.1 session
+dashboard, on-device voice transcription, the video render surface, and the
+real iroh-live subscribe FFI — `ios-bridge` cross-compiles cleanly to
+`aarch64-apple-ios`). See `BENCHMARKS.md` for the local-model latency work
+(KV-cache reuse brings a warm step to ~2.3 s, under the < 5 s NFR).
+
+**Two things this build genuinely cannot do for itself, and needs a human
+for, before it runs end-to-end:**
+
+1. **Grant the daemon macOS permissions and run it on a real Mac.** The
+   daemon correctly refuses to start without Screen Recording + Accessibility
+   (PRD P0-13, so it never streams a black frame or a Mac it can't drive).
+   macOS provides **no CLI to grant these** — `tccutil` only resets, the
+   `TCC.db` is SIP-protected — so an interactive click in **System Settings →
+   Privacy & Security** is required, then re-run the daemon (`cargo build
+   --release` in `mac-daemon/`, run `target/release/holoiroh-daemon`; it will
+   then print a ticket QR + verification phrase + PIN). This is what unblocks
+   every live-run row (end-to-end video, the leak/reconnect/latency
+   measurements, live policy gating).
+2. **Deploy the iOS app to a real iPhone** (Xcode device-deploy, linking the
+   `ios-bridge` staticlib as an xcframework) to exercise camera QR scanning,
+   real voice capture, and the live remote view — none of which can be driven
+   headlessly.
+
+Separately, `git push` has no effect until a remote is configured
+(`git remote add origin <url>`); all work to date is committed locally.
+
 `mac-daemon` publishes an `iroh-live` broadcast and ticket with a macOS
 ScreenCaptureKit video source attached (`capture.rs`, screen/display
 capture only -- no audio yet), selectable via a `--display <index>` CLI
