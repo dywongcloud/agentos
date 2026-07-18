@@ -1,0 +1,70 @@
+[package]
+name = "holoiroh-daemon"
+version = "0.1.0"
+edition = "2024"
+description = "Mac-side daemon that publishes screen+audio over iroh-live P2P and bridges prompts to holo-desktop-cli"
+
+[dependencies]
+# iroh-live is not published on crates.io as of this writing (verified via
+# https://crates.io/api/v1/crates/iroh-live -> {"errors":[{"detail":"crate
+# `iroh-live` does not exist"}]}, checked 2026-07-17). Using a git dependency
+# against the upstream repo instead, pinned to a specific commit on `main`
+# for reproducible builds (n0-computer/iroh-live has no version tags yet).
+# The crate lives at the `iroh-live` subpath of that repo's own Cargo
+# workspace (root Cargo.toml `members = ["iroh-live", ...]`), so `package`
+# must be specified explicitly since the git URL itself points at the
+# workspace root, not the crate directory.
+#
+# Pinned commit: 5f95758fcd1450e443a9134c9d9342bcc3957b85
+# ("deps: update iroh and moq (#41)", 2026-07-15) — latest commit on `main`
+# at the time this dependency was added. Bump deliberately; re-verify the
+# crate's public API hasn't shifted before moving the pin.
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "5f95758fcd1450e443a9134c9d9342bcc3957b85", package = "iroh-live" }
+# Direct dependency so control_channel.rs can reach `iroh::protocol::{Router, ProtocolHandler,
+# AcceptError}` / `iroh::endpoint::Connection` for the control-channel ALPN, on top of the same
+# `iroh::Endpoint` iroh-live's `Live` type owns. Pinned to the exact version iroh-live's own
+# dependency graph resolves to (`cargo tree -p iroh` -> 1.0.2 as of this writing) via `=`, so
+# Cargo can never resolve two different `iroh` versions into the build.
+iroh = "=1.0.2"
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "io-util", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# holo_bridge: talks to `holo serve`'s local A2A (JSON-RPC over HTTP + SSE) endpoint and manages
+# the `holo serve` subprocess. See holo_bridge/mod.rs doc comment for the source-grounded protocol
+# details (verified against hcompai/holo-desktop-cli source, not invented).
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Parses the `text/event-stream` body of the A2A `message/stream` JSON-RPC response frame-by-frame.
+eventsource-stream = "0.2"
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+tokio-util = "0.7"
+
+[target.'cfg(unix)'.dependencies]
+# Used only to send SIGTERM (graceful shutdown) to the `holo serve` child before falling back
+# to SIGKILL; this daemon is macOS-only per holoiroh/README.md so `cfg(unix)` always applies.
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Permission preflight (src/permissions.rs): CGPreflightScreenCaptureAccess and
+# AXIsProcessTrusted, both plain synchronous TCC-state queries with no prompting side effect.
+# objc2-core-graphics is already part of this crate's dependency graph transitively (pulled in
+# by iroh-live's macOS ScreenCaptureKit-based capture backend, per Cargo.lock), so this entry
+# promotes it to a direct dependency rather than adding a second binding crate for the same
+# framework. objc2-application-services is new (ApplicationServices/Accessibility has no
+# existing transitive binding in this graph). Feature flags below were confirmed directly
+# against the crates' own generated source (`generated/mod.rs`'s per-symbol `#[cfg(feature =
+# "...")]` re-export gates), not guessed from scraped docs.rs pages -- see permissions.rs
+# module doc:
+#   - CGPreflightScreenCaptureAccess is re-exported only under `feature = "CGWindow"`
+#     (objc2-core-graphics-0.3.2/src/generated/mod.rs:2338).
+#   - AXIsProcessTrusted needs BOTH `feature = "HIServices"` (gates the entire `HIServices`
+#     module the symbol lives in -- generated/mod.rs:23-25) AND `feature = "AXUIElement"`
+#     (gates the individual re-export within that module --
+#     generated/HIServices/mod.rs:124). Confirmed by `cargo build` still failing to find the
+#     symbol with only "AXUIElement" enabled, tracing the module-level cfg gate directly.
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow"] }
+objc2-application-services = { version = "0.3", default-features = false, features = ["HIServices", "AXUIElement"] }
