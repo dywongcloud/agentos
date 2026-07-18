@@ -424,6 +424,67 @@ pub enum ClientMessage {
     Pin {
         pin: String,
     },
+    /// The user's answer to a [`ServerMessage::InputRequest`]. Carries a
+    /// **structured choice selection only** -- the `selected_option` field
+    /// is expected to be one of the strings the corresponding
+    /// `InputRequest::response_options` offered (or, for kinds like
+    /// `sensitive_access_consent` that model a yes/no gate, one of the
+    /// options the daemon listed for that purpose). This variant can never
+    /// carry a credential, password, MFA code, or other raw manual input --
+    /// per the Project Aro PRD's P0-14 requirement, real credential entry is
+    /// designed to flow through a **separate `manual_input` channel** that
+    /// never reaches the model/agent context (and is not implemented by
+    /// this wire schema at all; see [`ServerMessage::InputRequest`]'s doc
+    /// for the full rationale). A client must never put a password/PIN/MFA
+    /// code string into `selected_option` -- there is intentionally no field
+    /// shape here that would make that natural (no free-text field), only a
+    /// selection among the pre-enumerated `response_options`.
+    InputResponse {
+        /// Echoes the `request_id` of the [`ServerMessage::InputRequest`]
+        /// this is answering, so the daemon can match it against the
+        /// pending request it is tracking (and reject/ignore a response to
+        /// an already-expired or unknown request -- see
+        /// `ControlChannel::accept`'s pending-input-request handling).
+        request_id: String,
+        /// The chosen option, expected to be a member of the original
+        /// request's `response_options`. Structured selection only -- never
+        /// a free-text or credential value (see variant doc above).
+        selected_option: String,
+    },
+}
+
+/// Classifies *why* the daemon is asking the user for input via
+/// [`ServerMessage::InputRequest`]. Matches the five kinds named in the
+/// Project Aro PRD's P0-14 requirement verbatim; see that variant's doc for
+/// the full contract this classification serves.
+///
+/// Serializes as a bare snake_case string (`#[serde(rename_all =
+/// "snake_case")]` with no associated data), so it sits directly in the
+/// `kind` field of the wire JSON, e.g. `"kind":"mfa"` -- not a nested tagged
+/// object, since none of these five kinds carry kind-specific fields beyond
+/// what `InputRequest`'s own `context`/`response_options` already provide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRequestKind {
+    /// A credential (password, API key, secret, etc.) is needed to proceed.
+    /// **This kind never carries the credential itself** -- only the fact
+    /// that one is needed and why (via `context`). The actual credential
+    /// value is out of scope for this wire message entirely; see
+    /// [`ServerMessage::InputRequest`]'s doc for where it's designed to go
+    /// instead (a separate `manual_input` channel, not part of this schema).
+    Credential,
+    /// A multi-factor authentication code/approval is needed.
+    Mfa,
+    /// The agent found more than one plausible way to proceed and needs the
+    /// user to pick one -- `response_options` carries the candidates.
+    AmbiguousChoice,
+    /// The agent is missing some piece of information it cannot infer or
+    /// safely guess (e.g. "which calendar account should I use?").
+    MissingInfo,
+    /// The next step would touch something sensitive (financial action,
+    /// destructive operation, access to private data) and needs explicit
+    /// user consent before the agent proceeds.
+    SensitiveAccessConsent,
 }
 
 impl ClientMessage {
@@ -443,6 +504,7 @@ impl ClientMessage {
             ClientMessage::VoiceTranscript { .. } => "voice_transcript",
             ClientMessage::Stop => "stop",
             ClientMessage::Pin { .. } => "pin",
+            ClientMessage::InputResponse { .. } => "input_response",
         }
     }
 }
@@ -484,6 +546,70 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         text: Option<String>,
     },
+    /// Asks the user for structured input the agent cannot proceed without
+    /// (Project Aro PRD, row P0-14). This variant is **metadata only**: it
+    /// describes *what* is needed and *why*, plus (when applicable) a closed
+    /// set of choices the user can pick from -- it can never carry the
+    /// actual sensitive value itself (a password, an MFA code, an API key).
+    ///
+    /// This is a hard invariant, not just a convention: every field on this
+    /// variant is `String`/`Vec<String>`/`u64` metadata describing the
+    /// *request*, and this type has no constructor path that accepts or
+    /// forwards a credential value into any of them. Real credential/manual
+    /// input is designed to flow over a **separate `manual_input` channel**
+    /// (out of this wire schema's scope -- not implemented here) that is
+    /// architected to never reach the model/agent context at all, matching
+    /// the PRD's explicit requirement that "credential characters are never
+    /// logged, never included in screenshots, never echoed in task events".
+    /// Concretely: nothing at any layer of this daemon should ever call
+    /// `ServerMessage::input_request` (or construct this variant directly)
+    /// with a raw secret as an argument -- `context`/`response_options`
+    /// exist to describe the *shape* of what's needed ("GitHub personal
+    /// access token", "the 6-digit code from your authenticator app"), never
+    /// to hold the value.
+    ///
+    /// The user's answer comes back as [`ClientMessage::InputResponse`] for
+    /// `AmbiguousChoice`/`MissingInfo`/`SensitiveAccessConsent` kinds (a
+    /// selection among `response_options`); for `Credential`/`Mfa` kinds,
+    /// this message only ever announces that manual entry is needed --
+    /// providing the actual secret is out of band for this channel entirely
+    /// (the separate `manual_input` channel above).
+    ///
+    /// See [`ControlChannel::accept`]'s pending-input-request tracking for
+    /// how `expires_at` is enforced (expiry-to-safe-pause: no
+    /// `InputResponse` before `expires_at` emits a
+    /// [`ServerMessage::Status`] saying the task safely paused, not an
+    /// error).
+    InputRequest {
+        /// Correlates this request with the eventual
+        /// [`ClientMessage::InputResponse`] (or with the safe-pause
+        /// [`ServerMessage::Status`] emitted on expiry).
+        request_id: String,
+        /// Which of the five PRD-defined kinds this request is.
+        kind: InputRequestKind,
+        /// Human-readable explanation of what's needed and why (e.g.
+        /// "Holo needs your GitHub personal access token to push this
+        /// branch" or "Two calendars match 'team standup' -- which one?").
+        /// Never contains a credential value itself (see variant doc above).
+        context: String,
+        /// The closed set of choices the user may pick from, echoed back
+        /// verbatim as [`ClientMessage::InputResponse::selected_option`].
+        /// May legitimately be empty for kinds that don't have discrete
+        /// choices to offer (e.g. `Credential`/`Mfa`, which are simply
+        /// announcing that out-of-band manual entry is needed with no
+        /// enumerable options) -- an empty `Vec` serializes as `[]`, not
+        /// omitted, so the client can always rely on the field being
+        /// present.
+        response_options: Vec<String>,
+        /// Unix epoch milliseconds after which this request is considered
+        /// expired if no [`ClientMessage::InputResponse`] has arrived. Plain
+        /// `u64` epoch millis (not `chrono`/`time`, neither of which this
+        /// crate depends on) -- JSON has no native timestamp type, so this
+        /// is the simplest unambiguous wire representation; see
+        /// [`Self::input_request`] for how it's computed from
+        /// `std::time::SystemTime`.
+        expires_at: u64,
+    },
 }
 
 impl ServerMessage {
@@ -497,6 +623,7 @@ impl ServerMessage {
             ServerMessage::Error { .. } => "error",
             ServerMessage::TaskProgress { .. } => "task_progress",
             ServerMessage::AuthRejected { .. } => "auth_rejected",
+            ServerMessage::InputRequest { .. } => "input_request",
         }
     }
 
@@ -530,6 +657,69 @@ impl ServerMessage {
     pub fn auth_rejected(text: impl Into<String>) -> Self {
         ServerMessage::AuthRejected {
             text: Some(text.into()),
+        }
+    }
+
+    /// Convenience constructor for an `input_request` message. `ttl` is how
+    /// long from *now* (real wall-clock time, via [`epoch_millis_now`]) the
+    /// request stays valid; `expires_at` is computed here so every call site
+    /// works in relative durations rather than hand-computing epoch millis.
+    ///
+    /// Deliberately takes only metadata-shaped arguments
+    /// (`kind`/`context`/`response_options`) -- there is no parameter here
+    /// through which a credential value could be threaded, by construction
+    /// (see [`ServerMessage::InputRequest`]'s doc for why that matters).
+    ///
+    /// Not yet called from `main.rs`'s binary path -- this row wires the
+    /// wire-protocol type, the `PendingInputRequest` tracking, and the
+    /// expiry-to-safe-pause mechanics in [`ControlChannel::accept`]; the
+    /// *trigger* (some real signal from `holo_bridge`/`holo-desktop-cli`
+    /// indicating a turn actually needs credential/MFA/choice/consent
+    /// input) does not exist in `holo_bridge::control::ControlEvent` today
+    /// and is explicitly out of scope here rather than fabricated (see this
+    /// task's PRD notes) -- same "real API, not yet wired into `main.rs`"
+    /// status as [`Self::send_on_new_stream`] and `read_line` above.
+    /// Exercised directly (not via the daemon binary) by
+    /// `examples/input_request_probe.rs`.
+    #[allow(dead_code)]
+    pub fn input_request(
+        request_id: impl Into<String>,
+        kind: InputRequestKind,
+        context: impl Into<String>,
+        response_options: Vec<String>,
+        ttl: std::time::Duration,
+    ) -> Self {
+        ServerMessage::InputRequest {
+            request_id: request_id.into(),
+            kind,
+            context: context.into(),
+            response_options,
+            expires_at: epoch_millis_now().saturating_add(ttl.as_millis() as u64),
+        }
+    }
+
+    /// Convenience constructor for the `status` message emitted when a
+    /// pending [`ServerMessage::InputRequest`] expires with no
+    /// [`ClientMessage::InputResponse`] -- see
+    /// [`ControlChannel::accept`]'s pending-input-request expiry handling.
+    /// Deliberately a `Status`, never an `Error`: expiry is a safe,
+    /// expected outcome (the task pauses cleanly, waiting for the user),
+    /// not a failure -- matching the task's explicit "safely paused (not
+    /// failed)" requirement.
+    ///
+    /// [`ControlChannel::accept`]'s own expiry arm routes through
+    /// `ControlEvent::DaemonStatus` instead of calling this directly (its
+    /// `send` half of the stream is owned by the writer task by the time
+    /// expiry can fire, so it cannot construct a `ServerMessage` and write
+    /// it inline) -- both paths share [`input_request_expired_text`] so the
+    /// wording stays identical. Kept as public API for any future direct
+    /// caller (e.g. a test/probe building the message without going through
+    /// the full connection loop) and exercised directly by
+    /// `examples/input_request_probe.rs`.
+    #[allow(dead_code)]
+    pub fn input_request_expired(request_id: impl Into<String>) -> Self {
+        ServerMessage::Status {
+            text: Some(input_request_expired_text(&request_id.into())),
         }
     }
 
@@ -584,6 +774,34 @@ impl ServerMessage {
             ControlEvent::DaemonStatus { text } => ServerMessage::status(text),
         }
     }
+}
+
+/// Current wall-clock time as Unix epoch milliseconds, saturating to `0` in
+/// the (practically impossible on any real system clock) case that
+/// [`std::time::SystemTime::now`] reports a time before
+/// [`std::time::UNIX_EPOCH`]. Used to compute
+/// [`ServerMessage::InputRequest::expires_at`]
+/// ([`ServerMessage::input_request`]) and to check pending-request expiry
+/// in [`ControlChannel::accept`].
+fn epoch_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The human-readable text for the safe-pause status emitted when an
+/// [`ServerMessage::InputRequest`] expires with no
+/// [`ClientMessage::InputResponse`]. Shared by
+/// [`ServerMessage::input_request_expired`] (the direct constructor) and
+/// [`ControlChannel::accept`]'s expiry arm (which routes through
+/// `ControlEvent::DaemonStatus` instead, since `send` is owned by the
+/// writer task by the time expiry can fire) so both paths emit identical
+/// wording rather than two independently-maintained copies.
+fn input_request_expired_text(request_id: &str) -> String {
+    format!(
+        "input request {request_id} expired with no response -- task safely paused, waiting for input"
+    )
 }
 
 /// Serializes `msg` as one newline-delimited JSON line and writes it to
@@ -656,6 +874,12 @@ where
 /// translate to, so the accept loop acks it locally instead of forwarding
 /// it (see the `Ok(ClientMessage::Pin { .. })` arm in
 /// [`ProtocolHandler::accept`]).
+///
+/// Also returns `None` for [`ClientMessage::InputResponse`] -- that variant
+/// answers a pending [`ServerMessage::InputRequest`] the accept loop itself
+/// is tracking (matching `request_id` against the outstanding request and
+/// clearing its expiry timer), not something `HoloBridge`'s A2A-oriented
+/// `ControlMessage` has any equivalent shape for today.
 fn to_control_message(request_id: String, msg: ClientMessage) -> Option<ControlMessage> {
     match msg {
         ClientMessage::Prompt { text } => Some(ControlMessage::Prompt {
@@ -675,6 +899,79 @@ fn to_control_message(request_id: String, msg: ClientMessage) -> Option<ControlM
             force: false,
         }),
         ClientMessage::Pin { .. } => None,
+        ClientMessage::InputResponse { .. } => None,
+    }
+}
+
+/// One [`ServerMessage::InputRequest`] a connection is currently waiting on
+/// a [`ClientMessage::InputResponse`] for (or expiry of).
+///
+/// [`ControlChannel::accept`] tracks **at most one** of these per
+/// connection at a time, matching `HoloControlBridge`'s existing
+/// single-active-turn concurrency model (`busy`/`queue` in
+/// `holo_bridge::control`) -- a turn that needs user input pauses that one
+/// turn; it does not make sense for a single control-channel connection to
+/// have multiple simultaneous outstanding input requests today, and
+/// tracking more than one would need its own bounded-queue design this row
+/// does not need to solve. A future multi-outstanding-request design would
+/// replace this `Option` with a keyed map, but nothing in this daemon
+/// currently produces more than one at a time.
+///
+/// Fields are private (constructed only by [`ControlChannel::accept`]'s
+/// internal bookkeeping in real use); [`Self::for_probing`] is the one
+/// exception, mirroring [`AuthState::for_probing`]'s rationale exactly --
+/// `examples/input_request_probe.rs` needs to build one directly to witness
+/// [`wait_for_expiry`]'s real timing behavior without spinning up a live
+/// `iroh` connection.
+pub struct PendingInputRequest {
+    request_id: String,
+    /// Epoch millis, same unit as [`ServerMessage::InputRequest::expires_at`]
+    /// -- copied here (rather than re-deriving from a stored
+    /// `ServerMessage`) so [`wait_for_expiry`] only needs this one `u64` to
+    /// compute the sleep duration.
+    expires_at: u64,
+}
+
+impl PendingInputRequest {
+    /// Builds a `PendingInputRequest` directly for
+    /// `examples/input_request_probe.rs` (see struct doc) -- not called
+    /// from `main.rs`'s binary path, same status as
+    /// [`AuthState::for_probing`].
+    #[allow(dead_code)]
+    pub fn for_probing(request_id: impl Into<String>, expires_at: u64) -> Self {
+        PendingInputRequest {
+            request_id: request_id.into(),
+            expires_at,
+        }
+    }
+}
+
+/// Resolves once `pending`'s deadline (`expires_at`, epoch millis) has
+/// passed, or never resolves at all if `pending` is `None` -- letting this
+/// be used directly as one arm of `tokio::select!` in
+/// [`ControlChannel::accept`]'s connection loop without that arm ever
+/// firing spuriously when no request is outstanding.
+///
+/// Computes the sleep duration from *real* wall-clock time
+/// ([`epoch_millis_now`]) on every poll rather than once up front, so a
+/// deadline that is already in the past (or arrives while this future is
+/// first constructed) resolves on the very next `.await` point instead of
+/// via any special-cased branch -- `Duration::ZERO` sleeps resolve
+/// immediately, which is exactly the desired "already expired -> safe-pause
+/// right away" behavior for a degenerate past-`expires_at` request.
+///
+/// `pub` (rather than private) so `examples/input_request_probe.rs` can
+/// race real `tokio::time` against a real [`PendingInputRequest`] the same
+/// way [`ControlChannel::accept`]'s own `tokio::select!` does -- same
+/// probe-access rationale as [`ControlChannel::authenticate`].
+pub async fn wait_for_expiry(pending: &Option<PendingInputRequest>) {
+    match pending {
+        Some(p) => {
+            let now = epoch_millis_now();
+            let remaining = p.expires_at.saturating_sub(now);
+            tokio::time::sleep(std::time::Duration::from_millis(remaining)).await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -1236,12 +1533,62 @@ impl ProtocolHandler for ControlChannel {
         // instance from the writer task's `outbound_state` above.
         let mut inbound_state = InboundEnvelopeState::new();
 
+        // The `request_id` of the single outstanding `InputRequest` this
+        // connection is waiting on, if any -- see `PendingInputRequest`'s
+        // doc for why this daemon tracks at most one at a time. `None` most
+        // of the time; only `Some` between the moment an `InputRequest` is
+        // sent (see `HoloControlBridge`/future callers of
+        // `ServerMessage::input_request`) and either a matching
+        // `InputResponse` or the expiry timer firing.
+        let mut pending_input_request: Option<PendingInputRequest> = None;
+
         loop {
+            // Race the next inbound line against both the writer task ending
+            // (existing behavior) and, when a request is outstanding, its
+            // expiry deadline -- `tokio::time::sleep_until` on a `None`
+            // pending request would never fire could not be expressed
+            // directly in `select!`, so the sleep future itself is only
+            // constructed/polled when `pending_input_request` is `Some`
+            // (`Either`-free via a plain `match` producing a boxed future
+            // would work too, but a local async block capturing the
+            // `Option` by reference and immediately returning if `None` is
+            // simpler and allocation-free).
             let line = tokio::select! {
                 line = lines.next_line() => line,
                 _ = &mut send_task => {
                     debug!(peer = %remote, "control channel: writer task ended");
                     break;
+                }
+                _ = wait_for_expiry(&pending_input_request) => {
+                    // `wait_for_expiry` only resolves when
+                    // `pending_input_request` is `Some` and its deadline has
+                    // passed -- safe to `.take()` and `.expect()` here.
+                    let expired = pending_input_request.take().expect(
+                        "wait_for_expiry only resolves when pending_input_request is Some",
+                    );
+                    warn!(
+                        peer = %remote,
+                        request_id = %expired.request_id,
+                        "control channel: input_request expired with no response, pausing safely"
+                    );
+                    // Routed through `events_tx` (like every other outgoing
+                    // message on this connection) rather than writing to
+                    // `send` directly -- `send` was moved into `send_task`
+                    // above, and `ControlEvent::DaemonStatus` is exactly the
+                    // "out-of-band, not tied to a request/response turn"
+                    // shape this is (see that variant's doc). It maps to a
+                    // `ServerMessage::Status` (never `Error`) via
+                    // `ServerMessage::from_control_event`, matching the
+                    // "safely paused, not failed" requirement.
+                    if events_tx
+                        .send(ControlEvent::DaemonStatus {
+                            text: input_request_expired_text(&expired.request_id),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
                 }
             };
 
@@ -1353,6 +1700,49 @@ impl ProtocolHandler for ControlChannel {
                         break;
                     }
                 }
+                Ok(ClientMessage::InputResponse { request_id, selected_option }) => {
+                    match &pending_input_request {
+                        Some(pending) if pending.request_id == request_id => {
+                            debug!(
+                                peer = %remote,
+                                request_id = %request_id,
+                                selected_option = %selected_option,
+                                "control channel: input_request answered"
+                            );
+                            pending_input_request = None;
+                            if events_tx
+                                .send(ControlEvent::Ack {
+                                    request_id: request_id.clone(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        _ => {
+                            // Per PROTOCOL.md's malformed-input philosophy:
+                            // an InputResponse that doesn't match anything
+                            // outstanding (already expired, already
+                            // answered, or never sent) is not a transport
+                            // error -- reply with a normal error event and
+                            // keep the connection open.
+                            warn!(
+                                peer = %remote,
+                                request_id = %request_id,
+                                "control channel: input_response for no matching pending input_request (already expired or unknown), ignoring"
+                            );
+                            if events_tx
+                                .send(ControlEvent::Error {
+                                    request_id: request_id.clone(),
+                                    message: "no matching pending input_request (already expired or unknown)".to_string(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
                 Ok(msg) => {
                     debug!(peer = %remote, ?msg, "control channel: received message");
                     // task_id threading: an inbound envelope that already
@@ -1377,14 +1767,19 @@ impl ProtocolHandler for ControlChannel {
                     // `Stop` has no `Done` terminal event of its own kind to close the loop on
                     // (see `HoloControlBridge::handle_stop`, which emits `Done{Canceled}` for
                     // dropped queued prompts using *their own* `request_id`s, not `Stop`'s), so
-                    // it is intentionally not given a start record here. Recorded from `msg`
-                    // itself, before it's consumed into `to_control_message` below -- this is
-                    // the only point in this whole turn where `ActionClass` (which wire message
-                    // kind arrived) is known; `ControlEvent`/`ControlMessage` never carry it.
+                    // it is intentionally not given a start record here. `Pin`/`InputResponse`
+                    // are handled entirely by their own arms above and never actually reach this
+                    // match (kept as an explicit `None` arm so the match stays exhaustive over
+                    // `ClientMessage`). Recorded from `msg` itself, before it's consumed into
+                    // `to_control_message` below -- this is the only point in this whole turn
+                    // where `ActionClass` (which wire message kind arrived) is known;
+                    // `ControlEvent`/`ControlMessage` never carry it.
                     if let Some(action_class) = match &msg {
                         ClientMessage::Prompt { .. } => Some(ActionClass::Prompt),
                         ClientMessage::VoiceTranscript { .. } => Some(ActionClass::VoiceTranscript),
-                        ClientMessage::Stop | ClientMessage::Pin { .. } => None,
+                        ClientMessage::Stop
+                        | ClientMessage::Pin { .. }
+                        | ClientMessage::InputResponse { .. } => None,
                     } {
                         audit_starts.lock().expect("audit_starts lock poisoned").insert(
                             request_id.clone(),
@@ -1394,8 +1789,8 @@ impl ProtocolHandler for ControlChannel {
                             },
                         );
                     }
-                    // Only `Pin` maps to `None`, and that variant is
-                    // handled entirely by the arm above -- every other
+                    // Only `Pin`/`InputResponse` map to `None`, and both are
+                    // handled entirely by the arms above -- every other
                     // `ClientMessage` variant always produces `Some`.
                     let Some(control_message) = to_control_message(request_id, msg) else {
                         continue;
