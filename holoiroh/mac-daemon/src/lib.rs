@@ -18,4 +18,5 @@ pub mod auth;
 pub mod capture;
 pub mod control_channel;
 pub mod holo_bridge;
+pub mod limits;
 pub mod permissions;

@@ -24,10 +24,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, RwLock};
 use tokio::sync::mpsc;
 
 use crate::holo_bridge::a2a_client::{A2aClient, TaskUpdate, TerminalState};
+use crate::limits::ActionCounter;
 
 /// One incoming control-channel message, keyed by the `type` discriminator the task
 /// description names explicitly (`"prompt"`, `"voice_transcript"`, `"stop"`).
@@ -203,6 +205,15 @@ pub struct HoloControlBridge {
     /// `AtomicBool` so the "check busy, and if free mark busy" step is one atomic
     /// critical section together with the queue-length check below (a plain
     /// compare-and-swap on its own can't also observe/mutate `queue` in the same step).
+    ///
+    /// This is also the concrete mechanism that enforces
+    /// [`crate::limits::MAX_ACTIVE_TASKS_PER_MAC`] (PRD 10.4): with the cap
+    /// at 1, "at most one task actively running" is exactly "at most one
+    /// `Prompt`/`VoiceTranscript` turn holds `busy == true` at a time" --
+    /// every other concurrent request is queued (see `queue` below), never
+    /// run concurrently. No separate counter is needed for a cap of 1; this
+    /// doc comment exists so that equivalence is explicit rather than an
+    /// unstated coincidence.
     busy: Mutex<bool>,
     /// Prompts that arrived while `busy` was `true`, oldest-first (`pop_front` drains in
     /// arrival order). Guarded by the same lock discipline as `busy`: both are read/written
@@ -337,6 +348,17 @@ impl HoloControlBridge {
                 self.emit(ControlEvent::Queued { request_id, ahead });
                 return;
             }
+            // `busy` flipping true here is the one and only place a task becomes "active" on
+            // this Mac; `MAX_ACTIVE_TASKS_PER_MAC` (PRD 10.4) is a `usize` rather than a `bool`
+            // to describe an eventual general cap, but a plain boolean IS the cap==1 case (a
+            // `bool` has exactly two states, "0 active" / "1 active", matching a cap of 1
+            // exactly) -- this assertion makes that equivalence a real, checked invariant
+            // instead of only a doc comment's claim.
+            debug_assert_eq!(
+                crate::limits::MAX_ACTIVE_TASKS_PER_MAC,
+                1,
+                "busy: Mutex<bool> only models a max-1-active-task cap; a higher cap needs a counter, not a bool"
+            );
             *busy = true;
         }
 
@@ -350,14 +372,96 @@ impl HoloControlBridge {
     /// (`handle_prompt` for the immediately-run case, `drain_queue` for queued ones) own the
     /// busy-flag lifecycle so this stays a plain "run this one turn" primitive reusable from
     /// both call sites.
+    ///
+    /// ## Agent action cap ([`crate::limits::AGENT_ACTION_CAP_DEFAULT`], PRD 10.4)
+    ///
+    /// A fresh [`ActionCounter`] is constructed per turn and
+    /// [`ActionCounter::try_record`] is called once for every
+    /// [`TaskUpdate::Working`] update the backend streams -- each `Working`
+    /// update is one unit of observable agent progress (a tool call/step),
+    /// which is the closest real signal this bridge has to "one agent
+    /// action" (the backend's `TrajectoryEvent` union is opaque JSON to
+    /// this crate -- see `holo_bridge`'s own module doc on why -- so a
+    /// finer per-tool-call count isn't available without decoding it).
+    ///
+    /// **Real enforcement, with one honestly-documented limitation**: once
+    /// the cap is hit, every subsequent update for this turn -- of *any*
+    /// variant, not just further `Working` ones -- is suppressed via a
+    /// latch (`capped`), and the turn's outcome is reported as a capped
+    /// [`ControlEvent::Error`] instead of whatever the backend eventually
+    /// returns. The latch matters: without it, an `Answer`/`Terminal`
+    /// update arriving right after the capped `Working` update would skip
+    /// the action-counting branch entirely (it isn't `Working`) and get
+    /// emitted immediately, racing ahead of (or duplicating) the
+    /// capped-turn error emitted once `send_and_stream` returns. What this
+    /// does **not** do: actually stop `holo serve` from continuing to run
+    /// the agent past the 100th action server-side.
+    /// [`crate::holo_bridge::a2a_client::A2aClient::send_and_stream`]'s
+    /// `on_update` callback is a plain synchronous `FnMut(TaskUpdate)` with
+    /// no return value the caller can use to signal "abort the stream", and
+    /// issuing a real `tasks/cancel` requires the resolved `context_id`
+    /// [`crate::holo_bridge::a2a_client::A2aClient::send_and_stream`] only
+    /// returns *after* the stream ends -- so a true server-side abort
+    /// exactly at action 101 is not reachable without changing
+    /// `send_and_stream`'s callback contract to let it return an abort
+    /// signal, which is out of this change's scope (see this module's
+    /// `holo_bridge` doc-level "what could not be confirmed" convention:
+    /// this is the same kind of honestly-scoped gap, not a silent one).
     async fn run_prompt(&self, request_id: String, text: String, context_id: Option<&str>) {
         let request_id_for_updates = request_id.clone();
+        let actions = ActionCounter::new_default();
+        // Latched once the cap is hit, so every subsequent update of *any* variant -- not just
+        // further `Working` ones -- is suppressed too. Without this, an `Answer`/`Terminal`
+        // update arriving right after the capped `Working` update would skip the
+        // `try_record`-guarded branch entirely (it isn't `Working`) and get emitted immediately,
+        // racing ahead of the capped-turn `ControlEvent::Error` this function emits below --
+        // the peer could see a real success/terminal event interleaved with (or before) the
+        // cap error. A `std::sync::atomic::AtomicBool` rather than reusing `actions.count()`
+        // for this check because `count() >= cap()` is also true exactly on the call that
+        // *causes* the cap to be hit, and that call's own `Working` update must still be
+        // suppressed by the `try_record` branch above it, not one this flag would also catch
+        // one update later than necessary.
+        let capped = std::sync::atomic::AtomicBool::new(false);
         let client = self.client.read().expect("client lock poisoned").clone();
         let result = client
             .send_and_stream(&text, context_id, |update| {
+                if capped.load(Ordering::SeqCst) {
+                    return;
+                }
+                if matches!(update, TaskUpdate::Working { .. }) {
+                    if let Err(cap) = actions.try_record() {
+                        tracing::warn!(
+                            request_id = request_id_for_updates,
+                            cap,
+                            "agent action cap reached for this task (PRD 10.4); suppressing further progress events"
+                        );
+                        capped.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
                 self.emit(translate_update(&request_id_for_updates, update));
             })
             .await;
+
+        if actions.count() >= actions.cap() {
+            tracing::warn!(
+                request_id,
+                actions = actions.count(),
+                cap = actions.cap(),
+                "prompt turn hit the agent action cap (PRD 10.4)"
+            );
+            self.emit(ControlEvent::Error {
+                request_id,
+                message: format!(
+                    "agent action cap reached ({} actions, cap {}); turn's further progress was suppressed. \
+                     Note: this does not stop the backend agent from continuing to run server-side -- \
+                     see HoloControlBridge::run_prompt's doc for why a true server-side abort isn't wired yet.",
+                    actions.count(),
+                    actions.cap()
+                ),
+            });
+            return;
+        }
 
         match result {
             Ok(resolved_context_id) => {

@@ -19,6 +19,7 @@ mod auth;
 mod capture;
 mod control_channel;
 mod holo_bridge;
+mod limits;
 mod permissions;
 
 use std::sync::Arc;
