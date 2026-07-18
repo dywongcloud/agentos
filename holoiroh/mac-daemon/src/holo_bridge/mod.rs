@@ -139,6 +139,15 @@ impl HoloBridge {
         self.control.replace_event_sink(events_tx);
     }
 
+    /// `(turn currently in flight, prompts queued behind it)`. See
+    /// [`HoloControlBridge::busy_state`] -- surfaced through the control channel's
+    /// on-connect greeting so a reconnecting peer immediately learns whether a stale
+    /// in-flight/queued turn survived the drop, without needing to wait for the next
+    /// [`ControlEvent`].
+    pub fn busy_state(&self) -> (bool, usize) {
+        self.control.busy_state()
+    }
+
     /// PID of the managed `holo serve` process, for diagnostics/health reporting.
     pub fn holo_serve_pid(&self) -> Option<u32> {
         self.process.pid()

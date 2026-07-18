@@ -420,8 +420,15 @@ impl ControlChannel {
     /// from an unknown device is rejected, not queued or buffered). On a
     /// correct PIN, the device id is persisted to the allowlist immediately
     /// via [`Allowlist::save`] so future connections skip the PIN step.
+    ///
+    /// Free function taking `auth` explicitly (rather than a `&self`
+    /// method reaching for `self.auth`) so unit tests below can exercise
+    /// this exact gate logic directly, without needing a real
+    /// `Arc<HoloBridge>` (which requires a live `holo serve` subprocess) to
+    /// construct a full `ControlChannel` -- [`ControlChannel::accept`]
+    /// simply calls `authenticate(&self.auth, ...)`.
     async fn authenticate<R>(
-        &self,
+        auth: &Arc<std::sync::Mutex<AuthState>>,
         remote: &str,
         lines: &mut tokio::io::Lines<R>,
     ) -> std::result::Result<(), String>
@@ -431,7 +438,7 @@ impl ControlChannel {
         // Fast path: already allowlisted (or PIN auth disabled entirely) --
         // no need to consume any input off the stream at all.
         {
-            let state = self.auth.lock().expect("auth lock poisoned");
+            let state = auth.lock().expect("auth lock poisoned");
             if state.expected_pin.is_none() || state.allowlist.contains_key(remote) {
                 return Ok(());
             }
@@ -459,7 +466,7 @@ impl ControlChannel {
             }
         };
 
-        let mut state = self.auth.lock().expect("auth lock poisoned");
+        let mut state = auth.lock().expect("auth lock poisoned");
         let expected = state
             .expected_pin
             .clone()
@@ -536,7 +543,7 @@ impl ProtocolHandler for ControlChannel {
         // must present the correct PIN as their first line before anything
         // else on this stream is processed. See `authenticate`'s doc and
         // `holoiroh/PAIRING.md`'s "Auth beyond ticket possession" section.
-        if let Err(reason) = self.authenticate(&remote.to_string(), &mut lines).await {
+        if let Err(reason) = Self::authenticate(&self.auth, &remote.to_string(), &mut lines).await {
             warn!(peer = %remote, reason = %reason, "control channel: rejecting connection, auth failed");
             let _ = write_line(&mut send, &ServerMessage::auth_rejected(reason)).await;
             let _ = send.finish();
@@ -550,6 +557,26 @@ impl ProtocolHandler for ControlChannel {
         if let Err(err) = write_line(&mut send, &ServerMessage::status("control channel ready")).await
         {
             warn!(peer = %remote, error = %err, "control channel: failed to send greeting");
+        }
+
+        // Reconnect visibility: if a Holo task survived a previous connection's drop (still
+        // running, or prompts still queued behind it -- see `HoloControlBridge::busy_state`),
+        // tell the newly (re)connected peer immediately rather than leaving it to guess from
+        // silence until the next `ControlEvent` happens to arrive. This is the direct fix for
+        // "a stale in-flight Holo task should not be silently abandoned -- surface its
+        // last-known state on reconnect".
+        let (busy, queued) = self.bridge.busy_state();
+        if busy || queued > 0 {
+            let text = match (busy, queued) {
+                (true, 0) => "reconnected: a Holo task is still running from before".to_string(),
+                (true, n) => format!(
+                    "reconnected: a Holo task is still running from before, {n} more queued behind it"
+                ),
+                (false, n) => format!("reconnected: {n} queued Holo task(s) waiting to run"),
+            };
+            if let Err(err) = write_line(&mut send, &ServerMessage::status(text)).await {
+                warn!(peer = %remote, error = %err, "control channel: failed to send reconnect status");
+            }
         }
 
         // Per-connection channel carrying translated ServerMessages back
@@ -795,6 +822,32 @@ mod tests {
     }
 
     #[test]
+    fn control_event_queued_maps_to_status_with_ahead_count() {
+        let event = ControlEvent::Queued {
+            request_id: "r1".into(),
+            ahead: 2,
+        };
+        assert_eq!(
+            ServerMessage::from_control_event(event),
+            ServerMessage::status("queued, 2 ahead")
+        );
+        let json = serde_json::to_string(&ServerMessage::status("queued, 2 ahead")).unwrap();
+        assert_eq!(json, r#"{"type":"status","text":"queued, 2 ahead"}"#);
+    }
+
+    #[test]
+    fn control_event_queued_zero_ahead_still_reads_correctly() {
+        let event = ControlEvent::Queued {
+            request_id: "r1".into(),
+            ahead: 0,
+        };
+        assert_eq!(
+            ServerMessage::from_control_event(event),
+            ServerMessage::status("queued, 0 ahead")
+        );
+    }
+
+    #[test]
     fn client_message_pin_round_trips() {
         let msg = ClientMessage::Pin {
             pin: "123456".to_string(),
@@ -843,96 +896,36 @@ mod tests {
         assert!(to_control_message("r1".into(), ClientMessage::Stop).is_some());
     }
 
-    // --- authenticate() gate tests: real execution against a fake
-    // HoloBridge and an in-memory duplex byte stream standing in for the
-    // iroh RecvStream, not a mock returning canned answers -- the actual
-    // `authenticate` method runs, reads real bytes off a real
-    // `tokio::io::Lines`, and its actual return value is asserted.
+    // --- authenticate() gate tests: real execution of
+    // `ControlChannel::authenticate` itself (not a re-implementation of its
+    // logic) against a real in-memory `AuthState` and a real
+    // `tokio::io::Lines` reader over an in-memory byte buffer standing in
+    // for the iroh `RecvStream` -- `authenticate` is a free function taking
+    // `&Arc<Mutex<AuthState>>` explicitly (see its doc comment) specifically
+    // so these tests can call it directly without needing a real
+    // `Arc<HoloBridge>` (which would require a live `holo serve`
+    // subprocess, unavailable in a unit-test sandbox).
 
-    fn fake_bridge() -> Arc<HoloBridge> {
-        // HoloBridge::start requires a real `holo` subprocess to succeed,
-        // which isn't available in a unit-test sandbox -- authenticate()
-        // never touches `self.bridge` at all (it only reads `self.auth`),
-        // so a bridge is never actually constructed in these tests; instead
-        // each test builds a bare `ControlChannel` value via a tiny local
-        // helper that skips `HoloBridge` entirely (see `channel_with_auth`
-        // below), matching what `authenticate` actually depends on.
-        unreachable!("fake_bridge is intentionally never called -- see channel_with_auth")
-    }
-
-    /// Builds a `ControlChannel` for gate testing without requiring a real
-    /// `HoloBridge` (see `fake_bridge`'s doc for why). Safe because
-    /// `authenticate()` only reads `self.auth`, never `self.bridge`, and
-    /// `ControlChannel`'s fields are private to this module so this helper
-    /// (in the same module, via `#[cfg(test)] mod tests { use super::*; }`)
-    /// can construct one directly with a null `Arc` pointer stand-in --
-    /// actually, `Arc<HoloBridge>` cannot be safely fabricated without a
-    /// real `HoloBridge`, so instead this constructs a `ControlChannel`
-    /// through the same `AuthState`-only path `authenticate` reads, proving
-    /// the gate logic in isolation from the bridge it happens to be a field
-    /// alongside.
-    fn auth_state_with_pin(pin: Option<&str>, pre_allowed: &[&str]) -> Arc<std::sync::Mutex<AuthState>> {
+    fn auth_state_with_pin(
+        pin: Option<&str>,
+        pre_allowed: &[&str],
+    ) -> Arc<std::sync::Mutex<AuthState>> {
         let mut allowlist = Allowlist::default();
         for device in pre_allowed {
             allowlist.add_entry(device.to_string(), None);
         }
         Arc::new(std::sync::Mutex::new(AuthState {
             allowlist,
-            allowlist_path: std::env::temp_dir().join("holoiroh-test-unused-allowlist.json"),
+            allowlist_path: std::env::temp_dir().join(format!(
+                "holoiroh-test-allowlist-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )),
             expected_pin: pin.map(|p| p.to_string()),
         }))
-    }
-
-    /// Minimal stand-in exercising exactly the logic `ControlChannel::authenticate`
-    /// runs, using the same `AuthState` type and the same `verify_pin`/
-    /// `Allowlist` calls -- duplicated here (rather than requiring a real
-    /// `Arc<HoloBridge>` to construct a full `ControlChannel`) so the gate's
-    /// actual decision logic is exercised against real in-memory duplex
-    /// I/O, not asserted from memory. Any behavior change to
-    /// `ControlChannel::authenticate` that isn't mirrored here should make
-    /// these tests and the real method visibly diverge on review.
-    async fn run_gate<R>(
-        auth: &Arc<std::sync::Mutex<AuthState>>,
-        remote: &str,
-        lines: &mut tokio::io::Lines<R>,
-    ) -> std::result::Result<(), String>
-    where
-        R: tokio::io::AsyncBufRead + Unpin,
-    {
-        {
-            let state = auth.lock().expect("auth lock poisoned");
-            if state.expected_pin.is_none() || state.allowlist.contains_key(remote) {
-                return Ok(());
-            }
-        }
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => return Err("connection closed before PIN was presented".to_string()),
-            Err(err) => return Err(format!("read error waiting for PIN: {err}")),
-        };
-        let msg: ClientMessage = match serde_json::from_str(&line) {
-            Ok(msg) => msg,
-            Err(err) => {
-                return Err(format!(
-                    "expected a PIN message first, got unparseable input: {err}"
-                ));
-            }
-        };
-        let candidate = match msg {
-            ClientMessage::Pin { pin } => pin,
-            other => {
-                return Err(format!(
-                    "expected a PIN message first from an unrecognized device, got {other:?} instead"
-                ));
-            }
-        };
-        let mut state = auth.lock().expect("auth lock poisoned");
-        let expected = state.expected_pin.clone().expect("checked Some above");
-        if !verify_pin(&candidate, &expected) {
-            return Err("incorrect PIN".to_string());
-        }
-        state.allowlist.add_entry(remote.to_string(), None);
-        Ok(())
     }
 
     fn lines_from(input: &'static str) -> tokio::io::Lines<std::io::Cursor<&'static [u8]>> {
@@ -946,7 +939,7 @@ mod tests {
         // an already-allowlisted device, this would return the "connection
         // closed before PIN was presented" error instead of Ok(()).
         let mut lines = lines_from("");
-        let result = run_gate(&auth, "node-known", &mut lines).await;
+        let result = ControlChannel::authenticate(&auth, "node-known", &mut lines).await;
         assert!(result.is_ok(), "known device must pass without needing a PIN: {result:?}");
     }
 
@@ -954,7 +947,7 @@ mod tests {
     async fn gate_allows_any_device_when_pin_auth_disabled() {
         let auth = auth_state_with_pin(None, &[]);
         let mut lines = lines_from("");
-        let result = run_gate(&auth, "node-totally-unknown", &mut lines).await;
+        let result = ControlChannel::authenticate(&auth, "node-totally-unknown", &mut lines).await;
         assert!(result.is_ok(), "auth disabled must let any device through: {result:?}");
     }
 
@@ -962,7 +955,7 @@ mod tests {
     async fn gate_accepts_unknown_device_with_correct_pin_and_allowlists_it() {
         let auth = auth_state_with_pin(Some("123456"), &[]);
         let mut lines = lines_from("{\"type\":\"pin\",\"pin\":\"123456\"}\n");
-        let result = run_gate(&auth, "node-new", &mut lines).await;
+        let result = ControlChannel::authenticate(&auth, "node-new", &mut lines).await;
         assert!(result.is_ok(), "correct PIN must be accepted: {result:?}");
         assert!(
             auth.lock().unwrap().allowlist.contains_key("node-new"),
@@ -974,7 +967,7 @@ mod tests {
     async fn gate_rejects_unknown_device_with_wrong_pin() {
         let auth = auth_state_with_pin(Some("123456"), &[]);
         let mut lines = lines_from("{\"type\":\"pin\",\"pin\":\"000000\"}\n");
-        let result = run_gate(&auth, "node-attacker", &mut lines).await;
+        let result = ControlChannel::authenticate(&auth, "node-attacker", &mut lines).await;
         assert_eq!(result, Err("incorrect PIN".to_string()));
         assert!(
             !auth.lock().unwrap().allowlist.contains_key("node-attacker"),
@@ -986,7 +979,7 @@ mod tests {
     async fn gate_rejects_unknown_device_sending_a_non_pin_message_first() {
         let auth = auth_state_with_pin(Some("123456"), &[]);
         let mut lines = lines_from("{\"type\":\"prompt\",\"text\":\"do something\"}\n");
-        let result = run_gate(&auth, "node-skipping-pin", &mut lines).await;
+        let result = ControlChannel::authenticate(&auth, "node-skipping-pin", &mut lines).await;
         assert!(result.is_err(), "a prompt sent before PIN auth must be rejected, not queued/processed");
         assert!(!auth.lock().unwrap().allowlist.contains_key("node-skipping-pin"));
     }
@@ -995,7 +988,7 @@ mod tests {
     async fn gate_rejects_unknown_device_that_closes_before_sending_pin() {
         let auth = auth_state_with_pin(Some("123456"), &[]);
         let mut lines = lines_from(""); // EOF immediately
-        let result = run_gate(&auth, "node-ghost", &mut lines).await;
+        let result = ControlChannel::authenticate(&auth, "node-ghost", &mut lines).await;
         assert_eq!(
             result,
             Err("connection closed before PIN was presented".to_string())
@@ -1006,7 +999,7 @@ mod tests {
     async fn gate_rejects_unknown_device_sending_malformed_json_as_pin() {
         let auth = auth_state_with_pin(Some("123456"), &[]);
         let mut lines = lines_from("not json at all\n");
-        let result = run_gate(&auth, "node-garbage", &mut lines).await;
+        let result = ControlChannel::authenticate(&auth, "node-garbage", &mut lines).await;
         assert!(result.is_err());
         assert!(!auth.lock().unwrap().allowlist.contains_key("node-garbage"));
     }
@@ -1015,7 +1008,7 @@ mod tests {
     async fn gate_rejects_unknown_device_sending_empty_pin() {
         let auth = auth_state_with_pin(Some("123456"), &[]);
         let mut lines = lines_from("{\"type\":\"pin\",\"pin\":\"\"}\n");
-        let result = run_gate(&auth, "node-empty-pin", &mut lines).await;
+        let result = ControlChannel::authenticate(&auth, "node-empty-pin", &mut lines).await;
         assert!(result.is_err(), "empty PIN must never satisfy verify_pin");
     }
 }

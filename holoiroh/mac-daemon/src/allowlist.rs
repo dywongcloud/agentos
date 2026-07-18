@@ -97,6 +97,11 @@ impl Allowlist {
     }
 
     /// Convenience wrapper around [`Self::load`] using [`Self::default_path`].
+    // Not yet called from `main.rs` (`ControlChannel::load_allowlist_best_effort`
+    // calls `Self::default_path` + `Self::load` separately so it can log the
+    // resolved path on failure) -- kept as the natural one-call convenience
+    // a future caller (or a test) reaches for, rather than deleted.
+    #[allow(dead_code)]
     pub fn load_default() -> Result<Self> {
         Self::load(Self::default_path()?)
     }
@@ -120,6 +125,12 @@ impl Allowlist {
     }
 
     /// Convenience wrapper around [`Self::save`] using [`Self::default_path`].
+    // Not yet called (control_channel.rs's authenticate() saves to the
+    // resolved `state.allowlist_path` it already holds rather than
+    // re-resolving the default path) -- kept as the natural convenience for
+    // any future caller that only has an `Allowlist` value, not also the
+    // path it was loaded from.
+    #[allow(dead_code)]
     pub fn save_default(&self) -> Result<()> {
         self.save(Self::default_path()?)
     }
@@ -155,26 +166,37 @@ impl Allowlist {
 
     /// Removes `device_id` from the allowlist (the revocation primitive
     /// `PAIRING.md` and README's "Security model" section describe but that
-    /// no call site invokes yet). Returns `true` if an entry was removed.
+    /// no call site invokes yet -- there is no `--revoke-device <id>` CLI
+    /// command or control-channel message wired up to call this). Returns
+    /// `true` if an entry was removed.
+    #[allow(dead_code)]
     pub fn remove_entry(&mut self, device_id: &str) -> bool {
         let before = self.entries.len();
         self.entries.retain(|e| e.device_id != device_id);
         self.entries.len() != before
     }
 
-    /// Number of allowlisted devices.
+    /// Number of allowlisted devices. Not yet called from `main.rs`/
+    /// `control_channel.rs` (no diagnostics/status command surfaces this
+    /// yet) -- kept as the obvious accessor a future `--list-paired-devices`
+    /// command would use.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True if no devices are allowlisted yet (the state a fresh install is
-    /// in before any pairing has ever completed).
+    /// in before any pairing has ever completed). Same not-yet-called status
+    /// as [`Self::len`].
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// All allowlisted device ids, for diagnostics (e.g. a future `--list-
-    /// paired-devices` CLI command).
+    /// paired-devices` CLI command). Same not-yet-called status as
+    /// [`Self::len`].
+    #[allow(dead_code)]
     pub fn device_ids(&self) -> HashSet<&str> {
         self.entries.iter().map(|e| e.device_id.as_str()).collect()
     }

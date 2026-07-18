@@ -14,10 +14,15 @@ does not share code, dependencies, or deployment with it.
 broadcast and ticket, and runs a working bidirectional control channel
 (`control_channel.rs`, ALPN `holoiroh/control/1`) bridged to `holo serve`
 (`holo_bridge/`) -- see [`PROTOCOL.md`](./PROTOCOL.md) for the control
-channel's wire schema. Screen/audio capture is still not wired up. `ios/`
-is a skeleton SwiftUI app that builds for iOS 17 but has no pairing, video,
-or control-channel logic yet -- the Swift side of the control channel
-(actually sending/receiving `PROTOCOL.md`'s JSON) remains unimplemented.
+channel's wire schema. The control channel's accept path now enforces a
+PIN + persisted device-allowlist auth gate on unrecognized devices (real,
+tested, see [`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md)) -- a QR
+rendering of the ticket and a ticket-rotation flag are designed in that
+same doc but not yet implemented. Screen/audio capture is still not wired
+up. `ios/` is a skeleton SwiftUI app that builds for iOS 17 but has no
+pairing, video, or control-channel logic yet -- the Swift side of the
+control channel (actually sending/receiving `PROTOCOL.md`'s JSON,
+including the new `pin`/`auth_rejected` messages) remains unimplemented.
 See "Build status" below for exact, witnessed build results.
 
 ## Components
@@ -332,14 +337,33 @@ toolchain, no iOS SDKs), neither of the above would be possible — bare
 a missing iOS SDK; the correct read is always "does an iOS-targeted build
 succeed," not "does the bare host-platform build succeed."
 
-## Security model (planned, not yet implemented)
+## Security model
 
-Pairing is currently "whoever has the ticket can connect" — the ticket
-itself is the credential. Before this is usable beyond local testing it
-needs a second factor (PIN entry, or an explicit allow-list keyed by the
-connecting peer's iroh node ID) so a leaked ticket alone isn't sufficient,
-plus a kill-switch on the Mac side to immediately revoke an active session
-and stop the broadcast.
+**Real, wired, tested as of this writing**: a PIN + device-allowlist second
+factor. See [`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md) for the full
+design and an honest real-vs-designed breakdown (short version: the PIN
+generation, allowlist persistence, and the accept-path enforcement gate are
+all real code, unit-tested and additionally verified end-to-end over a live
+`iroh` connection; a QR-code rendering of the ticket and a `--rotate-every`
+rotation flag are designed but not yet implemented; device revocation has a
+real, tested data-structure method (`Allowlist::remove_entry`) but no
+command/UI wired to call it yet).
+
+In short: the daemon generates a fresh PIN on every startup (printed
+alongside the ticket) and only lets an unrecognized device past the control
+channel's greeting after it presents that PIN; a device that does so once is
+persisted to `~/.holoiroh/allowlist.json` and skips the PIN on future
+connections. `--no-pin-auth` reverts to the old ticket-only behavior for
+local dev/testing.
+
+**Still missing**: a kill-switch on the Mac side to immediately stop the
+broadcast/revoke an *active* session (revocation data exists but nothing
+calls it, and even calling it wouldn't drop an already-open connection —
+see `PAIRING.md`'s "Device revocation" section), and the fuller mutual
+short-phrase-verification + iOS Keychain + cross-device-revocation spec
+tracked separately as this repo's `holoiroh-pairing-ticket-exchange` PRD
+row (Project Aro PRD P0-2/7.1), which supersedes this PIN+allowlist scheme
+once built.
 
 ## Setup (once implemented)
 
