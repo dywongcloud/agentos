@@ -8,10 +8,13 @@ description = "extern \"C\" FFI bridge exposing iroh-live ticket-connect/subscri
 name = "holoiroh_ios_bridge"
 # staticlib: what actually gets linked into the iOS xcframework (a `.a` per
 # target triple, combined via `xcodebuild -create-xcframework`).
-# lib (rlib): kept so this crate remains usable as an ordinary Rust
-# dependency too (unit tests via `cargo test`, `cargo check` on the host
-# triple in this environment where no iOS SDK/targets are installed --
-# see ../ios/IROH_FFI.md's "Environment note" section).
+# lib (rlib): kept so this crate remains usable as an ordinary Rust dependency
+# too -- specifically so `examples/ffi_probe.rs` (this repo's NO-UNIT-TESTS
+# rule means validation is a `cargo run --example` binary, not a test file)
+# can link the crate and exercise the real `extern "C"` surface's
+# construction/teardown + error paths on the host triple. The staticlib slice
+# is the one that cross-compiles to `aarch64-apple-ios` for the xcframework;
+# see ../ios/IROH_FFI.md's "As-built: xcframework packaging" section.
 crate-type = ["staticlib", "lib"]
 
 [dependencies]

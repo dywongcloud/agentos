@@ -1,14 +1,19 @@
 # iOS FFI: does iroh or iroh-live ship official Swift bindings?
 
 **Finding: the base `iroh` crate does; `iroh-live` (the crate this project
-actually depends on) does not. Path taken: (b), the fallback plan --
-a hand-written Rust staticlib crate, `holoiroh/ios-bridge/`.**
+actually depends on) does not. Path taken: (b) -- a hand-written Rust
+staticlib crate, `holoiroh/ios-bridge/`, which is now a real
+implementation (not a scaffold): see the "As-built" sections below.**
 
 This document records the research behind that decision so it doesn't need
-re-doing, and describes the fallback's shape. Researched 2026-07-17 via
-`gh api`/`gh repo view` against the live GitHub repos and `WebFetch` against
-raw READMEs/podspecs/manifests -- not from training-data memory of these
-projects, which move fast enough that memory would likely be stale.
+re-doing, and (as of the as-built pass) documents the real subscribe FFI,
+its witnessed builds, and the exact xcframework packaging + Swift
+integration. The research was done 2026-07-17 via `gh api`/`gh repo view`
+against the live GitHub repos and `WebFetch` against raw
+READMEs/podspecs/manifests; the as-built subscribe API was verified against
+the vendored `iroh-live` source at commit `5f95758` -- neither from
+training-data memory of these projects, which move fast enough that memory
+would likely be stale.
 
 ## What was checked
 
@@ -214,25 +219,168 @@ small Rust `staticlib` crate that:
   wrapper is separate follow-on work once the Rust implementations are
   real, not stubs).
 
-See `holoiroh/ios-bridge/src/lib.rs` for the actual scaffolded
-`extern "C"` signatures (currently `unimplemented!()` bodies -- wiring
-them to real `iroh-live` calls is separate follow-on work, per the task
-that requested this scaffold) and its module-level doc comment for the
-exact xcframework packaging command sequence.
+See `holoiroh/ios-bridge/src/lib.rs` for the real `extern "C"`
+implementation (the "As-built" section below records exactly what it does
+and what was witnessed) and its module-level doc comment.
 
-## Environment note: cross-compilation not available here
+## As-built: the real subscribe FFI
 
-`rustup target list --installed` in this environment shows only
-`aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, and three `wasm32`/
-`x86_64-unknown-linux-*` targets -- **no** `aarch64-apple-ios` or
-`aarch64-apple-ios-sim`, and `cargo-lipo` is not installed. This means the
-`ios-bridge` crate scaffolded here has been verified with `cargo check -p
-ios-bridge` on the host triple only; actually cross-compiling to an iOS
-target (`cargo build --target aarch64-apple-ios`) and producing the
-`.xcframework` requires a macOS machine with Xcode installed and the
-iOS/iOS-simulator rustup targets added (`rustup target add
-aarch64-apple-ios aarch64-apple-ios-sim`) -- a separate, later step, not
-something this environment can complete or fake evidence of.
+The `ios-bridge` crate is **no longer a scaffold** -- every `extern "C"`
+function has a real body wired to the actual `iroh-live` subscribe API,
+verified against the vendored crate source at the pinned commit `5f95758`
+(not guessed -- the exact call chain was read out of
+`~/.cargo/git/checkouts/iroh-live-*/5f95758/iroh-live/examples/subscribe_test.rs`,
+`frame_dump.rs`, `iroh-live/src/{live,subscription,ticket}.rs`, and
+`moq-media/src/subscribe.rs`).
+
+### The verified call chain
+
+| Step | Real `iroh-live` API (source location) |
+| --- | --- |
+| Bind + session | `iroh::Endpoint::builder(iroh::endpoint::presets::N0).bind().await` -> `iroh_live::Live::builder(ep).with_router().spawn()` (the exact pattern `subscribe_test.rs`/`frame_dump.rs` use) |
+| Parse ticket | `iroh_live::ticket::LiveTicket::from_str(s)` -> a struct with public `endpoint: EndpointAddr` + `broadcast_name: String` (`iroh-live/src/ticket.rs`) |
+| Connect + subscribe | `live.subscribe(ticket.endpoint, &ticket.broadcast_name).await` -> `iroh_live::Subscription` (`iroh-live/src/live.rs:229`) |
+| Get video track | `subscription.broadcast().video_ready().await` -> `moq_media::subscribe::VideoTrack` (waits for the catalog to advertise a video rendition, then subscribes best-quality and starts the decoder pipeline -- VideoToolbox on Apple targets; `moq-media/src/subscribe.rs:688`) |
+| Pull a frame | `track.try_recv()` (non-blocking, drains to the latest) -> `Option<moq_media::format::VideoFrame>` (`moq-media/src/subscribe.rs:1089`) |
+| Frame bytes | `frame.rgba_image().as_raw()` -> tightly-packed `width*height*4` RGBA8 `&[u8]`, normalizing any backing pixel format (packed RGBA/BGRA, GPU, NV12) (`rusty-codecs/src/format.rs:748`) |
+
+The C surface maps that onto: `holoiroh_ios_bridge_new` (runtime + endpoint
+bind + `Live` spawn) -> `holoiroh_ios_bridge_ticket_connect` (parse +
+`live.subscribe`) -> `holoiroh_ios_bridge_subscribe` (`video_ready`) ->
+`holoiroh_ios_bridge_poll_next_frame` (non-blocking `try_recv`, RGBA8 bytes
+into a caller-owned buffer + a `HoloirohFrame` metadata struct with
+`width`/`height`/`timestamp_us`/`pixel_format`/`kind`) -> explicit
+`_subscription_free`/`_free`. `async`/`await` never crosses the C ABI: a
+Tokio multi-thread runtime owned inside the crate drives every async call
+via `block_on` for connect/subscribe, while poll is a synchronous
+`try_recv`. Every fallible function is wrapped in `catch_unwind` so a Rust
+panic can never unwind across the boundary (undefined behavior); it returns
+a negative `HoloirohStatus` + a heap error string (freed via
+`holoiroh_ios_bridge_free_error_string`) instead.
+
+The two control-channel functions (`_control_send`/`_poll_control_event`)
+are honestly **not implemented** in this build -- the control channel is a
+separate iroh ALPN (`holoiroh/control/1`), not part of the media subscribe
+path -- so they return `HOLOIROH_ERR_UNSUPPORTED` (never a panic) until the
+iOS control transport is built (tracked separately; see
+`holoiroh/README.md`'s "Remote kill-switch").
+
+### Witnessed builds (this environment, real execution)
+
+The prior "cross-compilation not available here" note is **superseded** --
+this environment has Xcode (iPhoneOS SDK 26.4) and the iOS rustup target is
+installable. Witnessed:
+
+- **`cargo build -p holoiroh-ios-bridge` (host `aarch64-apple-darwin`):**
+  succeeds, **0 warnings** -- compiles the full `iroh-live` / `iroh-moq` /
+  `moq-media` / `rusty-codecs` / `openh264` / `objc2-av-foundation` graph
+  into the staticlib+rlib.
+- **`rustup target add aarch64-apple-ios` then `cargo build -p
+  holoiroh-ios-bridge --target aarch64-apple-ios`:** **succeeds** (exit 0).
+  Produces `target/aarch64-apple-ios/debug/libholoiroh_ios_bridge.a`, and
+  `nm` on it lists all nine `_holoiroh_ios_bridge_*` `extern "C"` symbols as
+  Mach-O text symbols. **This is a real finding: the entire `iroh-live`
+  transitive dependency graph cross-compiles to a physical-device iOS
+  target here** -- no crate in the graph blocked it.
+- **`examples/ffi_probe.rs` (`cargo run --example ffi_probe`, no unit test
+  file per this repo's rule):** exit 0. Witnesses the C-ABI contract end to
+  end -- `_new` returns a non-null handle; a malformed ticket returns
+  `HOLOIROH_ERR_INVALID_TICKET` + a freed error string; a well-formed but
+  unreachable ticket returns `HOLOIROH_ERR_CONNECT_FAILED` ("No addressing
+  information available" -- the real `live.subscribe` dial failed cleanly,
+  since this sandbox has no reachable iroh relay) with no panic/hang;
+  not-connected `_subscribe` returns null; null args are tolerated across
+  the surface; the control fns report `HOLOIROH_ERR_UNSUPPORTED`; and full
+  teardown runs with no crash/leak.
+- **`swift build` for the iOS 17 simulator** (`--sdk iphonesimulator
+  --triple arm64-apple-ios17.0-simulator`): succeeds -- `IrohLiveFrameSource.swift`
+  compiles against the real iOS SDK.
+
+### What is real vs. still needs a device / network / Xcode-link
+
+**Real and witnessed:** the C ABI, its error handling and null-tolerance,
+the Rust subscribe wiring compiling and linking (host + `aarch64-apple-ios`
+staticlib with the exported symbols), the probe exercising construction /
+error paths / teardown, the C header compiling as valid C, and
+`IrohLiveFrameSource.swift` compiling against the iOS SDK.
+
+**Still needs a real device + network + a full Xcode project:** an actual
+frame arriving. That requires a live publisher (the Mac daemon) reachable
+over a real NAT-punched/relayed iroh connection, plus an Xcode app target
+that links the `.xcframework` (the one build step below). Headlessly, the
+dial cannot complete and no `VideoFrame` is produced -- so this is **not**
+"live video works." It is: the C ABI, the real subscribe wiring, and the
+cross-compile are all real and witnessed; the last mile (frames on screen)
+needs a device + network + link.
+
+## As-built: xcframework packaging (the one build step Xcode needs)
+
+The staticlib becomes an `.xcframework` the app target links. This is the
+same shape `iroh-ffi`'s own `Iroh` binary target uses, hand-assembled since
+there is no uniffi codegen on the `iroh-live` side:
+
+```sh
+cd holoiroh
+# 1. iOS rustup targets (device + both simulator arches). aarch64-apple-ios
+#    was installed and its build witnessed this session; the two sim targets
+#    are the same shape.
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios-sim
+
+# 2. A release staticlib per target.
+cargo build -p holoiroh-ios-bridge --release --target aarch64-apple-ios
+cargo build -p holoiroh-ios-bridge --release --target aarch64-apple-ios-sim
+cargo build -p holoiroh-ios-bridge --release --target x86_64-apple-ios-sim
+
+# 3. Fuse the two simulator slices into one fat binary (an xcframework slice
+#    must be a single binary, but "simulator" covers arm64 + Intel Macs).
+lipo -create \
+  target/aarch64-apple-ios-sim/release/libholoiroh_ios_bridge.a \
+  target/x86_64-apple-ios-sim/release/libholoiroh_ios_bridge.a \
+  -output target/libholoiroh_ios_bridge-sim.a
+
+# 4. The C header + module map already live in ios-bridge/include/ (committed:
+#    HoloirohIosBridge.h + module.modulemap). Regenerate the header's type
+#    section any time the extern "C" signatures change:
+#      (cd ios-bridge && cbindgen --config cbindgen.toml \
+#         --crate holoiroh-ios-bridge --output include/HoloirohIosBridge.h)
+#    then re-append the hand-kept function-prototype block (cbindgen 0.27 skips
+#    edition-2024 `#[unsafe(no_mangle)]` fns -- see the header's own note).
+
+# 5. Assemble the xcframework: device slice + fused simulator slice, each
+#    paired with the same headers dir (which carries the module map too).
+xcodebuild -create-xcframework \
+  -library target/aarch64-apple-ios/release/libholoiroh_ios_bridge.a \
+  -headers ios-bridge/include \
+  -library target/libholoiroh_ios_bridge-sim.a \
+  -headers ios-bridge/include \
+  -output HoloirohIosBridge.xcframework
+```
+
+### Linking it into the app (the single remaining Xcode step)
+
+`ios/` is a pure SwiftPM package; a pure package can't itself produce an
+installable `.app`, so a thin Xcode app target (or a SwiftPM binary target)
+wraps it. To wire the FFI in, that target needs exactly one thing: **add
+`HoloirohIosBridge.xcframework` under General -> Frameworks, Libraries, and
+Embedded Content** (or a `.binaryTarget(name: "HoloirohIosBridge", path:
+"HoloirohIosBridge.xcframework")` in a `Package.swift`). With it linked,
+`#if canImport(HoloirohIosBridge)` in
+`ios/Sources/HoloIrohApp/Video/IrohLiveFrameSource.swift` flips on and the
+real implementation compiles; without it, the file still builds (the
+`#else` branch is a compile-honest stub that logs "not linked" and produces
+no frames), which is why the headless `swift build` above succeeds. Because
+`iroh`'s `netwatch` calls into them on Apple platforms, also link
+**`SystemConfiguration`** and **`Network.framework`** (the same frameworks
+`iroh-ffi`'s own `Package.swift` links -- see Finding (a) above).
+
+Then swap the frame source at `MainView`'s single binding site: replace
+`SyntheticVideoFrameSource()` with `IrohLiveFrameSource(ticket: pastedTicket)`.
+`IrohLiveFrameSource` conforms to `VideoFrameSource`, pulls RGBA8 frames off
+`holoiroh_ios_bridge_poll_next_frame` on a background queue, wraps them in
+pooled `kCVPixelFormatType_32RGBA` `CVPixelBuffer`s, and pushes
+`.pixelBuffer(pb, pts: .invalid)` through the exact same `onFrame` seam the
+synthetic source uses -- so `VideoRenderView` shows them display-immediately
+with no change to the view.
 
 ## Sources consulted (all fetched live, not from memory)
 

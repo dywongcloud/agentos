@@ -45,18 +45,28 @@ points (thread-safe, display-immediately low-latency scheduling, and
 `.failed`-status flush-and-resume recovery) for the H.264/HEVC frames the
 Mac daemon's VideoToolbox-encoded `iroh-live` stream will decode to. The
 view binds to a small `VideoFrameSource` protocol so the concrete frame
-producer is swappable. **What is *not* wired yet is the frame *source*,
-not the renderer**: there is still no live `iroh-live` subscription
-feeding real frames in (that is the separate `ios-bridge`
-subscribe/poll-next-frame path -- see `ios/IROH_FFI.md`). To prove the
-render path works end-to-end without a network source, a
-`SyntheticVideoFrameSource` generates animated `CVPixelBuffer`s on device
-(a scrolling gradient + a sweeping bar, driven by a `CADisplayLink`) and
-pushes them through the exact same `onFrame`/`enqueue` seam a real source
-will use -- so the preview animates today and the real source drops into
-`MainView`'s single binding site later without touching the view. Read
-this honestly: **the render half is implemented and witnessed; the
-network source half is not** -- this is not "video streaming works."
+producer is swappable. The **network frame source now exists too**: the
+`ios-bridge` `extern "C"` FFI has a real `iroh-live` subscribe
+implementation (ticket-connect -> `Live::subscribe` -> `video_ready` ->
+non-blocking frame poll returning RGBA8 bytes across the C boundary --
+verified against the vendored crate source, see `ios/IROH_FFI.md`'s
+"As-built" section), and a Swift `IrohLiveFrameSource` (conforming to
+`VideoFrameSource`) wraps that FFI into pooled `CVPixelBuffer`s pushed
+through the same `onFrame` seam. To prove the render path works end-to-end
+without a network source, a `SyntheticVideoFrameSource` also generates
+animated `CVPixelBuffer`s on device (a scrolling gradient + a sweeping bar,
+driven by a `CADisplayLink`) and pushes them through the exact same
+`onFrame`/`enqueue` seam -- so the preview animates today and
+`IrohLiveFrameSource` drops into `MainView`'s single binding site (once the
+xcframework is linked) without touching the view. Read this honestly: **the
+render half AND the Rust subscribe FFI + Swift wrapper are implemented and
+witnessed (host + `aarch64-apple-ios` builds, an FFI probe exercising the
+C-ABI/error/teardown paths, the Swift source compiling against the iOS
+SDK); what still needs a real device + network + Xcode-link is an actual
+frame arriving on screen** -- the headless dial can't complete (no reachable
+iroh relay in this sandbox) and no full Xcode app target links the
+`.xcframework` here. This is **not** "video streaming works" -- it is "the
+subscribe FFI is real and compiles for iOS; the last mile needs a device."
 
 The rest is still not wired to a real transport: there is no iroh/FFI
 networking, no actual QR scanning, and no on-device transcription; the
@@ -224,10 +234,16 @@ holoiroh/
 │       └── registry_probe.rs              # registry round-trip + Single/Ambiguous/NotFound resolution + `open -b` deterministic launch
 ├── ios-bridge/                    # Rust staticlib crate: extern "C" FFI bridge for iOS
 │   ├── Cargo.toml                 # crate-type = ["staticlib", "lib"]
-│   └── src/lib.rs                 # ticket-connect/subscribe/poll-next-frame extern "C" fns (stub bodies)
+│   ├── cbindgen.toml              # cbindgen config for regenerating the C header's type section
+│   ├── include/
+│   │   ├── HoloirohIosBridge.h    # C header (the Swift-visible surface) matching the extern "C" ABI
+│   │   └── module.modulemap       # exposes the header as an importable Swift module
+│   ├── src/lib.rs                 # REAL ticket-connect/subscribe/poll-next-frame extern "C" impl (iroh-live subscribe, RGBA8 frames across the C boundary)
+│   └── examples/
+│       └── ffi_probe.rs           # cargo run --example: exercises the extern "C" construction/error/teardown paths (no unit tests, per repo rule)
 ├── ios/                            # Swift Package Manager package: the iOS client
 │   ├── Package.swift
-│   ├── IROH_FFI.md                 # research: no official Swift bindings for iroh-live -> ios-bridge/ fallback
+│   ├── IROH_FFI.md                 # as-built: real subscribe FFI + xcframework packaging + Swift integration (was: research/fallback plan)
 │   └── Sources/HoloIrohApp/
 │       ├── HoloIrohApp.swift       # @main App entry point
 │       ├── ContentView.swift       # NavigationStack: PairingView -> MainView
@@ -237,7 +253,8 @@ holoiroh/
 │       ├── Video/
 │       │   ├── VideoFrameSource.swift          # protocol seam: decoded-frame producer (VideoFrame = pixelBuffer | sampleBuffer)
 │       │   ├── VideoRenderView.swift           # UIViewRepresentable over AVSampleBufferDisplayLayer + enqueue(CVPixelBuffer/CMSampleBuffer)
-│       │   └── SyntheticVideoFrameSource.swift # on-device animated CVPixelBuffer generator (CADisplayLink) -- render witness, stands in for the network source
+│       │   ├── SyntheticVideoFrameSource.swift # on-device animated CVPixelBuffer generator (CADisplayLink) -- render witness, stands in for the network source
+│       │   └── IrohLiveFrameSource.swift       # REAL network source: wraps the ios-bridge poll-next-frame FFI into pooled CVPixelBuffers (behind #if canImport(HoloirohIosBridge) so the package still builds unlinked)
 │       └── Models/
 │           └── ServerMessage.swift # Swift mirror of PROTOCOL.md's wire schema
 └── README.md                       # this file
@@ -348,20 +365,27 @@ A thin client:
    `n0-computer/iroh-ffi` repo, but that only covers raw `Endpoint`/
    `Connection` — `iroh-live`'s `LocalBroadcast`/`subscribe`/frame-pull
    surface has no bindings at all). See [`ios/IROH_FFI.md`](./ios/IROH_FFI.md)
-   for the full research and rationale. The chosen path: a hand-written
-   Rust staticlib bridge, [`ios-bridge/`](./ios-bridge) (scaffolded with
-   stub `extern "C"` signatures for ticket-connect/subscribe/poll-next-frame;
-   real implementations are separate follow-on work), built into an
-   `.xcframework` for the Swift side to import — not yet integrated in
-   this skeleton.
+   for the full research and the as-built details. The chosen path: a
+   hand-written Rust staticlib bridge, [`ios-bridge/`](./ios-bridge), whose
+   `extern "C"` surface for ticket-connect/subscribe/poll-next-frame now has
+   a **real `iroh-live` subscribe implementation** (verified against the
+   vendored crate source), builds for the host **and** cross-compiles to
+   `aarch64-apple-ios` (both witnessed), and is packaged into an
+   `.xcframework` for the Swift side to import. The one remaining step is a
+   full Xcode app target linking that `.xcframework` — this SwiftPM skeleton
+   builds with or without it.
 2. **Live view.** The render surface is real: `VideoRenderView`
    (`AVSampleBufferDisplayLayer`) displays a stream of decoded frames
-   delivered through a `VideoFrameSource`. Once the `iroh-live`
-   subscription is wired (via `ios-bridge`), its decoded frames feed that
-   same surface, giving a live mirror of the Mac's screen. Until then the
-   view is bound to an on-device `SyntheticVideoFrameSource` so the render
-   path is exercised for real; the network frame source is the piece
-   that remains unbuilt, not the renderer.
+   delivered through a `VideoFrameSource`. The `iroh-live` subscription is
+   now wired on both sides: `ios-bridge`'s FFI pulls decoded RGBA8 frames,
+   and `IrohLiveFrameSource` (Swift, conforming to `VideoFrameSource`) wraps
+   them into `CVPixelBuffer`s and pushes them into this same surface —
+   giving a live mirror of the Mac's screen once a device links the
+   xcframework and reaches a live daemon. Until then the view is bound to an
+   on-device `SyntheticVideoFrameSource` so the render path is exercised for
+   real; the network source is now built and compiles for iOS, with only the
+   device + network + xcframework-link last mile remaining, not the source
+   itself.
 3. **Prompts.** A text field and a microphone button let the user send
    instructions. Voice input is transcribed (on-device or via a
    transcription service — TBD) before being sent as text over the

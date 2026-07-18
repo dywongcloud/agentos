@@ -1,0 +1,13 @@
+// Clang module map exposing the holoiroh-ios-bridge C ABI as an importable
+// module so Swift can `import HoloirohIosBridge` and call the extern "C"
+// functions in HoloirohIosBridge.h directly (wrapped ergonomically by
+// ../../ios/Sources/HoloIrohApp/Video/IrohLiveFrameSource.swift).
+//
+// This lives inside the xcframework's Headers/ directory alongside the header
+// (the shape `iroh-ffi`'s own Iroh binary target uses); `xcodebuild
+// -create-xcframework -headers include/` copies both in. See
+// ../../ios/IROH_FFI.md's "As-built: xcframework packaging" section.
+module HoloirohIosBridge {
+    header "HoloirohIosBridge.h"
+    export *
+}
