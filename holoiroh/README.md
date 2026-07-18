@@ -217,6 +217,7 @@ holoiroh/
 │       ├── audit_log_probe.rs             # AuditLogger append/round-trip + PRD P0-12 acceptance test (no dictated text on disk)
 │       ├── task_state_probe.rs            # TaskState serde round-trips + is_valid_transition, full lifecycle diagram
 │       ├── holo_bridge_queue_probe.rs     # HoloControlBridge concurrent-prompt-queueing races
+│       ├── holo_stop_probe.rs             # remote kill-switch: ClientMessage::Stop -> ControlMessage::Stop mapping + `holo stop`/`--force` arg construction + a real `holo stop` invocation + handle_stop queue-drain/error paths
 │       ├── local_model_probe.rs           # builds the exact llama-server + holo serve commands and verifies the local-inference env wiring, WITHOUT spawning the 21 GB model
 │       ├── executor_probe.rs              # every ComputerUseExecutor trait method against the real HoloDesktopExecutor (unreachable A2A backend)
 │       ├── policy_probe.rs                # policy 6-class taxonomy + decision table incl. the PRD 16a adversarial zero-send acceptance test
@@ -696,14 +697,53 @@ persisted to `~/.holoiroh/allowlist.json` and skips the PIN on future
 connections. `--no-pin-auth` reverts to the old ticket-only behavior for
 local dev/testing.
 
-**Still missing**: a kill-switch on the Mac side to immediately stop the
-broadcast/revoke an *active* session (revocation data exists but nothing
-calls it, and even calling it wouldn't drop an already-open connection —
-see `PAIRING.md`'s "Device revocation" section), and the fuller mutual
-short-phrase-verification + iOS Keychain + cross-device-revocation spec
-tracked separately as this repo's `holoiroh-pairing-ticket-exchange` PRD
-row (Project Aro PRD P0-2/7.1), which supersedes this PIN+allowlist scheme
-once built.
+### Remote kill-switch (stop/cancel)
+
+The remote **stop kill-switch** — an iOS "Stop"/"Cancel" control that halts
+whatever the agent is doing on the Mac — is wired end-to-end **on the daemon
+side** and structured-and-ready on the iOS side:
+
+- **Daemon side (real, wired, probe-witnessed).** A control-channel
+  `ClientMessage::Stop` maps (via
+  `control_channel::to_control_message`) to `ControlMessage::Stop` with no
+  `context_id`, which `HoloControlBridge::handle_stop` handles by draining
+  any queued prompts (each gets a terminal `Done{Canceled}`) and then
+  engaging the CLI-level global kill switch: it shells out to the real
+  `holo stop` (see `holo_bridge/stop.rs`), the same pause-then-cancel effect
+  as `holo-desktop-cli`'s own double-Esc / `holo stop`. A `force` variant
+  maps to `holo stop --force`. This whole path is witnessed by
+  `examples/holo_stop_probe.rs` (see "Build status" below): the
+  `ClientMessage::Stop → ControlMessage::Stop{context_id:None}` mapping, the
+  exact `holo stop` / `holo stop --force` argument-vector construction, a
+  **real `holo stop` invocation** against the installed `~/.holo/bin/holo`
+  (a benign no-op with no turn in flight), the full `handle_stop`
+  queue-drain, and the graceful `ControlEvent::Error` when the `holo` binary
+  is missing.
+- **iOS side (structured and ready, one wiring step remaining).** The
+  `SessionView` Working/Connecting/Input-needed/Draft-ready panels' "Cancel"
+  control now routes through a real control-channel send seam
+  (`ControlChannelSender.swift`'s `ControlChannelSending`) and sends the
+  actual `ClientMessage.stop`, JSON-encoded to its exact `{"type":"stop"}`
+  `PROTOCOL.md` wire form. What is **not** yet real is only the byte path off
+  the device: there is no `iroh`/FFI networking in the iOS skeleton yet, so
+  the seam's default `LoggingControlChannelSender` performs the real *encode*
+  and surfaces the message in the status/log panel instead of writing it to a
+  socket. The single remaining wiring step is documented on the
+  `ControlChannelSending` protocol: hand the encoded bytes to the
+  `ios-bridge` control-channel send FFI once that transport is built. So the
+  Stop action is ready to send the right message today; only the transport
+  underneath it is stubbed.
+
+**Still missing**: a *different* kill-switch — the Mac-side control to
+immediately stop the **broadcast** / revoke an *active already-open session*
+(revocation data exists but nothing calls it, and even calling it wouldn't
+drop an already-open connection — see `PAIRING.md`'s "Device revocation"
+section); the iOS control-channel **transport** itself (the one wiring step
+above — actually putting the encoded `stop`/`prompt` bytes on a real `iroh`
+stream); and the fuller mutual short-phrase-verification + iOS Keychain +
+cross-device-revocation spec tracked separately as this repo's
+`holoiroh-pairing-ticket-exchange` PRD row (Project Aro PRD P0-2/7.1), which
+supersedes this PIN+allowlist scheme once built.
 
 ## Session & rate limits (PRD 10.4)
 

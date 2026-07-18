@@ -224,8 +224,19 @@ entire bare message body):
   `text` field) but tagged separately so the daemon/UI can distinguish
   input modality for logging/UX (e.g. showing a mic icon in the status
   panel) without re-deriving it from context.
-- `stop`: cancels/interrupts whatever `holo-desktop-cli` is currently
-  doing. No `text`.
+- `stop`: the remote **kill-switch** — cancels/interrupts whatever
+  `holo-desktop-cli` is currently doing. No `text`. On the daemon this maps
+  (via `control_channel::to_control_message`) to `ControlMessage::Stop` with
+  no `context_id`, which `HoloControlBridge::handle_stop` handles by draining
+  any queued prompts (each gets a terminal `status`/`Done{Canceled}`) and
+  then engaging the CLI-level global kill switch by shelling out to
+  `holo stop` (see `mac-daemon/src/holo_bridge/stop.rs`) — the same
+  pause-then-cancel effect as the double-Esc / `holo stop` kill switch built
+  into `holo-desktop-cli` itself. Because the wire `stop` carries no
+  `context_id`, it always engages this *global* stop ("stop whatever is
+  running") rather than a scoped A2A `tasks/cancel`; a future schema revision
+  that threads a `context_id`/`task_id` through would let a client scope the
+  stop to one specific turn.
 - `pin`: presents a PIN for first-connection auth (see
   `mac-daemon/PAIRING.md`'s "Auth beyond ticket possession" section). Must
   be the **first** message sent by a client whose device id is not already

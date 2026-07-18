@@ -54,16 +54,33 @@
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
+/// The exact argument vector `holo_stop` passes to the `holo` CLI for a given
+/// `force` flag: `["stop"]` for a graceful pause-then-cancel, or
+/// `["stop", "--force"]` to additionally SIGKILL the `hai-agent-runtime`
+/// process (see this module's doc and `holo stop --help`).
+///
+/// Factored out of [`holo_stop`] as a pure function so the kill-switch's
+/// command construction is witnessable in isolation -- `examples/holo_stop_probe.rs`
+/// asserts on this directly for both `force` values without having to actually
+/// SIGKILL a runtime (which `holo stop --force` would do to any live
+/// `hai-agent-runtime`). `holo_stop` itself builds its `Command` from exactly
+/// this vector, so the probe is asserting on the real invocation shape, not a
+/// parallel copy that could drift.
+pub fn build_stop_args(force: bool) -> Vec<&'static str> {
+    if force {
+        vec!["stop", "--force"]
+    } else {
+        vec!["stop"]
+    }
+}
+
 /// Run `holo stop` (optionally `--force`) as a child process and wait for it to exit.
 ///
 /// `holo_bin` is the same executable path/name used to spawn `holo serve` (see
 /// `process.rs`) -- `stop` is a subcommand of the same CLI, not a separate binary.
 pub async fn holo_stop(holo_bin: &str, force: bool) -> Result<()> {
     let mut cmd = Command::new(holo_bin);
-    cmd.arg("stop");
-    if force {
-        cmd.arg("--force");
-    }
+    cmd.args(build_stop_args(force));
 
     tracing::info!(force, "issuing `{holo_bin} stop`");
 

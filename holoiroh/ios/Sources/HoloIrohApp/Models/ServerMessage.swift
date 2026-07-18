@@ -135,6 +135,18 @@ enum ClientMessage: Codable, Equatable {
             try container.encode(Kind.stop, forKey: .type)
         }
     }
+
+    /// Short label for the message's wire `type` discriminant, for the
+    /// status/log panel (e.g. a sent `.stop` shows as "stop"). Mirrors the
+    /// daemon's `ClientMessage::type_tag` snake_case discriminants exactly
+    /// (`"prompt"`, `"voice_transcript"`, `"stop"`).
+    var wireKindLabel: String {
+        switch self {
+        case .prompt: return "prompt"
+        case .voiceTranscript: return "voice_transcript"
+        case .stop: return "stop"
+        }
+    }
 }
 
 /// One entry in the status/log panel. Wraps a `ServerMessage` with a
