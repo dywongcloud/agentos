@@ -147,6 +147,13 @@ impl HoloBridge {
     /// Shut down the managed `holo serve` subprocess (SIGTERM, then SIGKILL after a grace
     /// period). Call this during daemon shutdown so `holo serve` (and, transitively, the
     /// `hai-agent-runtime` process it manages) doesn't outlive the daemon as an orphan.
+    ///
+    /// This is the preferred shutdown path (it awaits graceful exit); `HoloBridge` does not
+    /// implement its own `Drop` beyond what its fields already do -- `self.process` is a
+    /// [`HoloServeProcess`], whose own `Drop` impl (see `process.rs`) is the synchronous
+    /// safety net for the case where this method is never reached (e.g. `main.rs`'s
+    /// `Arc::try_unwrap(bridge)` failing because another clone is still alive elsewhere, or a
+    /// panic during shutdown).
     pub async fn shutdown(self) -> Result<()> {
         self.process.shutdown().await
     }

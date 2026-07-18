@@ -42,6 +42,12 @@ eventsource-stream = "0.2"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
+# Registers a synchronous SIGINT/SIGTERM handler in main.rs so the daemon's explicit shutdown
+# sequence (closing the iroh Live session + LocalBroadcast, terminating the tracked `holo serve`
+# child) runs on both signals -- `tokio::signal::ctrl_c()` alone only ever fires on SIGINT, not
+# SIGTERM (e.g. what plain `kill`/launchd send by default), which would skip graceful cleanup on
+# that path entirely.
+ctrlc = "3"
 
 [target.'cfg(unix)'.dependencies]
 # Used only to send SIGTERM (graceful shutdown) to the `holo serve` child before falling back

@@ -19,6 +19,7 @@ mod holo_bridge;
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use iroh::protocol::Router;
 use iroh_live::{Live, media::publish::LocalBroadcast, ticket::LiveTicket};
 use tokio::sync::mpsc;
@@ -113,12 +114,51 @@ async fn main() -> anyhow::Result<()> {
     info!(name = %BROADCAST_NAME, "publishing");
 
     // --- wait for shutdown ---
-    tokio::signal::ctrl_c().await?;
+    //
+    // `ctrlc::set_handler` (not `tokio::signal::ctrl_c()`) so both SIGINT *and* SIGTERM trigger
+    // graceful cleanup: `ctrl_c()` alone only ever fires on SIGINT, which would silently skip
+    // the explicit shutdown sequence below (dropping/closing the iroh `Live` session +
+    // `LocalBroadcast`, terminating the tracked `holo serve` child) on a plain `kill` or
+    // launchd/Docker stop, both of which send SIGTERM by default. `ctrlc`'s handler runs on its
+    // own dedicated OS thread and is not `async`, so it only flips a channel to wake the async
+    // task below rather than doing any cleanup itself.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_tx = std::sync::Mutex::new(Some(shutdown_tx));
+    ctrlc::set_handler(move || {
+        if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+    })
+    .context("failed to register SIGINT/SIGTERM handler")?;
+    let _ = shutdown_rx.await;
+
+    info!("shutdown signal received, cleaning up");
     router.shutdown().await?;
+    // Explicitly drop the broadcast before `live.shutdown()` -- `LocalBroadcast` owns its own
+    // media pipelines/track handles and releases them in its own `Drop` impl (see vendored
+    // `iroh-live`'s `moq-media/src/publish.rs`); dropping it here (rather than letting it fall
+    // out of scope implicitly at the end of `main`) makes that release happen deterministically
+    // as part of this shutdown sequence, before the underlying `Live` session it was published
+    // through goes away.
+    drop(broadcast);
     if let Some(bridge) = bridge {
-        if let Ok(bridge) = Arc::try_unwrap(bridge) {
-            if let Err(err) = bridge.shutdown().await {
-                warn!(error = %err, "holo_bridge shutdown error");
+        match Arc::try_unwrap(bridge) {
+            Ok(bridge) => {
+                if let Err(err) = bridge.shutdown().await {
+                    warn!(error = %err, "holo_bridge shutdown error");
+                }
+            }
+            Err(bridge) => {
+                // Another Arc clone is still alive (e.g. a control-channel connection handler
+                // still running its accept loop) -- we can't consume `HoloBridge::shutdown(self)`
+                // through a shared reference. Falling out of scope here still runs
+                // `HoloServeProcess`'s `Drop` safety net (best-effort SIGTERM + kill_on_drop)
+                // once every clone is gone, so the child is not left orphaned; it just won't get
+                // the graceful awaited SIGTERM-then-wait path `shutdown()` provides.
+                warn!(
+                    refs = Arc::strong_count(&bridge),
+                    "holo_bridge still has other Arc references at shutdown; falling back to Drop-based cleanup instead of graceful shutdown()"
+                );
             }
         }
     }

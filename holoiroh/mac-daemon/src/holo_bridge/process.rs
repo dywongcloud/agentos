@@ -33,6 +33,7 @@
 //!   simply refused (nothing is bound yet).
 
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -41,6 +42,15 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
 use crate::holo_bridge::a2a_client::A2aClient;
+
+/// Process-wide guard ensuring at most one `holo serve` child is ever tracked as running by
+/// this daemon at a time. `HoloBridge::start` (the only current call site) is invoked once per
+/// daemon lifetime, but this guard is the actual enforcement point rather than relying on that
+/// caller discipline: [`HoloServeProcess::spawn`] refuses to spawn a second child while this is
+/// `true`, and it is cleared on every exit path (`shutdown()`, `Drop`) so a later `spawn()` call
+/// (e.g. after a future "restart holo serve" feature) can succeed once the previous child is
+/// actually gone.
+static HOLO_SERVE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Env var `holo serve` reads for its bearer token (`ServeSettings.auth_token` /
 /// `A2A_TOKEN_ENV` in `serve.py`). Setting this ourselves before spawn means we never have
@@ -83,6 +93,29 @@ impl HoloServeProcess {
     /// `holo_bin` is the path to (or bare name of) the `holo` CLI executable; resolved via
     /// `PATH` by `tokio::process::Command` when it's a bare name like `"holo"`.
     pub async fn spawn(holo_bin: &str, port: u16) -> Result<Self> {
+        // Refuse to double-spawn: at most one `holo serve` child may be tracked as running by
+        // this daemon at a time (see `HOLO_SERVE_RUNNING` doc). `compare_exchange` makes the
+        // check-and-set atomic so two concurrent `spawn()` calls can't both observe `false` and
+        // both proceed.
+        if HOLO_SERVE_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            bail!("holo serve is already running (tracked child process exists); refusing to spawn a second instance");
+        }
+
+        // From here on, any early return must flip the guard back off -- wrap the rest of the
+        // body so `?`/`bail!` below can't leak the guard in the "true but no child exists" state.
+        match Self::spawn_inner(holo_bin, port).await {
+            Ok(process) => Ok(process),
+            Err(err) => {
+                HOLO_SERVE_RUNNING.store(false, Ordering::SeqCst);
+                Err(err)
+            }
+        }
+    }
+
+    async fn spawn_inner(holo_bin: &str, port: u16) -> Result<Self> {
         let auth_token = generate_token();
         let base_url = format!("http://127.0.0.1:{port}");
 
@@ -137,8 +170,23 @@ impl HoloServeProcess {
     /// Terminate `holo serve`. Sends SIGTERM first (mirrors the CLI's own `Ctrl+C to stop`
     /// story -- `holo serve` has no documented graceful-shutdown RPC of its own, it relies on
     /// process signals / uvicorn's own signal handling), then force-kills if it doesn't exit
-    /// promptly.
+    /// promptly. This is the primary (async, awaitable) shutdown path; [`Drop`] below is a
+    /// best-effort synchronous safety net for the case where this was never called (early
+    /// return, panic unwind), not a replacement for it -- calling this explicitly is always
+    /// preferred since it can actually wait for exit.
     pub async fn shutdown(mut self) -> Result<()> {
+        let result = self.terminate_and_wait().await;
+        // Mark the child as no longer tracked regardless of outcome, so a later `spawn()` isn't
+        // permanently refused because this one failed to confirm exit. `self` is consumed here
+        // and its `Drop` impl will also observe `Ordering::SeqCst` false -> false (a harmless
+        // no-op store), since we already cleared it.
+        HOLO_SERVE_RUNNING.store(false, Ordering::SeqCst);
+        result
+    }
+
+    /// Shared SIGTERM-then-wait-then-SIGKILL logic used by both [`Self::shutdown`] and, as a
+    /// synchronous last resort, [`Drop`].
+    async fn terminate_and_wait(&mut self) -> Result<()> {
         #[cfg(unix)]
         {
             if let Some(pid) = self.child.id() {
@@ -162,6 +210,35 @@ impl HoloServeProcess {
                 Ok(())
             }
         }
+    }
+}
+
+impl Drop for HoloServeProcess {
+    /// Best-effort safety net for the case where [`Self::shutdown`] was never called (e.g. the
+    /// daemon panicked, or a future call site drops a `HoloServeProcess` without awaiting
+    /// shutdown). `Drop` cannot be `async`, so this cannot wait for graceful exit the way
+    /// `shutdown()` does -- it best-effort SIGTERMs the child synchronously (same signal
+    /// `shutdown()` sends first) and then relies on the `Command`'s own `kill_on_drop(true)`
+    /// (set in `spawn_inner`) as the final backstop: when `self.child` (a `tokio::process::Child`)
+    /// is dropped right after this, `kill_on_drop` SIGKILLs it if it's still alive. Also clears
+    /// the single-instance guard so the process is never left permanently un-spawnable after an
+    /// unclean exit.
+    fn drop(&mut self) {
+        HOLO_SERVE_RUNNING.store(false, Ordering::SeqCst);
+        #[cfg(unix)]
+        {
+            if let Some(pid) = self.child.id() {
+                tracing::warn!(pid, "HoloServeProcess dropped without shutdown(); sending SIGTERM as a safety net (kill_on_drop will SIGKILL if this doesn't land in time)");
+                // SAFETY: same as in `terminate_and_wait` -- valid pid, well-defined syscall,
+                // ESRCH-on-already-exited is a harmless no-op.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+            }
+        }
+        // No synchronous wait here (Drop can't await); `kill_on_drop(true)` on the underlying
+        // `Command` (see spawn_inner) guarantees the OS process doesn't outlive this `Child`
+        // handle even if the SIGTERM above didn't have time to take effect.
     }
 }
 
