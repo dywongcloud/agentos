@@ -39,7 +39,7 @@ See "Build status" below for exact, witnessed build results.
 
 ```
 holoiroh/
-├── Cargo.toml                     # Rust workspace manifest (members = ["mac-daemon"])
+├── Cargo.toml                     # Rust workspace manifest (members = ["mac-daemon", "ios-bridge"])
 ├── PROTOCOL.md                    # control-channel wire schema (ClientMessage/ServerMessage)
 ├── mac-daemon/                    # Rust binary crate: the Mac-side daemon
 │   ├── Cargo.toml
@@ -53,8 +53,12 @@ holoiroh/
 │           ├── control.rs         # internal ControlMessage/ControlEvent (request_id/context_id-correlated)
 │           ├── process.rs         # manages the `holo serve` subprocess
 │           └── stop.rs
+├── ios-bridge/                    # Rust staticlib crate: extern "C" FFI bridge for iOS
+│   ├── Cargo.toml                 # crate-type = ["staticlib", "lib"]
+│   └── src/lib.rs                 # ticket-connect/subscribe/poll-next-frame extern "C" fns (stub bodies)
 ├── ios/                            # Swift Package Manager package: the iOS client
 │   ├── Package.swift
+│   ├── IROH_FFI.md                 # research: no official Swift bindings for iroh-live -> ios-bridge/ fallback
 │   └── Sources/HoloIrohApp/
 │       ├── HoloIrohApp.swift       # @main App entry point
 │       ├── ContentView.swift       # NavigationStack: PairingView -> MainView
@@ -155,8 +159,18 @@ and [MoQ](https://quic.video/) for media framing):
 A thin client:
 
 1. **Pairing.** The user pastes or scans (QR) the ticket the Mac daemon
-   printed, and the app dials it via the iroh transport (a Swift binding
-   / FFI over `iroh`'s Rust core — not yet integrated in this skeleton).
+   printed, and the app dials it via the iroh transport. **Neither `iroh`
+   nor `iroh-live` ships official Swift bindings for the API this project
+   actually needs** (`iroh` has official bindings via the separate
+   `n0-computer/iroh-ffi` repo, but that only covers raw `Endpoint`/
+   `Connection` — `iroh-live`'s `LocalBroadcast`/`subscribe`/frame-pull
+   surface has no bindings at all). See [`ios/IROH_FFI.md`](./ios/IROH_FFI.md)
+   for the full research and rationale. The chosen path: a hand-written
+   Rust staticlib bridge, [`ios-bridge/`](./ios-bridge) (scaffolded with
+   stub `extern "C"` signatures for ticket-connect/subscribe/poll-next-frame;
+   real implementations are separate follow-on work), built into an
+   `.xcframework` for the Swift side to import — not yet integrated in
+   this skeleton.
 2. **Live view.** Once connected, the app subscribes to the `iroh-live`
    broadcast and renders incoming video frames plus audio, i.e. a live
    mirror of the Mac's screen.

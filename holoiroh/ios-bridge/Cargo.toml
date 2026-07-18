@@ -1,0 +1,38 @@
+[package]
+name = "holoiroh-ios-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "extern \"C\" FFI bridge exposing iroh-live ticket-connect/subscribe/frame-pull to the iOS Swift client, since neither iroh nor iroh-live ships official Swift/UniFFI bindings for iroh-live's media API -- see ../ios/IROH_FFI.md for the research behind this crate's existence."
+
+[lib]
+name = "holoiroh_ios_bridge"
+# staticlib: what actually gets linked into the iOS xcframework (a `.a` per
+# target triple, combined via `xcodebuild -create-xcframework`).
+# lib (rlib): kept so this crate remains usable as an ordinary Rust
+# dependency too (unit tests via `cargo test`, `cargo check` on the host
+# triple in this environment where no iOS SDK/targets are installed --
+# see ../ios/IROH_FFI.md's "Environment note" section).
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+# Same git-pinned dependency mac-daemon/Cargo.toml uses, kept in lockstep
+# deliberately (both crates must agree on iroh-live's wire-compatible
+# version). See mac-daemon/Cargo.toml's comment for why this is a git dep
+# (iroh-live is not published on crates.io as of this writing) and why
+# `package = "iroh-live"` is required (the git URL points at iroh-live's
+# own multi-crate workspace root).
+iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "5f95758fcd1450e443a9134c9d9342bcc3957b85", package = "iroh-live" }
+# Pinned to the same iroh version iroh-live's own dependency graph resolves
+# to, same rationale as mac-daemon/Cargo.toml.
+iroh = "=1.0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+anyhow = "1"
+
+[build-dependencies]
+# Generates ios-bridge.h from this crate's `extern "C"` signatures at build
+# time. Not yet wired into build.rs (no build.rs exists yet) -- see this
+# crate's src/lib.rs module doc for the exact command; left as a documented
+# manual step for now rather than a build.rs that would silently do nothing
+# useful in this environment (no iOS SDK to actually validate the header
+# against).
+cbindgen = "0.27"
