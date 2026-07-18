@@ -57,6 +57,12 @@ eventsource-stream = "0.2"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
+# executor.rs: BroadcastStream wrapper for the ComputerUseExecutor::observe() event stream, and
+# thiserror for its ExecutorError enum. Both are already resolved in Cargo.lock transitively
+# (tokio-stream via iroh-live's graph, thiserror widely), so promoting them to direct deps here
+# pulls in no new crate -- it just makes them nameable from this crate's own source.
+tokio-stream = { version = "0.1", features = ["sync"] }
+thiserror = "2"
 # Registers a synchronous SIGINT/SIGTERM handler in main.rs so the daemon's explicit shutdown
 # sequence (closing the iroh Live session + LocalBroadcast, terminating the tracked `holo serve`
 # child) runs on both signals -- `tokio::signal::ctrl_c()` alone only ever fires on SIGINT, not

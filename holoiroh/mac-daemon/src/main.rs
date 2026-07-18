@@ -19,6 +19,13 @@ mod audit_log;
 mod auth;
 mod capture;
 mod control_channel;
+// NOTE: `executor` (the ComputerUseExecutor abstraction seam, PRD 7.3) is deliberately declared
+// only in `lib.rs`, not here. It is an available seam consumed by `examples/executor_probe.rs`
+// via the `holoiroh_daemon` lib crate; wiring the live daemon's control path to route through it
+// (rather than calling `HoloBridge` directly, as `main.rs` does today) is a separate follow-on and
+// is intentionally out of this pass's scope. Declaring `mod executor;` in the binary target too
+// would compile the whole seam as dead code here (25 warnings), since nothing in `main.rs`
+// references it yet -- so it lives in the lib target only until that wiring lands.
 mod holo_bridge;
 mod limits;
 mod permissions;

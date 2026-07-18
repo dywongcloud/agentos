@@ -94,6 +94,19 @@ pub struct HoloBridge {
     process: tokio::sync::Mutex<HoloServeProcess>,
     holo_bin: String,
     port: u16,
+    /// The A2A agent card's `protocolVersion`, captured at startup (and re-verified on
+    /// `restart_process`). Surfaced via [`HoloBridge::protocol_version`] so a caller building an
+    /// executor over this bridge can report the real backend protocol version in its
+    /// capabilities, rather than guessing. `None` when the card did not advertise one.
+    ///
+    /// `#[allow(dead_code)]`: read by [`crate::executor::start_holo_desktop_executor`] via the
+    /// accessor below, which lives in the `executor` module -- compiled into the *lib* target
+    /// (and its examples) but not the *bin* target (`main.rs` does not yet route through the
+    /// executor seam; see its `mod executor` note), so from the binary crate's isolated
+    /// perspective this field is not read. Same lib-vs-bin asymmetry `#[allow(dead_code)]` already
+    /// covers elsewhere in this crate.
+    #[allow(dead_code)]
+    protocol_version: Option<String>,
     pub control: HoloControlBridge,
 }
 
@@ -125,6 +138,7 @@ impl HoloBridge {
             protocol_version = ?card.protocol_version,
             "holo serve agent card verified"
         );
+        let protocol_version = card.protocol_version.clone();
 
         let control = HoloControlBridge::new(client, holo_bin.clone(), events_tx);
 
@@ -132,8 +146,21 @@ impl HoloBridge {
             process: tokio::sync::Mutex::new(process),
             holo_bin,
             port,
+            protocol_version,
             control,
         })
+    }
+
+    /// The A2A agent card's `protocolVersion` this bridge's `holo serve` advertised at startup,
+    /// or `None` if it did not advertise one. See the `protocol_version` field. Used by
+    /// [`crate::executor::start_holo_desktop_executor`] to report the real backend version in
+    /// [`crate::executor::ExecutorCapabilities`].
+    ///
+    /// `#[allow(dead_code)]` for the same lib-vs-bin reason as the field it reads (the only
+    /// caller lives in the `executor` module, absent from the bin target).
+    #[allow(dead_code)]
+    pub fn protocol_version(&self) -> Option<&str> {
+        self.protocol_version.as_deref()
     }
 
     /// Non-blocking liveness check on the supervised `holo serve` child. See
