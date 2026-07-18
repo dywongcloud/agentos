@@ -19,6 +19,7 @@ mod audit_log;
 mod auth;
 mod capture;
 mod control_channel;
+mod duration;
 // NOTE: `executor` (the ComputerUseExecutor abstraction seam, PRD 7.3) is deliberately declared
 // only in `lib.rs`, not here. It is an available seam consumed by `examples/executor_probe.rs`
 // via the `holoiroh_daemon` lib crate; wiring the live daemon's control path to route through it
@@ -79,6 +80,18 @@ struct Cli {
     /// default).
     #[arg(long)]
     no_pin_auth: bool,
+
+    /// Re-print the pairing ticket + verification phrase on a fixed interval while the daemon
+    /// keeps running (e.g. `30m`, `2h`, `1h30m`), so a stale QR screenshot stops being the one
+    /// the operator is reading off. See `holoiroh/mac-daemon/PAIRING.md`'s "Ticket rotation"
+    /// section. NOTE: this re-prints the *current* ticket -- a full fresh-keypair-per-tick
+    /// identity rotation (which would invalidate old tickets entirely) requires tearing down and
+    /// rebuilding the iroh `Live` session mid-run and is documented there as a separate, larger
+    /// step. Rotation-on-restart already happens implicitly (fresh keypair per process start
+    /// when `IROH_SECRET` is unset), and the device allowlist gives device-level rotation
+    /// protection regardless.
+    #[arg(long, value_parser = duration::parse_rotate_duration)]
+    rotate_every: Option<std::time::Duration>,
 }
 
 /// `holo` CLI executable used to spawn `holo serve` (see
@@ -94,6 +107,20 @@ fn holo_serve_port() -> u16 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8765)
+}
+
+/// Print the shareable ticket as a QR code, its raw text, and its verification phrase -- the
+/// exact block re-emitted both at startup and on each `--rotate-every` rotation tick, so the two
+/// are byte-identical. `context` is a short label (e.g. "pairing" / "rotated") shown in the
+/// header line so the operator can tell a rotation apart from the initial print.
+fn print_pairing_block(ticket_str: &str, context: &str) {
+    println!("--- {context} ticket ---");
+    print_ticket_qr(ticket_str);
+    println!("{ticket_str}");
+    println!(
+        "verification phrase (must match the iOS app): {}",
+        pairing_phrase::pairing_phrase(ticket_str)
+    );
 }
 
 /// Render `ticket` as a scannable QR code to stdout using unicode block
@@ -382,19 +409,12 @@ async fn main() -> anyhow::Result<()> {
     live.publish(BROADCAST_NAME, &broadcast).await?;
     let ticket = LiveTicket::new(live.endpoint().addr(), BROADCAST_NAME);
     let ticket_str = ticket.to_string();
-    print_ticket_qr(&ticket_str);
-    println!("{ticket}");
-    // Short verification phrase (SAS), derived deterministically from the
-    // ticket. The iOS app derives the SAME phrase from the scanned ticket
-    // (byte-identical SHA-256 + wordlist, see ios/PAIRING_PHRASE.md) and
-    // asks the user to confirm the two match -- so a MITM who substituted
-    // the QR (and thus the ticket) produces a different phrase here than the
-    // phone shows, and the mismatch is visible. Print it right below the
-    // ticket so the operator can read it off to compare.
-    println!(
-        "verification phrase (must match the iOS app): {}",
-        pairing_phrase::pairing_phrase(&ticket_str)
-    );
+    // Ticket QR + raw text + verification phrase (SAS). The iOS app derives the SAME phrase from
+    // the scanned ticket (byte-identical SHA-256 + wordlist, see ios/PAIRING_PHRASE.md) and asks
+    // the user to confirm the two match -- so a MITM who substituted the QR (and thus the ticket)
+    // produces a different phrase here than the phone shows. `print_pairing_block` is reused on
+    // each `--rotate-every` rotation tick below so the printouts are identical.
+    print_pairing_block(&ticket_str, "pairing");
     if let Some(pin) = &pin {
         println!("pairing PIN (first connection only): {pin}");
     } else {
@@ -419,7 +439,45 @@ async fn main() -> anyhow::Result<()> {
         }
     })
     .context("failed to register SIGINT/SIGTERM handler")?;
-    let _ = shutdown_rx.await;
+
+    // Wait for shutdown, racing it against the optional `--rotate-every` rotation ticker. When
+    // the ticker fires, re-print the pairing block (QR + ticket + verification phrase) so a stale
+    // QR screenshot stops matching what the operator is now reading off. This re-prints the
+    // *current* ticket (see `Cli::rotate_every`'s doc for why a full fresh-keypair rotation is a
+    // separate, larger step); the phrase re-renders identically since it is derived from the
+    // ticket. When `rotate_every` is `None`, `rotate_ticker` never fires and this behaves exactly
+    // like the plain `shutdown_rx.await` it replaces.
+    let mut rotate_ticker = cli.rotate_every.map(|interval| {
+        let mut t = tokio::time::interval(interval);
+        // The first `.tick()` on a fresh `interval` completes immediately; skip it so we don't
+        // re-print the pairing block a millisecond after the startup print. `MissedTickBehavior::
+        // Skip` also means a rotation missed under load is dropped, not fired in a catch-up burst.
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        t
+    });
+    let mut shutdown_rx = shutdown_rx;
+    loop {
+        match &mut rotate_ticker {
+            Some(ticker) => {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    _ = ticker.tick() => {
+                        // Skip the immediate first tick (see above), then re-print on each real one.
+                        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+                        if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                            continue;
+                        }
+                        info!("rotate-every: re-printing pairing block");
+                        print_pairing_block(&ticket_str, "rotated");
+                    }
+                }
+            }
+            None => {
+                let _ = (&mut shutdown_rx).await;
+                break;
+            }
+        }
+    }
 
     info!("shutdown signal received, cleaning up");
     health_check_shutdown.cancel();

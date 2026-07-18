@@ -18,6 +18,7 @@ pub mod audit_log;
 pub mod auth;
 pub mod capture;
 pub mod control_channel;
+pub mod duration;
 pub mod executor;
 pub mod holo_bridge;
 pub mod limits;

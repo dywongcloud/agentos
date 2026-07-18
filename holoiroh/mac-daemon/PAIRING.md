@@ -33,15 +33,22 @@ see below -- but nothing calls it yet).
 | PIN + allowlist gate wired into the control-channel accept path | **Real, wired, end-to-end tested** | `src/control_channel.rs` `ControlChannel::authenticate`, called from `ProtocolHandler::accept` |
 | `ClientMessage::Pin` / `ServerMessage::AuthRejected` wire messages | **Real** | `src/control_channel.rs`, mirrored in `PROTOCOL.md` |
 | Device revocation (`remove_entry`) | **Real function, not called from any command/UI** | `src/allowlist.rs::Allowlist::remove_entry` |
-| `--rotate-every <duration>` flag | **Designed only, not implemented** | see "Ticket rotation" below |
+| `--rotate-every <duration>` flag | **Real (ticket-reprint on a timer)** | `src/main.rs` `Cli::rotate_every` (parsed by `src/duration.rs::parse_rotate_duration`, accepts `30m`/`2h`/`90s`/`1h30m`) + a `tokio::select!` ticker branch that re-prints the ticket QR + verification phrase each tick via `print_pairing_block()`; witnessed via `examples/ticket_rotation_probe.rs`. **Ticket-string reprint only** — full fresh-keypair identity rotation (which would invalidate old tickets) remains designed-only, see "Open design gap" below. |
 | Full PRD P0-2/7.1 spec (mutual short-phrase, Keychain, cross-device revoke) | **Not implemented; separate, larger PRD row** | `holoiroh-pairing-ticket-exchange` |
 
 The PIN+allowlist auth gate is **not a design document standing in for
 code** -- it is real Rust, compiled, unit-tested (`cargo test -p
 holoiroh-daemon`), and was additionally verified end-to-end over a live
 `iroh` QUIC connection during this work (see "End-to-end witness" below).
-The QR code and `--rotate-every` are genuinely design-only: no code for
-either exists in this crate as of this writing.
+The QR code is real (terminal rendering). `--rotate-every` is now real too,
+but only in its **ticket-reprint** form: on each tick it re-derives and
+re-prints the *current* ticket's QR + verification phrase, so a stale
+screenshot stops being the one the operator reads off. The larger
+**fresh-keypair-per-tick** identity rotation (which would invalidate old
+tickets entirely) remains designed-only — it requires tearing down and
+rebuilding the `iroh` `Live` session mid-run, and is entangled with the
+publish path that only runs past the macOS TCC preflight; see "Open design
+gap" below.
 
 ## Startup UX today (real, witnessed)
 
@@ -169,39 +176,36 @@ gives largely the same practical benefit at the *device* level even if the
 Mac's own ticket rotates, since a previously-paired device is recognized
 by its own node id, not by the Mac's).
 
-### What's designed but not implemented: `--rotate-every <duration>`
+### What's implemented: `--rotate-every <duration>` (ticket-reprint form)
 
-A CLI flag design for explicit, running-process rotation (distinct from
-"rotates because you restarted the process"):
-
-```rust
-/// Regenerate the ticket (and underlying iroh identity) automatically
-/// while the daemon keeps running, every <duration> (e.g. "30m", "2h").
-/// Parsed via the `humantime` crate's Duration (not yet a dependency).
-/// Not implemented -- see PAIRING.md "Exact remaining wiring step".
-#[arg(long, value_parser = humantime::parse_duration)]
-rotate_every: Option<Duration>,
-```
-
-Sketch of the loop this would need in `main.rs`, alongside the existing
-`tokio::signal::ctrl_c().await?` wait:
+The flag is a real CLI arg on `main.rs`'s `Cli`, parsed by the crate's own
+dependency-free `src/duration.rs::parse_rotate_duration` (no `humantime`
+dependency was added):
 
 ```rust
-if let Some(interval) = cli.rotate_every {
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                // re-derive/re-publish a new ticket, print it (+ QR)
-                // as if the daemon had just started
-            }
-            _ = tokio::signal::ctrl_c() => break,
-        }
-    }
-} else {
-    tokio::signal::ctrl_c().await?;
-}
+/// Re-print the pairing ticket + verification phrase on a fixed interval
+/// while the daemon keeps running (e.g. `30m`, `2h`, `1h30m`), so a stale
+/// QR screenshot stops being the one the operator is reading off.
+#[arg(long, value_parser = duration::parse_rotate_duration)]
+rotate_every: Option<std::time::Duration>,
 ```
+
+The loop is real too, a `tokio::select!` ticker branch alongside the
+existing shutdown wait; on each tick it re-prints the *current* ticket's QR
++ verification phrase via the same `print_pairing_block()` used at startup
+(so startup and rotation output are byte-identical apart from the header
+label). The first `interval` tick fires immediately and is skipped so the
+startup print isn't duplicated. `parse_rotate_duration`, and the fact that
+a distinct ticket yields a distinct verification phrase via the same
+`pairing_phrase()` the reprint calls, are witnessed by
+`examples/ticket_rotation_probe.rs` (`cargo run --example
+ticket_rotation_probe`).
+
+What this deliberately does **not** do: mint a fresh `iroh` keypair /
+`LiveTicket` per tick. It re-prints the current ticket — useful for
+defeating a stale screenshot and for operator awareness, not for
+invalidating a leaked-but-unused ticket. That larger behavior is the open
+gap below.
 
 ### Open design gap, stated honestly
 
@@ -230,24 +234,30 @@ decision about which of these two very different things it means:
   that restarts it every N minutes, no new code needed at all, though that
   loses in-flight `holo_bridge` state each time.
 
-This gap is not silently glossed over: **`--rotate-every` is not
-implemented, and even its design has an unresolved question about which of
-two meaningfully different behaviors it should be** that would need to be
-settled before implementation starts, not discovered partway through.
+This gap is not silently glossed over: **`--rotate-every` is implemented in
+its ticket-reprint form (the cheap, connected-client-safe behavior), and
+the full-identity-rotation behavior remains unimplemented** because it has
+an unresolved question about how it should interact with connected clients
+and `holo_bridge` state — settled before that larger behavior is built, not
+discovered partway through.
 
-### Exact remaining wiring step
+### Exact remaining wiring step (for full-identity rotation only)
 
-1. Add `humantime = "2"` to `Cargo.toml` for duration parsing (or use
-   `clap`'s own duration support if a `humantime`-free path is preferred --
-   not independently checked in this pass).
-2. Add the `rotate_every: Option<Duration>` field to `Cli` in `main.rs`.
-3. **Resolve the ticket-string-only vs full-identity-rebuild question
-   above first** -- this determines whether the rotation loop calls a
-   (currently nonexistent) `Live`/`LocalBroadcast` re-publish method, or
-   tears down and rebuilds `live`/`router`/`endpoint` entirely (which also
-   has implications for `holo_bridge`'s already-started subprocess and any
-   in-flight control-channel connection -- neither of which this sketch
-   addresses).
+The flag, the dependency-free duration parser, and the ticker-driven
+ticket-reprint loop are done (see above). What remains for the *larger*
+fresh-keypair-per-tick behavior:
+
+1. **Resolve the ticket-string-only vs full-identity-rebuild question
+   above** -- this determines whether the rotation loop calls a (currently
+   nonexistent) `Live`/`LocalBroadcast` re-publish method, or tears down and
+   rebuilds `live`/`router`/`endpoint` entirely (which also has implications
+   for `holo_bridge`'s already-started subprocess and any in-flight
+   control-channel connection).
+2. That rebuild path can only be exercised end-to-end past the macOS TCC
+   preflight (the publish path refuses to start without Screen
+   Recording/Accessibility grants), so it is gated on the same live daemon
+   run as the rest of the streaming feature -- see
+   `holoiroh-user-action-grant-tcc-and-run-daemon`.
 
 ## Auth beyond ticket possession
 
@@ -410,11 +420,14 @@ For anyone picking this up next:
    the ticket `println!` (terminal by default; `--qr-png` flag for
    Preview.app). No control-channel/protocol changes needed. See "QR code
    UX" above for the exact API calls.
-2. **`--rotate-every`**: resolve the ticket-string-only-vs-full-rebuild
-   design question first (see "Open design gap" above), then add the flag
-   and rotation loop to `main.rs`. Interacts with `holo_bridge`'s subprocess
-   lifecycle and any in-flight control-channel connection -- not a
-   drop-in addition.
+2. **`--rotate-every`**: the flag + duration parser + ticker-driven
+   ticket-reprint loop are **done** (see "What's implemented" above). The
+   only remaining piece is the *full fresh-keypair-per-tick* rotation, which
+   still needs the ticket-string-only-vs-full-rebuild design question
+   resolved (see "Open design gap" above) and the TCC-gated live daemon run
+   to exercise the `Endpoint` rebuild -- it interacts with `holo_bridge`'s
+   subprocess lifecycle and any in-flight control-channel connection, so it
+   is not a drop-in addition.
 3. **Device revocation UI**: `Allowlist::remove_entry` exists and is
    tested; wire it to something an operator can actually invoke (a CLI
    subcommand, a control-channel message, a signal handler) and decide how
