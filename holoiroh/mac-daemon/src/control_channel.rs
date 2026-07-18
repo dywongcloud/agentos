@@ -184,6 +184,26 @@ impl ServerMessage {
     /// they're folded into human-readable `text` rather than dropped
     /// silently -- a future PROTOCOL.md revision may promote them to real
     /// fields (see PROTOCOL.md's "Future extension" section).
+    ///
+    /// ## Not wired to [`crate::task_state::TaskState`]
+    ///
+    /// [`crate::task_state::TaskState`] is this crate's Project Aro PRD
+    /// task-lifecycle enum (created/queued/connecting/.../completed, plus
+    /// interactive-wait and terminal states) -- deliberately **not**
+    /// threaded into this function. The one variant here with any real
+    /// per-state correspondence, [`ControlEvent::Queued`] below, already
+    /// has a byte-exact wire string (`"queued, N ahead"`) asserted by
+    /// `examples/control_channel_probe.rs`; embedding `TaskState`'s
+    /// serialized value into it would be a breaking, unrequested wire
+    /// change, not a natural hook. Every other arm carries either free
+    /// text or the unrelated 3-way `DoneStatus`, with no correspondence to
+    /// `TaskState`'s finer granularity -- `holo_bridge::a2a_client`'s
+    /// `TaskUpdate` (`Working`/`Answer`/`Terminal`) is the actual upstream
+    /// event source, and it does not report which fine-grained lifecycle
+    /// state a task is in. The next task that gives this bridge a
+    /// fine-grained event source (e.g. `holo-desktop-cli` trajectory
+    /// events that name a specific step) is the one that should wire
+    /// `TaskState` in here, not this one.
     pub fn from_control_event(event: ControlEvent) -> Self {
         match event {
             ControlEvent::Ack { .. } => ServerMessage::ack(),

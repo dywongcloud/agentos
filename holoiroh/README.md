@@ -47,6 +47,7 @@ holoiroh/
 │       ├── main.rs                # entrypoint: Live + Router + capture + control channel + holo_bridge
 │       ├── capture.rs             # macOS ScreenCaptureKit video source (--display <index> selection)
 │       ├── control_channel.rs     # iroh ALPN transport for PROTOCOL.md's ClientMessage/ServerMessage
+│       ├── task_state.rs          # Project Aro PRD task lifecycle enum + is_valid_transition (not yet wired to a live event source)
 │       └── holo_bridge/           # bridges control messages to `holo serve`'s A2A endpoint
 │           ├── mod.rs
 │           ├── a2a_client.rs
