@@ -110,6 +110,12 @@ pub enum TerminalState {
     Canceled,
 }
 
+/// `Clone` is cheap: `reqwest::Client` is internally `Arc`-based (connection pool shared across
+/// clones), and `base_url`/`auth_token` are small owned `String`s. Used by
+/// `HoloControlBridge`'s call sites to clone the current client out from behind its `RwLock`
+/// before an `.await` (the guard itself can't cross one), and by `HoloBridge::restart_process`
+/// to swap in a freshly-built client after respawning `holo serve`.
+#[derive(Clone)]
 pub struct A2aClient {
     http: reqwest::Client,
     base_url: String,

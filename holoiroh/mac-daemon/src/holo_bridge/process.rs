@@ -167,6 +167,14 @@ impl HoloServeProcess {
         self.child.id()
     }
 
+    /// Non-blocking liveness check: `Ok(None)` if still running, `Ok(Some(status))` if it has
+    /// already exited (crashed or was killed outside this daemon's own shutdown path), `Err` on
+    /// an OS-level error reaping the process. Thin wrapper over `tokio::process::Child::try_wait`
+    /// -- see `holo_bridge::health`, the only caller.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
     /// Terminate `holo serve`. Sends SIGTERM first (mirrors the CLI's own `Ctrl+C to stop`
     /// story -- `holo serve` has no documented graceful-shutdown RPC of its own, it relies on
     /// process signals / uvicorn's own signal handling), then force-kills if it doesn't exit

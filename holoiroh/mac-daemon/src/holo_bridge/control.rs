@@ -133,6 +133,10 @@ pub enum ControlEvent {
     /// `crate::control_channel::ServerMessage::from_control_event` maps this to the wire
     /// `{"type":"status","text":"queued, N ahead"}` the task asks for.
     Queued { request_id: String, ahead: usize },
+    /// Out-of-band daemon lifecycle status, not tied to any single request -- e.g.
+    /// `holo_bridge::health`'s crash-detected/restarting/restarted notifications. Carries no
+    /// `request_id` since it isn't a response to a specific prompt.
+    DaemonStatus { text: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -169,7 +173,10 @@ struct QueuedPrompt {
 /// `ControlEvent`s back out; this type only owns the A2A/CLI interaction and the
 /// prompt-to-context continuity.
 pub struct HoloControlBridge {
-    client: A2aClient,
+    /// `std::sync::RwLock` (not `tokio::sync::RwLock`) matching `events_tx` below -- `client`
+    /// is only ever swapped wholesale (`replace_client`, on `holo_bridge::health` restart), a
+    /// cheap `Clone` of a small struct, never held across an `.await`.
+    client: RwLock<A2aClient>,
     /// Wrapped in a `std::sync::RwLock` (not `tokio::sync::RwLock`) so the
     /// active event sink can be swapped per control-channel connection
     /// (see `crate::control_channel`, which calls
@@ -211,12 +218,19 @@ impl HoloControlBridge {
         events_tx: mpsc::UnboundedSender<ControlEvent>,
     ) -> Self {
         Self {
-            client,
+            client: RwLock::new(client),
             events_tx: RwLock::new(events_tx),
             holo_bin: holo_bin.into(),
             busy: Mutex::new(false),
             queue: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Swap in a freshly-built `A2aClient` pointed at a respawned `holo serve` process. See
+    /// `HoloBridge::restart_process`, the only caller. Does not touch `busy`/`queue`/`events_tx`
+    /// -- only which process subsequent A2A calls go to.
+    pub fn replace_client(&self, client: A2aClient) {
+        *self.client.write().expect("client lock poisoned") = client;
     }
 
     /// Reports whether a turn is currently running and how many more are queued behind it.
@@ -239,6 +253,15 @@ impl HoloControlBridge {
     /// from a previous connection.
     pub fn replace_event_sink(&self, events_tx: mpsc::UnboundedSender<ControlEvent>) {
         *self.events_tx.write().expect("events_tx lock poisoned") = events_tx;
+    }
+
+    /// Emit a [`ControlEvent::DaemonStatus`] -- see `holo_bridge::health`, the only caller
+    /// outside this module. Public (unlike [`Self::emit`]) since it's the sole way an
+    /// out-of-band supervisor (not itself in possession of a `request_id`) can surface
+    /// something to the currently-connected peer over the same event path every A2A-derived
+    /// event already flows through.
+    pub fn emit_daemon_status(&self, text: impl Into<String>) {
+        self.emit(ControlEvent::DaemonStatus { text: text.into() });
     }
 
     fn emit(&self, event: ControlEvent) {
@@ -329,8 +352,8 @@ impl HoloControlBridge {
     /// both call sites.
     async fn run_prompt(&self, request_id: String, text: String, context_id: Option<&str>) {
         let request_id_for_updates = request_id.clone();
-        let result = self
-            .client
+        let client = self.client.read().expect("client lock poisoned").clone();
+        let result = client
             .send_and_stream(&text, context_id, |update| {
                 self.emit(translate_update(&request_id_for_updates, update));
             })
@@ -418,7 +441,8 @@ impl HoloControlBridge {
         // session cancel; see a2a_client module doc). This is the lower-blast-radius option
         // and should win when both are meaningful.
         if let Some(ctx) = context_id.as_deref() {
-            if let Err(err) = self.client.cancel(ctx, None).await {
+            let client = self.client.read().expect("client lock poisoned").clone();
+            if let Err(err) = client.cancel(ctx, None).await {
                 tracing::warn!(request_id, context_id = ctx, error = %err, "A2A tasks/cancel failed");
                 self.emit(ControlEvent::Error {
                     request_id: request_id.clone(),

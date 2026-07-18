@@ -204,6 +204,7 @@ impl ServerMessage {
             ControlEvent::Queued { ahead, .. } => {
                 ServerMessage::status(format!("queued, {ahead} ahead"))
             }
+            ControlEvent::DaemonStatus { text } => ServerMessage::status(text),
         }
     }
 }

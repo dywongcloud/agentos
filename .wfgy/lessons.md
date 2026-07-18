@@ -1,3 +1,4 @@
+# WFGY lessons
 
 ## 2026-07-17 — CONSOLIDATE gate's zero-open-PRD-items check blocks a narrowly-scoped subtask against a 90-row multi-session PRD
 Goal (G): Write holoiroh/mac-daemon/LaunchAgent/com.holoiroh.daemon.plist and document background-service install + iOS distribution + NAT traversal in holoiroh/README.md -- a narrow, self-contained documentation/config task.
@@ -22,3 +23,27 @@ Goal (G): Design + document pairing/QR-code UX, ticket rotation policy, and a PI
 What drifted / what went wrong: nothing drifted in the actual work -- PAIRING.md written, allowlist.rs (Allowlist struct + verify_pin + generate_pin, 17 tests), control_channel.rs wired with a real auth gate (ClientMessage::Pin/ServerMessage::AuthRejected, ControlChannel::authenticate called from accept() before the greeting), and the full reject/accept-via-PIN/accept-via-allowlist lifecycle verified end-to-end over a REAL live iroh QUIC connection (not just unit tests) using examples/control_probe.rs against a running daemon with a stub holo-serve backend. All 9 directly-relevant PRD rows resolved with real witnesses. The CONSOLIDATE gate then denied transition a 4th consecutive time (per its own denial message) because .gm/prd.yml has grown to 97 total rows, 33 still pending and NOT blockedBy:external -- these are the same disjoint holoiroh-project backlog named in the 2026-07-17 lesson above (iOS Swift app, screen capture, workflow fanout, task envelope protocol, etc.), now larger than before. `residual-scan` itself refuses to even run while any PRD row is open, confirming the gate has zero task-scope awareness.
 Fix / resolution: Did not retry the bare transition a 5th time (would repeat the identical stuck-loop-escalation denial). Added a row (stuck-consolidate-gate-vs-unrelated-holoiroh-backlog) naming the concrete stuck state, invoked wfgy-method (this entry), confirmed via BBPF that the only two live options (fabricate 33 rows' worth of witnesses for work never done, or actually build an entire iOS app + capture pipeline in this pass) both violate the task's own explicit honesty requirement ("do not mark this done if the enforcement isn't real") and G itself -- so committed the real, complete, tested work locally via gm's own git_add/git_commit verbs (never raw Bash git) and stopped short of COMPLETE, reporting the blocker explicitly.
 Generalizes to: This is now the SECOND independent session (after the 2026-07-17 LaunchAgent/README one) to hit the identical "inherited-PRD-scope blocks CONSOLIDATE for a narrow subtask" wall in this repo, and the backlog has grown (39 -> 90 -> 97 total rows) between occurrences rather than shrinking -- meaning no session has yet been dispatched to actually clear it, and every narrowly-scoped dispatch into this repo will keep hitting this same wall until either (a) someone runs a dedicated multi-session effort against the full holoiroh backlog, or (b) the PRD-scoping policy itself is changed so CONSOLIDATE only requires the dispatched task's own touched rows, not every row in the file. Future sessions: check `.gm/prd.yml` pending count immediately after orient, and if it's large and clearly spans unrelated project scope, expect this wall at CONSOLIDATE and go straight to blockedBy:external + wfgy-method rather than re-discovering it via repeated denials.
+
+## 2026-07-18 — git_push gate correctly refuses: agentOS has no remote configured, and worktrees add a second blocker layer
+Goal (G): Implement Holo auth check, holo-serve health-check loop, and macOS permission
+preflight in holoiroh/mac-daemon/src/, verify cargo build succeeds, report to user.
+What drifted / what went wrong: At CONSOLIDATE, git_push was denied twice -- first bare
+(branch mismatch: worktree is on `worktree-wf_2b002703-24c-6`, not `main`), then again
+when re-attempted, because the repo has zero git remotes configured at all
+(`git remote -v` empty). This second fact was already recorded in a prior session's
+memory (`agentos-no-git-remote`) but had to be independently re-confirmed this session
+before trusting it as the real blocker rather than a transient/local issue.
+Fix / resolution: Did not retry git_push a third time (would repeat the same denial --
+the remote genuinely does not exist, no branch choice fixes that). Applied BBCR:
+checkpointed at the last-known-good state (commit 1cb3d34, clean worktree, cargo build
+verified passing), surfaced the blocker explicitly to the user instead of confabulating
+a push, and left the PRD git-consolidation step correctly unresolved/blocked rather than
+marking it falsely complete.
+Generalizes to: In this repo (agentOS) specifically, any task that reaches CONSOLIDATE
+should expect git_push to fail structurally until a human runs `gh repo create` +
+`git remote add origin <url>` -- this is not worth retrying, only worth checking once
+per session (`git remote -v`) and then reporting. Separately: worktree sessions add a
+second, independent blocker (worktree branch != main) that resolves differently (pass an
+explicit `{"branch": "main"}` or `{"branch": "<worktree-branch>"}`) and should not be
+conflated with the no-remote blocker -- diagnose which one is actually firing before
+picking a recovery action.

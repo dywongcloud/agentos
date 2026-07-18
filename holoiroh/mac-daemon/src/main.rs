@@ -15,9 +15,11 @@
 //! wired up yet.
 
 mod allowlist;
+mod auth;
 mod capture;
 mod control_channel;
 mod holo_bridge;
+mod permissions;
 
 use std::sync::Arc;
 
@@ -84,7 +86,47 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("holoiroh-daemon starting");
 
+    // --- load holoiroh/mac-daemon/.env (gitignored; HAI_API_KEY) into process env, before
+    // anything reads it. Missing file is not an error -- `dotenvy::dotenv()` only errors on a
+    // malformed .env that IS present; a user relying purely on `~/.holo/.env` (holo login's
+    // own output) never needs a local .env at all. ---
+    match dotenvy::dotenv() {
+        Ok(path) => info!(path = %path.display(), "loaded .env"),
+        Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            // No local .env -- fine, HAI_API_KEY may still come from ~/.holo/.env or an
+            // already-exported process env var.
+        }
+        Err(err) => warn!(error = %err, "failed to parse .env; continuing without it"),
+    }
+
     let cli = Cli::parse();
+
+    // --- Holo auth token check, before any other startup work. `holo
+    // serve` (mounted below via `HoloBridge::start`) depends on
+    // `holo login` having already happened; failing here with a clear
+    // instruction is far better than letting `holo serve` fail
+    // confusingly (or partially start) later. ---
+    match auth::check_holo_token() {
+        Ok(token) => info!(source = %token.path().display(), "Holo auth token found"),
+        Err(err) => {
+            eprintln!("[holoiroh-daemon] {err}");
+            eprintln!("  {}", err.remediation());
+            anyhow::bail!("Holo auth check failed: {err}");
+        }
+    }
+
+    // --- macOS permission preflight (Screen Recording + Accessibility).
+    // Refuse to start the broadcast with a black/frozen stream or a
+    // daemon that can't actually drive the Mac -- report every missing
+    // permission at once and exit before any capture/publish work. ---
+    let preflight = permissions::preflight();
+    if !preflight.is_ok() {
+        preflight.report();
+        anyhow::bail!(
+            "{} macOS permission(s) missing; see instructions above",
+            preflight.missing.len()
+        );
+    }
 
     // --- iroh endpoint (reads IROH_SECRET if set, otherwise generates a
     // fresh key each run). Built *without* `.with_router()` because we own
@@ -103,10 +145,20 @@ async fn main() -> anyhow::Result<()> {
     // unavailable" as a status message) -- so this is logged, not
     // propagated with `?`. ---
     let (bridge_events_tx, _bridge_events_rx) = mpsc::unbounded_channel();
+    let health_check_shutdown = tokio_util::sync::CancellationToken::new();
     let bridge = match HoloBridge::start(holo_bin(), holo_serve_port(), bridge_events_tx).await {
         Ok(bridge) => {
-            info!(pid = ?bridge.holo_serve_pid(), "holo_bridge started");
-            Some(Arc::new(bridge))
+            info!(pid = ?bridge.holo_serve_pid().await, "holo_bridge started");
+            let bridge = Arc::new(bridge);
+            // Ongoing supervisor: `HoloBridge::start`'s own health wait only runs once, at
+            // startup. This background loop keeps polling for the rest of the daemon's
+            // lifetime and restarts `holo serve` on crash -- see `holo_bridge::health`'s
+            // module doc for why this can never reach into the iroh P2P session.
+            tokio::spawn(holo_bridge::health::run_health_check_loop(
+                bridge.clone(),
+                health_check_shutdown.clone(),
+            ));
+            Some(bridge)
         }
         Err(err) => {
             warn!(error = %err, "holo_bridge failed to start -- control channel will run without it");
@@ -196,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = shutdown_rx.await;
 
     info!("shutdown signal received, cleaning up");
+    health_check_shutdown.cancel();
     router.shutdown().await?;
     // Explicitly drop the broadcast before `live.shutdown()` -- `LocalBroadcast` owns its own
     // media pipelines/track handles and releases them in its own `Drop` impl (see vendored

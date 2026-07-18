@@ -75,6 +75,7 @@
 
 pub mod a2a_client;
 pub mod control;
+pub mod health;
 pub mod process;
 pub mod stop;
 
@@ -87,7 +88,12 @@ pub use process::HoloServeProcess;
 /// Owns the `holo serve` subprocess and the control bridge built on top of it. This is the
 /// type `main.rs` constructs once on daemon startup and keeps alive for the process lifetime.
 pub struct HoloBridge {
-    process: HoloServeProcess,
+    // `tokio::sync::Mutex` (not `std`) since `holo_bridge::health`'s restart path holds this
+    // across an `.await` (respawning the child, which itself awaits `/health`) -- a std Mutex
+    // guard can't cross an await point.
+    process: tokio::sync::Mutex<HoloServeProcess>,
+    holo_bin: String,
+    port: u16,
     pub control: HoloControlBridge,
 }
 
@@ -120,9 +126,46 @@ impl HoloBridge {
             "holo serve agent card verified"
         );
 
-        let control = HoloControlBridge::new(client, holo_bin, events_tx);
+        let control = HoloControlBridge::new(client, holo_bin.clone(), events_tx);
 
-        Ok(Self { process, control })
+        Ok(Self {
+            process: tokio::sync::Mutex::new(process),
+            holo_bin,
+            port,
+            control,
+        })
+    }
+
+    /// Non-blocking liveness check on the supervised `holo serve` child. See
+    /// [`HoloServeProcess::try_wait`] and `holo_bridge::health`, the only caller.
+    pub async fn try_wait_process(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.process.lock().await.try_wait()
+    }
+
+    /// Replace a dead `holo serve` child with a freshly-spawned one, and rebuild
+    /// [`HoloControlBridge`]'s internal A2A client to point at it. Does NOT touch `self.control`'s
+    /// event sink, busy/queue state, or anything else about the bridge's identity -- only the
+    /// underlying process and the client's connection to it change, so in-flight callers holding
+    /// a reference to this `HoloBridge` are unaffected beyond their next A2A call going to the
+    /// new process. See `holo_bridge::health`'s module doc for why this can never reach the iroh
+    /// P2P session (this type has no field referencing it).
+    pub async fn restart_process(&self) -> Result<()> {
+        let new_process = HoloServeProcess::spawn(&self.holo_bin, self.port)
+            .await
+            .context("failed to respawn holo serve")?;
+        let client = new_process.client();
+        client
+            .probe_agent_card()
+            .await
+            .context("respawned holo serve did not present a valid/compatible A2A agent card")?;
+
+        let mut slot = self.process.lock().await;
+        // Old process's `Drop` (best-effort SIGTERM + kill_on_drop) runs here when `old` goes
+        // out of scope -- it already exited (that's why we're restarting), so this is a no-op
+        // safety net, not a real termination.
+        let _old = std::mem::replace(&mut *slot, new_process);
+        self.control.replace_client(client);
+        Ok(())
     }
 
     /// Handle one incoming control-channel message (`prompt` / `voice_transcript` / `stop`).
@@ -149,8 +192,8 @@ impl HoloBridge {
     }
 
     /// PID of the managed `holo serve` process, for diagnostics/health reporting.
-    pub fn holo_serve_pid(&self) -> Option<u32> {
-        self.process.pid()
+    pub async fn holo_serve_pid(&self) -> Option<u32> {
+        self.process.lock().await.pid()
     }
 
     /// Shut down the managed `holo serve` subprocess (SIGTERM, then SIGKILL after a grace
@@ -164,6 +207,6 @@ impl HoloBridge {
     /// `Arc::try_unwrap(bridge)` failing because another clone is still alive elsewhere, or a
     /// panic during shutdown).
     pub async fn shutdown(self) -> Result<()> {
-        self.process.shutdown().await
+        self.process.into_inner().shutdown().await
     }
 }
