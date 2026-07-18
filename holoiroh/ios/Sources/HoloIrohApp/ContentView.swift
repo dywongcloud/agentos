@@ -1,18 +1,36 @@
 import SwiftUI
 
-/// Placeholder root view. Will become the pairing / live-view / prompt
-/// screen described in holoiroh/README.md.
+/// Root view: hosts the `NavigationStack` that moves the user from
+/// `PairingView` to `MainView` on "connect", per holoiroh/README.md's
+/// iOS-side architecture (Pairing -> Live view / Prompts / Status).
+///
+/// Navigation state is a simple `[Route]` path rather than a boolean --
+/// using `NavigationStack(path:)` (iOS 16+, well within this package's
+/// iOS 17 minimum) keeps the door open for deeper stacks later (e.g. a
+/// settings screen) without another rewrite of the navigation wiring.
+/// There is still no real iroh/control-channel connection here: "connect"
+/// only means "the user supplied a ticket and pushed past pairing."
 struct ContentView: View {
+    private enum Route: Hashable {
+        case main(ticket: String)
+    }
+
+    @State private var path: [Route] = []
+
     var body: some View {
-        VStack(spacing: 12) {
-            Text("HoloIroh")
-                .font(.largeTitle)
-                .fontWeight(.bold)
-            Text("Skeleton -- pairing and live view not yet implemented")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+        NavigationStack(path: $path) {
+            PairingView { ticket in
+                path.append(.main(ticket: ticket))
+            }
+            .navigationDestination(for: Route.self) { route in
+                switch route {
+                case .main(let ticket):
+                    MainView(ticket: ticket) {
+                        path.removeAll()
+                    }
+                }
+            }
         }
-        .padding()
     }
 }
 
