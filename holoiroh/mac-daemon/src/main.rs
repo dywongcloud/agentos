@@ -20,6 +20,7 @@ mod capture;
 mod control_channel;
 mod holo_bridge;
 mod permissions;
+mod sensitive_categories;
 
 use std::sync::Arc;
 

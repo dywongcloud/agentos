@@ -20,8 +20,19 @@ the control channel's wire schema. The control channel's accept path now
 enforces a PIN + persisted device-allowlist auth gate on unrecognized
 devices (real, tested, see [`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md))
 -- a QR rendering of the ticket and a ticket-rotation flag are designed in
-that same doc but not yet implemented. System/mic audio capture is still
-not wired up. `ios/` is now a real multi-screen SwiftUI app skeleton that
+that same doc but not yet implemented. Project Aro PRD §9's class-5
+sensitive-app category data model now exists too (`sensitive_categories.rs`:
+the default password-manager/banking/health/system-settings/etc. category
+list with illustrative macOS bundle IDs, the always-ask/always-allow/
+hard-block per-category setting, and real load/save against a
+user-editable `~/.holoiroh/sensitive_categories.toml` or `.json`, real,
+tested via `cargo run --example sensitive_categories_probe`) -- this is a
+data-model-and-config-file row only: nothing calls into it from a live
+policy-interception point yet, because no `ComputerUseExecutor`/policy-
+wrapper equivalent (nor the approval-request round trip to the iPhone app)
+exists in this Rust codebase yet; see that module's own doc comment for
+exactly what wiring it in for real would still require. System/mic audio
+capture is still not wired up. `ios/` is now a real multi-screen SwiftUI app skeleton that
 builds for iOS 17: `ContentView` hosts a `NavigationStack` moving from
 `PairingView` (paste an iroh ticket, plus a placeholder "Scan QR" button)
 to `MainView` on "connect" (video preview placeholder, prompt text field

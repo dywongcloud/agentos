@@ -45,6 +45,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Config-file format for sensitive_categories.rs (~/.holoiroh/sensitive_categories.toml),
+# chosen as the default over JSON there because it's the friendlier format for a human to
+# hand-edit. Pinned to "0.8" (not the newer 1.x line) because 0.8.23 is already resolved
+# transitively in this workspace's Cargo.lock (via iroh-live's own dependency graph) with
+# serde support -- using the same version avoids pulling a second toml major version into
+# the build.
+toml = "0.8"
 # Parses the `text/event-stream` body of the A2A `message/stream` JSON-RPC response frame-by-frame.
 eventsource-stream = "0.2"
 futures-util = "0.3"
