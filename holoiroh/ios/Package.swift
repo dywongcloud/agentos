@@ -15,7 +15,8 @@ let package = Package(
     targets: [
         .target(
             name: "HoloIrohApp",
-            path: "Sources/HoloIrohApp"
+            path: "Sources/HoloIrohApp",
+            exclude: ["REQUIRED_INFO_PLIST_KEYS.md"]
         )
     ]
 )
