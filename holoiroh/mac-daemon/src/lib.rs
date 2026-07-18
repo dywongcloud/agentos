@@ -22,5 +22,6 @@ pub mod executor;
 pub mod holo_bridge;
 pub mod limits;
 pub mod permissions;
+pub mod policy;
 pub mod sensitive_categories;
 pub mod task_state;
