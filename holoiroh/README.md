@@ -15,10 +15,19 @@ broadcast and ticket, and runs a working bidirectional control channel
 (`control_channel.rs`, ALPN `holoiroh/control/1`) bridged to `holo serve`
 (`holo_bridge/`) -- see [`PROTOCOL.md`](./PROTOCOL.md) for the control
 channel's wire schema. Screen/audio capture is still not wired up. `ios/`
-is a skeleton SwiftUI app that builds for iOS 17 but has no pairing, video,
-or control-channel logic yet -- the Swift side of the control channel
-(actually sending/receiving `PROTOCOL.md`'s JSON) remains unimplemented.
-See "Build status" below for exact, witnessed build results.
+is now a real multi-screen SwiftUI app skeleton that builds for iOS 17:
+`ContentView` hosts a `NavigationStack` moving from `PairingView` (paste
+an iroh ticket, plus a placeholder "Scan QR" button) to `MainView` on
+"connect" (video preview placeholder, prompt text field + Send, a
+placeholder microphone button, and a scrolling status/log list of
+`ServerMessage`-equivalent entries). None of this is wired to a real
+transport yet -- there is no iroh/FFI networking, no actual QR scanning,
+no on-device transcription, and no real video rendering; the log list is
+driven by locally-synthesized entries so the UI is demonstrably live
+rather than static mock data. The Swift side of the control channel
+(actually sending/receiving `PROTOCOL.md`'s JSON over a real connection)
+remains unimplemented. See "Build status" below for exact, witnessed
+build results.
 
 ## Components
 
@@ -40,8 +49,12 @@ holoiroh/
 ├── ios/                            # Swift Package Manager package: the iOS client
 │   ├── Package.swift
 │   └── Sources/HoloIrohApp/
-│       ├── HoloIrohApp.swift
-│       └── ContentView.swift
+│       ├── HoloIrohApp.swift       # @main App entry point
+│       ├── ContentView.swift       # NavigationStack: PairingView -> MainView
+│       ├── PairingView.swift       # paste ticket + Scan QR placeholder + Connect
+│       ├── MainView.swift          # video placeholder, prompts, mic, status/log list
+│       └── Models/
+│           └── ServerMessage.swift # Swift mirror of PROTOCOL.md's wire schema
 └── README.md                       # this file
 ```
 
@@ -253,12 +266,15 @@ falls back to. This is the normal, correct failure mode for an iOS-only
 SPM package built with the bare CLI command on macOS — it is not evidence
 of a defect in `Package.swift` or the Swift sources.
 
-Building with an explicit iOS Simulator target succeeds both ways:
+Building with an explicit iOS Simulator target succeeds both ways --
+re-witnessed after adding `PairingView.swift`, `MainView.swift`, and
+`Models/ServerMessage.swift` (all five source files now compile clean,
+no warnings):
 
 ```
 $ swift build --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" \
     --triple arm64-apple-ios17.0-simulator
-Build complete! (4.20s)
+Build complete! (5.95s)
 
 $ xcodebuild -scheme HoloIrohApp \
     -destination 'generic/platform=iOS Simulator' -sdk iphonesimulator build
