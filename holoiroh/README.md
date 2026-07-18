@@ -20,9 +20,18 @@ the control channel's wire schema. The control channel's accept path now
 enforces a PIN + persisted device-allowlist auth gate on unrecognized
 devices (real, tested, see [`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md))
 -- a QR rendering of the ticket and a ticket-rotation flag are designed in
-that same doc but not yet implemented. System/mic audio capture is still
-not wired up. `ios/` is now a real multi-screen SwiftUI app skeleton that
-builds for iOS 17: `ContentView` hosts a `NavigationStack` moving from
+that same doc but not yet implemented. Startup now also does two real,
+wired preflight checks before any capture/publish work begins: a Holo
+auth-token check (`auth.rs`, refuses to start with a clear instruction if
+`holo login` was never run) and a macOS Screen Recording + Accessibility
+TCC permission preflight (`permissions.rs`, same refuse-with-instructions
+behavior rather than starting into a black/frozen stream). `holo_bridge/`
+also now runs an ongoing health-check loop (`holo_bridge/health.rs`) that
+polls the supervised `holo serve` subprocess and restarts it on crash,
+independent of the one-time startup health check `process.rs` already did.
+System/mic audio capture is still not wired up. `ios/` is now a real
+multi-screen SwiftUI app skeleton that builds for iOS 17: `ContentView`
+hosts a `NavigationStack` moving from
 `PairingView` (paste an iroh ticket, plus a placeholder "Scan QR" button)
 to `MainView` on "connect" (video preview placeholder, prompt text field
 + Send, a placeholder microphone button, and a scrolling status/log list
@@ -33,7 +42,17 @@ driven by locally-synthesized entries so the UI is demonstrably live
 rather than static mock data. The Swift side of the control channel
 (actually sending/receiving `PROTOCOL.md`'s JSON over a real connection,
 including the `pin`/`auth_rejected` messages) remains unimplemented.
-See "Build status" below for exact, witnessed build results.
+
+`mac-daemon` has **no `#[cfg(test)]` unit tests** as of this writing --
+they were deliberately removed (this repo's no-unit-tests rule: validation
+must be real, witnessed execution, not assertions run later) and
+`cargo test -p holoiroh-daemon` now runs **0 tests**. Their coverage was
+re-witnessed as `cargo run --example <name>_probe` binaries instead --
+`allowlist_probe`, `auth_probe`, `auth_gate_probe`,
+`control_channel_probe`, `holo_bridge_queue_probe`, and
+`permissions_probe`, alongside the pre-existing `control_probe` (a real
+external `iroh` dial against a live daemon) -- see "Build status" below
+for exact, witnessed build and probe results.
 
 ## Components
 
@@ -41,18 +60,32 @@ See "Build status" below for exact, witnessed build results.
 holoiroh/
 ├── Cargo.toml                     # Rust workspace manifest (members = ["mac-daemon", "ios-bridge"])
 ├── PROTOCOL.md                    # control-channel wire schema (ClientMessage/ServerMessage)
-├── mac-daemon/                    # Rust binary crate: the Mac-side daemon
+├── mac-daemon/                    # Rust binary + lib crate: the Mac-side daemon
 │   ├── Cargo.toml
-│   └── src/
-│       ├── main.rs                # entrypoint: Live + Router + capture + control channel + holo_bridge
-│       ├── capture.rs             # macOS ScreenCaptureKit video source (--display <index> selection)
-│       ├── control_channel.rs     # iroh ALPN transport for PROTOCOL.md's ClientMessage/ServerMessage
-│       └── holo_bridge/           # bridges control messages to `holo serve`'s A2A endpoint
-│           ├── mod.rs
-│           ├── a2a_client.rs
-│           ├── control.rs         # internal ControlMessage/ControlEvent (request_id/context_id-correlated)
-│           ├── process.rs         # manages the `holo serve` subprocess
-│           └── stop.rs
+│   ├── PAIRING.md                 # PIN+allowlist design + real-vs-designed status table
+│   ├── src/
+│   │   ├── main.rs                # entrypoint: auth check + permission preflight + Live + Router + capture + control channel + holo_bridge
+│   │   ├── lib.rs                 # library target re-exporting modules for examples/ probes to consume
+│   │   ├── capture.rs             # macOS ScreenCaptureKit video source (--display <index> selection)
+│   │   ├── control_channel.rs     # iroh ALPN transport for PROTOCOL.md's ClientMessage/ServerMessage + PIN/allowlist accept gate
+│   │   ├── allowlist.rs           # persisted device allowlist (~/.holoiroh/allowlist.json) + PIN generation/verification
+│   │   ├── auth.rs                # startup check for an existing Holo login token (~/.holo/.env)
+│   │   ├── permissions.rs         # macOS Screen Recording + Accessibility TCC preflight
+│   │   └── holo_bridge/           # bridges control messages to `holo serve`'s A2A endpoint
+│   │       ├── mod.rs
+│   │       ├── a2a_client.rs
+│   │       ├── control.rs         # internal ControlMessage/ControlEvent (request_id/context_id-correlated)
+│   │       ├── process.rs         # manages the `holo serve` subprocess (one-time startup health check)
+│   │       ├── health.rs          # ongoing health-check loop: polls holo serve, restarts it on crash
+│   │       └── stop.rs
+│   └── examples/                  # cargo run --example <name>: real-execution probes (no unit tests in this crate)
+│       ├── control_probe.rs           # real external iroh dial against a live daemon's control channel
+│       ├── control_channel_probe.rs   # ClientMessage/ServerMessage JSON round-trips + ControlEvent mapping
+│       ├── auth_gate_probe.rs         # ControlChannel::authenticate PIN/allowlist gate, in-memory
+│       ├── allowlist_probe.rs         # Allowlist load/save/add/remove + PIN generate/verify, real temp files
+│       ├── auth_probe.rs              # auth::extract_api_key / check_holo_token_in against real strings/files
+│       ├── permissions_probe.rs       # PreflightResult/MissingPermission construction + instruction text
+│       └── holo_bridge_queue_probe.rs # HoloControlBridge concurrent-prompt-queueing races
 ├── ios-bridge/                    # Rust staticlib crate: extern "C" FFI bridge for iOS
 │   ├── Cargo.toml                 # crate-type = ["staticlib", "lib"]
 │   └── src/lib.rs                 # ticket-connect/subscribe/poll-next-frame extern "C" fns (stub bodies)
@@ -291,33 +324,43 @@ witness (both pre-existing in the working tree, not introduced by the
   `.cargo/config.toml`, so this has to be duplicated explicitly.
 
 **Control channel (`control_channel.rs` + `holo_bridge/`): `cargo build`
-and `cargo test -p holoiroh-daemon` both succeed, including the `[lib]`
-target added so `examples/control_probe.rs` can dial the control channel
-as an external `iroh` peer.**
+succeeds, including the `[lib]` target added so `examples/control_probe.rs`
+can dial the control channel as an external `iroh` peer. There are no
+`#[cfg(test)]` unit tests in this crate as of this writing** — they were
+deliberately removed (`cargo test -p holoiroh-daemon` now runs 0 tests;
+see "Status" above) and their coverage re-witnessed as `cargo run
+--example <name>_probe` binaries instead:
 
 ```
 $ cargo test -p holoiroh-daemon
-running 11 tests
-test control_channel::tests::client_message_prompt_round_trips ... ok
-test control_channel::tests::client_message_voice_transcript_round_trips ... ok
-test control_channel::tests::client_message_stop_has_no_text_field ... ok
-test control_channel::tests::server_message_ack_omits_null_text ... ok
-test control_channel::tests::server_message_status_round_trips_with_text ... ok
-test control_channel::tests::server_message_task_progress_round_trips ... ok
-test control_channel::tests::server_message_error_round_trips ... ok
-test control_channel::tests::malformed_json_is_a_deserialize_error_not_a_panic ... ok
-test control_channel::tests::unknown_type_is_a_deserialize_error_not_a_panic ... ok
-test control_channel::tests::control_event_ack_maps_to_server_message_ack ... ok
-test control_channel::tests::control_event_error_maps_to_server_message_error ... ok
+running 0 tests
 
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ cargo run -p holoiroh-daemon --example control_channel_probe
+[... ClientMessage/ServerMessage round-trips for every variant ...]
+error: serialize -> {"type":"error","text":"holo-desktop-cli exited unexpectedly (code 1)"}
+auth_rejected: serialize -> {"type":"auth_rejected","text":"incorrect PIN"}
+=== malformed / unknown input: real deserialize errors, not panics ===
+serde_json::from_str("not json") -> is_err=true
+serde_json::from_str({"type":"unknown_variant"}) -> is_err=true
+=== ServerMessage::from_control_event mapping ===
+ControlEvent::Queued{ahead: 2} -> Status { text: Some("queued, 2 ahead") }
+control_channel_probe: OK -- all wire-schema cases witnessed via real execution
 ```
 
-These exercise real `serde_json::to_string`/`from_str` round-trips for
-every `ClientMessage`/`ServerMessage` variant against the exact JSON
+This probe exercises real `serde_json::to_string`/`from_str` round-trips
+for every `ClientMessage`/`ServerMessage` variant against the exact JSON
 [`PROTOCOL.md`](./PROTOCOL.md) specifies (optional `text` present/omitted,
 malformed/unknown-`type` input producing a `serde_json::Error` rather than
 a panic), plus the `ControlEvent` → `ServerMessage` translation.
+`examples/allowlist_probe.rs` (real temp-file round-trips for
+`Allowlist::load`/`save`/`add_entry`/`remove_entry`, PIN
+generation/verification, and the security-relevant "corrupt file fails
+closed, not open" case) and `examples/permissions_probe.rs`
+(`PreflightResult`/`MissingPermission` construction and instruction text,
+including real `stderr` output) were run the same way, with all cases
+passing.
 
 Running the binary end-to-end was also witnessed, in two configurations:
 
@@ -345,6 +388,19 @@ Running the binary end-to-end was also witnessed, in two configurations:
   unreachable from this sandbox, not a defect in `control_channel.rs`.
   The protocol-dispatch layer that *is* reachable without full external
   network access was exercised and confirmed correct.
+
+**Startup auth/permission preflight (`auth.rs`, `permissions.rs`) and the
+`holo serve` health-check loop (`holo_bridge/health.rs`): real, wired into
+`main.rs`/`HoloBridge`, and unit-level-witnessed via `examples/auth_probe.rs`,
+`examples/auth_gate_probe.rs`, and `examples/permissions_probe.rs`** (see
+above) — token-file parsing, PIN/allowlist gate logic, and
+`PreflightResult`/`MissingPermission` construction were each exercised
+against real strings/files/in-memory state with passing output. A live,
+end-to-end run of `holoiroh-daemon` itself on macOS hardware with Screen
+Recording/Accessibility actually granted (to confirm the preflight passes
+cleanly and the daemon proceeds to publish) was **not** re-witnessed in
+this pass; treat that specific end-to-end path as real-but-not-freshly-
+verified until it is.
 
 **`swift build` in `holoiroh/ios`: succeeds, but only when given an iOS
 target explicitly.**
