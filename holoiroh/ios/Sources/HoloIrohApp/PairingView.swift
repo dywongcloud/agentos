@@ -1,20 +1,35 @@
 import SwiftUI
 
-/// Pairing screen: the user pastes (or, eventually, scans) the iroh
-/// ticket printed by `mac-daemon` on startup, then taps Connect to move
-/// to `MainView`.
+/// Pairing screen: the user scans (or pastes) the iroh ticket printed by
+/// `mac-daemon` on startup, confirms the short verification phrase matches
+/// what the Mac shows, then connects.
 ///
-/// Networking is not wired up yet -- `onConnect` is handed the raw
-/// pasted ticket string and it's the caller's (currently `ContentView`'s)
-/// responsibility to decide what "connect" means. This view only owns
-/// ticket-text state and the two button actions described in the task:
-/// paste + a "Scan QR" placeholder.
+/// ## Flow (Project Aro PRD P0-2)
+/// 1. **Scan or paste the ticket.** "Scan QR" opens a live camera scanner
+///    (`QRScannerSheet` → `QRScannerView`, AVFoundation) whose decoded
+///    string is run through `PairingTicket.extract` and auto-filled into the
+///    ticket field. Pasting the ticket text is the equivalent manual path.
+/// 2. **Verify the short phrase.** Tapping Connect does *not* connect
+///    immediately: it opens `PairingVerificationView`, which shows a short
+///    phrase deterministically derived from the ticket (`PairingPhrase`).
+///    The user confirms it matches the phrase the Mac is displaying next to
+///    its QR. Only that explicit confirmation calls `onConnect`. A
+///    substituted QR/ticket yields a different phrase, so a
+///    man-in-the-middle is caught here.
+///
+/// `onConnect` is still handed the raw ticket string and it's the caller's
+/// (`ContentView`'s) responsibility to decide what "connect" means — that
+/// contract is unchanged; the verification gate is entirely local to this
+/// screen, so `ContentView`'s navigation wiring did not have to change.
 struct PairingView: View {
-    /// Called when the user taps Connect with a non-empty ticket.
+    /// Called only after the user has confirmed the verification phrase
+    /// matches the Mac's, with the trimmed ticket.
     let onConnect: (String) -> Void
 
     @State private var ticketText: String = ""
-    @State private var showScanPlaceholderAlert = false
+    @State private var showScanner = false
+    @State private var showVerification = false
+    @State private var scanError: String?
 
     private var trimmedTicket: String {
         ticketText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -30,7 +45,7 @@ struct PairingView: View {
                 Text("HoloIroh")
                     .font(.largeTitle)
                     .fontWeight(.bold)
-                Text("Paste the iroh ticket printed by the Mac daemon, or scan its QR code, to pair.")
+                Text("Scan the QR code the Mac daemon prints, or paste its iroh ticket, to pair.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -74,27 +89,28 @@ struct PairingView: View {
             .padding(.horizontal)
 
             Button {
-                // Placeholder: real QR scanning (AVFoundation capture
-                // session + code detection) is a later task. For now this
-                // surfaces that the control exists without pretending to
-                // scan anything.
-                showScanPlaceholderAlert = true
+                scanError = nil
+                showScanner = true
             } label: {
                 Label("Scan QR", systemImage: "qrcode.viewfinder")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
             .padding(.horizontal)
-            .alert("Scan QR", isPresented: $showScanPlaceholderAlert) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text("QR scanning isn't implemented yet -- paste the ticket text above instead.")
+
+            if let scanError {
+                Text(scanError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
             }
 
             Spacer()
 
             Button {
-                onConnect(trimmedTicket)
+                // Do NOT connect yet — require phrase verification first.
+                showVerification = true
             } label: {
                 Text("Connect")
                     .frame(maxWidth: .infinity)
@@ -103,6 +119,30 @@ struct PairingView: View {
             .disabled(!canConnect)
             .padding(.horizontal)
             .padding(.bottom, 32)
+        }
+        // Scanner: decode -> extract the ticket -> auto-fill the field.
+        .sheet(isPresented: $showScanner) {
+            QRScannerSheet { scanned in
+                if let ticket = PairingTicket.extract(from: scanned) {
+                    ticketText = ticket
+                    scanError = nil
+                } else {
+                    scanError = "That QR code didn't contain an iroh ticket. Paste the ticket text instead."
+                }
+            }
+        }
+        // Verification gate: confirm the short phrase, then connect.
+        .sheet(isPresented: $showVerification) {
+            PairingVerificationView(
+                ticket: trimmedTicket,
+                onConfirmed: {
+                    showVerification = false
+                    onConnect(trimmedTicket)
+                },
+                onRejected: {
+                    showVerification = false
+                }
+            )
         }
     }
 }
