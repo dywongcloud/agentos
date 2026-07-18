@@ -53,3 +53,32 @@ Goal (G): Implement holoiroh/mac-daemon's iroh-live Live/LocalBroadcast/ticket p
 What drifted / what went wrong: G itself was fully achieved and witnessed early (real build + real run + real ticket + commit), but the gm chain's COMPLETE gate structurally requires remote-pushed + CI-validated, and this repo (agentOS/agentos) has no git remote configured at all -- confirmed independently by two separate sessions now (see mem-918f7f965fd8cc8c-723). Retried the bare transition 3x with identical denials before recognizing the stuck-loop signal.
 Fix / resolution: Per gm's own stuck-loop-escalation + BBCR discipline: added a PRD row (complete-gate-stuck-no-remote-ci) with blockedBy:[external, "no git remote configured"], invoked wfgy-method for bounded-retry-then-surface, and will report the terminal state honestly to the calling agent rather than fabricate a .ci-validated marker or claim the chain reached true COMPLETE when a structural, user-fixable-only precondition cannot be satisfied.
 Generalizes to: Any future gm session in this repo hitting CONSOLIDATE/COMPLETE will hit the identical remote-pushed/CI-validated wall until a human runs `gh repo create` + `git remote add origin` (or equivalent) on agentOS. Don't re-diagnose from scratch -- this is now documented twice.
+
+## 2026-07-18 — task_state.rs task: same no-remote wall hit a 6th time, resolved cleanly on first denial
+Goal (G): Implement holoiroh/mac-daemon/src/task_state.rs (Project Aro PRD task lifecycle
+enum + is_valid_transition), wire into control_channel.rs's ControlEvent-to-ServerMessage
+status text if a natural hook exists, keep cargo build clean, verify via a real
+cargo run --example.
+What drifted / what went wrong: nothing drifted in the actual work. TaskState (30 variants:
+16 flow + 4 interactive-wait + 7 alpha-terminal + 3 Tinfoil-deferred) and an exhaustive
+is_valid_transition were implemented, wired into lib.rs/main.rs, and live-witnessed via a
+new examples/task_state_probe.rs (happy-path edges, non-adjacent-skip rejections,
+interactive-wait interrupt/resume, terminal zero-outdegree sweep over all 30 states,
+Tinfoil-deferred unreachability sweep, snake_case serde round-trip for all 30 variants --
+all assertions passed, cargo build clean across lib/bin/example/full-workspace). Separately,
+determined the one ControlEvent variant with any real per-state correspondence (Queued) has
+a byte-exact wire string already under test from a prior task -- embedding TaskState there
+would be a breaking protocol change, not a natural hook -- so left it undwired with an
+explicit doc cross-reference in both files, per the task's own explicit "don't force it in"
+instruction. At CONSOLIDATE, git_push{branch:main} failed with the now-familiar no-remote
+error; re-verified live via exec_js (not just recalled memory) before trusting it.
+Fix / resolution: Recognized the pattern from 5 prior lessons in this same file on the
+first denial -- did not retry blindly. Committed real work locally (7a833c5), added a
+blockedBy:external PRD row with fresh exec_js-witnessed evidence (git remote -v empty,
+gh repo view/gh run list both fail "no git remotes found"), and stopped at CONSOLIDATE
+rather than fabricating a .ci-validated marker.
+Generalizes to: This is now a 6-times-independently-confirmed structural fact about this
+repo. A future session should treat "no git remote" as a known environment property to
+check once (git remote -v) immediately after orient, not something to rediscover via
+denied transitions -- and should feel free to cite this lessons file directly as
+corroboration rather than re-deriving the diagnosis from scratch.
