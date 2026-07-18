@@ -22,6 +22,7 @@ mod control_channel;
 mod holo_bridge;
 mod limits;
 mod permissions;
+mod policy;
 mod sensitive_categories;
 mod task_state;
 
