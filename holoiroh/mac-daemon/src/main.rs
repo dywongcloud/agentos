@@ -29,6 +29,7 @@ mod control_channel;
 mod holo_bridge;
 mod limits;
 mod local_model;
+mod pairing_phrase;
 mod permissions;
 mod policy;
 mod registry;
@@ -380,8 +381,20 @@ async fn main() -> anyhow::Result<()> {
     // terminals whose font distorts block-character QR codes. ---
     live.publish(BROADCAST_NAME, &broadcast).await?;
     let ticket = LiveTicket::new(live.endpoint().addr(), BROADCAST_NAME);
-    print_ticket_qr(&ticket.to_string());
+    let ticket_str = ticket.to_string();
+    print_ticket_qr(&ticket_str);
     println!("{ticket}");
+    // Short verification phrase (SAS), derived deterministically from the
+    // ticket. The iOS app derives the SAME phrase from the scanned ticket
+    // (byte-identical SHA-256 + wordlist, see ios/PAIRING_PHRASE.md) and
+    // asks the user to confirm the two match -- so a MITM who substituted
+    // the QR (and thus the ticket) produces a different phrase here than the
+    // phone shows, and the mismatch is visible. Print it right below the
+    // ticket so the operator can read it off to compare.
+    println!(
+        "verification phrase (must match the iOS app): {}",
+        pairing_phrase::pairing_phrase(&ticket_str)
+    );
     if let Some(pin) = &pin {
         println!("pairing PIN (first connection only): {pin}");
     } else {

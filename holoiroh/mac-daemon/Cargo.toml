@@ -68,6 +68,11 @@ thiserror = "2"
 # retyping a long ticket string. `default-features = false` drops the `image`/PNG feature we
 # don't use for the terminal-block rendering path -- keeps the dep light (no image codecs).
 qrcode = { version = "0.14", default-features = false }
+# src/pairing_phrase.rs: SHA-256 for the SAS pairing phrase, byte-identical to the iOS side's
+# CryptoKit SHA-256 (see holoiroh/ios/PAIRING_PHRASE.md's cross-platform contract). `sha2` is
+# already resolved transitively in Cargo.lock via iroh's dependency graph, so this promotes it
+# to a direct dep without pulling a new crate.
+sha2 = "0.10"
 # Registers a synchronous SIGINT/SIGTERM handler in main.rs so the daemon's explicit shutdown
 # sequence (closing the iroh Live session + LocalBroadcast, terminating the tracked `holo serve`
 # child) runs on both signals -- `tokio::signal::ctrl_c()` alone only ever fires on SIGINT, not

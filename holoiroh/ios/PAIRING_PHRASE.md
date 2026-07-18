@@ -93,12 +93,19 @@ right bytes.)
 
 A Rust reimplementation is correct iff it reproduces this table exactly.
 
-## Daemon side (follow-on — NOT implemented yet)
+## Daemon side — IMPLEMENTED
 
-The Mac daemon must print this same phrase next to its QR/ticket at startup,
-so the user has something to compare the iPhone's phrase against. This is
-**not implemented in this pass** — this pass defines the algorithm and ships
-the iOS half. The follow-on on the daemon:
+The Mac daemon now prints this same phrase next to its QR/ticket at startup
+(`main.rs`, right after `print_ticket_qr` / the raw ticket:
+`verification phrase (must match the iOS app): ...`), so the user has
+something to compare the iPhone's phrase against. It lives in
+`mac-daemon/src/pairing_phrase.rs` (`sha2::Sha256` + the identical 256-word
+`WORDLIST`), and `examples/pairing_phrase_probe.rs` witnesses byte-for-byte
+agreement with the iOS side against this doc's two known-answer vectors
+(`grove cover rival quilt`, `blend patio eagle cliff`) via real execution.
+Both ends of the SAS mutual-verification loop are therefore live.
+
+The original follow-on recipe that was implemented, kept for reference:
 
 1. Add the `sha2` crate to `mac-daemon/Cargo.toml` (or reuse it if already
    present transitively — check first).
