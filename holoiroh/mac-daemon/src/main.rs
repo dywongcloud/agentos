@@ -472,9 +472,15 @@ async fn main() -> anyhow::Result<()> {
     // graceful cleanup: `ctrl_c()` alone only ever fires on SIGINT, which would silently skip
     // the explicit shutdown sequence below (dropping/closing the iroh `Live` session +
     // `LocalBroadcast`, terminating the tracked `holo serve` child) on a plain `kill` or
-    // launchd/Docker stop, both of which send SIGTERM by default. `ctrlc`'s handler runs on its
-    // own dedicated OS thread and is not `async`, so it only flips a channel to wake the async
-    // task below rather than doing any cleanup itself.
+    // launchd/Docker stop, both of which send SIGTERM by default. REQUIRES the `ctrlc` crate's
+    // `termination` feature (Cargo.toml) -- without it, `set_handler` only ever catches SIGINT,
+    // SIGTERM is silently ignored by the process's default disposition (terminate immediately,
+    // no handler run at all), and this whole shutdown sequence below never executes. Witnessed
+    // live as the real cause of a recurring "daemon hangs, no QR" report: every `kill`/closed-
+    // terminal stop of a prior daemon run left `holo serve` + `hai-agent-runtime` orphaned and
+    // still holding port 8765/18795, so the NEXT launch attempt raced already-squatted ports.
+    // `ctrlc`'s handler runs on its own dedicated OS thread and is not `async`, so it only flips
+    // a channel to wake the async task below rather than doing any cleanup itself.
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown_tx = std::sync::Mutex::new(Some(shutdown_tx));
     ctrlc::set_handler(move || {
