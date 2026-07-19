@@ -14,20 +14,20 @@ import SwiftUI
 /// button, not here, since that's where the real prompt field lives.
 struct ContentView: View {
     private enum Route: Hashable {
-        case main(ticket: String)
+        case main(ticket: String, pin: String)
     }
 
     @State private var path: [Route] = []
 
     var body: some View {
         NavigationStack(path: $path) {
-            PairingView { ticket in
-                path.append(.main(ticket: ticket))
+            PairingView { ticket, pin in
+                path.append(.main(ticket: ticket, pin: pin))
             }
             .navigationDestination(for: Route.self) { route in
                 switch route {
-                case .main(let ticket):
-                    MainView(ticket: ticket) {
+                case .main(let ticket, let pin):
+                    MainView(ticket: ticket, pin: pin) {
                         path.removeAll()
                     }
                 }

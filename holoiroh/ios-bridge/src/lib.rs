@@ -39,12 +39,16 @@
 //!   tightly-packed `width * height * 4` RGBA8 byte buffer that maps directly
 //!   onto a `kCVPixelFormatType_32RGBA` `CVPixelBuffer` on the Swift side.
 //!
-//! The control-channel functions (`holoiroh_ios_bridge_control_send` /
-//! `_poll_control_event`) are a **separate** iroh ALPN
-//! (`holoiroh/control/1`), not part of the media subscribe path, and are
-//! honestly reported as unsupported (returning [`HOLOIROH_ERR_UNSUPPORTED`]
-//! without panicking) until the Swift-side control transport is built -- see
-//! their doc comments.
+//! The control-channel functions (`holoiroh_ios_bridge_control_connect` /
+//! `_control_send` / `_poll_control_event`) ride a **separate** iroh ALPN
+//! (`holoiroh/control/1`, byte-identical to
+//! `mac-daemon/src/control_channel.rs`'s `CONTROL_ALPN`), not the media
+//! subscribe path: `_control_connect` dials the same peer the ticket named
+//! (via `live.endpoint().connect(peer, CONTROL_ALPN)`), opens one
+//! bidirectional stream, performs the bare-line PIN handshake the daemon's
+//! auth gate expects, then hands the recv half to a reader task feeding an
+//! NDJSON event queue -- see each function's doc comment for the exact wire
+//! contract.
 //!
 //! # FFI design notes
 //!
@@ -101,16 +105,20 @@
 //!    (`../ios/Sources/HoloIrohApp/Video/IrohLiveFrameSource.swift`) wraps
 //!    the C functions into a `VideoFrameSource`.
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use iroh::Endpoint;
-use iroh::endpoint::presets;
+use iroh::endpoint::{Connection, SendStream, presets};
+use iroh::{Endpoint, EndpointAddr};
 use iroh_live::Live;
 use iroh_live::media::subscribe::VideoTrack;
 use iroh_live::ticket::LiveTicket;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::runtime::Runtime;
 
 /// Opaque handle to a running bridge instance: owns the Tokio runtime, the
@@ -185,8 +193,10 @@ pub const HOLOIROH_ERR_BUFFER_TOO_SMALL: HoloirohStatus = -5;
 /// The subscription's video track has ended (producer dropped): no further
 /// frames will ever arrive. Distinct from "no frame yet" (`0`).
 pub const HOLOIROH_ERR_ENDED: HoloirohStatus = -6;
-/// The requested operation is not supported by this build (e.g. the
-/// control-channel functions, whose transport is separate follow-on work).
+/// The requested operation is not supported by this build. No function
+/// currently returns this (the control-channel functions, which used to,
+/// are implemented as of this build) -- the constant is kept so the C ABI's
+/// error-code numbering stays stable.
 pub const HOLOIROH_ERR_UNSUPPORTED: HoloirohStatus = -7;
 /// A required pointer argument was null.
 pub const HOLOIROH_ERR_NULL_ARG: HoloirohStatus = -8;
@@ -199,6 +209,20 @@ pub const HOLOIROH_ERR_PANIC: HoloirohStatus = -9;
 /// RGBA (R,G,B,A byte order), `width * 4` bytes per row. Maps to Swift's
 /// `kCVPixelFormatType_32RGBA`.
 pub const HOLOIROH_PIXFMT_RGBA8: u32 = 0;
+
+/// ALPN identifying the control-channel protocol on the daemon's `iroh`
+/// `Endpoint`. Must stay byte-for-byte identical to
+/// `mac-daemon/src/control_channel.rs`'s `CONTROL_ALPN` (the two crates
+/// deliberately share no lib crate -- see that module's doc for the wire
+/// schema this ALPN carries).
+pub const CONTROL_ALPN: &[u8] = b"holoiroh/control/1";
+
+/// How long [`holoiroh_ios_bridge_control_connect`] waits for the daemon's
+/// first reply line (a bare `auth_rejected`, or the envelope-wrapped ready
+/// greeting) after writing the PIN line. Generous enough for a relay-path
+/// round trip plus the daemon's allowlist-save on first pairing; the QUIC
+/// connect itself has already succeeded by the time this timer starts.
+const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------
 // Private Rust state behind the opaque handles
@@ -217,6 +241,40 @@ struct BridgeInner {
     /// has succeeded. Behind a `Mutex` because the connect call and any later
     /// access can come from different Swift threads.
     subscription: Mutex<Option<iroh_live::Subscription>>,
+    /// The daemon peer address parsed out of the last successful
+    /// [`holoiroh_ios_bridge_ticket_connect`] ticket (`LiveTicket::endpoint`)
+    /// -- the address [`holoiroh_ios_bridge_control_connect`] dials on
+    /// [`CONTROL_ALPN`]. `None` until a ticket has been parsed.
+    control_peer: Mutex<Option<EndpointAddr>>,
+    /// The live control-channel connection + send stream, once
+    /// [`holoiroh_ios_bridge_control_connect`] has succeeded. One lock serves
+    /// both idempotency (connect holds it across the whole dial, so
+    /// concurrent connect calls serialize instead of double-dialing) and
+    /// writes ([`holoiroh_ios_bridge_control_send`] serializes on it).
+    control: Mutex<Option<ControlState>>,
+    /// NDJSON lines read off the control stream by the reader task spawned
+    /// in [`holoiroh_ios_bridge_control_connect`], drained one line per
+    /// [`holoiroh_ios_bridge_poll_control_event`] call. `Arc` because the
+    /// reader task (spawned on `runtime`, hence `'static`) shares it with
+    /// the FFI side.
+    control_events: Arc<Mutex<VecDeque<String>>>,
+    /// Set by the reader task on stream end (EOF or read error) and by a
+    /// failed [`holoiroh_ios_bridge_control_send`]. Once the event queue is
+    /// also drained, [`holoiroh_ios_bridge_poll_control_event`] reports
+    /// [`HOLOIROH_ERR_ENDED`].
+    control_ended: Arc<AtomicBool>,
+}
+
+/// The live control-channel transport stored in [`BridgeInner`]'s `control`
+/// slot once [`holoiroh_ios_bridge_control_connect`] succeeds. Keeps the
+/// [`Connection`] handle alive alongside the send half (an iroh/QUIC
+/// connection closes once every handle to it is dropped; the recv half lives
+/// inside the reader task, so `connection` here pins it from the FFI side
+/// too and gives [`holoiroh_ios_bridge_free`] something to `close()`
+/// explicitly).
+struct ControlState {
+    connection: Connection,
+    send: SendStream,
 }
 
 /// The real state behind a [`HoloirohSubscription`] opaque pointer: the
@@ -299,6 +357,10 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_new() -> *mut HoloirohBridge {
             runtime,
             live,
             subscription: Mutex::new(None),
+            control_peer: Mutex::new(None),
+            control: Mutex::new(None),
+            control_events: Arc::new(Mutex::new(VecDeque::new())),
+            control_ended: Arc::new(AtomicBool::new(false)),
         });
         Some(Box::into_raw(inner) as *mut HoloirohBridge)
     });
@@ -340,6 +402,15 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_free(bridge: *mut HoloirohBridge) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             *sub = None;
+        }
+        // Close the control channel (if connected) before shutting the Live
+        // session down; the reader task ends on its own when the closed
+        // stream EOFs, and is torn down with the runtime regardless.
+        {
+            let mut control = inner.control.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(state) = control.take() {
+                state.connection.close(0u32.into(), b"bridge freed");
+            }
         }
         inner.runtime.block_on(async {
             inner.live.shutdown().await;
@@ -407,6 +478,19 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_ticket_connect(
                 return HOLOIROH_ERR_INVALID_TICKET;
             }
         };
+
+        // Record the daemon's dialable address for the control channel:
+        // holoiroh_ios_bridge_control_connect dials this same peer on
+        // CONTROL_ALPN. Stored as soon as the ticket parses (not only on
+        // subscribe success) so a media-side failure -- e.g. the Mac isn't
+        // broadcasting yet -- doesn't also block the control channel.
+        {
+            let mut peer = inner
+                .control_peer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *peer = Some(ticket.endpoint.clone());
+        }
 
         // 3. Connect + subscribe on the runtime. This dials the publisher
         //    (direct P2P with NAT hole-punch, relay fallback) and subscribes to
@@ -649,62 +733,411 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_poll_next_frame(
 // Control channel (PROTOCOL.md ClientMessage / ServerMessage)
 // ---------------------------------------------------------------------
 
-/// Sends one `ClientMessage` (per `../PROTOCOL.md`) over the control channel
-/// to the connected Mac daemon.
+/// Establishes the control channel to the Mac daemon the bridge is
+/// ticket-connected to: dials the peer stored by
+/// [`holoiroh_ios_bridge_ticket_connect`] on [`CONTROL_ALPN`], opens one
+/// bidirectional QUIC stream, performs the PIN handshake, and waits (up to
+/// [`CONTROL_HANDSHAKE_TIMEOUT`]) for the daemon's first reply line.
 ///
-/// **Not implemented in this build.** The control channel is a *separate* iroh
-/// ALPN (`holoiroh/control/1`, see `../mac-daemon/src/control_channel.rs`),
-/// distinct from the media subscribe path this crate's video FFI wires. The
-/// iroh-live `Live` session owns the endpoint through its own MoQ router;
-/// opening a client-side bidirectional stream on the control ALPN over that
-/// same connection is real additional work tracked separately (the iOS
-/// control-channel transport, see `holoiroh/README.md`'s "Remote kill-switch"
-/// section). Until then this returns [`HOLOIROH_ERR_UNSUPPORTED`] rather than
-/// pretending to send -- it never panics.
+/// Wire contract (mirror of `mac-daemon/src/control_channel.rs`):
+/// - The PIN goes out as a **bare** (non-envelope) NDJSON line
+///   `{"type":"pin","pin":"..."}` -- exactly what the daemon's
+///   `ControlChannel::authenticate` gate requires as the very first line
+///   from an unrecognized device. (The gate would reject an envelope-
+///   wrapped PIN, so this one line is deliberately not enveloped.)
+/// - On success the daemon's first line is its envelope-wrapped greeting
+///   (`payload` = `{"type":"status","text":"control channel ready"}`) ->
+///   returns [`HOLOIROH_OK`], stores the send stream on the bridge, and
+///   spawns a reader task queueing every subsequent NDJSON line for
+///   [`holoiroh_ios_bridge_poll_control_event`].
+/// - On auth failure the daemon's first (and only) line is a **bare**
+///   `{"type":"auth_rejected","text":...}` -> returns
+///   [`HOLOIROH_ERR_CONNECT_FAILED`] with the daemon's reason in
+///   `*out_error`. Timeout / early close also map to
+///   [`HOLOIROH_ERR_CONNECT_FAILED`].
+///
+/// Everything *after* the handshake is envelope-framed both directions
+/// (`TaskEnvelope<ClientMessage>` / `TaskEnvelope<ServerMessage>`, see
+/// `PROTOCOL.md`): [`holoiroh_ios_bridge_control_send`] passes caller-built
+/// envelope lines through verbatim, and the lines handed back by
+/// [`holoiroh_ios_bridge_poll_control_event`] are envelope JSON for the
+/// Swift side to decode.
+///
+/// Idempotent: returns [`HOLOIROH_OK`] immediately if already connected
+/// (checked and connected under one lock, so concurrent callers serialize
+/// rather than double-dial). Requires a prior successful
+/// [`holoiroh_ios_bridge_ticket_connect`] (which stores the peer address)
+/// -- returns [`HOLOIROH_ERR_NOT_CONNECTED`] otherwise. Blocks the calling
+/// thread; call from a background queue.
+///
+/// Note: for a device the daemon has *already allowlisted*, the daemon's
+/// auth gate never consumes the PIN line; it instead falls through to the
+/// daemon's main envelope loop, which replies with one harmless
+/// `{"type":"error","text":"malformed envelope: ..."}` envelope that will
+/// surface once via [`holoiroh_ios_bridge_poll_control_event`]. This is
+/// cosmetic: the ready greeting is written before that loop reads anything,
+/// so it still arrives first and this function still returns
+/// [`HOLOIROH_OK`].
 ///
 /// # Safety
-/// `bridge` may be a live pointer or null; `json_cstr`/`out_error` follow the
-/// same contract as elsewhere in this module. (Arguments are unused in this
-/// build beyond the error reporting.)
+/// `bridge` must be a live pointer from [`holoiroh_ios_bridge_new`].
+/// `pin_cstr` must be a valid null-terminated C string for the duration of
+/// this call. `out_error` follows the same contract as in
+/// [`holoiroh_ios_bridge_ticket_connect`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
+    bridge: *mut HoloirohBridge,
+    pin_cstr: *const c_char,
+    out_error: *mut *mut c_char,
+) -> HoloirohStatus {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let Some(inner) = (unsafe { bridge_ref(bridge) }) else {
+            unsafe { set_error(out_error, "bridge pointer is null") };
+            return HOLOIROH_ERR_NULL_ARG;
+        };
+        if pin_cstr.is_null() {
+            unsafe { set_error(out_error, "pin string pointer is null") };
+            return HOLOIROH_ERR_NULL_ARG;
+        }
+        let pin = match unsafe { CStr::from_ptr(pin_cstr) }.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                unsafe { set_error(out_error, "pin string is not valid UTF-8") };
+                return HOLOIROH_ERR_UNKNOWN;
+            }
+        };
+
+        // Idempotency + single-dialer: the control slot's lock is held for
+        // the whole connect, so a second caller either sees the stored
+        // state (returns OK) or blocks until the first dial resolves.
+        // Holding a std::sync::Mutex guard across `block_on` is sound here:
+        // Runtime::block_on polls the future on *this* thread (it has no
+        // `Send` bound), and nothing inside the future takes this lock.
+        let mut control = inner.control.lock().unwrap_or_else(|e| e.into_inner());
+        if control.is_some() {
+            return HOLOIROH_OK;
+        }
+
+        let Some(peer) = inner
+            .control_peer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            unsafe {
+                set_error(
+                    out_error,
+                    "no peer to dial: call holoiroh_ios_bridge_ticket_connect first",
+                )
+            };
+            return HOLOIROH_ERR_NOT_CONNECTED;
+        };
+
+        // Bare (non-envelope) PIN line -- see this function's doc. serde_json
+        // handles JSON string escaping of arbitrary PIN content.
+        let mut pin_line = serde_json::json!({ "type": "pin", "pin": pin }).to_string();
+        pin_line.push('\n');
+
+        let connect_result = inner.runtime.block_on(async {
+            let connection = inner
+                .live
+                .endpoint()
+                .connect(peer, CONTROL_ALPN)
+                .await
+                .map_err(|err| format!("control-channel connect failed: {err}"))?;
+            let (mut send, recv) = connection
+                .open_bi()
+                .await
+                .map_err(|err| format!("control-channel open_bi failed: {err}"))?;
+            send.write_all(pin_line.as_bytes())
+                .await
+                .map_err(|err| format!("control-channel PIN write failed: {err}"))?;
+            send.flush()
+                .await
+                .map_err(|err| format!("control-channel PIN flush failed: {err}"))?;
+
+            // First reply line: bare auth_rejected, or the envelope-wrapped
+            // ready greeting.
+            let mut lines = BufReader::new(recv).lines();
+            let greeting = tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, async {
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) if line.trim().is_empty() => continue,
+                        Ok(Some(line)) => break Ok(line),
+                        Ok(None) => {
+                            break Err(
+                                "connection closed before control-channel greeting (auth rejected \
+                                 without a reason, or daemon shut down)"
+                                    .to_string(),
+                            );
+                        }
+                        Err(err) => {
+                            break Err(format!(
+                                "read error awaiting control-channel greeting: {err}"
+                            ));
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| {
+                format!(
+                    "timed out after {}s waiting for control-channel greeting",
+                    CONTROL_HANDSHAKE_TIMEOUT.as_secs()
+                )
+            })??;
+
+            let value: serde_json::Value = serde_json::from_str(&greeting)
+                .map_err(|err| format!("unparseable control-channel greeting: {err}"))?;
+            if value.get("type").and_then(|t| t.as_str()) == Some("auth_rejected") {
+                let reason = value
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("(no reason given)");
+                return Err(format!("auth rejected: {reason}"));
+            }
+            // Anything else this early is the daemon's post-auth greeting
+            // envelope (its accept loop writes `status: "control channel
+            // ready"` immediately after the auth gate passes, before reading
+            // anything) -- matched structurally rather than on the greeting
+            // text, so a daemon-side wording tweak can't break pairing.
+            Ok::<_, String>((connection, send, lines))
+        });
+
+        let (connection, send, lines) = match connect_result {
+            Ok(parts) => parts,
+            Err(msg) => {
+                unsafe { set_error(out_error, &msg) };
+                return HOLOIROH_ERR_CONNECT_FAILED;
+            }
+        };
+
+        // Reader task: every subsequent NDJSON line goes into the shared
+        // queue for poll_control_event; EOF or a read error marks the
+        // channel ended. Reuses the handshake's `Lines` reader so any bytes
+        // it buffered past the greeting are not lost.
+        inner.control_ended.store(false, Ordering::Release);
+        let events = inner.control_events.clone();
+        let ended = inner.control_ended.clone();
+        inner.runtime.spawn(async move {
+            let mut lines = lines;
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        events
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push_back(line);
+                    }
+                    Ok(None) | Err(_) => {
+                        ended.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        });
+
+        *control = Some(ControlState { connection, send });
+        HOLOIROH_OK
+    }));
+
+    match result {
+        Ok(status) => status,
+        Err(_) => {
+            unsafe { set_error(out_error, "internal panic during control_connect") };
+            HOLOIROH_ERR_PANIC
+        }
+    }
+}
+
+/// Sends one NDJSON line (per `../PROTOCOL.md`: a `TaskEnvelope<
+/// ClientMessage>` the Swift side has already serialized -- this function is
+/// transport-only and does not inspect or re-frame the JSON) over the
+/// control channel to the connected Mac daemon, appending the terminating
+/// `\n` if the caller didn't include one. Blocks until the bytes are
+/// accepted by the QUIC stream; call from a background queue.
+///
+/// Returns [`HOLOIROH_ERR_NOT_CONNECTED`] until
+/// [`holoiroh_ios_bridge_control_connect`] has succeeded. On a write
+/// failure (peer gone, connection lost) returns
+/// [`HOLOIROH_ERR_CONNECT_FAILED`] and drops the stored stream so a later
+/// `control_connect` call can re-dial.
+///
+/// # Safety
+/// `bridge` must be a live pointer from [`holoiroh_ios_bridge_new`].
+/// `json_cstr` must be a valid null-terminated C string for the duration of
+/// this call. `out_error` follows the same contract as elsewhere in this
+/// module.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_control_send(
     bridge: *mut HoloirohBridge,
     json_cstr: *const c_char,
     out_error: *mut *mut c_char,
 ) -> HoloirohStatus {
-    let _ = (bridge, json_cstr);
-    unsafe {
-        set_error(
-            out_error,
-            "control channel not implemented in this build: the holoiroh/control/1 ALPN transport \
-             is separate follow-on work (see ios-bridge module doc and PROTOCOL.md)",
-        );
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let Some(inner) = (unsafe { bridge_ref(bridge) }) else {
+            unsafe { set_error(out_error, "bridge pointer is null") };
+            return HOLOIROH_ERR_NULL_ARG;
+        };
+        if json_cstr.is_null() {
+            unsafe { set_error(out_error, "json string pointer is null") };
+            return HOLOIROH_ERR_NULL_ARG;
+        }
+        let json = match unsafe { CStr::from_ptr(json_cstr) }.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                unsafe { set_error(out_error, "json string is not valid UTF-8") };
+                return HOLOIROH_ERR_UNKNOWN;
+            }
+        };
+
+        // NDJSON framing: exactly one trailing newline.
+        let mut line = json.trim_end_matches(['\r', '\n']).to_owned();
+        line.push('\n');
+
+        let mut control = inner.control.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = control.as_mut() else {
+            unsafe {
+                set_error(
+                    out_error,
+                    "control channel not connected: call \
+                     holoiroh_ios_bridge_control_connect first",
+                )
+            };
+            return HOLOIROH_ERR_NOT_CONNECTED;
+        };
+
+        let write_result = inner.runtime.block_on(async {
+            state.send.write_all(line.as_bytes()).await?;
+            state.send.flush().await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        match write_result {
+            Ok(()) => HOLOIROH_OK,
+            Err(err) => {
+                // The stream is dead: drop the stored state so a later
+                // control_connect can re-dial, and mark the channel ended so
+                // poll_control_event reports ENDED once the queue drains.
+                *control = None;
+                inner.control_ended.store(true, Ordering::Release);
+                unsafe {
+                    set_error(out_error, &format!("control-channel write failed: {err}"))
+                };
+                HOLOIROH_ERR_CONNECT_FAILED
+            }
+        }
+    }));
+
+    match result {
+        Ok(status) => status,
+        Err(_) => {
+            unsafe { set_error(out_error, "internal panic during control_send") };
+            HOLOIROH_ERR_PANIC
+        }
     }
-    HOLOIROH_ERR_UNSUPPORTED
 }
 
-/// Non-blocking poll for the next `ServerMessage` (per `../PROTOCOL.md`)
-/// received on the control channel.
+/// Non-blocking poll for the next NDJSON line (per `../PROTOCOL.md`: a
+/// `TaskEnvelope<ServerMessage>` -- or, rarely, a bare `ServerMessage` if
+/// the daemon replied outside a session) received on the control channel.
 ///
-/// **Not implemented in this build** -- same reason as
-/// [`holoiroh_ios_bridge_control_send`]. Sets `*out_json` to null and returns
-/// [`HOLOIROH_ERR_UNSUPPORTED`]; never panics.
+/// Semantics:
+/// - **A line is queued** -> writes a freshly-allocated null-terminated
+///   copy to `*out_json` (caller frees via
+///   [`holoiroh_ios_bridge_free_error_string`]) and returns [`HOLOIROH_OK`].
+/// - **Queue empty, stream alive** -> sets `*out_json` to null and returns
+///   [`HOLOIROH_OK`]; poll again shortly.
+/// - **Queue empty, stream ended** (daemon closed it, or a prior
+///   `control_send` failed) -> sets `*out_json` to null and returns
+///   [`HOLOIROH_ERR_ENDED`]; a fresh
+///   [`holoiroh_ios_bridge_control_connect`] may re-establish the channel.
 ///
 /// # Safety
-/// `bridge` may be a live pointer or null; `out_json`, if non-null, must be a
-/// valid writable `*mut *mut c_char`.
+/// `bridge` must be a live pointer from [`holoiroh_ios_bridge_new`].
+/// `out_json` must be a valid writable `*mut *mut c_char`; the string
+/// written there (if any) must later be freed via
+/// [`holoiroh_ios_bridge_free_error_string`]. `out_error` follows the same
+/// contract as elsewhere in this module.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_poll_control_event(
     bridge: *mut HoloirohBridge,
     out_json: *mut *mut c_char,
+    out_error: *mut *mut c_char,
 ) -> HoloirohStatus {
-    let _ = bridge;
-    if !out_json.is_null() {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if out_json.is_null() {
+            unsafe { set_error(out_error, "out_json pointer is null") };
+            return HOLOIROH_ERR_NULL_ARG;
+        }
         unsafe {
             *out_json = std::ptr::null_mut();
         }
+        let Some(inner) = (unsafe { bridge_ref(bridge) }) else {
+            unsafe { set_error(out_error, "bridge pointer is null") };
+            return HOLOIROH_ERR_NULL_ARG;
+        };
+
+        // Same NOT_CONNECTED contract as `control_send`: an empty queue is ambiguous between
+        // "never connected" and "connected, nothing new yet" unless this is checked explicitly.
+        // Witnessed live by ffi_probe: without this check a never-connected bridge polled OK (0)
+        // with a null out_json instead of reporting it was never connected.
+        if inner
+            .control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            unsafe {
+                set_error(
+                    out_error,
+                    "control channel not connected: call holoiroh_ios_bridge_control_connect first",
+                );
+            }
+            return HOLOIROH_ERR_NOT_CONNECTED;
+        }
+
+        let popped = inner
+            .control_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+
+        match popped {
+            Some(line) => {
+                // A NUL byte can't cross as a C string; JSON off this wire
+                // never contains one, but strip defensively rather than
+                // panicking or silently dropping the whole event.
+                let cstring = CString::new(line).unwrap_or_else(|err| {
+                    let mut bytes = err.into_vec();
+                    bytes.retain(|b| *b != 0);
+                    CString::new(bytes).expect("all NUL bytes removed")
+                });
+                unsafe {
+                    *out_json = cstring.into_raw();
+                }
+                HOLOIROH_OK
+            }
+            None => {
+                if inner.control_ended.load(Ordering::Acquire) {
+                    HOLOIROH_ERR_ENDED
+                } else {
+                    HOLOIROH_OK
+                }
+            }
+        }
+    }));
+
+    match result {
+        Ok(status) => status,
+        Err(_) => {
+            unsafe { set_error(out_error, "internal panic during poll_control_event") };
+            HOLOIROH_ERR_PANIC
+        }
     }
-    HOLOIROH_ERR_UNSUPPORTED
 }
 
 // ---------------------------------------------------------------------

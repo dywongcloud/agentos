@@ -23,10 +23,13 @@ import SwiftUI
 /// screen, so `ContentView`'s navigation wiring did not have to change.
 struct PairingView: View {
     /// Called only after the user has confirmed the verification phrase
-    /// matches the Mac's, with the trimmed ticket.
-    let onConnect: (String) -> Void
+    /// matches the Mac's, with the trimmed ticket and the pairing PIN the
+    /// daemon displayed (empty if the daemon runs with `--no-pin-auth` or
+    /// the device is already allowlisted -- see PROTOCOL.md's PIN handshake).
+    let onConnect: (_ ticket: String, _ pin: String) -> Void
 
     @State private var ticketText: String = ""
+    @State private var pinText: String = ""
     @State private var showScanner = false
     @State private var showVerification = false
     @State private var scanError: String?
@@ -88,6 +91,22 @@ struct PairingView: View {
             }
             .padding(.horizontal)
 
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Pairing PIN")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                // The short PIN the daemon prints beside its QR (PROTOCOL.md's
+                // pre-session PIN handshake). Optional: an already-allowlisted
+                // device (or a daemon run with `--no-pin-auth`) needs none.
+                TextField("PIN shown by the Mac (optional)", text: $pinText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .keyboardType(.numberPad)
+                    .accessibilityLabel("Pairing PIN field")
+            }
+            .padding(.horizontal)
+
             Button {
                 scanError = nil
                 showScanner = true
@@ -137,7 +156,7 @@ struct PairingView: View {
                 ticket: trimmedTicket,
                 onConfirmed: {
                     showVerification = false
-                    onConnect(trimmedTicket)
+                    onConnect(trimmedTicket, pinText.trimmingCharacters(in: .whitespacesAndNewlines))
                 },
                 onRejected: {
                     showVerification = false
@@ -148,10 +167,10 @@ struct PairingView: View {
 }
 
 #Preview("Pairing - empty") {
-    PairingView(onConnect: { _ in })
+    PairingView(onConnect: { _, _ in })
 }
 
 #Preview("Pairing - filled") {
-    PairingView(onConnect: { _ in })
+    PairingView(onConnect: { _, _ in })
         .onAppear {}
 }

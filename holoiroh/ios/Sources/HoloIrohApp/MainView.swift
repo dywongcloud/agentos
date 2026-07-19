@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// Main screen shown once the app has "connected" (see `ContentView`'s
-/// navigation wiring -- there is no real control-channel/iroh connection
-/// yet, only the pairing hand-off).
+/// Main screen shown once the app has paired (see `ContentView`'s navigation
+/// wiring). On appear it opens the real connection: one shared
+/// `holoiroh-ios-bridge` handle (`HoloConnection`) carrying both the
+/// `iroh-live` video subscription and the control-ALPN channel.
 ///
 /// This screen is the **task dashboard** and drives the full Project Aro PRD
 /// section 6.1 user-visible state machine: it holds a single `SessionState`
@@ -32,26 +33,29 @@ import SwiftUI
 /// 3. The **status/log panel**, always visible below the state panel.
 /// 4. The per-state **SessionView** panel.
 ///
-/// ## Demonstrably LIVE, not static mock
+/// ## Transport
 ///
-/// There is no live control channel yet, so state transitions are triggered
-/// locally -- exactly the same legitimate stand-in pattern the log panel
-/// already uses (locally-synthesized `ServerMessage` entries). Two triggers:
+/// When the app target links `HoloirohIosBridge.xcframework`, everything here
+/// is driven by the real transport: `HoloConnection` connects the ticket and
+/// PIN on appear, `frameSource` becomes the shared-bridge
+/// `IrohLiveFrameSource`, outbound messages go through
+/// `FFIControlChannelSender`, and inbound daemon `ServerMessage`s
+/// (`handleServerMessage`) drive `session` and the log panel.
 ///
-/// - **Organic**: sending a prompt (typed or via the mic) from `.idle`
-///   advances `.idle → .reviewing`, and the *Send* control there advances
-///   `.reviewing → .connecting → .working`, each with synthesized log
-///   entries -- so a normal prompt-send walks the real UI states forward.
-/// - **Direct**: a "Demo" toolbar menu jumps straight to any of the eight
-///   states with representative payloads, so every state and its controls are
-///   reachable and inspectable in the simulator without scripting a whole run.
-///
-/// The UI states are *real* and really rendered; only the transition *trigger*
-/// is a local demo stand-in for the not-yet-wired control channel.
+/// In bridge-less builds (simulator/CI, `#if canImport` stub) the transport
+/// is unavailable: sends fall back to the `LoggingControlChannelSender`
+/// stand-in, the synthetic frame source keeps the render path live, and the
+/// "Demo" toolbar menu still jumps directly to any of the eight states so
+/// every state's controls remain reachable and inspectable.
 struct MainView: View {
     /// The ticket this session paired with, shown in the header so the
     /// user can confirm which daemon they connected to.
     let ticket: String
+
+    /// The pairing PIN captured on the pairing screen, used for the control
+    /// channel's pre-session PIN handshake (`control_connect`). Empty when
+    /// the daemon needs none (`--no-pin-auth` / already-allowlisted device).
+    let pin: String
 
     /// Returns to `PairingView`.
     let onDisconnect: () -> Void
@@ -74,6 +78,15 @@ struct MainView: View {
     /// The single source of truth for which PRD 6.1 state the dashboard shows.
     @State private var session: SessionState = .idle
 
+    /// The shared-bridge connection owner: ONE `holoiroh-ios-bridge` handle
+    /// carrying both the video subscription and the control channel. Created
+    /// per screen; `onAppear` connects it with this session's ticket + PIN.
+    @StateObject private var connection = HoloConnection()
+
+    /// The last task-committing message sent (`advanceFromReviewToWorking`),
+    /// kept so the Failed panel's Retry re-sends the same request.
+    @State private var lastSentTask: ClientMessage?
+
     @State private var promptText: String = ""
     @StateObject private var voice = VoiceTranscriberModel()
     @State private var logEntries: [LogEntry] = [
@@ -82,30 +95,35 @@ struct MainView: View {
 
     /// The frame producer bound to the video surface. Held with `@State`
     /// so it keeps a stable identity across view updates (a fresh source
-    /// on every re-render would restart the display link each time). This
-    /// is the single swap point: replacing `SyntheticVideoFrameSource()`
-    /// with the real `iroh-live` source (once `ios-bridge` is wired) is the
-    /// only change the live-view feature needs here.
+    /// on every re-render would restart the display link each time).
+    /// Starts as the synthetic pre-connect placeholder and is swapped for
+    /// the real shared-bridge `IrohLiveFrameSource` the moment
+    /// `HoloConnection` reaches `.connected` (see `handleConnectionPhase`);
+    /// bridge-less builds keep the synthetic source for the whole session.
     @State private var frameSource: VideoFrameSource = SyntheticVideoFrameSource()
 
     /// The control-channel send seam (`ControlChannelSender.swift`). This is
     /// the **single injection site** for the outbound message path -- most
     /// importantly the remote kill-switch `ClientMessage.stop` the Cancel
     /// controls send (see `sendControlMessage` / `sessionActions.cancel`).
-    /// Today it is the `LoggingControlChannelSender` stand-in, which really
-    /// encodes each message to its `PROTOCOL.md` wire bytes and surfaces it in
-    /// the status/log panel; swapping in the real `iroh`/`ios-bridge` transport
-    /// is a one-line change here and nowhere else (see the protocol's doc for
-    /// the exact remaining wiring step). Computed rather than stored so its
-    /// `report` closure can append to `logEntries` without a stored-property
-    /// initialization-order problem.
+    /// Once `HoloConnection` completes the control-ALPN PIN handshake this is
+    /// the real `FFIControlChannelSender` (every message goes over the wire
+    /// via `holoiroh_ios_bridge_control_send`); before that -- and in
+    /// bridge-less simulator/CI builds -- it falls back to the
+    /// `LoggingControlChannelSender` stand-in, which encodes the same wire
+    /// bytes and surfaces them in the log panel. Computed rather than stored
+    /// so the fallback's `report` closure can append to `logEntries` without
+    /// a stored-property initialization-order problem.
     private var controlChannel: ControlChannelSending {
-        LoggingControlChannelSender { message, wire in
+        if let real = connection.controlSender {
+            return real
+        }
+        return LoggingControlChannelSender { message, wire in
             // Surface the sent message in the same status/log panel every other
             // event flows through. The trailing newline is trimmed for display
             // (it is real on the wire, noise in the UI).
             let trimmed = wire.trimmingCharacters(in: .whitespacesAndNewlines)
-            logEntries.append(LogEntry(message: .status(text: "→ sent \(message.wireKindLabel): \(trimmed)")))
+            logEntries.append(LogEntry(message: .status(text: "→ sent (not connected) \(message.wireKindLabel): \(trimmed)")))
         }
     }
 
@@ -145,6 +163,7 @@ struct MainView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Disconnect", role: .destructive) {
+                    connection.shutdown()
                     onDisconnect()
                 }
             }
@@ -158,6 +177,13 @@ struct MainView: View {
         .onChange(of: voice.lastError) { _, error in
             guard let error else { return }
             logEntries.append(LogEntry(message: .error(text: error)))
+        }
+        // Real transport lifecycle: connect the shared bridge on appear,
+        // reflect its phase changes, and tear it down when the screen goes.
+        .onAppear(perform: configureConnectionIfNeeded)
+        .onDisappear { connection.shutdown() }
+        .onChange(of: connection.phase) { _, newPhase in
+            handleConnectionPhase(newPhase)
         }
     }
 
@@ -190,11 +216,14 @@ struct MainView: View {
 
     // MARK: - Session action wiring
 
-    /// The control callbacks handed to `SessionView`. Each drives a local
-    /// transition and/or a synthesized log entry -- the legitimate stand-in
-    /// for the not-yet-wired control channel. When the real channel lands,
-    /// these bodies send `ClientMessage`s and the daemon's `ServerMessage`
-    /// responses drive `session`/`logEntries` instead.
+    /// The control callbacks handed to `SessionView`. The task-committing
+    /// legs are real: `send` commits the reviewed request over the control
+    /// channel (`advanceFromReviewToWorking`), `cancel` sends the kill-switch
+    /// `ClientMessage.stop`, and `retry` re-sends the last request; the
+    /// daemon's `ServerMessage` responses then drive `session`
+    /// (`handleServerMessage`). Actions with no wire message yet
+    /// (approve/choose/resolve-locally/take-control) remain local transitions
+    /// until the protocol grows their `ClientMessage` shapes.
     private var sessionActions: SessionActions {
         SessionActions(
             start: { beginReview(from: currentTranscriptOrDemo()) },
@@ -251,8 +280,14 @@ struct MainView: View {
                 session = .idle
             },
             retry: {
-                log(.status(text: "retrying task"))
-                session = .connecting
+                if let lastSentTask {
+                    sendControlMessage(lastSentTask)
+                    log(.status(text: "retrying task"))
+                    session = .connecting
+                } else {
+                    log(.status(text: "nothing to retry"))
+                    session = .idle
+                }
             },
             dismiss: {
                 log(.status(text: "failure dismissed"))
@@ -267,6 +302,93 @@ struct MainView: View {
         payload.isPaused.toggle()
         session = .working(payload)
         log(.status(text: payload.isPaused ? "paused" : "resumed"))
+    }
+
+    // MARK: - Real connection wiring
+
+    /// Wires the connection's decoded-event stream into this view and starts
+    /// the real connect (bridge create → ticket connect → control-ALPN PIN
+    /// handshake). Safe to call again on re-appear: `HoloConnection.connect`
+    /// is idempotent once past `.idle`.
+    private func configureConnectionIfNeeded() {
+        connection.onServerMessage = { message in
+            handleServerMessage(message)
+        }
+        connection.connect(ticket: ticket, pin: pin)
+    }
+
+    /// Reacts to connection lifecycle changes: on `.connected`, swap the
+    /// synthetic placeholder for the shared-bridge live frame source; on
+    /// `.failed`, surface the reason (bridge-less builds land here too, and
+    /// keep the synthetic source + logging-sender fallbacks).
+    private func handleConnectionPhase(_ phase: HoloConnection.Phase) {
+        switch phase {
+        case .idle, .connecting:
+            break
+        case .connected:
+            if let live = connection.liveFrameSource {
+                frameSource.stop()
+                frameSource = live
+            }
+        case .failed(let reason):
+            log(.error(text: "connection unavailable: \(reason)"))
+        }
+    }
+
+    // MARK: - Real control-channel event handling
+
+    /// Projects one daemon `ServerMessage` onto the log panel and, where it
+    /// implies a lifecycle change, onto `session` -- the coarse PRD 6.1
+    /// projection (`SessionState`'s mapping table). The wire protocol's four
+    /// message kinds are coarse, so the projection is too: `task_progress`
+    /// advances/updates the active task, `error` fails it, `ack`/`status`
+    /// are log-only.
+    private func handleServerMessage(_ message: ServerMessage) {
+        log(message)
+        switch message {
+        case .ack, .status:
+            break
+        case .taskProgress(let text):
+            applyTaskProgress(text)
+        case .error(let text):
+            failActiveTask(cause: text)
+        }
+    }
+
+    /// `task_progress` drives Connecting → Working (the daemon accepted the
+    /// task and is acting) and thereafter updates the Working dashboard
+    /// fields in place.
+    private func applyTaskProgress(_ text: String?) {
+        let line = text ?? "working"
+        switch session {
+        case .connecting:
+            session = .working(WorkingPayload(
+                app: macName,
+                status: line,
+                lastAction: "task accepted",
+                nextAction: "in progress"
+            ))
+        case .working(var payload):
+            payload.lastAction = payload.status
+            payload.status = line
+            session = .working(payload)
+        default:
+            break
+        }
+    }
+
+    /// A daemon-reported `error` fails whatever task is active; outside a
+    /// task it is log-only (already appended by `handleServerMessage`).
+    private func failActiveTask(cause: String?) {
+        switch session {
+        case .connecting, .working, .inputNeeded, .draftReady, .awaitingApproval:
+            session = .failed(FailurePayload(
+                cause: cause ?? "The daemon reported an error.",
+                recovery: "Retry the task, or take control on the Mac."
+            ))
+        case .idle, .reviewing, .failed:
+            break
+        }
     }
 
     // MARK: - Organic transitions (prompt-send walk)
@@ -291,34 +413,39 @@ struct MainView: View {
         promptText = ""
     }
 
-    /// Reviewing → Connecting → Working, the "Send" leg of the organic walk.
-    /// The connecting stage is shown briefly, then the task starts working --
-    /// matching the real connect-then-remote-view-active sequence, driven here
-    /// by a short local delay rather than real connection events.
+    /// Reviewing → Connecting, the "Send" leg: commits the reviewed request
+    /// to the daemon over the control channel. There is no local timer any
+    /// more -- the transition out of `.connecting` is driven by the daemon's
+    /// real responses (`handleServerMessage`): a `task_progress` advances to
+    /// `.working`, an `error` fails the task.
     private func advanceFromReviewToWorking() {
-        log(.status(text: "sent -- establishing connection"))
+        guard case .reviewing(let payload) = session else { return }
+        // Voice-originated transcripts keep their `voice_transcript` wire tag
+        // (PROTOCOL.md); typed prompts go out as `prompt`.
+        let message: ClientMessage = payload.transcript == voice.liveText
+            ? .voiceTranscript(text: payload.transcript)
+            : .prompt(text: payload.transcript)
+        lastSentTask = message
+        sendControlMessage(message)
+        log(.status(text: "sent -- waiting for the daemon"))
         session = .connecting
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            // Only advance if the user hasn't cancelled/jumped away in the
-            // meantime (the demo Cancel returns to .idle).
-            guard case .connecting = session else { return }
-            session = .working(Self.demoWorking)
-            log(.taskProgress(text: "remote view active -- agent working"))
-        }
     }
 
     // MARK: - Video preview
 
     private var videoPreview: some View {
         // Real render surface: a `VideoRenderView` (AVSampleBufferDisplayLayer)
-        // bound to `frameSource`. The synthetic source makes it animate
-        // today; the real iroh-live source drops into `frameSource`'s init
-        // later without touching this view.
+        // bound to `frameSource` -- the shared-bridge `IrohLiveFrameSource`
+        // once connected, the synthetic placeholder before then. `.id` keys
+        // the representable to the source's identity so the connect-time swap
+        // tears down the old binding (`dismantleUIView` stops the old source)
+        // and `makeUIView` starts the new one.
         VideoRenderView(source: frameSource)
+            .id(ObjectIdentifier(frameSource as AnyObject))
             .background(Color.black)
             .aspectRatio(16.0 / 9.0, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 12))
-            .accessibilityLabel("Live video preview (synthetic test frames until the network source is connected)")
+            .accessibilityLabel("Live remote view")
     }
 
     // MARK: - Status / log panel
@@ -427,18 +554,11 @@ struct MainView: View {
         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        // Send the prompt through the same control-channel seam the kill-switch
-        // Stop uses (`sendControlMessage`) -- so the outbound path is exercised
-        // for real (the message is JSON-encoded to its `PROTOCOL.md` wire form)
-        // rather than only logged. The transport underneath is still the
-        // `LoggingControlChannelSender` stand-in until the real `iroh` channel
-        // lands (a one-line swap at `controlChannel`), at which point the
-        // daemon's real `ServerMessage` responses replace the local ack below.
-        sendControlMessage(.prompt(text: trimmed))
-        logEntries.append(LogEntry(message: .ack(text: nil)))
-
-        // Organic transition: capturing a prompt puts us into Reviewing so the
-        // user confirms before it becomes a signed task.
+        // Capturing a prompt only *stages* it: nothing reaches the daemon
+        // until the user confirms with the Reviewing panel's Send control
+        // (`advanceFromReviewToWorking`), which performs the real
+        // control-channel send. Acks now come from the daemon, not a local
+        // synthesized entry.
         beginReview(from: trimmed)
     }
 
@@ -529,6 +649,6 @@ private extension MainView {
 
 #Preview("Main - idle") {
     NavigationStack {
-        MainView(ticket: "iroh-live:example-ticket", onDisconnect: {})
+        MainView(ticket: "iroh-live:example-ticket", pin: "123456", onDisconnect: {})
     }
 }

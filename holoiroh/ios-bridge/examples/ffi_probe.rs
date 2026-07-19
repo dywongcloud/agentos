@@ -19,9 +19,10 @@
 //!      string, never a panic.
 //!   5. `poll_next_frame` / `subscribe` / `free` tolerate **null** arguments
 //!      (the `free(NULL)` C convention + null-arg guards).
-//!   6. `control_send` / `poll_control_event` return
-//!      `HOLOIROH_ERR_UNSUPPORTED` (honest "separate follow-on"), never a
-//!      panic.
+//!   6. `control_send` / `poll_control_event` on a bridge that never called
+//!      `control_connect` return `HOLOIROH_ERR_NOT_CONNECTED`, never a panic
+//!      (the live control-channel handshake/send/receive path is witnessed
+//!      separately by `examples/control_ffi_probe.rs` against a real daemon).
 //!   7. Full teardown (`subscription_free`, `free`) runs with no crash/leak.
 //!
 //! What this probe CANNOT witness headlessly: a real frame actually arriving.
@@ -34,7 +35,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 
 use holoiroh_ios_bridge::{
-    HOLOIROH_ERR_INVALID_TICKET, HOLOIROH_ERR_UNSUPPORTED, HOLOIROH_OK, HoloirohFrame,
+    HOLOIROH_ERR_INVALID_TICKET, HOLOIROH_ERR_NOT_CONNECTED, HOLOIROH_OK, HoloirohFrame,
     holoiroh_ios_bridge_control_send, holoiroh_ios_bridge_free,
     holoiroh_ios_bridge_free_error_string, holoiroh_ios_bridge_new,
     holoiroh_ios_bridge_poll_control_event, holoiroh_ios_bridge_poll_next_frame,
@@ -162,22 +163,32 @@ fn main() {
     // --- 6. control channel: honest UNSUPPORTED, never a panic ---
     println!("[6] control_send / poll_control_event  (honest unsupported)");
     {
+        // The control channel is now REALLY implemented (holoiroh_ios_bridge_control_connect /
+        // _control_send / _poll_control_event -- see examples/control_ffi_probe.rs for the full
+        // live PIN-handshake + send/receive witness against a real daemon). This probe doesn't
+        // dial a daemon, so it exercises the honest not-yet-connected error path instead: every
+        // control fn on a bridge that never called control_connect must report
+        // HOLOIROH_ERR_NOT_CONNECTED, never panic, never silently succeed.
         let json = CString::new(r#"{"type":"prompt","text":"hi"}"#).unwrap();
         let mut err: *mut c_char = ptr::null_mut();
         let send_status =
             unsafe { holoiroh_ios_bridge_control_send(bridge, json.as_ptr(), &mut err) };
         let send_msg = take_error(err);
-        println!("    control_send -> {send_status} (expected HOLOIROH_ERR_UNSUPPORTED={HOLOIROH_ERR_UNSUPPORTED})");
+        println!("    control_send (no control_connect yet) -> {send_status} (expected HOLOIROH_ERR_NOT_CONNECTED={HOLOIROH_ERR_NOT_CONNECTED})");
         println!("    control_send error string: {send_msg:?}");
-        assert_eq!(send_status, HOLOIROH_ERR_UNSUPPORTED);
+        assert_eq!(send_status, HOLOIROH_ERR_NOT_CONNECTED);
 
         let mut out_json: *mut c_char = ptr::null_mut();
-        let poll_status =
-            unsafe { holoiroh_ios_bridge_poll_control_event(bridge, &mut out_json) };
-        println!("    poll_control_event -> {poll_status} (out_json null? {})", out_json.is_null());
-        assert_eq!(poll_status, HOLOIROH_ERR_UNSUPPORTED);
-        assert!(out_json.is_null(), "poll_control_event must null out_json when unsupported");
-        println!("    OK: control channel reports UNSUPPORTED cleanly (no panic)\n");
+        let mut poll_err: *mut c_char = ptr::null_mut();
+        let poll_status = unsafe {
+            holoiroh_ios_bridge_poll_control_event(bridge, &mut out_json, &mut poll_err)
+        };
+        let poll_msg = take_error(poll_err);
+        println!("    poll_control_event (no control_connect yet) -> {poll_status} (out_json null? {})", out_json.is_null());
+        println!("    poll_control_event error string: {poll_msg:?}");
+        assert_eq!(poll_status, HOLOIROH_ERR_NOT_CONNECTED);
+        assert!(out_json.is_null(), "poll_control_event must null out_json when not connected");
+        println!("    OK: control channel reports NOT_CONNECTED cleanly before control_connect (no panic)\n");
     }
 
     // --- 7. teardown: free the bridge (runs live.shutdown().await) ---

@@ -28,7 +28,13 @@ iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "5f95758fc
 # Pinned to the same iroh version iroh-live's own dependency graph resolves
 # to, same rationale as mac-daemon/Cargo.toml.
 iroh = "=1.0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+# NDJSON control-channel framing: builds the bare `{"type":"pin","pin":...}`
+# handshake line (with correct JSON string escaping for arbitrary PIN input)
+# and classifies the daemon's first reply line (bare `auth_rejected` vs the
+# envelope-wrapped greeting). Same crate/major the mac-daemon uses for the
+# other side of this wire.
+serde_json = "1"
 anyhow = "1"
 
 [build-dependencies]

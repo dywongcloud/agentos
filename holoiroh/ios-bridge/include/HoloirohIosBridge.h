@@ -127,8 +127,9 @@ typedef struct {
 #define HOLOIROH_ERR_ENDED -6
 
 /**
- * The requested operation is not supported by this build (e.g. the
- * control-channel functions, whose transport is separate follow-on work).
+ * The requested operation is not supported by this build. No function
+ * currently returns this (the control-channel functions are implemented as
+ * of this build); kept so the error-code numbering stays stable.
  */
 #define HOLOIROH_ERR_UNSUPPORTED -7
 
@@ -207,21 +208,49 @@ int holoiroh_ios_bridge_poll_next_frame(HoloirohSubscription *subscription,
                                         HoloirohFrame *out_frame);
 
 /**
- * Sends one ClientMessage (PROTOCOL.md JSON) over the control channel.
- * NOT IMPLEMENTED in this build (the holoiroh/control/1 ALPN transport is
- * separate follow-on work): returns HOLOIROH_ERR_UNSUPPORTED, sets *out_error.
+ * Establishes the control channel (holoiroh/control/1 ALPN) to the Mac the
+ * bridge is ticket-connected to: dials the peer stored by
+ * holoiroh_ios_bridge_ticket_connect, opens one bidirectional stream, sends
+ * the bare PIN handshake line {"type":"pin","pin":...}, and waits (up to
+ * 30s) for the daemon's first reply line. Returns HOLOIROH_OK once the
+ * daemon's "control channel ready" greeting arrives (a reader task then
+ * queues every subsequent NDJSON line for
+ * holoiroh_ios_bridge_poll_control_event); HOLOIROH_ERR_CONNECT_FAILED on
+ * auth_rejected / timeout / transport failure (with *out_error set if
+ * non-NULL); HOLOIROH_ERR_NOT_CONNECTED if ticket_connect hasn't succeeded
+ * yet. Idempotent: an already-connected bridge returns HOLOIROH_OK
+ * immediately. Blocks; call off the main thread.
+ */
+HoloirohStatus holoiroh_ios_bridge_control_connect(HoloirohBridge *bridge,
+                                                   const char *pin_cstr,
+                                                   char **out_error);
+
+/**
+ * Sends one NDJSON line (a PROTOCOL.md TaskEnvelope<ClientMessage> the
+ * caller has already serialized; a trailing \n is appended if missing) over
+ * the connected control channel. Returns HOLOIROH_ERR_NOT_CONNECTED until
+ * holoiroh_ios_bridge_control_connect has succeeded;
+ * HOLOIROH_ERR_CONNECT_FAILED if the stream died (a later control_connect
+ * call may re-dial). Blocks until the bytes are accepted by the QUIC
+ * stream; call off the main thread.
  */
 HoloirohStatus holoiroh_ios_bridge_control_send(HoloirohBridge *bridge,
                                                 const char *json_cstr,
                                                 char **out_error);
 
 /**
- * Non-blocking poll for the next ServerMessage on the control channel.
- * NOT IMPLEMENTED in this build: sets *out_json to NULL, returns
- * HOLOIROH_ERR_UNSUPPORTED.
+ * Non-blocking poll for the next NDJSON line (a PROTOCOL.md
+ * TaskEnvelope<ServerMessage>, or a bare ServerMessage for pre-session
+ * replies) received on the control channel:
+ *   line available -> *out_json = Rust-allocated C string (free it with
+ *                     holoiroh_ios_bridge_free_error_string), returns
+ *                     HOLOIROH_OK
+ *   queue empty    -> *out_json = NULL, returns HOLOIROH_OK (poll again)
+ *   stream ended   -> *out_json = NULL, returns HOLOIROH_ERR_ENDED
  */
 HoloirohStatus holoiroh_ios_bridge_poll_control_event(HoloirohBridge *bridge,
-                                                      char **out_json);
+                                                      char **out_json,
+                                                      char **out_error);
 
 /**
  * Frees a C string previously returned via an out_error/out_json out-param by

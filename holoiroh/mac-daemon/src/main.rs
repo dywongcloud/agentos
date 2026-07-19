@@ -95,10 +95,40 @@ struct Cli {
 }
 
 /// `holo` CLI executable used to spawn `holo serve` (see
-/// `holo_bridge::process`). Overridable so a dev machine can point at a
-/// non-`PATH` binary without editing source.
+/// `holo_bridge::process`). Overridable via `HOLOIROH_HOLO_BIN` so a dev
+/// machine can point at a non-`PATH` binary without editing source.
+///
+/// Falls back to `~/.holo/bin/holo` (the path `holo login`'s own installer
+/// writes -- see `auth.rs`'s module doc) when bare `"holo"` is not resolvable
+/// on `PATH`, rather than always emitting the literal string `"holo"` and
+/// letting `tokio::process::Command::spawn` fail with an opaque
+/// `No such file or directory (os error 2)` -- witnessed live: `holo` is
+/// genuinely absent from a plain non-interactive shell's `PATH` (it's only on
+/// the user's own interactive shell rc), so this fallback is not hypothetical.
 fn holo_bin() -> String {
-    std::env::var("HOLOIROH_HOLO_BIN").unwrap_or_else(|_| "holo".to_string())
+    if let Ok(v) = std::env::var("HOLOIROH_HOLO_BIN") {
+        return v;
+    }
+    if which_on_path("holo").is_none() {
+        if let Some(home) = std::env::var_os("HOME") {
+            let fallback = std::path::Path::new(&home).join(".holo/bin/holo");
+            if fallback.is_file() {
+                return fallback.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "holo".to_string()
+}
+
+/// Minimal `PATH`-search for `name`, mirroring what `Command::spawn` itself
+/// does for a bare (non-slash-containing) program name -- used only to decide
+/// whether [`holo_bin`]'s `~/.holo/bin/holo` fallback is needed, not as a
+/// general-purpose `which` replacement.
+fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Local port `holo serve` listens on. See `holo_bridge::process`.
@@ -336,7 +366,10 @@ async fn main() -> anyhow::Result<()> {
             Some(bridge)
         }
         Err(err) => {
-            warn!(error = %err, "holo_bridge failed to start -- control channel will run without it");
+            // `{err:#}` (anyhow's full context chain), not `%err`/`{err}` (outermost message
+            // only) -- the outer "failed to start holo serve" alone swallowed the actionable
+            // root cause (e.g. the agent-card 401, or a bind failure) every time this fired.
+            warn!(error = %format!("{err:#}"), "holo_bridge failed to start -- control channel will run without it");
             None
         }
     };

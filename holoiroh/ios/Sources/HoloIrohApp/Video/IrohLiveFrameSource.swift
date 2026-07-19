@@ -46,15 +46,22 @@ import HoloirohIosBridge
 /// off the main thread, which `VideoRenderView.enqueue` explicitly tolerates.
 ///
 /// ## Lifecycle / ownership
-/// `start()` creates the bridge, connects the ticket, subscribes, and spins
-/// the poll loop. `stop()` tears the loop down and frees the subscription then
-/// the bridge, in that order (the subscription's decoder is driven by the
-/// bridge's runtime, so it must be freed first). Idempotent both ways.
+/// Two modes. **Owning** (`init(ticket:)`): `start()` creates the bridge,
+/// connects the ticket, subscribes, and spins the poll loop; `stop()` tears
+/// the loop down and frees the subscription then the bridge, in that order
+/// (the subscription's decoder is driven by the bridge's runtime, so it must
+/// be freed first). **Shared-bridge** (`init(bridge:)`, used by
+/// `HoloConnection`): the caller owns an already-ticket-connected bridge that
+/// also carries the control channel; this source only subscribes + polls, and
+/// on `stop()` frees only the subscription -- the owner frees the bridge from
+/// `stop(completion:)`'s completion. Idempotent both ways.
 final class IrohLiveFrameSource: VideoFrameSource {
     var onFrame: ((VideoFrame) -> Void)?
 
-    /// The `iroh-live:` ticket pasted/scanned on the pairing screen.
-    private let ticket: String
+    /// The `iroh-live:` ticket pasted/scanned on the pairing screen. `nil` in
+    /// shared-bridge mode (`init(bridge:)`), where the caller has already
+    /// ticket-connected the bridge it hands in.
+    private let ticket: String?
 
     /// Serial queue owning every FFI call and the poll loop. Serial so the
     /// opaque handles are only ever touched from one thread (the single-owner
@@ -68,7 +75,29 @@ final class IrohLiveFrameSource: VideoFrameSource {
     /// poll drops stale frames rather than falling behind.
     private let pollInterval: TimeInterval = 1.0 / 60.0
 
+    /// Protects `isRunning` so `stop()` can flip it synchronously from any
+    /// thread while the poll loop reads it from `queue` -- the loop occupies
+    /// the serial queue continuously, so an async-enqueued flip would never
+    /// run until the loop exited on its own.
+    private let runLock = NSLock()
     private var isRunning = false
+
+    /// Thread-safe read of the running flag (the poll loop's exit condition).
+    private var running: Bool {
+        runLock.lock()
+        defer { runLock.unlock() }
+        return isRunning
+    }
+
+    /// Thread-safe set; returns the previous value (for start idempotence).
+    @discardableResult
+    private func setRunning(_ newValue: Bool) -> Bool {
+        runLock.lock()
+        defer { runLock.unlock() }
+        let previous = isRunning
+        isRunning = newValue
+        return previous
+    }
 
     /// Reused CVPixelBuffer pool (sized on first frame, re-created if the
     /// stream's dimensions change). Avoids a per-frame allocation.
@@ -91,21 +120,28 @@ final class IrohLiveFrameSource: VideoFrameSource {
     // MARK: - VideoFrameSource
 
     func start() {
+        guard setRunning(true) == false else { return }
         queue.async { [weak self] in
-            guard let self, !self.isRunning else { return }
-            self.isRunning = true
-            self.runConnectAndPollLoop()
+            self?.runConnectAndPollLoop()
         }
     }
 
     func stop() {
-        // Flip the flag synchronously so an in-flight loop iteration exits, then
-        // free handles on the queue. `stop()` may be called from `deinit` or
-        // teardown on any thread.
+        stop(completion: nil)
+    }
+
+    /// Stops the poll loop and frees this source's handles, then runs
+    /// `completion` on the FFI queue. The flag flip really is synchronous
+    /// (`runLock`), so the in-flight loop iteration observes it and exits,
+    /// letting the queued teardown run. `completion` lets a shared-bridge
+    /// owner (`HoloConnection`) free the bridge only *after* the subscription
+    /// is gone (free order matters). May be called from `deinit` or teardown
+    /// on any thread.
+    func stop(completion: (() -> Void)?) {
+        setRunning(false)
         queue.async { [weak self] in
-            guard let self else { return }
-            self.isRunning = false
-            self.teardownHandles()
+            self?.teardownHandles()
+            completion?()
         }
     }
 
@@ -116,26 +152,53 @@ final class IrohLiveFrameSource: VideoFrameSource {
     private var bridge: OpaquePointer?
     private var subscription: OpaquePointer?
 
-    /// Connect + subscribe + poll, all on `queue`. Runs until `isRunning` is
-    /// cleared by `stop()` or the track ends.
-    private func runConnectAndPollLoop() {
-        // 1. Create the bridge (runtime + endpoint + Live session).
-        guard let bridge = holoiroh_ios_bridge_new() else {
-            NSLog("IrohLiveFrameSource: holoiroh_ios_bridge_new returned null")
-            isRunning = false
-            return
-        }
-        self.bridge = bridge
+    /// `false` in shared-bridge mode (`init(bridge:)`): the bridge belongs to
+    /// `HoloConnection`, so `teardownHandles` frees only the subscription and
+    /// leaves the bridge for its owner to free (via `stop(completion:)`).
+    private var ownsBridge = true
 
-        // 2. Connect the ticket (blocks; we are on a background queue).
-        var connectErr: UnsafeMutablePointer<CChar>?
-        let connectStatus = ticket.withCString { cstr in
-            holoiroh_ios_bridge_ticket_connect(bridge, cstr, &connectErr)
+    /// Shared-bridge mode: attach to an already-ticket-connected bridge owned
+    /// by the caller (`HoloConnection`), which also runs the control channel
+    /// on it. This source only subscribes to the video track and polls
+    /// frames; it never creates, connects, or frees the bridge.
+    init(bridge: OpaquePointer) {
+        self.ticket = nil
+        self.bridge = bridge
+        self.ownsBridge = false
+    }
+
+    /// Connect + subscribe + poll, all on `queue`. Runs until the running
+    /// flag is cleared by `stop()` or the track ends.
+    private func runConnectAndPollLoop() {
+        if bridge == nil {
+            // Owning mode (`init(ticket:)`): create + ticket-connect here.
+            guard let ticket else {
+                NSLog("IrohLiveFrameSource: no ticket and no injected bridge")
+                setRunning(false)
+                return
+            }
+            // 1. Create the bridge (runtime + endpoint + Live session).
+            guard let created = holoiroh_ios_bridge_new() else {
+                NSLog("IrohLiveFrameSource: holoiroh_ios_bridge_new returned null")
+                setRunning(false)
+                return
+            }
+            self.bridge = created
+
+            // 2. Connect the ticket (blocks; we are on a background queue).
+            var connectErr: UnsafeMutablePointer<CChar>?
+            let connectStatus = ticket.withCString { cstr in
+                holoiroh_ios_bridge_ticket_connect(created, cstr, &connectErr)
+            }
+            if connectStatus != HOLOIROH_OK {
+                logFFIError("ticket_connect", status: connectStatus, err: &connectErr)
+                teardownHandles()
+                setRunning(false)
+                return
+            }
         }
-        if connectStatus != HOLOIROH_OK {
-            logFFIError("ticket_connect", status: connectStatus, err: &connectErr)
-            teardownHandles()
-            isRunning = false
+        guard let bridge else {
+            setRunning(false)
             return
         }
 
@@ -144,7 +207,7 @@ final class IrohLiveFrameSource: VideoFrameSource {
         guard let subscription = holoiroh_ios_bridge_subscribe(bridge, &subErr) else {
             logFFIError("subscribe", status: -1, err: &subErr)
             teardownHandles()
-            isRunning = false
+            setRunning(false)
             return
         }
         self.subscription = subscription
@@ -154,7 +217,7 @@ final class IrohLiveFrameSource: VideoFrameSource {
     }
 
     private func pollLoop(subscription: OpaquePointer) {
-        while isRunning {
+        while running {
             var frame = HoloirohFrame()
             // Ensure the scratch buffer can hold the current frame; on the very
             // first frame it is empty, so we take the BUFFER_TOO_SMALL path once
@@ -257,15 +320,20 @@ final class IrohLiveFrameSource: VideoFrameSource {
         return pool
     }
 
-    /// Free the subscription then the bridge (order matters: the subscription's
-    /// decoder is driven by the bridge's runtime). Idempotent.
+    /// Free the subscription then (if owned) the bridge -- order matters: the
+    /// subscription's decoder is driven by the bridge's runtime. In
+    /// shared-bridge mode the bridge pointer is only dropped here; its owner
+    /// (`HoloConnection`) frees it afterwards via `stop(completion:)`.
+    /// Idempotent.
     private func teardownHandles() {
         if let subscription = subscription {
             holoiroh_ios_bridge_subscription_free(subscription)
             self.subscription = nil
         }
         if let bridge = bridge {
-            holoiroh_ios_bridge_free(bridge)
+            if ownsBridge {
+                holoiroh_ios_bridge_free(bridge)
+            }
             self.bridge = nil
         }
     }
@@ -290,9 +358,9 @@ final class IrohLiveFrameSource: VideoFrameSource {
         NSLog(
             "IrohLiveFrameSource: HoloirohIosBridge not linked -- build the ios-bridge "
                 + "xcframework and add it to the app target (see ios/IROH_FFI.md). "
-                + "No live frames will be produced. ticket=\(ticket)"
+                + "No live frames will be produced. ticket=\(ticket ?? "<shared bridge>")"
         )
-        isRunning = false
+        setRunning(false)
     }
 
     private func teardownHandles() {}

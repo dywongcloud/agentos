@@ -12,30 +12,20 @@ import Foundation
 /// type at exactly one place (`MainView`'s initializer default) with no change to
 /// any button, panel, or action closure.
 ///
-/// ## The one remaining wiring step to the real transport
+/// ## The real transport
 ///
-/// `send(_:)` is already given the correct, protocol-shaped `ClientMessage` value
-/// (`.stop` for the kill switch, `.prompt`/`.voiceTranscript` for instructions).
-/// The **only** thing not yet real is the byte path out of the device: there is
-/// no `iroh`/FFI networking in this skeleton (see `holoiroh/README.md` and
-/// `ios/IROH_FFI.md`). The remaining step is a single new type conforming to this
-/// protocol whose `send(_:)` calls the `ios-bridge` control-channel send
-/// (`holoiroh/ios-bridge/src/lib.rs`'s `extern "C"` surface -- the hand-written
-/// Rust staticlib that wraps `iroh`'s `Connection::open_bi` and writes one
-/// newline-delimited JSON line per `PROTOCOL.md`). Concretely, that type would:
+/// The real conforming type is `FFIControlChannelSender`
+/// (`HoloConnection.swift`): it holds the opaque bridge handle from
+/// ticket-connect (the same handle the live-video subscription uses) and
+/// writes each message's `encoded(_:)` NDJSON line to the daemon via
+/// `holoiroh_ios_bridge_control_send`, on the connection's serial FFI queue.
+/// It is injected at `MainView.controlChannel` the moment `HoloConnection`
+/// completes the control-ALPN PIN handshake.
 ///
-///   1. hold the opaque connection handle returned by the bridge's
-///      ticket-connect call (the same handle the live-video subscription uses),
-///   2. in `send(_:)`, JSON-encode the `ClientMessage` (the `encoded(_:)` helper
-///      below already produces the exact `PROTOCOL.md` NDJSON bytes -- e.g.
-///      `{"type":"stop"}\n`), optionally wrap it in the `TaskEnvelope` shape once
-///      the client tracks a `session_id`/`sequence_number`, and hand those bytes
-///      to the bridge's `send` FFI function.
-///
-/// Until then, `LoggingControlChannelSender` performs the *encode* half for real
-/// (so the wire bytes are exercised and witnessable) and reports the message to
-/// the status/log panel instead of putting it on a socket -- the same legitimate
-/// stand-in pattern the rest of `MainView` uses for the not-yet-wired channel.
+/// `LoggingControlChannelSender` remains as the pre-connect / bridge-less
+/// fallback: it performs the *encode* half for real (so the wire bytes are
+/// exercised and witnessable) and reports the message to the status/log
+/// panel instead of putting it on a socket.
 protocol ControlChannelSending {
     /// Send one `ClientMessage` to the daemon. Implementations must encode it as
     /// the `PROTOCOL.md` NDJSON wire form; see `ControlChannelSending.encoded(_:)`.
