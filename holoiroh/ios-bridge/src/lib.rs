@@ -838,17 +838,114 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
         let mut pin_line = serde_json::json!({ "type": "pin", "pin": pin }).to_string();
         pin_line.push('\n');
 
+        // First line of defense against the on-device "aborted by peer" race
+        // (see the retry loop below for the second): if the media
+        // subscription's connection to this SAME peer is live, grab a clone of
+        // it so we can wait for its path set to settle before dialing the
+        // control connection. iroh 1.0.x removed every endpoint-level
+        // path-state watcher (0.92's `Endpoint::conn_type()` is gone;
+        // `remote_info()` is an explicit non-watching snapshot), so the only
+        // real path-readiness signal left is the existing media Connection's
+        // own `paths()` -- the same is_ip()/is_relay()/is_selected() idiom
+        // iroh's own `test_paths_watcher` uses to wait for path stabilization.
+        // `Connection` is a cheap Arc-backed clone, taken while holding the
+        // subscription lock only momentarily (never across an await).
+        let media_conn = inner
+            .subscription
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.session().conn().clone());
+
         let connect_result = inner.runtime.block_on(async {
-            let connection = inner
-                .live
-                .endpoint()
-                .connect(peer, CONTROL_ALPN)
-                .await
-                .map_err(|err| format!("control-channel connect failed: {err}"))?;
-            let (mut send, recv) = connection
-                .open_bi()
-                .await
-                .map_err(|err| format!("control-channel open_bi failed: {err}"))?;
+            // Wait (bounded, 1.5s) for the media connection's path set to
+            // settle: either a direct (IP) path exists, or a relay path has
+            // been SELECTED as the transmission path -- not merely opened.
+            // Dialing the second QUIC connection mid-hole-punch is what races
+            // the path discovery and produces the transport-level abort; by
+            // the time the FIRST connection's paths have settled, the peer's
+            // address resolution is warm for the second dial. On timeout we
+            // fall through unchanged -- the retry loop below remains the
+            // safety net for any residual race window.
+            if let Some(conn) = &media_conn {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+                loop {
+                    let settled = conn
+                        .paths()
+                        .iter()
+                        .any(|p| p.is_ip() || (p.is_relay() && p.is_selected()));
+                    if settled || tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+
+            // Connection establishment (dial + open_bi) is retried up to
+            // MAX_CONNECT_ATTEMPTS times: on the physical device this half
+            // has been observed to fail with a transport-level QUIC abort
+            // (quinn-proto ConnectionError::ConnectionClosed, "aborted by
+            // peer") that does not reproduce on loopback-adjacent (Mac-to-
+            // Mac) runs of the identical code path -- consistent with a
+            // direct-path/NAT-traversal race rather than a real rejection
+            // (the daemon's own logs show QAD-observed address variance and
+            // HostUnreachable during hole-punch attempts on flaky networks).
+            // A short escalating backoff gives that race a beat to resolve.
+            // Each attempt is a *fresh* connect() call -- a half-failed
+            // connection/stream is never reused across attempts.
+            //
+            // Deliberately NOT retried: everything from the PIN write
+            // onward (write/flush/greeting-read below). A real
+            // `auth_rejected`, a malformed greeting, or a genuine handshake
+            // timeout must surface immediately on the first occurrence --
+            // retrying those would silently mask an authentication failure,
+            // which is a behavior regression, not resilience.
+            const MAX_CONNECT_ATTEMPTS: u32 = 3;
+            const CONNECT_RETRY_BACKOFF: [Duration; 2] =
+                [Duration::from_millis(300), Duration::from_millis(700)];
+
+            let mut connect_attempt_errors: Vec<String> = Vec::new();
+            let (connection, mut send, recv) = 'connect: loop {
+                let attempt = connect_attempt_errors.len() as u32 + 1;
+                let dial_result: Result<_, String> = async {
+                    let connection = inner
+                        .live
+                        .endpoint()
+                        .connect(peer.clone(), CONTROL_ALPN)
+                        .await
+                        .map_err(|err| format!("control-channel connect failed: {err}"))?;
+                    let (send, recv) = connection
+                        .open_bi()
+                        .await
+                        .map_err(|err| format!("control-channel open_bi failed: {err}"))?;
+                    Ok((connection, send, recv))
+                }
+                .await;
+
+                match dial_result {
+                    Ok(parts) => break 'connect parts,
+                    Err(msg) => {
+                        // Transport-level failure of the dial/open_bi half
+                        // only -- not an application-level rejection (those
+                        // can only occur after the PIN line is sent, i.e.
+                        // below this loop). Trace-log-equivalent: recorded
+                        // here as a comment/attempt-history since this crate
+                        // has no tracing subscriber wired up on iOS; the
+                        // full history is folded into the returned error on
+                        // final failure so a future diagnosis has evidence.
+                        connect_attempt_errors.push(format!("attempt {attempt}: {msg}"));
+                        if attempt >= MAX_CONNECT_ATTEMPTS {
+                            return Err(format!(
+                                "control-channel connect failed after {attempt} attempts: {}",
+                                connect_attempt_errors.join("; ")
+                            ));
+                        }
+                        tokio::time::sleep(CONNECT_RETRY_BACKOFF[(attempt - 1) as usize]).await;
+                        continue 'connect;
+                    }
+                }
+            };
+
             send.write_all(pin_line.as_bytes())
                 .await
                 .map_err(|err| format!("control-channel PIN write failed: {err}"))?;
