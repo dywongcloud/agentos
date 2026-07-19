@@ -129,16 +129,23 @@ fn print_pairing_block(ticket_str: &str, context: &str) {
 /// capacity) is logged and skipped rather than aborting startup -- the raw
 /// ticket text printed alongside it is always the authoritative fallback.
 fn print_ticket_qr(ticket: &str) {
-    match qrcode::QrCode::new(ticket.as_bytes()) {
+    // EcLevel::L (lowest error correction) minimizes the QR version and thus the
+    // module count: the ~230-byte ticket needs version 11 (61x61 modules) at
+    // `QrCode::new`'s implicit EcLevel::M default, but only version 9-10
+    // (53x53 / 57x57) at L. Low ECC is fine here -- the code is scanned straight
+    // off a pristine screen, not a damaged printed label.
+    match qrcode::QrCode::with_error_correction_level(ticket.as_bytes(), qrcode::EcLevel::L) {
         Ok(code) => {
-            // One-module-per-character rendering (the documented, API-verified
-            // baseline in PAIRING.md): ' ' background, '█' unicode full block
-            // foreground for a denser, more scannable grid than plain '#'.
+            // Dense1x2 packs two vertically-adjacent modules into one character
+            // cell (' ', '▄', '▀', '█'), so the code is HALF the terminal height
+            // of the old one-row-per-module `render::<char>()` output and each
+            // module is roughly square in a typical ~1:2 terminal font --
+            // ~31 rows x ~61 cols instead of 69x69, small enough to fit on
+            // screen unscrolled and far easier for a phone camera to lock onto.
+            // quiet_zone(true) keeps the 4-module light border scanners require.
             let rendered = code
-                .render::<char>()
+                .render::<qrcode::render::unicode::Dense1x2>()
                 .quiet_zone(true)
-                .light_color(' ')
-                .dark_color('█')
                 .build();
             println!("Scan this QR with the iOS app (or paste the ticket below):");
             println!("{rendered}");

@@ -1,68 +1,68 @@
 //! Manual, run-by-hand probe: witnesses that `main.rs`'s `print_ticket_qr` path renders a
-//! real, scannable QR code for a realistic iroh `LiveTicket`-shaped string. `main.rs` itself
-//! can't be driven to this point headlessly (its macOS permission preflight refuses to start
-//! without Screen Recording/Accessibility TCC grants, which need an interactive System
-//! Settings click), so this probe exercises the exact same `qrcode` render path against a real
-//! ticket-length string and asserts the output is a valid QR grid -- not `#[cfg(test)]`, run
-//! via `cargo run --example qr_probe`, per this repo's no-unit-tests rule.
-//!
-//! It reconstructs the same render call `main.rs::print_ticket_qr` makes (one-module-per-char,
-//! ' ' light / '█' dark, quiet zone on) rather than calling that private fn, and additionally
-//! decodes structural facts (module count matches the QR version for that data length) so the
-//! witness is that a *correct* QR was produced, not just that some characters were printed.
+//! real, SCANNABLE QR code for a realistic iroh `LiveTicket`-shaped string, and that the
+//! density fix (EcLevel::L + `Dense1x2` half-block rendering) is materially smaller/squarer
+//! than the old `QrCode::new` (EcLevel::M) + one-module-per-`char` render that a phone camera
+//! could not lock onto. `main.rs` can't be driven here headlessly (macOS TCC preflight), so
+//! this exercises the exact same `qrcode` render path against a real ticket-length string.
+//! Not `#[cfg(test)]`; run via `cargo run --example qr_probe [ticket]`, per the no-unit-tests rule.
 
 fn main() {
-    // A realistic iroh LiveTicket string: `iroh-live:` + a long base32-ish node/broadcast
-    // blob, ~180 chars -- the same order of magnitude a real ticket prints (see the ticket a
-    // prior pre-permission-gate daemon run emitted, recorded in PRD witnesses).
-    let ticket = "iroh-live:hExqb9KlcU9cySSy6wGwCsA_0zk5fy7Ny_MbBw3uzVgDAQDAqAFMjeIDAQDAqEABjeIDAQDAqP8KjeID6xr3hAqUpuVK8pWZ2mQ0hPzL9xNvWtQ7aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789/holoiroh";
+    // A realistic ~230-char ticket (the length the user's real daemon printed): `iroh-live:` +
+    // a long base64url node/broadcast blob + `/holoiroh`. Override by passing a real ticket as
+    // argv[1] to check its exact version/size.
+    let ticket: String = std::env::args().nth(1).unwrap_or_else(|| {
+        "iroh-live:UmmYHPAypao5FUFMdPzjzkeI7HlV6AfFVTVpkkVvaJwGACNodHRwczovL3VzdzEtMS5yZWxheS5uMC5pcm9oLmxpbmsuLwEALTJiaeqXAgEALTJiaajyAwEAwKgBTMjAwEAwKhAAcCjAwEAwKj_CsCjAw/holoiroh".to_string()
+    });
+    println!("=== ticket length: {} bytes ===", ticket.len());
 
-    println!("=== rendering a realistic {}-char ticket as a QR ===", ticket.len());
+    // Show the version/module-count win of EcLevel::L over the old QrCode::new (EcLevel::M)
+    // default -- fewer modules == a smaller, easier-to-scan code.
+    let mut l_width = 0usize;
+    for (name, ec) in [
+        ("L (new fix)", qrcode::EcLevel::L),
+        ("M (old QrCode::new default)", qrcode::EcLevel::M),
+    ] {
+        let code = qrcode::QrCode::with_error_correction_level(ticket.as_bytes(), ec)
+            .expect("ticket must be within QR capacity");
+        println!(
+            "  EcLevel::{name}: version {:?}, {} modules per side",
+            code.version(),
+            code.width()
+        );
+        if matches!(ec, qrcode::EcLevel::L) {
+            l_width = code.width();
+        }
+    }
 
-    let code = qrcode::QrCode::new(ticket.as_bytes())
-        .expect("a ~180-char ticket is well within QR capacity; construction must succeed");
-
-    // Structural witness: the chosen QR version must actually hold this data. `width()` is the
-    // module count per side; it grows with version. For ~180 bytes at the default error
-    // correction level the crate picks a version whose width is comfortably > 21 (version 1).
-    let width = code.width();
-    println!("QR chosen: {width}x{width} modules");
-    assert!(
-        width >= 25,
-        "a ~180-char payload should need a QR version larger than v1 (21x21); got {width}x{width}"
-    );
-
-    // Render exactly as main.rs::print_ticket_qr does.
+    // Render EXACTLY as main.rs::print_ticket_qr now does: EcLevel::L + Dense1x2 half-block.
+    let code = qrcode::QrCode::with_error_correction_level(ticket.as_bytes(), qrcode::EcLevel::L)
+        .expect("ticket must be within QR capacity");
     let rendered = code
-        .render::<char>()
+        .render::<qrcode::render::unicode::Dense1x2>()
         .quiet_zone(true)
-        .light_color(' ')
-        .dark_color('█')
         .build();
 
-    // Witness the rendered grid is non-trivial: it must contain foreground modules (not an
-    // all-blank render), and every line must be the same width (a well-formed grid), and there
-    // must be at least `width` rows (plus quiet zone).
     let lines: Vec<&str> = rendered.lines().collect();
-    let dark_count = rendered.chars().filter(|&c| c == '█').count();
-    assert!(dark_count > 50, "rendered QR must have real foreground modules; got {dark_count}");
-    let line_widths: std::collections::HashSet<usize> =
-        lines.iter().map(|l| l.chars().count()).collect();
-    assert_eq!(
-        line_widths.len(),
-        1,
-        "every QR row must be the same character width (a well-formed grid); got widths {line_widths:?}"
-    );
+    let rows = lines.len();
+    let cols = lines.first().map_or(0, |l| l.chars().count());
+    let old_side = l_width + 8; // old char render: one row+col per module + 4-module quiet zone each side.
+
+    // Structural witnesses: well-formed grid, non-empty, and the half-block render is at most
+    // ~half the row count of the old one-row-per-module render (that halving is the whole fix).
+    let uniform: std::collections::HashSet<usize> = lines.iter().map(|l| l.chars().count()).collect();
+    assert_eq!(uniform.len(), 1, "every QR row must be the same width; got {uniform:?}");
+    assert!(rows > 10 && cols > 10, "render must be a real grid; got {cols}x{rows}");
     assert!(
-        lines.len() >= width,
-        "rendered QR should have at least the module rows; got {} rows for {width} modules",
-        lines.len()
+        rows <= old_side / 2 + 2,
+        "Dense1x2 must roughly halve the height vs the old {old_side}-row char render; got {rows} rows"
     );
 
+    println!(
+        "Dense1x2 render: {cols} cols x {rows} rows  (old char render would be {old_side} x {old_side})"
+    );
     println!();
     println!("{rendered}");
     println!(
-        "qr_probe: OK -- realistic ticket rendered to a well-formed {width}x{width} QR ({dark_count} dark modules, {} uniform-width rows). Same qrcode render path main.rs::print_ticket_qr uses at startup.",
-        lines.len()
+        "qr_probe: OK -- EcLevel::L + Dense1x2 render is {rows} rows (vs {old_side} for the old M-level char render), a well-formed {cols}x{rows} grid. This is the exact path main.rs::print_ticket_qr uses; the far smaller/squarer code is what makes a phone camera able to scan it."
     );
 }

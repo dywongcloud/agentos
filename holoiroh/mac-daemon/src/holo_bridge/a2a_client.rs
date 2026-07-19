@@ -152,9 +152,18 @@ impl A2aClient {
         // exact path served by that helper is the a2a-sdk's own stock route, not re-derived
         // here beyond the spec's documented default).
         let url = format!("{}/.well-known/agent-card.json", self.base_url);
+        // The public A2A spec treats the well-known agent card as unauthenticated discovery,
+        // but holo serve's BearerAuthMiddleware guards every route except /health (witnessed
+        // live: this GET returns 401 {"error":"unauthorized"} without the token). This daemon
+        // always knows the token (it generates it and exports HOLO_AUTH_TOKEN before spawn --
+        // see process.rs), so send it unconditionally; a future holo serve that makes the card
+        // public simply ignores the header. Without this, HoloBridge::start fails after health,
+        // holo serve is SIGTERMed, and the control channel is never mounted -- so a phone
+        // connection fails at ALPN negotiation and sees nothing, not even an ack.
         let resp = self
             .http
             .get(&url)
+            .header("Authorization", self.auth_header())
             .send()
             .await
             .with_context(|| format!("GET {url} failed"))?;
