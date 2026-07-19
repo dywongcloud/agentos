@@ -187,14 +187,18 @@ fn print_ticket_qr(ticket: &str) {
 }
 
 /// Whether the daemon should run its own local `llama-server` (Aro Private mode) and point
-/// `holo serve` at it, versus leaving `holo serve` on whatever backend the environment already
-/// configures. Local is the **default** because the alpha build is local-only (Project Aro PRD
-/// P0-11: no cloud inference path). Set `HOLOIROH_LOCAL_MODEL=0` (or `false`/`no`) to opt out --
-/// e.g. a dev pointing `holo serve` at an already-running inference server by hand.
+/// `holo serve` at it, versus leaving `holo serve` on the hosted Holo3 API (via `HAI_API_KEY`).
+///
+/// Defaults to **off** (hosted API) as of this build: starting the local `llama-server` means
+/// loading a 21GB model, which can take minutes with no output before the daemon prints
+/// anything -- witnessed live as a silent, indistinguishable-from-hung startup on a plain
+/// `holoiroh-daemon` invocation with no env vars set (the exact symptom reported: "just hangs,
+/// no QR code shows up"). Set `HOLOIROH_LOCAL_MODEL=1` (or `true`/`yes`) to opt IN to local
+/// inference (Project Aro PRD P0-11's no-cloud-path mode) once that tradeoff is wanted again.
 fn local_model_enabled() -> bool {
     match std::env::var("HOLOIROH_LOCAL_MODEL") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"),
-        Err(_) => true,
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+        Err(_) => false,
     }
 }
 
