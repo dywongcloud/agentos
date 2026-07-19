@@ -217,15 +217,68 @@ impl HoloServeProcess {
         let auth_token = generate_token();
         let base_url = format!("http://127.0.0.1:{port}");
 
+        // Retried up to 8 times over ~8s: witnessed live that a daemon RESTART shortly after a
+        // clean SIGTERM shutdown of a PRIOR daemon can hit this port transiently unbindable --
+        // not by our own Rust-side preflight (a bare `TcpListener::bind` succeeds fine, since
+        // Rust sets SO_REUSEADDR by default), but by `holo serve`'s own Python HTTP server underneath
+        // it, which does NOT set SO_REUSEADDR and so refuses to bind while the just-killed prior
+        // `holo serve`'s connections are still draining through TCP TIME_WAIT (witnessed: up to
+        // ~6s for TIME_WAIT to clear on this port after a graceful shutdown). A single-shot spawn
+        // attempt turned an ordinary quick restart into a hard failure ("holo serve exited during
+        // startup" with the process's own "[Errno 48] Address already in use" on stderr), control
+        // channel never mounted, every phone connection then rejected at the QUIC ALPN level
+        // (error 120: peer doesn't support any known protocol) since CONTROL_ALPN was never
+        // registered on the router. Retrying the WHOLE spawn+health-wait (not just a Rust-side
+        // bind preflight, which cannot see holo serve's own SO_REUSEADDR-less bind failure) is
+        // the only retry shape that actually closes this race. A port genuinely held by an
+        // unrelated long-lived process still fails after the retry budget, with the real
+        // holo-serve-reported reason surfaced.
+        const MAX_SPAWN_ATTEMPTS: u32 = 8;
+        const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(1200);
+        let mut last_spawn_err = None;
+        for attempt in 1..=MAX_SPAWN_ATTEMPTS {
+            match Self::spawn_attempt(holo_bin, port, local_base_url, &auth_token, &base_url).await
+            {
+                Ok(child) => return Ok(child),
+                Err(err) => {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = MAX_SPAWN_ATTEMPTS,
+                        error = %format!("{err:#}"),
+                        "holo serve spawn attempt failed, retrying after backoff"
+                    );
+                    last_spawn_err = Some(err);
+                    if attempt < MAX_SPAWN_ATTEMPTS {
+                        tokio::time::sleep(SPAWN_RETRY_BACKOFF).await;
+                    }
+                }
+            }
+        }
+        Err(last_spawn_err.expect("loop runs at least once, so an error is always recorded on exhaustion"))
+    }
+
+    /// One attempt to spawn `holo serve` and wait for it to report healthy. Split out of
+    /// [`Self::spawn_inner`] so the caller can retry the WHOLE attempt (fresh process, fresh
+    /// port bind) on failure -- see that function's doc for why a bind-preflight-only retry is
+    /// insufficient.
+    async fn spawn_attempt(
+        holo_bin: &str,
+        port: u16,
+        local_base_url: Option<&str>,
+        auth_token: &str,
+        base_url: &str,
+    ) -> Result<Self> {
         // Port preflight: if something else is already listening on the port, `holo serve` will
         // die on bind -- worse, the health probe below polls `http://127.0.0.1:{port}/...`,
         // which the SQUATTER answers, so without this check the daemon can conclude "healthy"
         // while its own child is already dead (witnessed live: a stale test stub on 8765 made
         // the daemon report a healthy bridge, then the health loop found the real child dead
-        // and spun on restarts). Bind-and-release has a small TOCTOU window, which is fine:
-        // this is a diagnosability preflight producing an actionable error for the overwhelmingly
-        // common case, not the enforcement mechanism (bind failure inside holo serve remains the
-        // authoritative failure).
+        // and spun on restarts). Bind-and-release has a small TOCTOU window (holo serve's own
+        // bind is the authoritative check right after this), and a bare Rust bind can succeed
+        // in a SO_REUSEADDR-shaped TIME_WAIT window `holo serve` itself still cannot use -- this
+        // preflight catches the common "genuinely unrelated squatter" case with a fast, clear
+        // error; the TIME_WAIT-vs-holo-serve race is instead closed by `spawn_inner`'s
+        // whole-attempt retry loop around this function.
         if let Err(err) = std::net::TcpListener::bind(("127.0.0.1", port)) {
             bail!(
                 "port {port} is already in use by another process ({err}); `holo serve` cannot bind it. \
@@ -236,7 +289,7 @@ impl HoloServeProcess {
 
         // Build the exact command via the shared builder (also used by the verification example),
         // then add only the stdio/kill-on-drop settings that don't affect the argv/env contract.
-        let mut cmd = Self::build_command(holo_bin, port, local_base_url, &auth_token);
+        let mut cmd = Self::build_command(holo_bin, port, local_base_url, auth_token);
         cmd
             // Inherit the parent's env otherwise (HAI_API_KEY when NOT local, etc. from
             // mac-daemon/.env / the launching shell) so `holo serve`'s own settings loader
@@ -266,15 +319,15 @@ impl HoloServeProcess {
             spawn_log_drain(stderr, "holo serve", tracing::Level::INFO);
         }
 
-        wait_for_health(&base_url, &mut child).await?;
+        wait_for_health(base_url, &mut child).await?;
 
         tracing::info!(port, base_url = %base_url, "holo serve is healthy");
 
         Ok(Self {
             child,
             port,
-            base_url,
-            auth_token,
+            base_url: base_url.to_string(),
+            auth_token: auth_token.to_string(),
             // The single-instance claim is attached by `spawn` (the only caller) after this
             // returns -- `spawn_inner` itself never owns it, so its `?` error paths can't
             // affect the guard.
