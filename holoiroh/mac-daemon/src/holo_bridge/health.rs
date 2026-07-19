@@ -44,9 +44,10 @@ use super::HoloBridge;
 /// How often the health-check loop polls `holo serve` liveness.
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Crash-loop guard: if `holo serve` crashes again within this long of the previous restart,
-/// back off before retrying instead of respawning at full speed forever (e.g. a persistently
-/// broken install, missing dependency, or repeatedly-revoked permission).
+/// Crash-loop guard: if a restart is needed again within this long of the previous restart
+/// ATTEMPT (successful or failed -- a deterministic failure must back off too, not spam at
+/// full tick rate), pause before retrying (e.g. a persistently broken install, a squatted
+/// port, missing dependency, or repeatedly-revoked permission).
 const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(30);
 const CRASH_LOOP_BACKOFF: Duration = Duration::from_secs(15);
 
@@ -64,7 +65,7 @@ pub async fn run_health_check_loop(bridge: Arc<HoloBridge>, shutdown: Cancellati
     // checks immediately after.
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let mut last_restart_at: Option<tokio::time::Instant> = None;
+    let mut last_attempt_at: Option<tokio::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -73,7 +74,7 @@ pub async fn run_health_check_loop(bridge: Arc<HoloBridge>, shutdown: Cancellati
                 return;
             }
             _ = interval.tick() => {
-                check_and_restart_if_needed(&bridge, &mut last_restart_at).await;
+                check_and_restart_if_needed(&bridge, &mut last_attempt_at).await;
             }
         }
     }
@@ -81,7 +82,7 @@ pub async fn run_health_check_loop(bridge: Arc<HoloBridge>, shutdown: Cancellati
 
 async fn check_and_restart_if_needed(
     bridge: &Arc<HoloBridge>,
-    last_restart_at: &mut Option<tokio::time::Instant>,
+    last_attempt_at: &mut Option<tokio::time::Instant>,
 ) {
     let detail = match bridge.try_wait_process().await {
         Ok(None) => return, // still running -- nothing to do this tick
@@ -100,7 +101,7 @@ async fn check_and_restart_if_needed(
         "Holo bridge (holo serve) stopped unexpectedly ({detail}); restarting..."
     ));
 
-    if let Some(last) = *last_restart_at {
+    if let Some(last) = *last_attempt_at {
         if last.elapsed() < CRASH_LOOP_WINDOW {
             tracing::warn!(
                 "holo_bridge::health: crash loop detected (restarted less than {CRASH_LOOP_WINDOW:?} ago), backing off for {CRASH_LOOP_BACKOFF:?}"
@@ -111,17 +112,24 @@ async fn check_and_restart_if_needed(
 
     match bridge.restart_process().await {
         Ok(()) => {
-            *last_restart_at = Some(tokio::time::Instant::now());
+            *last_attempt_at = Some(tokio::time::Instant::now());
             tracing::info!("holo_bridge::health: holo serve restarted successfully");
             bridge
                 .control
                 .emit_daemon_status("Holo bridge (holo serve) restarted successfully.");
         }
         Err(err) => {
-            tracing::error!("holo_bridge::health: restart failed: {err}");
+            // A failed ATTEMPT arms the crash-loop backoff too. Keying backoff on successful
+            // restarts alone meant a deterministic failure (e.g. the port squatted by another
+            // process, or holo uninstalled) re-fired at the full tick rate forever -- the
+            // every-5s ERROR spam witnessed live. `{err:#}` prints anyhow's whole context
+            // chain; plain `{err}` showed only the outermost "failed to respawn holo serve"
+            // and swallowed the actionable root cause beneath it.
+            *last_attempt_at = Some(tokio::time::Instant::now());
+            tracing::error!("holo_bridge::health: restart failed: {err:#}");
             bridge
                 .control
-                .emit_daemon_status(format!("Holo bridge (holo serve) restart failed: {err}. Will retry."));
+                .emit_daemon_status(format!("Holo bridge (holo serve) restart failed: {err:#}. Will retry."));
             // Deliberately does not propagate a fatal error or exit the loop -- the daemon
             // (and the iroh P2P session it owns, which this module cannot reach at all -- see
             // module doc) stays up even while holo serve is persistently broken. The next

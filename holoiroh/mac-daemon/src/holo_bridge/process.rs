@@ -44,13 +44,53 @@ use tokio::time::{Instant, sleep};
 use crate::holo_bridge::a2a_client::A2aClient;
 
 /// Process-wide guard ensuring at most one `holo serve` child is ever tracked as running by
-/// this daemon at a time. `HoloBridge::start` (the only current call site) is invoked once per
-/// daemon lifetime, but this guard is the actual enforcement point rather than relying on that
-/// caller discipline: [`HoloServeProcess::spawn`] refuses to spawn a second child while this is
-/// `true`, and it is cleared on every exit path (`shutdown()`, `Drop`) so a later `spawn()` call
-/// (e.g. after a future "restart holo serve" feature) can succeed once the previous child is
-/// actually gone.
+/// this daemon at a time. [`HoloServeProcess::spawn`] refuses to spawn a second child while this
+/// is `true`. Held via an owned [`GuardClaim`] token rather than raw stores, so release is tied
+/// to ownership: only the object that acquired the claim can release it, and it does so exactly
+/// once. This exists because the earlier raw-`store(false)` design had two real bugs (witnessed
+/// live via `holo_bridge::health`'s "restart failed: failed to respawn holo serve" loop, and by
+/// `examples/serve_guard_probe.rs`):
+///
+/// 1. **Restart could never succeed.** `HoloBridge::restart_process` spawned the NEW child while
+///    the old (dead-child) `HoloServeProcess` still held the guard -- `compare_exchange` failed
+///    every time, deterministically, so the health loop errored every tick forever.
+/// 2. **The old process's `Drop` released the new process's guard.** `Drop` did an unconditional
+///    `store(false)`; after a (hypothetically successful) restart replaced the old object, the
+///    old `Drop` would clear the claim the NEW child had just acquired, re-opening the
+///    double-spawn hole the guard exists to close.
+///
+/// With [`GuardClaim`], the restart path disarms the old process (drops its claim) before
+/// spawning the replacement, and a claim-less process's `Drop` cannot touch the flag at all.
 static HOLO_SERVE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Owned claim on [`HOLO_SERVE_RUNNING`]. Acquiring ([`GuardClaim::try_acquire`]) atomically
+/// flips the flag `false -> true`; dropping the claim releases it (`-> false`), exactly once,
+/// and only for the claim that actually holds it. Zero-sized -- the token IS the ownership.
+///
+/// Public (not just `pub(crate)`) so `examples/serve_guard_probe.rs` can witness the
+/// acquire/second-acquire-fails/release/re-acquire lifecycle and the restart-ordering
+/// (disarm-old-then-acquire-new leaves the flag held by the new claim; dropping the disarmed
+/// old is a no-op) against the REAL static, per this repo's probe-witness rule.
+#[derive(Debug)]
+pub struct GuardClaim(());
+
+impl GuardClaim {
+    /// Atomically claim the guard. `None` if another live claim already holds it.
+    /// `compare_exchange` makes the check-and-set atomic so two concurrent callers can't both
+    /// observe `false` and both proceed.
+    pub fn try_acquire() -> Option<Self> {
+        HOLO_SERVE_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            .then_some(GuardClaim(()))
+    }
+}
+
+impl Drop for GuardClaim {
+    fn drop(&mut self) {
+        HOLO_SERVE_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Env var `holo serve` reads for its bearer token (`ServeSettings.auth_token` /
 /// `A2A_TOKEN_ENV` in `serve.py`). Setting this ourselves before spawn means we never have
@@ -104,6 +144,12 @@ pub struct HoloServeProcess {
     pub port: u16,
     pub base_url: String,
     pub auth_token: String,
+    /// This process's claim on the single-instance guard. `Some` while this object is the
+    /// tracked live child; taken (dropped -> released) by `shutdown()` and by
+    /// [`Self::disarm_guard`] (the restart path's disarm-old-before-spawn-new step). A `None`
+    /// claim means this object is a known-dead placeholder whose `Drop` must not (and cannot)
+    /// touch the shared flag.
+    guard: Option<GuardClaim>,
 }
 
 impl HoloServeProcess {
@@ -153,30 +199,40 @@ impl HoloServeProcess {
     /// see [`Self::build_command`].
     pub async fn spawn(holo_bin: &str, port: u16, local_base_url: Option<&str>) -> Result<Self> {
         // Refuse to double-spawn: at most one `holo serve` child may be tracked as running by
-        // this daemon at a time (see `HOLO_SERVE_RUNNING` doc). `compare_exchange` makes the
-        // check-and-set atomic so two concurrent `spawn()` calls can't both observe `false` and
-        // both proceed.
-        if HOLO_SERVE_RUNNING
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            bail!("holo serve is already running (tracked child process exists); refusing to spawn a second instance");
-        }
+        // this daemon at a time (see `HOLO_SERVE_RUNNING` / `GuardClaim` docs). The claim is an
+        // owned token: any early `?`/`bail!` below drops it, releasing the guard automatically --
+        // no manual store-on-error path to forget.
+        let Some(guard) = GuardClaim::try_acquire() else {
+            bail!(
+                "holo serve is already running (tracked child process exists); refusing to spawn a second instance"
+            );
+        };
 
-        // From here on, any early return must flip the guard back off -- wrap the rest of the
-        // body so `?`/`bail!` below can't leak the guard in the "true but no child exists" state.
-        match Self::spawn_inner(holo_bin, port, local_base_url).await {
-            Ok(process) => Ok(process),
-            Err(err) => {
-                HOLO_SERVE_RUNNING.store(false, Ordering::SeqCst);
-                Err(err)
-            }
-        }
+        let mut process = Self::spawn_inner(holo_bin, port, local_base_url).await?;
+        process.guard = Some(guard);
+        Ok(process)
     }
 
     async fn spawn_inner(holo_bin: &str, port: u16, local_base_url: Option<&str>) -> Result<Self> {
         let auth_token = generate_token();
         let base_url = format!("http://127.0.0.1:{port}");
+
+        // Port preflight: if something else is already listening on the port, `holo serve` will
+        // die on bind -- worse, the health probe below polls `http://127.0.0.1:{port}/...`,
+        // which the SQUATTER answers, so without this check the daemon can conclude "healthy"
+        // while its own child is already dead (witnessed live: a stale test stub on 8765 made
+        // the daemon report a healthy bridge, then the health loop found the real child dead
+        // and spun on restarts). Bind-and-release has a small TOCTOU window, which is fine:
+        // this is a diagnosability preflight producing an actionable error for the overwhelmingly
+        // common case, not the enforcement mechanism (bind failure inside holo serve remains the
+        // authoritative failure).
+        if let Err(err) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            bail!(
+                "port {port} is already in use by another process ({err}); `holo serve` cannot bind it. \
+                 Find the squatter with `lsof -nP -iTCP:{port} -sTCP:LISTEN`, kill it, or pick a \
+                 different port via HOLOIROH_HOLO_PORT"
+            );
+        }
 
         // Build the exact command via the shared builder (also used by the verification example),
         // then add only the stdio/kill-on-drop settings that don't affect the argv/env contract.
@@ -219,7 +275,23 @@ impl HoloServeProcess {
             port,
             base_url,
             auth_token,
+            // The single-instance claim is attached by `spawn` (the only caller) after this
+            // returns -- `spawn_inner` itself never owns it, so its `?` error paths can't
+            // affect the guard.
+            guard: None,
         })
+    }
+
+    /// Drop this process's claim on the single-instance guard, marking it a known-dead
+    /// placeholder. The restart path (`HoloBridge::restart_process`) calls this on the
+    /// dead-child process BEFORE spawning the replacement -- otherwise the replacement's
+    /// `GuardClaim::try_acquire` would fail against the dead process's still-held claim (the
+    /// deterministic "failed to respawn holo serve" loop this design fixes). After disarming,
+    /// this object's `Drop` still SIGTERMs the (already-exited) child as a harmless safety net
+    /// but cannot touch the shared flag.
+    pub fn disarm_guard(&mut self) {
+        // Dropping the claim IS the release (GuardClaim::drop stores false).
+        self.guard.take();
     }
 
     /// Build an [`A2aClient`] bound to this running server.
@@ -249,11 +321,11 @@ impl HoloServeProcess {
     /// preferred since it can actually wait for exit.
     pub async fn shutdown(mut self) -> Result<()> {
         let result = self.terminate_and_wait().await;
-        // Mark the child as no longer tracked regardless of outcome, so a later `spawn()` isn't
-        // permanently refused because this one failed to confirm exit. `self` is consumed here
-        // and its `Drop` impl will also observe `Ordering::SeqCst` false -> false (a harmless
-        // no-op store), since we already cleared it.
-        HOLO_SERVE_RUNNING.store(false, Ordering::SeqCst);
+        // Release this process's claim regardless of outcome, so a later `spawn()` isn't
+        // permanently refused because this one failed to confirm exit. Dropping the claim is
+        // the release; if this object never held one (already disarmed by the restart path),
+        // this is a no-op and cannot clobber a newer process's claim.
+        self.guard.take();
         result
     }
 
@@ -293,11 +365,13 @@ impl Drop for HoloServeProcess {
     /// `shutdown()` does -- it best-effort SIGTERMs the child synchronously (same signal
     /// `shutdown()` sends first) and then relies on the `Command`'s own `kill_on_drop(true)`
     /// (set in `spawn_inner`) as the final backstop: when `self.child` (a `tokio::process::Child`)
-    /// is dropped right after this, `kill_on_drop` SIGKILLs it if it's still alive. Also clears
-    /// the single-instance guard so the process is never left permanently un-spawnable after an
-    /// unclean exit.
+    /// is dropped right after this, `kill_on_drop` SIGKILLs it if it's still alive. The
+    /// single-instance guard releases via the owned `GuardClaim` field's own `Drop` (running as
+    /// part of this object's field drops, after this body) -- and ONLY if this object still
+    /// holds its claim: a disarmed process (see [`HoloServeProcess::disarm_guard`], the restart
+    /// path) has no claim, so dropping it cannot release the flag its replacement now holds.
+    /// The earlier unconditional `store(false)` here was exactly that bug.
     fn drop(&mut self) {
-        HOLO_SERVE_RUNNING.store(false, Ordering::SeqCst);
         #[cfg(unix)]
         {
             if let Some(pid) = self.child.id() {

@@ -188,8 +188,24 @@ impl HoloBridge {
     /// new process. See `holo_bridge::health`'s module doc for why this can never reach the iroh
     /// P2P session (this type has no field referencing it).
     pub async fn restart_process(&self) -> Result<()> {
+        // Take the slot lock for the WHOLE swap (disarm -> spawn -> replace): the health loop's
+        // `try_wait_process` (the only other lock taker on a hot path) blocks until the restart
+        // settles instead of racing a half-restarted state, and no concurrent restart can
+        // interleave. The spawn's health wait makes this a long hold; that is deliberate.
+        let mut slot = self.process.lock().await;
+
+        // Disarm the dead child's single-instance guard claim BEFORE spawning the replacement.
+        // Without this, `GuardClaim::try_acquire` inside `spawn` fails against the dead
+        // process's still-held claim, deterministically, every attempt -- the exact
+        // "restart failed: failed to respawn holo serve" every-tick loop witnessed live.
+        // (The child is confirmed exited -- that's why we're here -- so releasing its claim
+        // cannot enable a second LIVE instance.)
+        slot.disarm_guard();
+
         // Re-apply the exact same inference config the initial start used: a crash-restart must
-        // never silently drop from local (no-cloud) back to a hosted backend.
+        // never silently drop from local (no-cloud) back to a hosted backend. On failure the
+        // `?` releases the lock with the disarmed dead process still in the slot -- the next
+        // health tick observes it exited and retries this whole path (disarm is then a no-op).
         let new_process =
             HoloServeProcess::spawn(&self.holo_bin, self.port, self.local_base_url.as_deref())
                 .await
@@ -200,11 +216,12 @@ impl HoloBridge {
             .await
             .context("respawned holo serve did not present a valid/compatible A2A agent card")?;
 
-        let mut slot = self.process.lock().await;
         // Old process's `Drop` (best-effort SIGTERM + kill_on_drop) runs here when `old` goes
         // out of scope -- it already exited (that's why we're restarting), so this is a no-op
-        // safety net, not a real termination.
+        // safety net, not a real termination. Disarmed above, its drop cannot release the
+        // guard claim the new process now holds.
         let _old = std::mem::replace(&mut *slot, new_process);
+        drop(slot);
         self.control.replace_client(client);
         Ok(())
     }
