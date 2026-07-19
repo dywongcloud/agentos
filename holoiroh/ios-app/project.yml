@@ -1,0 +1,56 @@
+# xcodegen manifest for the HoloIroh iOS APP wrapper around the HoloIrohApp
+# Swift package (../ios). The package is a library product with the @main
+# entry inside it (Sources/HoloIrohApp/HoloIrohApp.swift); this wrapper exists
+# only because SPM cannot produce an iOS .app bundle -- Xcode needs an
+# application target for signing + device install. Regenerate the project
+# with `xcodegen generate` (brew install xcodegen) after editing this file;
+# HoloIroh.xcodeproj is a build artifact, never hand-edited.
+#
+# Signing is Automatic with no pinned team: build with
+# `xcodebuild -allowProvisioningUpdates` once an Apple ID is signed into
+# Xcode (Settings -> Accounts). The three usage-description strings come
+# verbatim from ../ios/Sources/HoloIrohApp/REQUIRED_INFO_PLIST_KEYS.md.
+name: HoloIroh
+options:
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  HoloIrohApp:
+    path: ../ios
+targets:
+  HoloIroh:
+    type: application
+    platform: iOS
+    sources:
+      - path: Shim
+    dependencies:
+      - package: HoloIrohApp
+        product: HoloIrohApp
+      # System frameworks/libs the Rust ios-bridge staticlib links against
+      # (surfaced as real undefined-symbol link errors on the first device
+      # build): SystemConfiguration for iroh's netdev/hickory-resolver DNS +
+      # reachability (SCDynamicStore*/SCNetworkInterface*), Security for
+      # rustls' keychain-backed roots, Network for the QUIC socket layer,
+      # libc++ for openh264's C++ objects, libresolv for res_* DNS fallbacks.
+      - sdk: SystemConfiguration.framework
+      - sdk: Security.framework
+      - sdk: Network.framework
+      - sdk: CoreMedia.framework
+      - sdk: VideoToolbox.framework
+      - sdk: libc++.tbd
+      - sdk: libresolv.tbd
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: HoloIroh
+        UILaunchScreen: {}
+        NSCameraUsageDescription: "HoloIroh uses the camera to scan the pairing QR code your Mac displays."
+        NSMicrophoneUsageDescription: "HoloIroh uses the microphone to let you speak prompts instead of typing them."
+        NSSpeechRecognitionUsageDescription: "HoloIroh transcribes your speech on-device (when supported) to turn it into a text prompt."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.dylanwong.holoiroh
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: XBBQ2LGY3K
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.10"

@@ -50,27 +50,32 @@ typedef int HoloirohStatus;
  * Obtained via `holoiroh_ios_bridge_new`, released via
  * `holoiroh_ios_bridge_free`.
  *
- * Zero-sized and never constructed on the Rust side as a real value -- only
- * ever handed out as `Box::into_raw(Box::new(BridgeInner {..}))` cast to
- * this opaque type, so C/Swift can hold and pass the pointer around without
- * any ability to read its layout. Distinct named type (not a bare `void*`) so
- * a caller gets a type error if they pass the wrong handle to the wrong
- * function.
+ * Never constructed on the Rust side as a real value -- only ever handed out
+ * as `Box::into_raw(Box::new(BridgeInner {..}))` cast to this opaque type, so
+ * C/Swift can hold and pass the pointer around without any ability to read
+ * its layout. Distinct named type (not a bare `void*`) so a caller gets a
+ * type error if they pass the wrong handle to the wrong function.
+ *
+ * Deliberately an INCOMPLETE type (forward declaration, no body): a defined
+ * struct -- even the zero-sized `uint8_t _private[0]` idiom this previously
+ * used -- imports into Swift as a nominal type, making every API take
+ * `UnsafeMutablePointer<HoloirohBridge>`, which broke the Swift wrapper's
+ * `OpaquePointer` handle fields the first time the module was actually
+ * imported (witnessed on the first real device build). An incomplete type
+ * imports as Swift `OpaquePointer`, which is exactly the semantics an opaque
+ * handle should have on both languages' sides.
  */
-typedef struct {
-  uint8_t _private[0];
-} HoloirohBridge;
+typedef struct HoloirohBridge HoloirohBridge;
 
 /**
  * Opaque handle to an active video subscription (post-`subscribe`), distinct
  * from `HoloirohBridge` so a bridge holds zero or one active video
  * subscriptions independently of its connection lifecycle. Obtained via
  * `holoiroh_ios_bridge_subscribe`, released via
- * `holoiroh_ios_bridge_subscription_free`.
+ * `holoiroh_ios_bridge_subscription_free`. Incomplete type for the same
+ * Swift-`OpaquePointer` import reason as `HoloirohBridge` above.
  */
-typedef struct {
-  uint8_t _private[0];
-} HoloirohSubscription;
+typedef struct HoloirohSubscription HoloirohSubscription;
 
 /**
  * One decoded media frame's metadata handed back across the FFI boundary by

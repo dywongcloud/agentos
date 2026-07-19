@@ -33,3 +33,5 @@ encrypted_secrets.json
 coverage/
 tsconfig.tsbuildinfo
 *.patch
+holoiroh/ios/Artifacts/
+holoiroh/ios-app/HoloIroh.xcodeproj/
