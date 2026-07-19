@@ -22,6 +22,8 @@
 	<string>1</string>
 	<key>NSCameraUsageDescription</key>
 	<string>HoloIroh uses the camera to scan the pairing QR code your Mac displays.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>HoloIroh connects directly to your paired Mac over your local network for the lowest-latency screen mirroring and control, falling back to a relay when a direct connection isn't possible.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>HoloIroh uses the microphone to let you speak prompts instead of typing them.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

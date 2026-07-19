@@ -47,6 +47,15 @@ targets:
         NSCameraUsageDescription: "HoloIroh uses the camera to scan the pairing QR code your Mac displays."
         NSMicrophoneUsageDescription: "HoloIroh uses the microphone to let you speak prompts instead of typing them."
         NSSpeechRecognitionUsageDescription: "HoloIroh transcribes your speech on-device (when supported) to turn it into a text prompt."
+        # Required for iroh's direct (hole-punched) P2P path to your Mac on the same
+        # network -- without this key declared, iOS either silently blocks local-subnet
+        # UDP traffic or shows the permission prompt with no effect (witnessed live:
+        # "prompted to allow iroh to discover local devices but that was it, same
+        # connection error"). iroh's N0 preset itself uses DNS-PKARR relay discovery,
+        # not mDNS/Bonjour service advertisement, so NSBonjourServices is not required --
+        # this is purely the local-network ACCESS entitlement iOS gates any local-subnet
+        # socket traffic behind (Settings -> Privacy & Security -> Local Network).
+        NSLocalNetworkUsageDescription: "HoloIroh connects directly to your paired Mac over your local network for the lowest-latency screen mirroring and control, falling back to a relay when a direct connection isn't possible."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dylanwong.holoiroh
