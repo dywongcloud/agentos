@@ -1,0 +1,92 @@
+name: holoiroh CI
+
+# Real build + witness pipeline for the holoiroh product (Rust mac-daemon +
+# ios-bridge P2P computer-use over iroh-live). The mac-daemon links macOS
+# frameworks (ScreenCaptureKit via iroh-live's capture backend, objc2
+# CoreGraphics/ApplicationServices) so the workspace only builds on macOS --
+# hence macos-latest, not ubuntu.
+#
+# This replaces the inherited Docker-publish workflows, which belonged to the
+# unrelated agentOS Next.js bot and published images to a foreign Docker Hub
+# account. This pipeline needs no secrets: it builds the real code and runs the
+# platform-independent example probes as genuine, exit-0 witnesses. Probes that
+# require live macOS TCC grants / screen capture / a running holo serve are
+# intentionally NOT run here (they cannot pass headlessly); the ones run below
+# are the pure-logic witnesses that exercise real code paths deterministically.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: holoiroh-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-witness:
+    name: build workspace + run probe witnesses
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: holoiroh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            holoiroh/target
+          key: holoiroh-cargo-${{ runner.os }}-${{ hashFiles('holoiroh/**/Cargo.toml') }}
+          restore-keys: |
+            holoiroh-cargo-${{ runner.os }}-
+
+      - name: Build the whole workspace (mac-daemon + ios-bridge) with all examples
+        run: cargo build --workspace --examples --locked
+
+      - name: Witness pure-logic probes (real code paths, deterministic, no TCC/device needed)
+        run: |
+          set -euo pipefail
+          # Each probe below runs a real code path and exits 0 on success (asserts
+          # inside panic on failure). These are the witnesses that do NOT require a
+          # live macOS TCC grant, screen capture, a real device, or a running holo
+          # serve -- so they pass headlessly in CI. The TCC/device/live-network
+          # probes (e.g. a full daemon run) are intentionally excluded; see this
+          # file's header and holoiroh/mac-daemon/PAIRING.md.
+          for probe in \
+            duration_probe_via_ticket_rotation \
+            ticket_rotation_probe \
+            pairing_phrase_probe \
+            policy_probe \
+            sensitive_categories_probe \
+            allowlist_probe \
+            auth_gate_probe \
+            auth_probe \
+            audit_log_probe \
+            control_channel_probe \
+            envelope_probe \
+            limits_probe \
+            task_state_probe \
+            registry_probe \
+            permissions_probe \
+            qr_probe \
+            input_request_probe \
+            local_model_edge_probe
+          do
+            # duration parsing is witnessed by ticket_rotation_probe; skip the alias
+            [ "$probe" = "duration_probe_via_ticket_rotation" ] && continue
+            echo "::group::probe $probe"
+            cargo run --example "$probe" -p holoiroh-daemon --locked
+            echo "::endgroup::"
+          done
+          echo "All pure-logic holoiroh probes passed as real-execution witnesses."
