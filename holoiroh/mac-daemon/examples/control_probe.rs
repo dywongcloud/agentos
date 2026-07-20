@@ -40,8 +40,15 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let mut args = env::args().skip(1);
-    let ticket_str = args.next().expect("usage: control_probe <ticket> [pin]");
+    let ticket_str = args.next().expect("usage: control_probe <ticket> [pin] [prompt]");
     let pin = args.next();
+    // Optional third arg: the prompt text to send after auth. Defaults to the
+    // original harmless hello. A real task here streams a REAL agent turn on
+    // the daemon's desktop -- pass explicit no-op instructions when the goal
+    // is witnessing the transport/turn plumbing rather than desktop actions.
+    let prompt_text = args
+        .next()
+        .unwrap_or_else(|| "control_probe: hello from a real iroh dial (post-PIN)".to_string());
     let ticket: LiveTicket = ticket_str.parse()?;
 
     let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
@@ -90,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
             Some(task_id.clone()),
             0,
             ClientMessage::Prompt {
-                text: "control_probe: hello from a real iroh dial (post-PIN)".to_string(),
+                text: prompt_text,
             },
         );
         write_line(&mut send, &prompt_env).await?;
@@ -114,6 +121,55 @@ async fn main() -> anyhow::Result<()> {
             "   (envelope: session_id={} task_id={:?} sequence_number={})",
             ack_env.session_id, ack_env.task_id, ack_env.sequence_number
         );
+
+        // Stream the turn to its end: every post-ack ServerMessage, until a
+        // `status` line arrives after at least one `task_progress` (Done maps
+        // to `status` on the wire -- see control_channel.rs's
+        // from_control_event; there is no distinct terminal type), or the
+        // overall/idle timeouts land. This turns the probe into a full
+        // phone-equivalent end-to-end witness of a live daemon turn.
+        let overall = tokio::time::Instant::now();
+        let mut saw_progress = false;
+        loop {
+            if overall.elapsed() > std::time::Duration::from_secs(600) {
+                println!("control_probe: overall turn timeout (600s)");
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(120), lines.next_line()).await {
+                Err(_) => {
+                    println!("control_probe: idle timeout (120s with no server line)");
+                    break;
+                }
+                Ok(Ok(None)) => {
+                    println!("control_probe: stream closed by daemon");
+                    break;
+                }
+                Ok(Err(err)) => {
+                    println!("control_probe: read error: {err}");
+                    break;
+                }
+                Ok(Ok(Some(line))) => {
+                    println!("<- {line}");
+                    if let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) {
+                        match env.payload {
+                            ServerMessage::TaskProgress { .. } => saw_progress = true,
+                            ServerMessage::Status { text } => {
+                                let queued = text.as_deref().map(|t| t.starts_with("queued")).unwrap_or(false);
+                                if saw_progress && !queued {
+                                    println!("control_probe: terminal status after progress -- turn concluded");
+                                    break;
+                                }
+                            }
+                            ServerMessage::Error { .. } => {
+                                println!("control_probe: error message received");
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
 
         println!("control_probe: OK -- PIN accepted, envelope-wrapped greeting + ack witnessed over a real iroh connection");
     } else {
