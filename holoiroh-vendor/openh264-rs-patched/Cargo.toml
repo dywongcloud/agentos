@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+# Vendored subset for holoiroh's [patch.crates-io] (see holoiroh/Cargo.toml):
+# only openh264-sys2 is patched here, so the "openh264" (higher-level crate,
+# never referenced by this patch) and "gfx" (README screenshots) directories
+# from the full upstream monorepo were pruned -- they pulled in large git-LFS
+# test video fixtures with no LFS content actually available in this shallow
+# vendor, which broke `git push`. openh264-sys2 does not depend on the
+# "openh264" crate's code, only on this workspace root's shared
+# authors/edition/version/etc (`*.workspace = true` in its own Cargo.toml),
+# which this trimmed member list still provides.
+members = [
+    "openh264-sys2",
+]
+
+[workspace.package]
+authors = ["Ralf Biedert <rb@xr.io>"]
+edition = "2024"
+license = "BSD-2-Clause"
+repository = "https://github.com/ralfbiedert/openh264-rs"
+rust-version = "1.85"
+version = "0.9.7"
+
+[workspace.dependencies]
+# Ours
+openh264-sys2 = { path = "openh264-sys2", version = "0.9.0", default-features = false }
+
+# Others
+libloading = "0.8.1"
+sha2 = "0.10.8"
+cc = "1.0"
+walkdir = "2.3"
+nasm-rs = "0.3.0"
+wide = "1.1.1"
+image = "0.25.5"
+image-compare = "0.5.0"
+mp4 = "0.14.0"
+anyhow = "1.0.71"
+rand = "0.10.0"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 } # We might want to disable this if it causes issues.
+
+# Things we still allow
+doc_markdown = "allow" # trips up on "OpenH264"
+cast_possible_truncation = "allow" # we're doing too much math for this
+cast_possible_wrap = "allow" # we're doing too much math for this
+cast_precision_loss = "allow" # we're doing too much math for this
+cast_sign_loss = "allow" # we're doing too much math for this
+unreadable_literal = "allow" # only really used in tests where it doesn't matter
+module_name_repetitions = "allow" # looks nicer
+
+
+#[profile.release]
+#debug = true

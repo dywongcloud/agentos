@@ -38,3 +38,26 @@ moq-media = { path = "../holoiroh-vendor/iroh-live-patched/moq-media" }
 rusty-codecs = { path = "../holoiroh-vendor/iroh-live-patched/rusty-codecs" }
 rusty-capture = { path = "../holoiroh-vendor/iroh-live-patched/rusty-capture" }
 iroh-moq = { path = "../holoiroh-vendor/iroh-live-patched/iroh-moq" }
+
+# Local patch of openh264-sys2 0.9.7 (crates.io): its build.rs panics
+# ("Unknown target env: sim") for any *-apple-ios-sim Rust target -- a real,
+# valid triple Simulator builds use, distinct from a bare device target
+# (target_env=""). This is a genuinely unreported upstream bug (confirmed:
+# no open/closed issue or PR on github.com/ralfbiedert/openh264-rs mentions
+# "sim"/"simulator"/"target_env", and current master HEAD still has the same
+# panic), so there is no upstream fix to point a git dependency at -- this
+# vendors a one-line fix (add a `Sim` arm to `TargetEnv::from_env`'s match,
+# behaving identically to the existing `NoEnv` arm everywhere it's consulted)
+# on top of an unmodified 0.9.7 checkout. openh264-sys2 is pulled in
+# transitively (openh264 -> rusty-codecs -> moq-media/rusty-capture ->
+# iroh-live) for real, load-bearing H.264 *decode* on iOS (VideoToolbox
+# covers macOS/iOS *encode* on the Mac daemon side, per rusty-codecs'
+# `videotoolbox` feature -- see the comment above this patch block -- but the
+# iOS app side still needs a real decoder for the frames it receives), so
+# this cannot simply be feature-gated out for Simulator builds without
+# breaking real device playback; without this patch the ios-bridge crate
+# (and therefore the whole HoloIroh app, since ios/Package.swift's
+# binaryTarget requires it) cannot be built for the iOS Simulator
+# destination at all.
+[patch.crates-io]
+openh264-sys2 = { path = "../holoiroh-vendor/openh264-rs-patched/openh264-sys2" }
