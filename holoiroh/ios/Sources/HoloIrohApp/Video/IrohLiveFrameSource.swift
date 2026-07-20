@@ -58,6 +58,22 @@ import HoloirohIosBridge
 final class IrohLiveFrameSource: VideoFrameSource {
     var onFrame: ((VideoFrame) -> Void)?
 
+    /// See `VideoFrameSource.lastFrameAt`. Written on the poll queue
+    /// (`deliverFrame`), read from the main thread (foreground liveness
+    /// check) -- hence the lock, not a bare stored property.
+    private let lastFrameLock = NSLock()
+    private var _lastFrameAt: Date?
+    var lastFrameAt: Date? {
+        lastFrameLock.lock()
+        defer { lastFrameLock.unlock() }
+        return _lastFrameAt
+    }
+    private func markFrameDelivered() {
+        lastFrameLock.lock()
+        _lastFrameAt = Date()
+        lastFrameLock.unlock()
+    }
+
     /// The `iroh-live:` ticket pasted/scanned on the pairing screen. `nil` in
     /// shared-bridge mode (`init(bridge:)`), where the caller has already
     /// ticket-connected the bridge it hands in.
@@ -326,6 +342,7 @@ final class IrohLiveFrameSource: VideoFrameSource {
         // `.invalid` pts -> the render view tags it display-immediately (the
         // low-latency live-mirror path). The frame's own timestamp_us is
         // available on `frame` if in-order scheduling is ever wanted instead.
+        markFrameDelivered()
         handler(.pixelBuffer(pb, pts: .invalid))
     }
 

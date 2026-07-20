@@ -110,6 +110,35 @@ struct MainView: View {
     /// recovery in `body` (see the `.onChange(of: scenePhase)` there).
     @Environment(\.scenePhase) private var scenePhase
 
+    // MARK: Live-share zoom (pinch to zoom, drag to pan, double-tap resets)
+
+    /// Committed zoom factor for the live-share surface (1 = fit). The
+    /// in-flight pinch multiplies on top via `pinchScale`; both are clamped
+    /// to `Self.zoomRange` so the mirror can neither shrink below fit nor
+    /// blow up past readable magnification.
+    @State private var zoomScale: CGFloat = 1
+    /// The pinch currently under the user's fingers (1 while none).
+    @GestureState private var pinchScale: CGFloat = 1
+    /// Committed pan offset of the zoomed content (points, post-scale).
+    @State private var panOffset: CGSize = .zero
+    /// The drag currently under the user's finger (.zero while none).
+    @GestureState private var panDrag: CGSize = .zero
+    private static let zoomRange: ClosedRange<CGFloat> = 1...5
+
+    // MARK: Auto-reconnect (app-switch/backgrounding recovery)
+
+    /// Consecutive automatic reconnect attempts since the last successful
+    /// `.connected`. Bounded (`Self.maxReconnectAttempts`) so a genuinely
+    /// dead daemon surfaces a real failure instead of silent retry forever.
+    @State private var reconnectAttempts = 0
+    /// True while a reconnect is scheduled/in flight, so overlapping
+    /// triggers (failure event + foreground return) collapse into one.
+    @State private var isReconnecting = false
+    /// Identity of the foreground liveness check in flight, so a stale
+    /// check (superseded by a newer app switch) is a no-op.
+    @State private var livenessCheckID = UUID()
+    private static let maxReconnectAttempts = 5
+
     /// The frame producer bound to the video surface. Held with `@State`
     /// so it keeps a stable identity across view updates (a fresh source
     /// on every re-render would restart the display link each time).
@@ -221,20 +250,109 @@ struct MainView: View {
         .onChange(of: connection.phase) { _, newPhase in
             handleConnectionPhase(newPhase)
         }
-        // Foreground recovery: iOS invalidates VideoToolbox decode sessions
-        // when the app backgrounds, so on return the old subscription's
-        // decoder can only error until a fresh keyframe arrives -- and if
-        // the track went stale, never. Restarting the frame source gets a
-        // FRESH track from the daemon, whose first frame is always a
-        // keyframe (live-witnessed in every frame-pull probe), healing the
-        // decoder deterministically. stop()/start() serialize on the
-        // source's own queue, and the shared bridge pointer survives stop()
-        // (see IrohLiveFrameSource.teardownHandles) -- live-witnessed as
-        // "works, then black screen after switching apps" without this.
+        // Boxed <-> fullscreen changes the zoom viewport; the committed pan
+        // was clamped for the old one, so start the new layout at fit.
+        .onChange(of: isVideoFullscreen) { _, _ in
+            resetZoom()
+        }
+        // Foreground recovery, two tiers (live-witnessed bug: "screen goes
+        // black and errors out if I open a different app"):
+        //
+        // Tier 1 (cheap, quick app switches): iOS invalidates VideoToolbox
+        // decode sessions on backgrounding, so restarting the frame source
+        // gets a FRESH track whose first frame is a keyframe, healing the
+        // decoder. Works only while the underlying QUIC session survived.
+        //
+        // Tier 2 (longer absences): iOS suspends the process, the QUIC
+        // session idles out daemon-side, and a frame-source restart then
+        // re-subscribes on a DEAD bridge -- black screen, plus the control
+        // pump's poll failure flips the phase to `.failed` ("errors out").
+        // Detection is a liveness check (no frame within 4s of the
+        // restart) or the phase already being `.failed` on return; recovery
+        // is a FULL reconnect (fresh bridge + ticket + PIN) via
+        // `attemptReconnect`, which the daemon supports (it re-accepts the
+        // same ticket + allowlisted device without a new PIN scan).
         .onChange(of: scenePhase) { _, newPhase in
-            guard newPhase == .active, connection.phase == .connected else { return }
-            frameSource.stop()
-            frameSource.start()
+            guard newPhase == .active else { return }
+            switch connection.phase {
+            case .connected:
+                frameSource.stop()
+                frameSource.start()
+                armForegroundLivenessCheck()
+            case .failed:
+                attemptReconnect(reason: "connection lost while backgrounded")
+            case .idle, .connecting:
+                break
+            }
+        }
+    }
+
+    // MARK: - Live-share zoom helpers
+
+    private func clampZoom(_ value: CGFloat) -> CGFloat {
+        min(max(value, Self.zoomRange.lowerBound), Self.zoomRange.upperBound)
+    }
+
+    /// Clamp a pan offset so the scaled content always covers the whole
+    /// viewport (no revealed backdrop): with center-anchored scaling, the
+    /// content edge reaches the viewport edge at +/- viewport*(scale-1)/2.
+    private func clampedPan(_ proposed: CGSize, scale: CGFloat, viewport: CGSize) -> CGSize {
+        let maxX = max(0, viewport.width * (scale - 1) / 2)
+        let maxY = max(0, viewport.height * (scale - 1) / 2)
+        return CGSize(
+            width: min(max(proposed.width, -maxX), maxX),
+            height: min(max(proposed.height, -maxY), maxY)
+        )
+    }
+
+    private func resetZoom() {
+        zoomScale = 1
+        panOffset = .zero
+    }
+
+    // MARK: - Auto-reconnect
+
+    /// After a foreground frame-source restart, verify frames actually
+    /// resume; if none arrive within the window, the transport is dead and
+    /// only a full reconnect helps. Keyed by `livenessCheckID` so only the
+    /// LATEST app switch's check can fire.
+    private func armForegroundLivenessCheck() {
+        let checkID = UUID()
+        livenessCheckID = checkID
+        let restartedAt = Date()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            guard livenessCheckID == checkID,
+                  scenePhase == .active,
+                  connection.phase == .connected else { return }
+            let last = frameSource.lastFrameAt
+            if last == nil || last! < restartedAt {
+                attemptReconnect(reason: "no frames after returning to foreground")
+            }
+        }
+    }
+
+    /// Bounded, backoff-spaced full reconnect: tear the dead session down
+    /// (`HoloConnection.reset`) and redo the whole connect (bridge + ticket
+    /// + PIN) with the credentials this screen was opened with. The peer
+    /// sees a status line, not an error, unless every attempt is exhausted.
+    private func attemptReconnect(reason: String) {
+        guard !isReconnecting else { return }
+        guard reconnectAttempts < Self.maxReconnectAttempts else {
+            log(.error(text: "reconnect failed after \(Self.maxReconnectAttempts) attempts -- use Disconnect and pair again"))
+            return
+        }
+        isReconnecting = true
+        reconnectAttempts += 1
+        let attempt = reconnectAttempts
+        log(.status(text: "connection lost (\(reason)) -- reconnecting (attempt \(attempt)/\(Self.maxReconnectAttempts))"))
+        // First attempt immediately; later ones back off (2s, 4s, 8s, 8s)
+        // so a daemon mid-restart isn't hammered.
+        let delay: TimeInterval = attempt == 1 ? 0 : min(pow(2, Double(attempt - 1)), 8)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            isReconnecting = false
+            guard connection.phase != .connected else { return }
+            connection.reset()
+            connection.connect(ticket: ticket, pin: pin)
         }
     }
 
@@ -450,12 +568,24 @@ struct MainView: View {
         case .idle, .connecting:
             break
         case .connected:
+            reconnectAttempts = 0
+            isReconnecting = false
+            resetZoom()
             if let live = connection.liveFrameSource {
                 frameSource.stop()
                 frameSource = live
             }
         case .failed(let reason):
+            // While the app is frontmost, a mid-session failure (daemon
+            // restarted, network blipped, QUIC idle-out racing the
+            // background transition) heals itself via the same bounded
+            // reconnect as the app-switch path. Backgrounded failures wait:
+            // sockets are suspended anyway, and the `.active` transition
+            // retries the moment the user returns.
             log(.error(text: "connection unavailable: \(reason)"))
+            if scenePhase == .active {
+                attemptReconnect(reason: reason)
+            }
         }
     }
 
@@ -577,6 +707,24 @@ struct MainView: View {
         boxCenterY: CGFloat
     ) -> some View {
         if connection.phase == .connected {
+            // The visible viewport the (possibly zoomed) mirror is clipped
+            // to. Zoom scales the render view INSIDE this fixed viewport;
+            // pan slides the scaled content, clamped so no black bars can
+            // be dragged into view.
+            let viewport = CGSize(
+                width: isVideoFullscreen ? size.width : boxWidth,
+                height: isVideoFullscreen ? size.height : boxHeight
+            )
+            let liveScale = clampZoom(zoomScale * pinchScale)
+            let liveOffset = clampedPan(
+                CGSize(
+                    width: panOffset.width + panDrag.width,
+                    height: panOffset.height + panDrag.height
+                ),
+                scale: liveScale,
+                viewport: viewport
+            )
+
             ZStack {
                 if isVideoFullscreen {
                     Color.black
@@ -586,11 +734,10 @@ struct MainView: View {
 
                 VideoRenderView(source: frameSource)
                     .id(ObjectIdentifier(frameSource as AnyObject))
+                    .scaleEffect(liveScale)
+                    .offset(liveOffset)
+                    .frame(width: viewport.width, height: viewport.height)
                     .background(Color.black)
-                    .frame(
-                        width: isVideoFullscreen ? size.width : boxWidth,
-                        height: isVideoFullscreen ? size.height : boxHeight
-                    )
                     .clipShape(RoundedRectangle(cornerRadius: isVideoFullscreen ? 0 : 28))
                     .overlay(
                         RoundedRectangle(cornerRadius: isVideoFullscreen ? 0 : 28)
@@ -613,7 +760,61 @@ struct MainView: View {
                         .padding(10)
                         .accessibilityLabel(isVideoFullscreen ? "Exit fullscreen" : "Fullscreen live view")
                     }
+                    .overlay(alignment: .bottomLeading) {
+                        // Zoom badge, only while zoomed: current factor +
+                        // an affordance hint that double-tap resets.
+                        if liveScale > 1.01 {
+                            Text(String(format: "%.1f\u{00D7}", liveScale))
+                                .font(.caption.weight(.semibold).monospacedDigit())
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .padding(10)
+                                .accessibilityLabel("Zoom \(String(format: "%.1f", liveScale))x, double tap to reset")
+                        }
+                    }
                     .contentShape(Rectangle())
+                    // Pinch to zoom. `simultaneousGesture` so it composes
+                    // with the pan drag below and never blocks the taps.
+                    .simultaneousGesture(
+                        MagnificationGesture()
+                            .updating($pinchScale) { value, state, _ in
+                                state = value
+                            }
+                            .onEnded { value in
+                                zoomScale = clampZoom(zoomScale * value)
+                                panOffset = clampedPan(panOffset, scale: zoomScale, viewport: viewport)
+                            }
+                    )
+                    // Drag to pan -- only once zoomed (at fit, the drag is
+                    // ignored so it can never swallow scroll-ish intents).
+                    // minimumDistance keeps single/double taps working.
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 12)
+                            .updating($panDrag) { value, state, _ in
+                                guard zoomScale > 1.01 else { return }
+                                state = value.translation
+                            }
+                            .onEnded { value in
+                                guard zoomScale > 1.01 else { return }
+                                panOffset = clampedPan(
+                                    CGSize(
+                                        width: panOffset.width + value.translation.width,
+                                        height: panOffset.height + value.translation.height
+                                    ),
+                                    scale: zoomScale,
+                                    viewport: viewport
+                                )
+                            }
+                    )
+                    // Double-tap: reset zoom (attached BEFORE the single-tap
+                    // so SwiftUI sequences them; the single-tap then only
+                    // fires when a second tap doesn't follow).
+                    .onTapGesture(count: 2) {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                            resetZoom()
+                        }
+                    }
                     .onTapGesture {
                         if !isVideoFullscreen {
                             withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {

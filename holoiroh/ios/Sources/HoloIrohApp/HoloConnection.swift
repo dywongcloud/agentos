@@ -137,16 +137,46 @@ final class HoloConnection: ObservableObject {
         #endif
     }
 
-    /// Tears the session down: control pump cancelled, frame source stopped
-    /// (freeing its subscription on its own queue), then -- and only then --
-    /// the bridge freed. Idempotent; call on Disconnect / screen teardown.
-    func shutdown() {
-        guard !isShutdown else { return }
-        isShutdown = true
+    /// Tears the current session down but leaves this object REUSABLE: back
+    /// to `.idle`, ready for another `connect(ticket:pin:)`. This is the
+    /// auto-reconnect primitive (see `MainView`'s foreground/failure
+    /// recovery): when the QUIC session dies while the app is backgrounded
+    /// (iOS suspends the process; the daemon side times the connection out),
+    /// the ONLY way back to live video is a fresh bridge + ticket connect +
+    /// PIN handshake -- restarting the frame source alone re-subscribes on a
+    /// dead bridge, which is exactly the live-witnessed "black screen and
+    /// errors out after switching apps" bug.
+    ///
+    /// Refused while `.connecting`: `establish` is mid-flight on `ffiQueue`
+    /// and its main-thread completions only check `isShutdown` -- resetting
+    /// under it could interleave a stale publication with the new session's.
+    /// Every real call site (failure recovery, foreground recovery) runs
+    /// from `.failed`/`.connected`, where `establish` has already finished.
+    func reset() {
+        guard !isShutdown, phase != .connecting else { return }
         controlSender = nil
         let source = liveFrameSource
         liveFrameSource = nil
         phase = .idle
+        #if canImport(HoloirohIosBridge)
+        eventPump?.cancel()
+        eventPump = nil
+        freeBridgeAfterStopping(source)
+        #else
+        source?.stop()
+        #endif
+    }
+
+    /// Tears the session down PERMANENTLY: like `reset()`, but this object
+    /// refuses all further use (`isShutdown`). Idempotent; call on
+    /// Disconnect / screen teardown.
+    func shutdown() {
+        guard !isShutdown else { return }
+        controlSender = nil
+        let source = liveFrameSource
+        liveFrameSource = nil
+        phase = .idle
+        isShutdown = true
         #if canImport(HoloirohIosBridge)
         eventPump?.cancel()
         eventPump = nil

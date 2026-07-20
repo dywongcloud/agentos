@@ -50,6 +50,15 @@ protocol VideoFrameSource: AnyObject {
     /// Stop producing frames and release any per-run resources (timers,
     /// decode sessions). Idempotent and safe to call from teardown.
     func stop()
+
+    /// When the most recent frame was delivered to `onFrame`, or `nil` if
+    /// none have been yet. Read from the main thread by `MainView`'s
+    /// foreground-recovery liveness check: after an app switch, "restarted
+    /// but no frame arrived within a few seconds" is the signal that the
+    /// underlying transport died in the background and a frame-source
+    /// restart alone cannot heal it (a full reconnect can). Implementations
+    /// must make this safe to read from any thread.
+    var lastFrameAt: Date? { get }
 }
 
 /// One decoded frame handed from a `VideoFrameSource` to `VideoRenderView`.

@@ -32,6 +32,16 @@ import QuartzCore
 final class SyntheticVideoFrameSource: VideoFrameSource {
     var onFrame: ((VideoFrame) -> Void)?
 
+    /// See `VideoFrameSource.lastFrameAt`. Timer-driven on the main thread,
+    /// but locked anyway so the protocol's any-thread-read promise holds.
+    private let lastFrameLock = NSLock()
+    private var _lastFrameAt: Date?
+    var lastFrameAt: Date? {
+        lastFrameLock.lock()
+        defer { lastFrameLock.unlock() }
+        return _lastFrameAt
+    }
+
     private let width: Int
     private let height: Int
     private let timescale: CMTimeScale = 600
@@ -82,6 +92,9 @@ final class SyntheticVideoFrameSource: VideoFrameSource {
     /// Renders one frame and pushes it through `onFrame`.
     @objc private func tick(_ link: CADisplayLink) {
         guard isRunning, let handler = onFrame else { return }
+        lastFrameLock.lock()
+        _lastFrameAt = Date()
+        lastFrameLock.unlock()
         guard let pixelBuffer = renderFrame(index: frameIndex) else { return }
         let pts = CMTime(value: frameIndex, timescale: timescale)
         frameIndex += 1
