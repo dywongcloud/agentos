@@ -472,6 +472,21 @@ impl HoloControlBridge {
             }
         }
 
+        // Intent-routing pre-step: pick the right holo3 model for this prompt's apparent
+        // complexity (see `crate::router`'s module doc). A no-op in local (no-cloud) mode or
+        // while on the tinfoil fallback -- `HoloBridge::route_model` enforces both. Best-effort:
+        // a failed switch is logged and the turn proceeds on whatever model is already active
+        // (degrade-don't-crash, matching every other backend-swap call site in this bridge).
+        if let Some(bridge) = &bridge {
+            if let Err(err) = bridge.route_model(&text).await {
+                tracing::warn!(
+                    request_id,
+                    error = %format!("{err:#}"),
+                    "intent router model switch failed; continuing on the currently active model"
+                );
+            }
+        }
+
         // At most ONE failover retry per turn: attempt 0 may suppress a backend failure and
         // switch to the fallback; attempt 1 runs with failover disabled, so its failure --
         // whatever the shape -- is emitted for real. No unbounded retry loops.

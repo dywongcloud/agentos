@@ -152,6 +152,17 @@ pub struct HoloBridge {
     fallback_since: std::sync::Mutex<Option<std::time::Instant>>,
     /// How long to stay on the fallback before a new turn probes the primary backend again.
     fallback_cooldown: std::time::Duration,
+    /// The per-prompt intent router's current model choice on the HOSTED primary path, when
+    /// it has switched away from the primary's own default. `None` = no routed override (the
+    /// primary's configured/default model is in effect). Same last-known-good discipline as
+    /// `on_fallback`: only set AFTER a successful [`Self::switch_to`], guarded by the same
+    /// `process` slot lock, and merged into [`Self::current_target`] so crash-restarts and
+    /// fallback-cooldown restores re-apply the routed model instead of silently dropping back
+    /// to the primary's default. Deliberately NOT consulted while `on_fallback` is true (the
+    /// router never fights the tinfoil failover -- see `router::choose_model`'s doc) or when
+    /// `primary` is the local llama-server (a local base URL always spawns with `model: None`;
+    /// see [`Self::route_model`]).
+    routed_model: std::sync::Mutex<Option<String>>,
     pub control: HoloControlBridge,
 }
 
@@ -207,19 +218,39 @@ impl HoloBridge {
             on_fallback: std::sync::Mutex::new(false),
             fallback_since: std::sync::Mutex::new(None),
             fallback_cooldown,
+            routed_model: std::sync::Mutex::new(None),
             control,
         })
     }
 
-    /// The backend a (re)spawn should use right now: the fallback while it is active, else
-    /// the primary. Cloned out so no lock is held across the spawn await.
-    fn current_target(&self) -> Option<InferenceTarget> {
+    /// The `(base_url, model)` a (re)spawn should use right now: the fallback target while it
+    /// is active, else the primary with the router's current model override merged in (when
+    /// the primary is the hosted path -- a `base_url: Some(..)` target, e.g. local llama-server,
+    /// never gets a model override, since `switch_to`/`build_command` already treat
+    /// `base_url: Some` and `model: Some` as mutually exclusive on the hosted-vs-local axis --
+    /// see [`Self::route_model`]'s doc for why). Returned as owned `String`s (not a borrowed
+    /// `InferenceTarget`) so a routed model -- which has no `base_url` at all -- can be
+    /// expressed without forcing `InferenceTarget::base_url` to become `Option`.
+    fn current_target(&self) -> (Option<String>, Option<String>) {
         let on_fallback = *self.on_fallback.lock().expect("on_fallback lock poisoned");
         if on_fallback {
-            self.fallback.clone()
-        } else {
-            self.primary.clone()
+            let Some(t) = &self.fallback else {
+                return (None, None);
+            };
+            return (Some(t.base_url.clone()), t.model.clone());
         }
+        let base_url = self.primary.as_ref().map(|t| t.base_url.clone());
+        let mut model = self.primary.as_ref().and_then(|t| t.model.clone());
+        // The router only ever applies to the HOSTED primary (no base_url of its own): a
+        // local-mode primary already ignores model names, so a routed override would be a
+        // silent no-op at best and, if `switch_to` ever paired it with a spawn expressing
+        // both base_url and model contradictorily, a P0-11 no-cloud-mode hazard at worst.
+        if base_url.is_none() {
+            if let Some(routed) = self.routed_model.lock().expect("routed_model lock poisoned").clone() {
+                model = Some(routed);
+            }
+        }
+        (base_url, model)
     }
 
     /// Whether the fallback backend is currently active (for status/log surfaces).
@@ -227,13 +258,34 @@ impl HoloBridge {
         *self.on_fallback.lock().expect("on_fallback lock poisoned")
     }
 
-    /// Swap the running `holo serve` onto `target` (terminate live child -> spawn replacement
-    /// -> verify agent card -> swap slot + A2A client). The whole swap holds the `process`
-    /// slot lock, same discipline as [`Self::restart_process`]. On spawn failure the dead
-    /// child stays in the slot; the health loop notices and restarts onto whatever backend
-    /// is marked active -- `on_fallback` is only flipped AFTER a successful swap, so a failed
-    /// switch self-heals back onto the backend that was last known good.
-    async fn switch_to(&self, target: Option<&InferenceTarget>, going_to_fallback: bool) -> Result<()> {
+    /// The intent router's current model override on the hosted primary path, if any (for
+    /// status/log surfaces).
+    ///
+    /// `#[allow(dead_code)]`: no bin-target caller yet (same lib-vs-bin asymmetry as
+    /// `protocol_version` above); kept as real public API for a future status/log surface.
+    #[allow(dead_code)]
+    pub fn routed_model(&self) -> Option<String> {
+        self.routed_model.lock().expect("routed_model lock poisoned").clone()
+    }
+
+    /// Swap the running `holo serve` onto `(base_url, model)` (terminate live child -> spawn
+    /// replacement -> verify agent card -> swap slot + A2A client). The whole swap holds the
+    /// `process` slot lock, same discipline as [`Self::restart_process`]. On spawn failure the
+    /// dead child stays in the slot; the health loop notices and restarts onto whatever backend
+    /// is marked active -- `on_fallback`/`routed_model` are only flipped AFTER a successful
+    /// swap, so a failed switch self-heals back onto the backend that was last known good.
+    ///
+    /// `going_to_fallback` and `new_routed_model` are the state-flip instructions applied only
+    /// on success; `new_routed_model` is `Some(None)` to explicitly clear a routed override
+    /// (switching back to the primary's default), `None` to leave `routed_model` untouched
+    /// (the fallback-activation and restore-to-primary call sites, which don't touch routing).
+    async fn switch_to(
+        &self,
+        base_url: Option<&str>,
+        model: Option<&str>,
+        going_to_fallback: bool,
+        new_routed_model: Option<Option<String>>,
+    ) -> Result<()> {
         let mut slot = self.process.lock().await;
 
         if let Err(err) = slot.terminate_in_place().await {
@@ -242,14 +294,9 @@ impl HoloBridge {
             tracing::warn!(error = %format!("{err:#}"), "terminating holo serve for backend switch failed");
         }
 
-        let new_process = HoloServeProcess::spawn(
-            &self.holo_bin,
-            self.port,
-            target.map(|t| t.base_url.as_str()),
-            target.and_then(|t| t.model.as_deref()),
-        )
-        .await
-        .context("failed to respawn holo serve on the new backend")?;
+        let new_process = HoloServeProcess::spawn(&self.holo_bin, self.port, base_url, model)
+            .await
+            .context("failed to respawn holo serve on the new backend")?;
         let client = new_process.client();
         client
             .probe_agent_card()
@@ -260,6 +307,9 @@ impl HoloBridge {
         *self.on_fallback.lock().expect("on_fallback lock poisoned") = going_to_fallback;
         *self.fallback_since.lock().expect("fallback_since lock poisoned") =
             going_to_fallback.then(std::time::Instant::now);
+        if let Some(routed) = new_routed_model {
+            *self.routed_model.lock().expect("routed_model lock poisoned") = routed;
+        }
         drop(slot);
         self.control.replace_client(client);
         Ok(())
@@ -277,7 +327,8 @@ impl HoloBridge {
             return Ok(FallbackActivation::AlreadyActive);
         }
         tracing::warn!(fallback = %target.label, "switching holo serve to the fallback inference backend");
-        self.switch_to(Some(&target), true).await?;
+        self.switch_to(Some(&target.base_url), target.model.as_deref(), true, None)
+            .await?;
         Ok(FallbackActivation::Switched {
             label: target.label,
         })
@@ -288,7 +339,9 @@ impl HoloBridge {
     /// Called at the start of each new turn. If the hosted backend is still rate-limited,
     /// that turn's failure re-triggers [`Self::activate_fallback`] -- one failed attempt per
     /// cooldown window is the probe cost, and the turn itself still completes via the retry.
-    /// Returns `true` when a restore actually happened.
+    /// Restores whatever model the router had last selected on the primary (`current_target`
+    /// merges `routed_model` in), not the primary's bare default. Returns `true` when a
+    /// restore actually happened.
     pub async fn maybe_restore_primary(&self) -> bool {
         if !self.is_on_fallback() {
             return false;
@@ -304,7 +357,20 @@ impl HoloBridge {
                     ?elapsed,
                     "fallback cooldown elapsed; switching holo serve back to the primary backend"
                 );
-                match self.switch_to(self.primary.clone().as_ref(), false).await {
+                // The primary's own base_url plus whatever model the router last selected
+                // there (merged in directly, not via `current_target()`: that method reads
+                // `on_fallback`, which is still `true` here -- it only flips inside
+                // `switch_to`, after this spawn succeeds).
+                let base_url = self.primary.as_ref().map(|t| t.base_url.clone());
+                let model = if base_url.is_none() {
+                    self.routed_model.lock().expect("routed_model lock poisoned").clone()
+                } else {
+                    self.primary.as_ref().and_then(|t| t.model.clone())
+                };
+                match self
+                    .switch_to(base_url.as_deref(), model.as_deref(), false, None)
+                    .await
+                {
                     Ok(()) => true,
                     Err(err) => {
                         tracing::warn!(
@@ -317,6 +383,44 @@ impl HoloBridge {
             }
             _ => false,
         }
+    }
+
+    /// Per-prompt intent routing on the hosted primary path: classify `prompt_text` and, if
+    /// the decision differs (with hysteresis) from the currently active model, respawn `holo
+    /// serve` onto it. No-ops (returns `Ok(())` immediately) when: local (no-cloud) mode is
+    /// active (`primary` has its own `base_url`, i.e. the local llama-server -- routing a
+    /// model NAME at a local server is meaningless, and P0-11 requires the alpha to never
+    /// introduce a hosted-shaped spawn there), or the fallback is currently active (the router
+    /// must never fight the tinfoil failover -- `maybe_restore_primary` re-applies the routed
+    /// model once the cooldown elapses and hosted service resumes). See `router::classify`.
+    pub async fn route_model(&self, prompt_text: &str) -> Result<()> {
+        // `primary: Some(..)` means local (no-cloud) mode -- `main.rs` only ever builds a
+        // primary `InferenceTarget` for the local llama-server; the hosted path leaves
+        // `primary: None` so `holo serve` keeps its own configured backend. Routing a model
+        // NAME only makes sense on that hosted path.
+        if self.primary.is_some() {
+            return Ok(());
+        }
+        if self.is_on_fallback() {
+            return Ok(());
+        }
+        let active = self.routed_model.lock().expect("routed_model lock poisoned").clone();
+        let active_tier = active
+            .as_deref()
+            .and_then(crate::router::Tier::from_model_id)
+            .unwrap_or(crate::router::Tier::Simple);
+        let Some(new_tier) = crate::router::should_switch(active_tier, prompt_text) else {
+            return Ok(());
+        };
+        let target_model = new_tier.model_id();
+        tracing::info!(
+            from = ?active_tier,
+            to = ?new_tier,
+            model = target_model,
+            "intent router switching holo serve's model"
+        );
+        self.switch_to(None, Some(target_model), false, Some(Some(target_model.to_string())))
+            .await
     }
 
     /// The A2A agent card's `protocolVersion` this bridge's `holo serve` advertised at startup,
@@ -365,12 +469,12 @@ impl HoloBridge {
         // undo an active failover. On failure the `?` releases the lock with the disarmed dead
         // process still in the slot -- the next health tick observes it exited and retries
         // this whole path (disarm is then a no-op).
-        let target = self.current_target();
+        let (base_url, model) = self.current_target();
         let new_process = HoloServeProcess::spawn(
             &self.holo_bin,
             self.port,
-            target.as_ref().map(|t| t.base_url.as_str()),
-            target.as_ref().and_then(|t| t.model.as_deref()),
+            base_url.as_deref(),
+            model.as_deref(),
         )
         .await
         .context("failed to respawn holo serve")?;

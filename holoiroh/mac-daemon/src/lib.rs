@@ -29,4 +29,5 @@ pub mod policy;
 pub mod registry;
 pub mod sensitive_categories;
 pub mod task_state;
-pub mod tinfoil_proxy;
+pub mod router;
+mod tinfoil_proxy;

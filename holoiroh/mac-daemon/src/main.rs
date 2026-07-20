@@ -31,6 +31,7 @@ mod holo_bridge;
 mod instance_guard;
 mod limits;
 mod local_model;
+mod router;
 mod tinfoil_proxy;
 mod pairing_phrase;
 mod permissions;
