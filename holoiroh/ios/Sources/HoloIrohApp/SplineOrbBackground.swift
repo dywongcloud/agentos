@@ -55,23 +55,50 @@ struct SplineOrbBackground: View {
 }
 
 #if canImport(SplineRuntime)
-/// The native-runtime orb. Loads the BUNDLED scene file first
-/// (`Resources/orb.splinecode`, shipped in the app -- zero network
-/// dependency; the remote-URL load silently failed on-device while the
-/// identical URL fetched fine from a Mac), falling back to the remote URL
-/// only if the bundle resource is somehow missing. A load failure falls
-/// through to the black/gradient underlay -- never an error surface on a
-/// background element.
+/// The native-runtime orb, using the REAL SplineView API: the init is
+/// NON-throwing (`init(sceneFileURL: URL?, ...)` -- the old
+/// `try SplineView(...)` tutorial pattern is a no-op on 0.2.x), and every
+/// load failure is delivered to the phase closure as
+/// `.failure(SplineViewError)`. The DEFAULT closure renders failures as a
+/// blank view with zero diagnostics -- exactly how "the orb doesn't
+/// render, just black" stayed undiagnosable. This explicit closure logs
+/// the concrete error case (fileUnknownFormat / fileOldFormat /
+/// fileNewFormat / fileUnreachable / deviceUnsupported) to the device
+/// console instead.
+///
+/// File preference order:
+/// 1. Bundled `orb.splineswift` -- the iOS runtime's REAL input format
+///    (only produced by the Spline editor's Export -> Mobile Platform ->
+///    Apple panel; not yet exported for this scene).
+/// 2. Bundled `orb.splinecode` -- the WEB runtime format; the iOS runtime
+///    accepts the URL but fails format validation (research-verified:
+///    docs + binary-strings audit of SplineRuntime 0.2.53). Kept only as
+///    a candidate in case a future runtime accepts it.
+/// 3. Remote scene.splinecode URL, same caveat.
 private struct NativeSplineOrb: View {
     private static let remoteURL = URL(string: "https://prod.spline.design/EEXJWT2Sfje1M4iS/scene.splinecode")!
 
     private var sceneURL: URL {
-        Bundle.module.url(forResource: "orb", withExtension: "splinecode") ?? Self.remoteURL
+        Bundle.module.url(forResource: "orb", withExtension: "splineswift")
+            ?? Bundle.module.url(forResource: "orb", withExtension: "splinecode")
+            ?? Self.remoteURL
     }
 
     var body: some View {
-        if let view = try? SplineView(sceneFileURL: sceneURL) {
-            view
+        let url = sceneURL
+        SplineView(sceneFileURL: url) { phase in
+            switch phase {
+            case .success(let content):
+                content
+            case .empty:
+                Color.clear
+            case .failure(let error):
+                // LOUD in the console, invisible on screen (the gradient
+                // underlay carries the design while broken).
+                Color.clear.onAppear {
+                    NSLog("SplineOrbBackground: SplineView FAILED for \(url.lastPathComponent): \(error) -- if fileUnknownFormat/fileNewFormat, the scene needs a .splineswift export from the Spline editor (Export -> Mobile Platform -> Apple)")
+                }
+            }
         }
     }
 }
