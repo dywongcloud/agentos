@@ -1,0 +1,18 @@
+[package]
+name = "holoiroh-wire"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-serde wire-protocol types shared by holoiroh-daemon (mac-daemon) and holoiroh-ios-bridge (ios-bridge): ClientMessage/ServerMessage/TaskEnvelope<T> and the CONTROL_ALPN/NDJSON framing constants both crates speak. Deliberately has NO iroh/tokio-runtime/macOS dependency -- see src/lib.rs's module doc for exactly why this crate had to be split out."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+# `write_line`/`read_line` are generic over any `AsyncWrite`/`AsyncBufRead` (NDJSON framing
+# only) -- they need tokio's async-IO *traits*, not a runtime. `default-features = false` +
+# only the `io-util` feature keeps this crate free of `rt`/`net`/`time`/`macros`, so depending
+# on `holoiroh-wire` can never drag in a tokio runtime flavor or reactor a caller didn't already
+# choose for itself (both mac-daemon and ios-bridge already pull in `tokio` with `io-util`
+# themselves, for their own runtime needs -- this crate just reuses the same trait surface
+# rather than reinventing an NDJSON writer/reader).
+tokio = { version = "1", default-features = false, features = ["io-util"] }

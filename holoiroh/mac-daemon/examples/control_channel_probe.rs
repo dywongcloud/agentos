@@ -2,9 +2,12 @@
 //! serialize/deserialize round-trips (both bare, for the pre-session PIN handshake, and
 //! envelope-wrapped via `TaskEnvelope<T>`, for every message after it -- see
 //! `PROTOCOL.md`'s "Envelope" section for exactly where that line falls) and
-//! `ServerMessage::from_control_event` mapping from `control_channel.rs`, printing real
-//! output. Witnesses the pure wire-schema logic that used to live in `control_channel.rs`'s
-//! `#[cfg(test)] mod tests` (removed per this repo's no-unit-tests rule).
+//! `control_channel::from_control_event` mapping (a free function, not an inherent
+//! `ServerMessage` method, since `ServerMessage` itself now lives in the `holoiroh-wire`
+//! crate -- see `control_channel.rs`'s doc comment on `from_control_event` for why),
+//! printing real output. Witnesses the pure wire-schema logic that used to live in
+//! `control_channel.rs`'s `#[cfg(test)] mod tests` (removed per this repo's no-unit-tests
+//! rule).
 //!
 //! This probe deliberately does NOT cover `ControlChannel::authenticate`'s PIN/allowlist gate,
 //! nor the envelope-validation logic in `TaskEnvelope`/`InboundEnvelopeState`
@@ -15,6 +18,7 @@
 //!
 //! Run with `cargo run --example control_channel_probe`.
 
+use holoiroh_daemon::control_channel;
 use holoiroh_daemon::control_channel::{ClientMessage, ServerMessage, TaskEnvelope};
 use holoiroh_daemon::holo_bridge::{ControlEvent, DoneStatus};
 
@@ -169,11 +173,11 @@ fn main() {
     println!("is_expired_at checks: OK");
 
     println!();
-    println!("=== ServerMessage::from_control_event mapping ===");
+    println!("=== control_channel::from_control_event mapping ===");
     let ack_event = ControlEvent::Ack {
         request_id: "r1".into(),
     };
-    let mapped = ServerMessage::from_control_event(ack_event);
+    let mapped = control_channel::from_control_event(ack_event);
     println!("ControlEvent::Ack -> {mapped:?}");
     assert_eq!(mapped, ServerMessage::ack());
 
@@ -181,7 +185,7 @@ fn main() {
         request_id: "r1".into(),
         message: "boom".into(),
     };
-    let mapped = ServerMessage::from_control_event(error_event);
+    let mapped = control_channel::from_control_event(error_event);
     println!("ControlEvent::Error -> {mapped:?}");
     assert_eq!(mapped, ServerMessage::error("boom"));
 
@@ -189,7 +193,7 @@ fn main() {
         request_id: "r1".into(),
         ahead: 2,
     };
-    let mapped = ServerMessage::from_control_event(queued_event);
+    let mapped = control_channel::from_control_event(queued_event);
     println!("ControlEvent::Queued{{ahead: 2}} -> {mapped:?}");
     assert_eq!(mapped, ServerMessage::status("queued, 2 ahead"));
     let json = serde_json::to_string(&mapped).unwrap();
@@ -200,7 +204,7 @@ fn main() {
         request_id: "r1".into(),
         ahead: 0,
     };
-    let mapped = ServerMessage::from_control_event(queued_zero_event);
+    let mapped = control_channel::from_control_event(queued_zero_event);
     println!("ControlEvent::Queued{{ahead: 0}} -> {mapped:?}");
     assert_eq!(mapped, ServerMessage::status("queued, 0 ahead"));
 
@@ -213,7 +217,7 @@ fn main() {
         status: DoneStatus::Failed,
         message: Some("agent backend error".into()),
     };
-    let mapped = ServerMessage::from_control_event(done_failed_event);
+    let mapped = control_channel::from_control_event(done_failed_event);
     println!("ControlEvent::Done{{status: Failed}} -> {mapped:?}");
     assert_eq!(mapped, ServerMessage::error("agent backend error"));
     let json = serde_json::to_string(&mapped).unwrap();
@@ -227,7 +231,7 @@ fn main() {
         status: DoneStatus::Completed,
         message: None,
     };
-    let mapped = ServerMessage::from_control_event(done_completed_event);
+    let mapped = control_channel::from_control_event(done_completed_event);
     println!("ControlEvent::Done{{status: Completed}} -> {mapped:?}");
     assert_eq!(mapped, ServerMessage::status("Completed"));
 

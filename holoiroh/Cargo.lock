@@ -2819,6 +2819,7 @@ dependencies = [
  "dotenvy",
  "eventsource-stream",
  "futures-util",
+ "holoiroh-wire",
  "iroh",
  "iroh-live",
  "libc",
@@ -2847,11 +2848,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cbindgen",
+ "holoiroh-wire",
  "iroh",
  "iroh-live",
  "serde_json",
  "tokio",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "holoiroh-wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

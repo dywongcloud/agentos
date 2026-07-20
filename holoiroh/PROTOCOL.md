@@ -7,10 +7,18 @@ broadcast, on the same `iroh` `Endpoint` (see `README.md`'s "Control
 channel" section and "Why iroh / iroh-live specifically" for the
 architecture rationale).
 
-This document is the source of truth for the wire schema. The Rust types in
-`mac-daemon/src/control_channel.rs` (`ClientMessage`, `ServerMessage`,
-`TaskEnvelope<T>`) implement it via `serde`; any change here must be
-mirrored there, and eventually in the Swift client.
+This document is the source of truth for the wire schema. The Rust types
+that implement it via `serde` (`ClientMessage`, `ServerMessage`,
+`TaskEnvelope<T>`) live in the `holoiroh-wire` crate (`holoiroh-wire/src/lib.rs`)
+so that both `mac-daemon` and `ios-bridge` (the iOS FFI crate, which must
+cross-compile to `aarch64-apple-ios` and cannot depend on `mac-daemon`'s
+macOS-only `holo_bridge`/`audit_log` modules) can share one definition
+instead of duplicating it. `mac-daemon/src/control_channel.rs`
+re-exports them at the same `control_channel::{ClientMessage, ServerMessage,
+TaskEnvelope, ...}` paths (and owns the connection-handling logic that
+*uses* this schema: the `iroh` `ProtocolHandler` impl, the PIN/allowlist
+auth gate, per-connection sequence state) — any change here must be
+mirrored in `holoiroh-wire/src/lib.rs`, and eventually in the Swift client.
 
 ## Project Aro PRD context: six logical streams, one implemented
 

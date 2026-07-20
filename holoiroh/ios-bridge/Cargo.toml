@@ -18,6 +18,18 @@ name = "holoiroh_ios_bridge"
 crate-type = ["staticlib", "lib"]
 
 [dependencies]
+# Pure-serde wire-protocol types shared with holoiroh-daemon (mac-daemon) -- this crate used
+# to hand-duplicate just the CONTROL_ALPN byte string (the one piece of the wire schema it
+# touched in actual Rust code; ClientMessage/ServerMessage/TaskEnvelope<T> are only ever seen
+# here as opaque JSON strings crossing the FFI boundary, decoded on the Swift side) since it
+# could not depend on holoiroh-daemon directly (control_channel.rs pulled in macOS-only
+# ScreenCaptureKit/etc via holo_bridge/audit_log, which do not cross-compile to
+# aarch64-apple-ios). holoiroh-wire has NONE of that -- pure serde/uuid plus generic
+# tokio::io framing helpers -- so this crate now depends on it directly instead of
+# duplicating CONTROL_ALPN, and can adopt the typed ClientMessage/ServerMessage/TaskEnvelope<T>
+# structs directly in Rust in the future instead of only ever seeing them as opaque JSON. See
+# ../holoiroh-wire/src/lib.rs's module doc for the full rationale.
+holoiroh-wire = { path = "../holoiroh-wire" }
 # Same git-pinned dependency mac-daemon/Cargo.toml uses, kept in lockstep
 # deliberately (both crates must agree on iroh-live's wire-compatible
 # version). See mac-daemon/Cargo.toml's comment for why this is a git dep

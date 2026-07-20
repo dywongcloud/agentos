@@ -5,6 +5,15 @@ edition = "2024"
 description = "Mac-side daemon that publishes screen+audio over iroh-live P2P and bridges prompts to holo-desktop-cli"
 
 [dependencies]
+# Pure-serde wire-protocol types (ClientMessage/ServerMessage/TaskEnvelope<T>/CONTROL_ALPN/
+# write_line/read_line/InboundEnvelopeState) that used to be defined directly in
+# src/control_channel.rs -- moved out to a sibling crate so `ios-bridge` (which must
+# cross-compile to aarch64-apple-ios) can depend on the same wire schema without pulling in
+# this crate's macOS-only holo_bridge/audit_log dependency graph. See
+# ../holoiroh-wire/src/lib.rs's module doc for the full rationale; control_channel.rs
+# re-exports these types so existing `control_channel::{ClientMessage, ...}` paths still
+# resolve.
+holoiroh-wire = { path = "../holoiroh-wire" }
 # Loads holoiroh/mac-daemon/.env (gitignored -- holds HAI_API_KEY, per the H Company
 # Inference API key the user supplied) into the process environment at startup, before
 # HoloBridge::start spawns `holo serve` (which inherits parent env for HAI_API_KEY --

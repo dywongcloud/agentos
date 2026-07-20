@@ -225,11 +225,16 @@ pub const HOLOIROH_PIXFMT_RGBA8: u32 = 0;
 pub const HOLOIROH_PIXFMT_BGRA8: u32 = 1;
 
 /// ALPN identifying the control-channel protocol on the daemon's `iroh`
-/// `Endpoint`. Must stay byte-for-byte identical to
-/// `mac-daemon/src/control_channel.rs`'s `CONTROL_ALPN` (the two crates
-/// deliberately share no lib crate -- see that module's doc for the wire
-/// schema this ALPN carries).
-pub const CONTROL_ALPN: &[u8] = b"holoiroh/control/1";
+/// `Endpoint`. Re-exported here from [`holoiroh_wire::CONTROL_ALPN`] rather
+/// than a local duplicate byte string -- this crate and
+/// `mac-daemon/src/control_channel.rs` both import the one definition in
+/// the `holoiroh-wire` crate now, instead of each hand-maintaining a copy
+/// that had to stay byte-for-byte identical by convention alone. See
+/// `holoiroh-wire/src/lib.rs`'s module doc for the wire schema this ALPN
+/// carries and why that crate exists. Re-exported (`pub use`, not a plain
+/// `use`) so existing call sites in this crate referencing the bare
+/// `CONTROL_ALPN` name (no module qualifier) keep resolving unchanged.
+pub use holoiroh_wire::CONTROL_ALPN;
 
 /// How long [`holoiroh_ios_bridge_control_connect`] waits for the daemon's
 /// first reply line (a bare `auth_rejected`, or the envelope-wrapped ready
