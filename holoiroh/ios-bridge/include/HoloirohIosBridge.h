@@ -38,6 +38,16 @@ extern "C" {
 #define HOLOIROH_PIXFMT_RGBA8 0
 
 /**
+ * Tightly-packed 8-bit BGRA (B,G,R,A byte order) -- what
+ * `holoiroh_ios_bridge_poll_next_frame` actually emits. Maps to Swift's
+ * `kCVPixelFormatType_32BGRA`, the universally-supported iOS display
+ * format (32RGBA pools are NOT supported by CoreVideo on iOS -- feeding
+ * RGBA made every CVPixelBufferPool creation fail silently, dropping all
+ * frames: the permanent-black-screen bug).
+ */
+#define HOLOIROH_PIXFMT_BGRA8 1
+
+/**
  * Result/error-code convention shared by every fallible function in this
  * module: `0` = success, negative = failure. The sign convention is fixed:
  * callers distinguish success from failure by the sign of the return value.

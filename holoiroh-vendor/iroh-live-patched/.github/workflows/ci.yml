@@ -1,0 +1,136 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly check for excluded workspace members (moq-media-dioxus).
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check-linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system deps
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libpipewire-0.3-dev libjack-jackd2-dev libclang-dev \
+            libegl-dev libgbm-dev libdrm-dev libfontconfig-dev \
+            libva-dev nasm
+
+      - run: cargo check --locked --workspace --all-targets
+      - run: cargo check --locked --workspace --all-targets --all-features
+      - run: cargo check --locked --workspace --all-targets --no-default-features
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo nextest run --locked --workspace
+      - run: cargo fmt --check
+
+  check-macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system deps
+        run: brew install libtool automake
+
+      - run: cargo check --locked --workspace --exclude pi-zero-demo --exclude pi-zero-minimal --all-targets
+      - run: cargo check --locked --workspace --exclude pi-zero-demo --exclude pi-zero-minimal --all-targets --all-features
+      - run: cargo check --locked --workspace --exclude pi-zero-demo --exclude pi-zero-minimal --all-targets --no-default-features
+      - run: cargo clippy --locked --workspace --exclude pi-zero-demo --exclude pi-zero-minimal --all-targets --all-features -- -D warnings
+      - run: cargo nextest run --locked --workspace --exclude pi-zero-demo --exclude pi-zero-minimal
+
+  # moq-media-dioxus is excluded from default-members (heavy dep tree).
+  # Check it weekly to catch breakage early.
+  check-dioxus:
+    name: Check moq-media-dioxus
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || contains(github.event.head_commit.message, '[check-dioxus]')
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install system deps
+        run: >
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          libasound2-dev libpipewire-0.3-dev libclang-dev
+          libegl-dev libgbm-dev libdrm-dev libfontconfig-dev nasm
+      - run: cargo check --locked -p moq-media-dioxus
+
+  e2e-browser:
+    name: Playwright E2E
+    runs-on: ubuntu-latest
+    needs: check-linux
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system deps
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libpipewire-0.3-dev libclang-dev \
+            libegl-dev libgbm-dev libdrm-dev libfontconfig-dev \
+            libva-dev nasm
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-make
+
+      # Pre-build so compilation doesn't eat into test timeouts.
+      - name: Build relay + CLI + examples
+        run: cargo make e2e-prebuild
+
+      - name: Build relay web assets
+        working-directory: iroh-live-relay/web
+        run: npm ci && npm run build
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+      - name: Install Playwright
+        working-directory: tests/e2e-browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run Playwright tests
+        working-directory: tests/e2e-browser
+        run: npx playwright test --workers=1
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-results
+          path: tests/e2e-browser/test-results/

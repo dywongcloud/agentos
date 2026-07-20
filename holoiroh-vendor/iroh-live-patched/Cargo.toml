@@ -1,0 +1,86 @@
+[workspace]
+members = [
+    "iroh-live",
+    "iroh-live-relay",
+    "iroh-moq",
+    "moq-media",
+    "moq-media-android",
+    "moq-media-dioxus",
+    "moq-media-egui",
+    "rusty-capture",
+    "rusty-codecs",
+    "demos/android/rust",
+    "demos/pi-zero",
+    "demos/pi-zero-minimal",
+    "demos/headless",
+    "demos/opengl",
+    "iroh-live-cli",
+]
+# moq-media-dioxus is a workspace member but excluded from default builds.
+# It pulls ~224 additional deps (blitz-dom, vello, etc.) and is prototype-quality.
+# Build it explicitly with: cargo build -p moq-media-dioxus
+default-members = [
+    "iroh-live",
+    "iroh-live-relay",
+    "iroh-moq",
+    "moq-media",
+    "moq-media-android",
+    "moq-media-egui",
+    "rusty-capture",
+    "rusty-codecs",
+    "demos/headless",
+    "demos/pi-zero",
+    "demos/pi-zero-minimal",
+    "demos/opengl",
+    "iroh-live-cli",
+]
+resolver = "2"
+
+[profile.release]
+debug = true
+
+[profile.release-dist]
+inherits = "release"
+debug = false
+strip = true
+lto = "thin"
+
+[workspace.dependencies]
+# External
+iroh = { version = "1.0.0", default-features = false, features = ["metrics", "portmapper", "fast-apple-datapath", "tls-aws-lc-rs"] }
+iroh-gossip = "0.101.0"
+iroh-tickets = "1.0.0"
+iroh-smol-kv = { version = "0.4.0", default-features = false }
+hang = "0.19.1"
+moq-lite = { package = "moq-net", version = "0.1.11" }
+moq-mux = "0.5.5"
+moq-relay = { version = "0.12.2", default-features = false }
+moq-native = { version = "0.17.1", default-features = false }
+web-transport-iroh = "0.6.0"
+
+# In-repo crates
+iroh-live = { path = "iroh-live", default-features = false }
+iroh-live-relay = { path = "iroh-live-relay" }
+iroh-moq = { path = "iroh-moq" }
+moq-media = { path = "moq-media", default-features = false }
+moq-media-android = { path = "moq-media-android" }
+moq-media-egui = { path = "moq-media-egui" }
+rusty-codecs = { path = "rusty-codecs", default-features = false }
+rusty-capture = { path = "rusty-capture", default-features = false }
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(docsrs)", "cfg(any_audio_codec)", "cfg(any_video_codec)", "cfg(any_codec)"] }
+elided_lifetimes_in_paths = "warn"
+unnameable_types = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+or_fun_call = "warn"
+use_self = "warn"
+unused_async = "warn"
+absolute_paths = "allow"
+manual_let_else = "warn"
+allow_attributes_without_reason = "warn"
+mod_module_files = "deny"
+

@@ -30,8 +30,9 @@ import SwiftUI
 ///    for the not-yet-wired `iroh-live` network source.
 /// 2. The **prompt bar** (text field + mic + send), always available so a new
 ///    request can be started from any state.
-/// 3. The **status/log panel**, always visible below the state panel.
-/// 4. The per-state **SessionView** panel.
+/// 3. The **status/log panel**, now inside the hidden controls sheet.
+/// 4. The per-state **SessionView** panel, also inside the controls sheet
+///    (toggled by the command bar's sparkle button; hidden by default).
 ///
 /// ## Transport
 ///
@@ -45,8 +46,8 @@ import SwiftUI
 /// In bridge-less builds (simulator/CI, `#if canImport` stub) the transport
 /// is unavailable: sends fall back to the `LoggingControlChannelSender`
 /// stand-in, the synthetic frame source keeps the render path live, and the
-/// "Demo" toolbar menu still jumps directly to any of the eight states so
-/// every state's controls remain reachable and inspectable.
+/// "Demo" menu (now in the controls sheet) still jumps directly to any of
+/// the eight states so every state's controls remain reachable.
 struct MainView: View {
     /// The ticket this session paired with, shown in the header so the
     /// user can confirm which daemon they connected to.
@@ -93,6 +94,22 @@ struct MainView: View {
         LogEntry(message: .status(text: "paired -- control channel not yet connected"))
     ]
 
+    /// Whether the live-share surface is expanded to fullscreen (tap the
+    /// floating panel to expand; the close control collapses it back).
+    /// Layout-only state: the underlying `VideoRenderView` keeps ONE view
+    /// identity across the transition, so the frame source is never
+    /// stopped/restarted by going fullscreen.
+    @State private var isVideoFullscreen = false
+
+    /// Whether the hidden controls sheet (the per-state SessionView panel,
+    /// the status/log panel, and Disconnect) is presented. Toggled by the
+    /// command bar's sparkle button; hidden by default.
+    @State private var showControls = false
+
+    /// App foreground/background state, driving the foreground video
+    /// recovery in `body` (see the `.onChange(of: scenePhase)` there).
+    @Environment(\.scenePhase) private var scenePhase
+
     /// The frame producer bound to the video surface. Held with `@State`
     /// so it keeps a stable identity across view updates (a fresh source
     /// on every re-render would restart the display link each time).
@@ -128,45 +145,64 @@ struct MainView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            ScrollView {
-                VStack(spacing: 12) {
-                    // Remote View is shown only in states that need it
-                    // (Working / DraftReady). It keeps a stable identity so
-                    // the single video surface is not rebuilt per state.
-                    if session.showsRemoteView {
-                        videoPreview
+        GeometryReader { geo in
+            // Shared layout math: the live-share box is ~85% of the width at
+            // a 16:10 aspect, with its top edge at ~40% of the height so the
+            // orb scene keeps the top of the screen entirely to itself. The
+            // SAME numbers drive both the box chrome and the persistent
+            // video surface so the two always coincide exactly.
+            let boxWidth = geo.size.width * 0.85
+            let boxHeight = boxWidth * 10.0 / 16.0
+            let boxCenterY = geo.size.height * 0.40 + boxHeight / 2
+            let isConnected = connection.phase == .connected
+            // Fullscreen only ever presents while the video surface exists;
+            // if the connection drops mid-fullscreen the normal layout comes
+            // straight back instead of leaving a black screen.
+            let isFullscreenActive = isVideoFullscreen && isConnected
+
+            ZStack {
+                // Layer 0: full-black backdrop + the blue blob orb Spline
+                // scene (see SplineOrbBackground's doc for the web-runtime
+                // rationale + offline gradient fallback). The orb renders
+                // its own top-area layout; nothing is overlaid on the top
+                // ~40% of the screen so it stays clear.
+                Color.black.ignoresSafeArea()
+                SplineOrbBackground()
+
+                if !isFullscreenActive {
+                    // CENTER: the live-screen-share box (chrome + placeholder
+                    // only -- the video itself is the persistent
+                    // `videoOverlay` surface below, framed to this box).
+                    liveShareBox(width: boxWidth, height: boxHeight)
+                        .position(x: geo.size.width / 2, y: boxCenterY)
+
+                    // BOTTOM: the single command bar.
+                    VStack(spacing: 0) {
+                        Spacer()
+                        commandBar
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 8)
                     }
-
-                    SessionView(
-                        state: session,
-                        macName: macName,
-                        macAvailable: macAvailable,
-                        inferenceMode: inferenceMode,
-                        actions: sessionActions
-                    )
                 }
-                .padding(.horizontal)
-                .padding(.top, 12)
+
+                // Topmost: the persistent live-share video surface -- ONE
+                // VideoRenderView across both the boxed and fullscreen
+                // layouts (same view identity; the fullscreen transition is
+                // a pure frame/layout change, never an unmount/remount).
+                videoOverlay(
+                    in: geo.size,
+                    boxWidth: boxWidth,
+                    boxHeight: boxHeight,
+                    boxCenterY: boxCenterY
+                )
             }
-
-            logPanel
-
-            promptBar
-                .padding()
         }
-        .navigationTitle("HoloIroh")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                demoMenu
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Disconnect", role: .destructive) {
-                    connection.shutdown()
-                    onDisconnect()
-                }
-            }
+        .toolbar(.hidden, for: .navigationBar)
+        // Hidden-by-default controls: the SessionView state panel, the
+        // status/log panel, and Disconnect live in this sheet, toggled by
+        // the command bar's sparkle button.
+        .sheet(isPresented: $showControls) {
+            controlsSheet
         }
         // Live partial + final transcript updates populate the prompt field
         // as they arrive while a recognition session is running.
@@ -185,11 +221,99 @@ struct MainView: View {
         .onChange(of: connection.phase) { _, newPhase in
             handleConnectionPhase(newPhase)
         }
+        // Foreground recovery: iOS invalidates VideoToolbox decode sessions
+        // when the app backgrounds, so on return the old subscription's
+        // decoder can only error until a fresh keyframe arrives -- and if
+        // the track went stale, never. Restarting the frame source gets a
+        // FRESH track from the daemon, whose first frame is always a
+        // keyframe (live-witnessed in every frame-pull probe), healing the
+        // decoder deterministically. stop()/start() serialize on the
+        // source's own queue, and the shared bridge pointer survives stop()
+        // (see IrohLiveFrameSource.teardownHandles) -- live-witnessed as
+        // "works, then black screen after switching apps" without this.
+        .onChange(of: scenePhase) { _, newPhase in
+            guard newPhase == .active, connection.phase == .connected else { return }
+            frameSource.stop()
+            frameSource.start()
+        }
+    }
+
+    // MARK: - Live-share box (chrome + placeholder)
+
+    /// The centered rounded live-screen-share box: black fill, thin light
+    /// border, corner radius 28. Shows the placeholder text until the
+    /// connection is up; once connected the persistent `videoOverlay`
+    /// surface renders the live video framed to exactly this box. Tapping
+    /// toggles fullscreen (only meaningful once connected).
+    private func liveShareBox(width: CGFloat, height: CGFloat) -> some View {
+        let isConnected = connection.phase == .connected
+        return RoundedRectangle(cornerRadius: 28)
+            .fill(Color.black)
+            .overlay(
+                RoundedRectangle(cornerRadius: 28)
+                    .stroke(Color.white.opacity(0.35), lineWidth: 1)
+            )
+            .overlay {
+                if !isConnected {
+                    Text("Live Screen Share here")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+                }
+            }
+            .frame(width: width, height: height)
+            .contentShape(RoundedRectangle(cornerRadius: 28))
+            .onTapGesture {
+                guard isConnected else { return }
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    isVideoFullscreen.toggle()
+                }
+            }
+            .accessibilityLabel("Live screen share")
+    }
+
+    // MARK: - Controls sheet (hidden by default)
+
+    /// The sheet the sparkle button toggles: the demo state-jump menu, the
+    /// per-state `SessionView` panel, the status/log panel, and Disconnect.
+    /// None of this is visible by default -- the main screen stays minimal.
+    private var controlsSheet: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                demoMenu
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                SessionView(
+                    state: session,
+                    macName: macName,
+                    macAvailable: macAvailable,
+                    inferenceMode: inferenceMode,
+                    actions: sessionActions
+                )
+
+                logPanel
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                Button(role: .destructive) {
+                    connection.shutdown()
+                    onDisconnect()
+                } label: {
+                    Text("Disconnect")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+            }
+            .padding()
+        }
+        .presentationDetents([.medium, .large])
     }
 
     // MARK: - Demo control (local transition trigger stand-in)
 
-    /// A toolbar menu that jumps directly to any of the eight PRD 6.1 states
+    /// A menu (in the controls sheet) that jumps to any of the eight PRD 6.1 states
     /// with a representative payload. This is the "direct" half of making the
     /// state machine demonstrably live without a wired control channel -- see
     /// this type's doc comment. Each jump also drops a synthesized log entry
@@ -431,21 +555,118 @@ struct MainView: View {
         session = .connecting
     }
 
-    // MARK: - Video preview
+    // MARK: - Live-share surface (boxed <-> fullscreen)
 
-    private var videoPreview: some View {
-        // Real render surface: a `VideoRenderView` (AVSampleBufferDisplayLayer)
-        // bound to `frameSource` -- the shared-bridge `IrohLiveFrameSource`
-        // once connected, the synthetic placeholder before then. `.id` keys
-        // the representable to the source's identity so the connect-time swap
-        // tears down the old binding (`dismantleUIView` stops the old source)
-        // and `makeUIView` starts the new one.
-        VideoRenderView(source: frameSource)
-            .id(ObjectIdentifier(frameSource as AnyObject))
-            .background(Color.black)
-            .aspectRatio(16.0 / 9.0, contentMode: .fit)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .accessibilityLabel("Live remote view")
+    /// The persistent live-share surface. Mounted the moment the connection
+    /// is up and NEVER unmounted by session-state changes or the fullscreen
+    /// toggle (the old `showsRemoteView`-gated slot tore the shared frame
+    /// source down on every state transition -- a live-witnessed
+    /// permanent-black-screen bug class). Boxed: framed to exactly the
+    /// center live-share box (chrome drawn by `liveShareBox`). Fullscreen
+    /// (tap to expand): fills the screen over a black backdrop with the live
+    /// chat feed + command bar overlaid, Twitch-style, so prompts can be
+    /// sent to the agent without leaving the mirror. ONE VideoRenderView
+    /// instance across both layouts: `.id` keys it to the SOURCE's identity
+    /// only (connect-time swap), never the fullscreen flag, so the
+    /// transition is a pure frame/layout change.
+    @ViewBuilder
+    private func videoOverlay(
+        in size: CGSize,
+        boxWidth: CGFloat,
+        boxHeight: CGFloat,
+        boxCenterY: CGFloat
+    ) -> some View {
+        if connection.phase == .connected {
+            ZStack {
+                if isVideoFullscreen {
+                    Color.black
+                        .ignoresSafeArea()
+                        .transition(.opacity)
+                }
+
+                VideoRenderView(source: frameSource)
+                    .id(ObjectIdentifier(frameSource as AnyObject))
+                    .background(Color.black)
+                    .frame(
+                        width: isVideoFullscreen ? size.width : boxWidth,
+                        height: isVideoFullscreen ? size.height : boxHeight
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: isVideoFullscreen ? 0 : 28))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: isVideoFullscreen ? 0 : 28)
+                            .stroke(Color.white.opacity(isVideoFullscreen ? 0 : 0.35), lineWidth: 1)
+                    )
+                    .overlay(alignment: .topTrailing) {
+                        // Expand / collapse control.
+                        Button {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                isVideoFullscreen.toggle()
+                            }
+                        } label: {
+                            Image(systemName: isVideoFullscreen
+                                  ? "arrow.down.right.and.arrow.up.left"
+                                  : "arrow.up.left.and.arrow.down.right")
+                                .font(.footnote.weight(.bold))
+                                .padding(8)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .padding(10)
+                        .accessibilityLabel(isVideoFullscreen ? "Exit fullscreen" : "Fullscreen live view")
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if !isVideoFullscreen {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                isVideoFullscreen = true
+                            }
+                        }
+                    }
+                    .accessibilityLabel("Live remote view of the Mac")
+                    .position(
+                        x: size.width / 2,
+                        y: isVideoFullscreen ? size.height / 2 : boxCenterY
+                    )
+
+                if isVideoFullscreen {
+                    VStack(spacing: 0) {
+                        Spacer()
+                        fullscreenChatOverlay
+                    }
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .allowsHitTesting(true)
+        }
+    }
+
+    /// Twitch-style live overlay for fullscreen: the last few log entries as
+    /// a translucent feed, with the command bar below for sending prompts to
+    /// the agent without leaving the mirror. Fullscreen sends go DIRECTLY to
+    /// the daemon (no Reviewing detour): fullscreen is the live-driving mode.
+    private var fullscreenChatOverlay: some View {
+        VStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(logEntries.suffix(5)) { entry in
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(entry.message.kindLabel)
+                            .font(.system(.caption2, design: .monospaced).weight(.bold))
+                            .foregroundStyle(logColor(for: entry.message))
+                        Text(entry.message.displayText)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.92))
+                            .lineLimit(2)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            commandBar(fullscreen: true)
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
     }
 
     // MARK: - Status / log panel
@@ -520,34 +741,79 @@ struct MainView: View {
         }
     }
 
-    // MARK: - Prompt bar
+    // MARK: - Command bar
 
-    private var promptBar: some View {
-        HStack(spacing: 8) {
-            TextField("Type a prompt…", text: $promptText, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
+    /// The default (main-screen) command bar. Same input path as before --
+    /// prompts are STAGED into the Reviewing panel, not sent directly.
+    private var commandBar: some View {
+        commandBar(fullscreen: false)
+    }
+
+    /// The single bottom command bar in one large dark rounded container:
+    /// sparkle (controls-sheet toggle) + prompt field + mic + send.
+    /// `fullscreen: true` (the live-mirror overlay) sends prompts DIRECTLY
+    /// to the daemon -- fullscreen is the live-driving mode, no Reviewing
+    /// detour -- while `false` keeps the existing stage-then-confirm flow.
+    private func commandBar(fullscreen: Bool) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                showControls.toggle()
+            } label: {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 38, height: 38)
+                    .background(Color(white: 0.15), in: RoundedRectangle(cornerRadius: 12))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Toggle session controls")
+
+            TextField("What do you want to do?", text: $promptText, axis: .vertical)
+                .textFieldStyle(.plain)
                 .lineLimit(1...4)
-                .onSubmit(sendPrompt)
+                .foregroundStyle(.white)
+                .tint(.white)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Color(white: 0.13), in: RoundedRectangle(cornerRadius: 14))
+                .onSubmit { fullscreen ? sendLivePrompt() : sendPrompt() }
 
             Button {
                 toggleMicrophone()
             } label: {
                 Image(systemName: voice.isRecording ? "mic.fill" : "mic")
-                    .foregroundStyle(voice.isRecording ? Color.red : Color.accentColor)
+                    .font(.system(size: 17))
+                    .foregroundStyle(voice.isRecording ? Color.red : Color(white: 0.75))
+                    .frame(width: 30, height: 38)
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.plain)
             .accessibilityLabel(voice.isRecording ? "Stop recording" : "Start voice prompt")
 
             Button {
-                sendPrompt()
+                fullscreen ? sendLivePrompt() : sendPrompt()
             } label: {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
+                Image(systemName: "paperplane")
+                    .font(.system(size: 17))
+                    .foregroundStyle(Color(white: 0.75))
+                    .frame(width: 30, height: 38)
             }
             .buttonStyle(.plain)
             .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .accessibilityLabel("Send prompt")
         }
+        .padding(12)
+        .background(Color(white: 0.09), in: RoundedRectangle(cornerRadius: 24))
+    }
+
+    /// Fullscreen live-mode send: straight to the daemon as a prompt, and
+    /// straight into the feed -- no Reviewing stage.
+    private func sendLivePrompt() {
+        let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        promptText = ""
+        lastSentTask = .prompt(text: trimmed)
+        sendControlMessage(.prompt(text: trimmed))
+        log(.status(text: "→ live prompt: \(trimmed)"))
     }
 
     private func sendPrompt() {

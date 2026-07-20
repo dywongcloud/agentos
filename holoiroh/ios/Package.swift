@@ -12,6 +12,16 @@ let package = Package(
             targets: ["HoloIrohApp"]
         )
     ],
+    dependencies: [
+        // Native Spline runtime for the blue blob orb background scene
+        // (SplineOrbBackground.swift). The official splinetool iOS package;
+        // 0.2.x is the current release line (latest tag verified via
+        // `git ls-remote --tags` before pinning). Native rendering (Metal)
+        // rather than the earlier WKWebView web-runtime approach -- the
+        // web runtime rendered a degraded orb on device, per live visual
+        // comparison against the reference scene render.
+        .package(url: "https://github.com/splinetool/spline-ios", from: "0.2.0")
+    ],
     targets: [
         // Rust iroh-live subscribe FFI, packaged per IROH_FFI.md's "As-built:
         // xcframework packaging" (device slice built from
@@ -37,7 +47,11 @@ let package = Package(
                 // -- so a macOS `swift build` of this package still compiles
                 // (stub path), while the Xcode device build links the real
                 // bridge and gets live video.
-                .target(name: "HoloirohIosBridge", condition: .when(platforms: [.iOS]))
+                .target(name: "HoloirohIosBridge", condition: .when(platforms: [.iOS])),
+                // iOS-only, same rationale: SplineOrbBackground's
+                // `#if canImport(SplineRuntime)` gate keeps the headless
+                // macOS `swift build` compiling (gradient-fallback path).
+                .product(name: "SplineRuntime", package: "spline-ios", condition: .when(platforms: [.iOS]))
             ],
             path: "Sources/HoloIrohApp",
             exclude: ["REQUIRED_INFO_PLIST_KEYS.md"]

@@ -115,14 +115,22 @@ enum SessionState: Equatable {
         }
     }
 
-    /// Whether this state shows the live Remote View. Per the task spec:
-    /// Working and DraftReady show the video (the user is watching the agent
-    /// act / inspecting a live draft); Idle/Reviewing/Connecting/Failed don't
-    /// need it. InputNeeded and AwaitingApproval embed their own frame
-    /// snapshot in their payload rather than the full live surface.
+    /// Whether this state shows the live Remote View. Working and DraftReady
+    /// show the video (the user is watching the agent act / inspecting a
+    /// live draft). Failed also shows it: `FailurePayload`'s whole point is
+    /// "actionable cause + recovery" (e.g. "take control to pick the channel
+    /// manually") -- the user needs to see the Mac's actual screen to act on
+    /// that, and hiding the video here previously tore down the entire live
+    /// connection (see `VideoRenderView.dismantleUIView`'s doc: removing the
+    /// view stops the shared `IrohLiveFrameSource`), not just a UI panel --
+    /// live-witnessed as a single failed backend task (a 429 from the
+    /// hosted inference API) silently killing screen mirroring for the rest
+    /// of the session. Idle/Reviewing/Connecting don't need it (no live task
+    /// or draft to watch yet). InputNeeded and AwaitingApproval embed their
+    /// own frame snapshot in their payload rather than the full live surface.
     var showsRemoteView: Bool {
         switch self {
-        case .working, .draftReady: return true
+        case .working, .draftReady, .failed: return true
         default: return false
         }
     }

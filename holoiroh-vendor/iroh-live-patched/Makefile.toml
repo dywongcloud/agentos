@@ -1,0 +1,157 @@
+# Use cargo-make to run tasks here: https://crates.io/crates/cargo-make
+
+[tasks.format]
+workspace = false
+command = "cargo"
+args = [
+     "fmt",
+     "--all",
+     "--",
+     "--config",
+     "unstable_features=true",
+     "--config",
+     "imports_granularity=Crate,group_imports=StdExternalCrate,reorder_imports=true,format_code_in_doc_comments=true",
+]
+
+[tasks.format-check]
+workspace = false
+command = "cargo"
+args = [
+     "fmt",
+     "--all",
+     "--check",
+     "--",
+     "--config",
+     "unstable_features=true",
+     "--config",
+     "imports_granularity=Crate,group_imports=StdExternalCrate,reorder_imports=true,format_code_in_doc_comments=true",
+]
+
+# ── CI-equivalent checks ─────────────────────────────────────────────
+
+[tasks.check-all-features]
+workspace = false
+command = "cargo"
+args = ["check", "--locked", "--workspace", "--all-targets", "--all-features"]
+
+[tasks.check-no-default]
+workspace = false
+command = "cargo"
+args = ["check", "--locked", "--workspace", "--all-targets", "--no-default-features"]
+
+[tasks.check-default-features]
+workspace = false
+command = "cargo"
+args = ["check", "--locked", "--workspace", "--all-targets"]
+
+[tasks.check]
+description = "cargo check: all features, no-default-features, and default features"
+workspace = false
+dependencies = ["check-all-features", "check-no-default", "check-default-features"]
+
+[tasks.clippy-all-features]
+workspace = false
+command = "cargo"
+args = ["clippy", "--locked", "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
+
+[tasks.clippy-no-default]
+workspace = false
+command = "cargo"
+args = ["clippy", "--locked", "--workspace", "--all-targets", "--no-default-features", "--", "-D", "warnings"]
+
+[tasks.clippy-default-features]
+workspace = false
+command = "cargo"
+args = ["clippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.clippy]
+description = "clippy with -D warnings: all features, no-default-features, and default features"
+workspace = false
+dependencies = ["clippy-all-features", "clippy-no-default", "clippy-default-features"]
+
+[tasks.check-all]
+description = "Full pre-commit check: cargo check (3 configs), clippy -D warnings (3 configs), fmt"
+workspace = false
+dependencies = [
+    "check-all-features",
+    "check-no-default",
+    "check-default-features",
+    "clippy-all-features",
+    "clippy-no-default",
+    "clippy-default-features",
+    "format-check",
+]
+
+# ── Tests ─────────────────────────────────────────────────────────────
+
+[tasks.test]
+description = "Run workspace tests via nextest (serializes patchbay tests)"
+workspace = false
+command = "cargo"
+args = ["nextest", "run", "--locked", "--workspace"]
+
+[tasks.test-patchbay]
+description = "Run patchbay network simulation tests (including ignored)"
+workspace = false
+command = "cargo"
+args = ["nextest", "run", "--locked", "-p", "iroh-live",
+        "-E", "binary(patchbay)", "--run-ignored", "all"]
+
+# ── E2E browser tests ────────────────────────────────────────────────
+
+[tasks.e2e-prebuild]
+description = "Pre-build binaries needed by Playwright E2E tests"
+workspace = false
+script = [
+    "cargo build --locked -p iroh-live-relay -p iroh-live-cli && cargo build --locked -p iroh-live --example subscribe_test",
+]
+
+[tasks.test-e2e]
+description = "Run Playwright browser E2E tests"
+workspace = false
+dependencies = ["e2e-prebuild"]
+cwd = "tests/e2e-browser"
+command = "npx"
+args = ["playwright", "test", "--workers=1"]
+
+[tasks.test-full]
+description = "Full CI-equivalent test suite: check-all, tests, browser E2E"
+workspace = false
+dependencies = ["check-all", "test", "test-e2e"]
+
+# ── Cross-compilation (aarch64, zigbuild + sysroot) ──────────────────
+#
+# Host-native (requires zig + cargo-zigbuild + sysroot):
+#   cargo make cross-sysroot-aarch64
+#   cargo make cross-build-aarch64 -- -p iroh-live-cli --release
+#
+# Docker (no host setup needed, just Docker):
+#   cargo make cross-build-aarch64-docker -- -p iroh-live-cli --release
+
+[tasks.cross-sysroot-aarch64]
+description = "Create the aarch64 Debian Bookworm sysroot (dpkg-deb, no sudo needed)."
+workspace = false
+script_runner = "@shell"
+script = '''
+"${CARGO_MAKE_WORKING_DIRECTORY}/cross/create-sysroot.sh"
+'''
+
+[tasks.cross-build-aarch64]
+description = "Cross-build for aarch64 via zigbuild. Pass extra args after --."
+workspace = false
+script_runner = "@shell"
+script = '''
+# cargo-make passes args after -- as positional params, with "--" itself
+# as the first param. Strip that leading "--" before forwarding.
+if [ "$1" = "--" ]; then shift; fi
+"${CARGO_MAKE_WORKING_DIRECTORY}/cross/zigbuild.sh" "$@"
+'''
+
+[tasks.cross-build-aarch64-docker]
+description = "Cross-build for aarch64 via zigbuild in Docker. Pass extra args after --."
+workspace = false
+script_runner = "@shell"
+script = '''
+if [ "$1" = "--" ]; then shift; fi
+"${CARGO_MAKE_WORKING_DIRECTORY}/cross/docker-zigbuild.sh" "$@"
+'''

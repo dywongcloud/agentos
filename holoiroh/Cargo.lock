@@ -2293,6 +2293,7 @@ dependencies = [
  "iroh-live",
  "serde_json",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2761,7 +2762,6 @@ dependencies = [
 [[package]]
 name = "iroh-live"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?rev=5f95758fcd1450e443a9134c9d9342bcc3957b85#5f95758fcd1450e443a9134c9d9342bcc3957b85"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2818,7 +2818,6 @@ dependencies = [
 [[package]]
 name = "iroh-moq"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?rev=5f95758fcd1450e443a9134c9d9342bcc3957b85#5f95758fcd1450e443a9134c9d9342bcc3957b85"
 dependencies = [
  "iroh",
  "moq-net",
@@ -3366,7 +3365,6 @@ dependencies = [
 [[package]]
 name = "moq-media"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?rev=5f95758fcd1450e443a9134c9d9342bcc3957b85#5f95758fcd1450e443a9134c9d9342bcc3957b85"
 dependencies = [
  "anyhow",
  "audioadapter-buffers",
@@ -5319,7 +5317,6 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 [[package]]
 name = "rusty-capture"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?rev=5f95758fcd1450e443a9134c9d9342bcc3957b85#5f95758fcd1450e443a9134c9d9342bcc3957b85"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -5348,7 +5345,6 @@ dependencies = [
 [[package]]
 name = "rusty-codecs"
 version = "0.1.0"
-source = "git+https://github.com/n0-computer/iroh-live?rev=5f95758fcd1450e443a9134c9d9342bcc3957b85#5f95758fcd1450e443a9134c9d9342bcc3957b85"
 dependencies = [
  "anyhow",
  "ash",

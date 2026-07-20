@@ -36,6 +36,23 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # other side of this wire.
 serde_json = "1"
 anyhow = "1"
+# On-device visibility into the media pipeline: `holoiroh_ios_bridge_new`
+# installs a process-global stderr tracing subscriber (Once-guarded), so
+# every decoder-selection line, per-packet decode error, and pipeline
+# start/stop from moq-media/rusty-codecs shows up in the device console
+# (`devicectl ... launch --console`). Added while root-causing the
+# permanent-black-screen bug: the decode path fails SILENTLY on iOS
+# without this -- every error the Mac-side probe could see was invisible
+# on the phone.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# examples/frame_pull_probe.rs only: surfaces moq-media's internal decode-
+# pipeline tracing (decoder selection, per-frame decode errors) which is
+# otherwise invisible -- the probe exists precisely because that pipeline
+# failed silently (zero frames, no error) on every platform. Not a
+# dependency of the shipped staticlib.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 # Generates ios-bridge.h from this crate's `extern "C"` signatures at build

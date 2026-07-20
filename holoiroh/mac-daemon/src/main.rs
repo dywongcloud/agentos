@@ -28,6 +28,7 @@ mod duration;
 // would compile the whole seam as dead code here (25 warnings), since nothing in `main.rs`
 // references it yet -- so it lives in the lib target only until that wiring lands.
 mod holo_bridge;
+mod instance_guard;
 mod limits;
 mod local_model;
 mod pairing_phrase;
@@ -202,10 +203,54 @@ fn local_model_enabled() -> bool {
     }
 }
 
+/// True if this machine has a working IPv6 default route, per `route -n get
+/// -inet6 default`'s stdout (macOS-only, matching this crate's
+/// `cfg(target_os = "macos")` scope elsewhere -- see `permissions.rs`).
+/// Having a link-local (`fe80::`) address on an interface is NOT sufficient
+/// -- that's present even on IPv4-only networks and cannot route to a real
+/// peer -- so this checks for an actual default route, not interface
+/// presence.
+///
+/// Deliberately checks **stdout content**, not exit status: `route`'s own
+/// behavior on "no route" is to print "route: writing to routing socket:
+/// not in table" to STDERR while still exiting **0** (verified live on this
+/// exact machine -- a first attempt at this check trusted exit status alone
+/// and would have silently always returned `true`, defeating the fix this
+/// function exists for). On a real route, stdout carries structured
+/// `destination:`/`gateway:`/etc. fields; on "not in table", stdout is
+/// empty. Checking for a non-empty stdout is therefore the actual signal.
+/// Any error running `route` itself (missing binary, permission issue) is
+/// treated as "no v6 route" -- the conservative choice, since an IPv4-only
+/// bind always works, while wrongly assuming v6 works risks the exact stall
+/// this check exists to prevent. See the call site in `main()` (iroh
+/// endpoint construction) for the full rationale.
+fn has_ipv6_default_route() -> bool {
+    std::process::Command::new("route")
+        .args(["-n", "get", "-inet6", "default"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|output| !output.stdout.is_empty())
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     tracing::info!("holoiroh-daemon starting");
+
+    // --- single-instance guard, before ANY other startup work (including
+    // .env/auth/permission checks below, which are all cheap to redo but
+    // pointless if a second instance is about to fail this exact check).
+    // See `instance_guard`'s module doc for the live-witnessed failure mode
+    // this closes: two daemons racing for `holo serve`'s port, with the
+    // loser silently publishing a QR code with no control channel mounted. ---
+    let _instance_guard = match instance_guard::InstanceGuard::acquire() {
+        Ok(guard) => guard,
+        Err(err) => {
+            eprintln!("[holoiroh-daemon] {err}");
+            anyhow::bail!("{err}");
+        }
+    };
 
     // --- load holoiroh/mac-daemon/.env (gitignored; HAI_API_KEY) into process env, before
     // anything reads it. Missing file is not an error -- `dotenvy::dotenv()` only errors on a
@@ -255,8 +300,43 @@ async fn main() -> anyhow::Result<()> {
     // and the control channel's ALPN can be mounted on one shared
     // `Endpoint`/`Router` -- see `Live::register_protocols`'s own doc:
     // "If you already have a router ... skip [`with_router`] and call
-    // `Live::register_protocols` on your own `RouterBuilder` instead." ---
-    let live = Live::from_env().await?.spawn();
+    // `Live::register_protocols` on your own `RouterBuilder` instead."
+    //
+    // NOT `Live::from_env().await?.spawn()` (iroh-live's own convenience
+    // path): that always binds BOTH an IPv4 and an IPv6 UDP transport
+    // (`Endpoint::builder`'s default), with no override hook. Live-witnessed
+    // failure mode this closes: on a Mac with no IPv6 default route (`route
+    // -n get -inet6 default` -> "not in table" -- real, not hypothetical;
+    // this machine has only a link-local `fe80::` v6 address) but a peer
+    // (e.g. an iPhone on cellular) that DOES have a real global IPv6
+    // address, iroh's QUIC layer still tries that IPv6 candidate path first
+    // and every `sendmsg` on it fails with `HostUnreachable` -- observed
+    // repeatedly, one attempt per relay-keepalive-ish interval, for 60+
+    // seconds before anything gets through on the working IPv4/relay path.
+    // From the phone's side this looks exactly like "connected but hangs,
+    // no errors": the control channel's `session established` log line
+    // fires, but the greeting/every reply is queued behind a doomed IPv6
+    // send. Building the endpoint by hand (`iroh_live::util::secret_key_from_env`
+    // + `Endpoint::builder`, matching `Live::from_env`'s own implementation)
+    // so `clear_ip_transports()` can drop the IPv6 UDP socket entirely when
+    // this machine has no v6 route -- skipping the dead path outright
+    // instead of waiting out iroh's own path-probing/migration timeout. ---
+    let secret_key = iroh_live::util::secret_key_from_env()?;
+    let mut endpoint_builder =
+        iroh::Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key);
+    if has_ipv6_default_route() {
+        info!("IPv6 default route present -- binding both IPv4 and IPv6 transports");
+    } else {
+        warn!(
+            "no IPv6 default route on this machine -- binding IPv4 only (a v6-capable peer would otherwise stall the control channel retrying doomed IPv6 sends; see main.rs's iroh-endpoint-construction comment)"
+        );
+        endpoint_builder = endpoint_builder
+            .clear_ip_transports()
+            .bind_addr("0.0.0.0:0")
+            .context("failed to configure IPv4-only iroh transport")?;
+    }
+    let endpoint = endpoint_builder.bind().await?;
+    let live = Live::builder(endpoint).spawn();
     info!(id = %live.endpoint().id(), "endpoint ready");
 
     // --- metadata-only local audit log (Project Aro PRD row P0-12; see `audit_log`'s module
@@ -406,7 +486,20 @@ async fn main() -> anyhow::Result<()> {
             control.register_protocols(router_builder)
         }
         None => {
-            info!("control channel not mounted: no holo_bridge available");
+            // Loud, not `info!`: this daemon is about to publish a fully
+            // valid-looking QR code/ticket/phrase that a phone CAN pair
+            // with, but whose control-channel dial will then fail ALPN
+            // negotiation on every attempt (iroh error 120, "peer doesn't
+            // support any known protocol") -- indistinguishable from a
+            // crash to the end user. The `instance_guard` module prevents
+            // the most common cause (a second daemon losing the `holo
+            // serve` port race) from reaching this branch at all; this
+            // warning covers every other `HoloBridge::start` failure mode
+            // (see the `Err(err)` arm above for the actual cause logged
+            // moments earlier).
+            warn!(
+                "control channel NOT mounted (no holo_bridge available) -- the QR code about to be printed will pair successfully but EVERY control-channel connection will then fail; see the 'holo_bridge failed to start' warning above for the root cause"
+            );
             router_builder
         }
     };

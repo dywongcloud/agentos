@@ -1,3 +1,40 @@
 [workspace]
 resolver = "2"
 members = ["mac-daemon", "ios-bridge"]
+
+# Local patch of the pinned iroh-live commit (5f95758, see mac-daemon/Cargo.toml
+# and ios-bridge/Cargo.toml's own comments on the git-pin rationale): upstream
+# rusty-codecs (iroh-live's H.264 codec crate) gates its VideoToolbox decoder
+# behind `#[cfg(target_os = "macos")]` specifically, not iOS -- so on a real
+# device build, the decoder module simply never compiles in and the FFI
+# bridge's `poll_next_frame` perpetually returns "no frame yet" with no error
+# anywhere, which is exactly what live-witnessed as "task completes over P2P
+# but the remote screen stays a black screen, no error shown". Confirmed via
+# `nm`/`strings` on the built `aarch64-apple-ios` static lib: zero VideoToolbox
+# symbols present.
+#
+# The patched checkout lives at `../holoiroh-vendor/iroh-live-patched` --
+# a SIBLING of this workspace root, not a subdirectory under it. Cargo
+# resolves the nearest ancestor `[workspace]` for any path dependency by
+# directory-tree containment, so a patched checkout nested inside this
+# workspace's own tree would incorrectly inherit THIS Cargo.toml (which has
+# no `[workspace.dependencies]`) instead of its own vendored root manifest --
+# live-hit as "error inheriting `hang` from workspace root manifest's
+# `workspace.dependencies.hang`: `workspace.dependencies` was not defined"
+# the first time this was vendored directly under `holoiroh/vendor/`.
+#
+# The patch itself broadens the `videotoolbox`/`apple-gpu` feature gates in
+# `rusty-codecs/src/{codec.rs,format.rs,codec/dynamic.rs,codec/tests/harness.rs,
+# processing/convert.rs}` from `target_os = "macos"` to `any(target_os =
+# "macos", target_os = "ios")` (VTDecompressionSession and the
+# objc2-video-toolbox/objc2-core-media bindings it uses are real, supported
+# iOS APIs -- this was never a platform limitation, just an unset cfg).
+# `metal-import`-gated code (render.rs) is deliberately left macOS-only: it's
+# a GPU-texture zero-copy rendering path `IrohLiveFrameSource` doesn't use
+# (it wants plain CPU-readback RGBA8 bytes, per that type's own module doc).
+[patch."https://github.com/n0-computer/iroh-live"]
+iroh-live = { path = "../holoiroh-vendor/iroh-live-patched/iroh-live" }
+moq-media = { path = "../holoiroh-vendor/iroh-live-patched/moq-media" }
+rusty-codecs = { path = "../holoiroh-vendor/iroh-live-patched/rusty-codecs" }
+rusty-capture = { path = "../holoiroh-vendor/iroh-live-patched/rusty-capture" }
+iroh-moq = { path = "../holoiroh-vendor/iroh-live-patched/iroh-moq" }

@@ -206,9 +206,23 @@ pub const HOLOIROH_ERR_NULL_ARG: HoloirohStatus = -8;
 pub const HOLOIROH_ERR_PANIC: HoloirohStatus = -9;
 
 /// Pixel-format tag for [`HoloirohFrame::pixel_format`]: tightly-packed 8-bit
-/// RGBA (R,G,B,A byte order), `width * 4` bytes per row. Maps to Swift's
-/// `kCVPixelFormatType_32RGBA`.
+/// RGBA (R,G,B,A byte order), `width * 4` bytes per row. Historical: no
+/// longer emitted by this build -- see [`HOLOIROH_PIXFMT_BGRA8`].
 pub const HOLOIROH_PIXFMT_RGBA8: u32 = 0;
+
+/// Pixel-format tag for [`HoloirohFrame::pixel_format`]: tightly-packed 8-bit
+/// BGRA (B,G,R,A byte order) -- what [`holoiroh_ios_bridge_poll_next_frame`]
+/// actually emits. Maps to Swift's `kCVPixelFormatType_32BGRA`.
+///
+/// Why BGRA, not RGBA: `kCVPixelFormatType_32RGBA` is NOT a supported
+/// CoreVideo pool/IOSurface format on iOS (it is on macOS), so the Swift
+/// side's `CVPixelBufferPoolCreate` silently returned nil and dropped EVERY
+/// frame -- live-witnessed as a permanent black screen while the on-device
+/// decode pipeline was verifiably delivering 20-40fps the whole session
+/// (device console: `vdec stats fps=20..40`, zero errors anywhere). 32BGRA
+/// is the universally-supported iOS display format, so the bridge swizzles
+/// R<->B during copy-out and tags frames with this constant.
+pub const HOLOIROH_PIXFMT_BGRA8: u32 = 1;
 
 /// ALPN identifying the control-channel protocol on the daemon's `iroh`
 /// `Endpoint`. Must stay byte-for-byte identical to
@@ -337,6 +351,28 @@ unsafe fn bridge_ref<'a>(bridge: *mut HoloirohBridge) -> Option<&'a BridgeInner>
 /// freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_new() -> *mut HoloirohBridge {
+    // On-device pipeline visibility (Once-guarded, idempotent across
+    // repeated bridge_new calls): without this, every media-pipeline
+    // tracing event -- decoder selection, per-packet decode errors,
+    // pipeline start/stop -- is silently dropped on iOS (no subscriber
+    // installed anywhere in the app), which is exactly how the
+    // permanent-black-screen bug stayed invisible on-device while the
+    // identical code path was fully debuggable on macOS probes. stderr
+    // reaches the device console when the app is launched with
+    // `devicectl ... launch --console`. `try_init` (not `init`): losing to
+    // a race with some other subscriber must never panic across FFI.
+    {
+        static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+        TRACING_INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(
+                    "warn,moq_media=debug,rusty_codecs=debug,moq_net=info,iroh_moq=info",
+                ))
+                .with_writer(std::io::stderr)
+                .try_init();
+        });
+    }
+
     let result = catch_unwind(|| {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -690,8 +726,10 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_poll_next_frame(
                 let width = frame.width();
                 let height = frame.height();
                 // Normalize any backing pixel format (packed RGBA/BGRA, GPU,
-                // NV12) into tightly-packed RGBA8. This is the single, stable
-                // byte surface handed to Swift.
+                // NV12) into tightly-packed RGBA8, then swizzle to BGRA8
+                // during copy-out -- see HOLOIROH_PIXFMT_BGRA8's doc for why
+                // (iOS CoreVideo has no 32RGBA pool support; feeding Swift
+                // RGBA made every CVPixelBufferPool creation fail silently).
                 let rgba = frame.rgba_image();
                 let bytes: &[u8] = rgba.as_raw();
                 let len = bytes.len();
@@ -702,7 +740,7 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_poll_next_frame(
                     (*out_frame).width = width;
                     (*out_frame).height = height;
                     (*out_frame).timestamp_us = frame.timestamp.as_micros() as u64;
-                    (*out_frame).pixel_format = HOLOIROH_PIXFMT_RGBA8;
+                    (*out_frame).pixel_format = HOLOIROH_PIXFMT_BGRA8;
                     (*out_frame).kind = 0; // video
                 }
 
@@ -716,6 +754,14 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_poll_next_frame(
                     }
                     unsafe {
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, len);
+                        // RGBA -> BGRA in place: swap byte 0 (R) and byte 2
+                        // (B) of every pixel. ~3.7MB at 720p, trivially fast
+                        // in release; keeps the conversion at the single
+                        // choke point both platforms already pass through.
+                        let out = std::slice::from_raw_parts_mut(buf, len);
+                        for px in out.chunks_exact_mut(4) {
+                            px.swap(0, 2);
+                        }
                     }
                 }
                 len as c_int
@@ -998,10 +1044,13 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
             // ready"` immediately after the auth gate passes, before reading
             // anything) -- matched structurally rather than on the greeting
             // text, so a daemon-side wording tweak can't break pairing.
-            Ok::<_, String>((connection, send, lines))
+            // `greeting` itself is threaded out here (not dropped) so the
+            // caller can queue it for `poll_control_event` -- see the
+            // `events.push_back(greeting)` call below for why.
+            Ok::<_, String>((connection, send, lines, greeting))
         });
 
-        let (connection, send, lines) = match connect_result {
+        let (connection, send, lines, greeting) = match connect_result {
             Ok(parts) => parts,
             Err(msg) => {
                 unsafe { set_error(out_error, &msg) };
@@ -1013,8 +1062,26 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
         // queue for poll_control_event; EOF or a read error marks the
         // channel ended. Reuses the handshake's `Lines` reader so any bytes
         // it buffered past the greeting are not lost.
+        //
+        // The greeting line itself (`greeting`, parsed above into `value`
+        // purely to check for `auth_rejected`) is queued here too, NOT
+        // discarded: it is the envelope-wrapped `TaskEnvelope<ServerMessage>`
+        // carrying the daemon-minted `session_id` the Swift side's
+        // `HoloConnection.decodeServerLine` needs to populate
+        // `OutboundEnvelopeState` before any outbound send can be
+        // envelope-wrapped -- see `ControlChannelSender.swift`'s
+        // `OutboundEnvelope`/`encoded(_:sessionState:)`. Previously this
+        // line was read and thrown away here, so `poll_control_event` never
+        // surfaced it and the Swift side's `sessionId` stayed `nil` forever
+        // -- live-witnessed as every send failing with "no session_id yet
+        // (daemon greeting not received)" even though the daemon logged
+        // "session established" and the greeting was sent successfully.
         inner.control_ended.store(false, Ordering::Release);
         let events = inner.control_events.clone();
+        events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(greeting);
         let ended = inner.control_ended.clone();
         inner.runtime.spawn(async move {
             let mut lines = lines;

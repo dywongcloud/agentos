@@ -137,10 +137,25 @@ final class IrohLiveFrameSource: VideoFrameSource {
     /// owner (`HoloConnection`) free the bridge only *after* the subscription
     /// is gone (free order matters). May be called from `deinit` or teardown
     /// on any thread.
+    ///
+    /// A non-nil `completion` marks this as the OWNER's final teardown (the
+    /// bridge is about to be freed), so the shared bridge pointer is dropped
+    /// too. A nil `completion` (the `stop()` overload -- what
+    /// `VideoRenderView.dismantleUIView` calls on every view unmount) keeps
+    /// the shared bridge pointer so a later `start()` (view REmount) can
+    /// re-subscribe. Live-witnessed bug this split fixes: SwiftUI
+    /// mounts/unmounts the video surface on every session-state change
+    /// (`SessionState.showsRemoteView`), and the old
+    /// unconditionally-pointer-dropping teardown meant the FIRST unmount
+    /// permanently killed video -- every later mount logged
+    /// "IrohLiveFrameSource: no ticket and no injected bridge" (captured
+    /// live from the device console) and bailed, a black screen with no
+    /// user-visible error for the rest of the session.
     func stop(completion: (() -> Void)?) {
         setRunning(false)
+        let ownerTeardown = completion != nil
         queue.async { [weak self] in
-            self?.teardownHandles()
+            self?.teardownHandles(releaseSharedBridge: ownerTeardown)
             completion?()
         }
     }
@@ -192,7 +207,10 @@ final class IrohLiveFrameSource: VideoFrameSource {
             }
             if connectStatus != HOLOIROH_OK {
                 logFFIError("ticket_connect", status: connectStatus, err: &connectErr)
-                teardownHandles()
+                // Owning mode only reaches here (shared mode never
+                // ticket-connects); the flag is moot but `true` matches the
+                // "this attempt's bridge is being discarded" intent.
+                teardownHandles(releaseSharedBridge: true)
                 setRunning(false)
                 return
             }
@@ -206,7 +224,10 @@ final class IrohLiveFrameSource: VideoFrameSource {
         var subErr: UnsafeMutablePointer<CChar>?
         guard let subscription = holoiroh_ios_bridge_subscribe(bridge, &subErr) else {
             logFFIError("subscribe", status: -1, err: &subErr)
-            teardownHandles()
+            // Keep the shared bridge on a subscribe failure: the connection
+            // is still alive and a later view remount should get to retry
+            // (owning mode still frees its own bridge via `ownsBridge`).
+            teardownHandles(releaseSharedBridge: false)
             setRunning(false)
             return
         }
@@ -254,10 +275,18 @@ final class IrohLiveFrameSource: VideoFrameSource {
         }
     }
 
-    /// Wrap the RGBA8 bytes in `scratch[0..<byteCount]` in a pooled
+    /// Wrap the BGRA8 bytes in `scratch[0..<byteCount]` in a pooled
     /// `CVPixelBuffer` and hand it to `onFrame`.
+    ///
+    /// BGRA, not RGBA: `kCVPixelFormatType_32RGBA` is not a supported
+    /// CoreVideo pool format on iOS (it is on macOS), so the previous
+    /// RGBA pipeline's `CVPixelBufferPoolCreate` returned nil and this
+    /// function silently dropped EVERY frame -- the permanent black screen,
+    /// with the on-device decoder verifiably running at 20-40fps the whole
+    /// time. The Rust bridge now swizzles to BGRA at its single copy-out
+    /// choke point and tags frames `HOLOIROH_PIXFMT_BGRA8`.
     private func deliverFrame(frame: HoloirohFrame, byteCount: Int) {
-        guard frame.pixel_format == UInt32(HOLOIROH_PIXFMT_RGBA8) else {
+        guard frame.pixel_format == UInt32(HOLOIROH_PIXFMT_BGRA8) else {
             NSLog("IrohLiveFrameSource: unexpected pixel_format \(frame.pixel_format)")
             return
         }
@@ -305,13 +334,24 @@ final class IrohLiveFrameSource: VideoFrameSource {
             return pool
         }
         let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32RGBA,
+            // 32BGRA: the only packed-RGBA-family format iOS CoreVideo
+            // supports for IOSurface-backed pools (32RGBA silently fails
+            // here on iOS -- see deliverFrame's doc for the black-screen
+            // history behind this line).
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
         ]
         var pool: CVPixelBufferPool?
-        guard CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool) == kCVReturnSuccess else {
+        let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool)
+        guard status == kCVReturnSuccess else {
+            // LOUD, never silent: a failing pool here drops every frame with
+            // no other symptom -- exactly how the unsupported-32RGBA-on-iOS
+            // bug stayed invisible for an entire debugging campaign. If this
+            // ever logs again, it is the same class of bug (unsupported
+            // format / dimensions) recurring.
+            NSLog("IrohLiveFrameSource: CVPixelBufferPoolCreate FAILED (\(status)) for \(width)x\(height) -- every frame will be dropped until this is fixed")
             return nil
         }
         pixelBufferPool = pool
@@ -321,11 +361,17 @@ final class IrohLiveFrameSource: VideoFrameSource {
     }
 
     /// Free the subscription then (if owned) the bridge -- order matters: the
-    /// subscription's decoder is driven by the bridge's runtime. In
-    /// shared-bridge mode the bridge pointer is only dropped here; its owner
-    /// (`HoloConnection`) frees it afterwards via `stop(completion:)`.
-    /// Idempotent.
-    private func teardownHandles() {
+    /// subscription's decoder is driven by the bridge's runtime. Idempotent.
+    ///
+    /// `releaseSharedBridge` controls the shared-mode bridge pointer: `false`
+    /// (view unmount via `stop()`) keeps it so a later `start()` can
+    /// re-subscribe on the same live connection; `true` (owner teardown via
+    /// `stop(completion:)`, or owning-mode always) drops it because the
+    /// owner is about to free the bridge -- keeping it would leave a
+    /// dangling pointer for a post-shutdown remount to crash on. See
+    /// `stop(completion:)`'s doc for the live-witnessed black-screen bug
+    /// behind this distinction.
+    private func teardownHandles(releaseSharedBridge: Bool) {
         if let subscription = subscription {
             holoiroh_ios_bridge_subscription_free(subscription)
             self.subscription = nil
@@ -333,8 +379,11 @@ final class IrohLiveFrameSource: VideoFrameSource {
         if let bridge = bridge {
             if ownsBridge {
                 holoiroh_ios_bridge_free(bridge)
+                self.bridge = nil
+            } else if releaseSharedBridge {
+                self.bridge = nil
             }
-            self.bridge = nil
+            // else: shared mode, view unmount -- keep the pointer for remount.
         }
     }
 
@@ -363,7 +412,7 @@ final class IrohLiveFrameSource: VideoFrameSource {
         setRunning(false)
     }
 
-    private func teardownHandles() {}
+    private func teardownHandles(releaseSharedBridge: Bool) {}
 
     #endif
 }

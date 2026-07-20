@@ -1,0 +1,9 @@
+/target
+/plans
+/SANDBOX
+/.agents
+/.claude
+/.zed
+/test-media
+/logs
+cross/sysroot-aarch64/

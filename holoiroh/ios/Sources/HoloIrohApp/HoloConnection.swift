@@ -105,6 +105,16 @@ final class HoloConnection: ObservableObject {
     /// same serial queue.
     private var eventPump: DispatchSourceTimer?
 
+    /// This connection's outbound envelope state (`session_id` + sequence
+    /// counter -- see `OutboundEnvelopeState`'s doc). `session_id` starts
+    /// `nil` and is populated the moment the daemon's envelope-wrapped
+    /// greeting is observed in `decodeServerLine`; `FFIControlChannelSender`
+    /// shares this exact instance, so every outbound send after the greeting
+    /// carries the daemon-assigned `session_id`. Fresh per `establish()` call
+    /// (a reconnect gets a new daemon-minted session, so the old id/sequence
+    /// must not carry over).
+    private var sessionState = OutboundEnvelopeState()
+
     #endif
 
     // MARK: - Lifecycle
@@ -165,6 +175,11 @@ final class HoloConnection: ObservableObject {
     /// Runs on `ffiQueue`. Creates the one bridge, ticket-connects it (video
     /// plane), then performs the control-ALPN PIN handshake (control plane).
     private func establish(ticket: String, pin: String) {
+        // Fresh per connection attempt: a reconnect gets a new daemon-minted
+        // `session_id` and its own sequence numbering from zero (see
+        // `sessionState`'s doc).
+        sessionState = OutboundEnvelopeState()
+
         guard let created = holoiroh_ios_bridge_new() else {
             reportFailure("holoiroh_ios_bridge_new returned null")
             return
@@ -197,6 +212,7 @@ final class HoloConnection: ObservableObject {
         let sender = FFIControlChannelSender(
             bridge: created,
             queue: ffiQueue,
+            sessionState: sessionState,
             report: { [weak self] message, wire in
                 // Runs on main (the sender hops there): surface the confirmed
                 // wire send in the same log stream as daemon events.
@@ -264,24 +280,37 @@ final class HoloConnection: ObservableObject {
         }
     }
 
-    /// A `TaskEnvelope`d server line: `{ ..., "payload": { "type": ... } }`.
-    /// The bridge is expected to hand up bare `ServerMessage` lines, but if
-    /// an envelope arrives its payload is unwrapped rather than dropped.
+    /// A `TaskEnvelope`d server line: `{ "session_id": ..., "payload": { "type": ... }, ... }`.
+    /// The bridge is expected to hand up bare `ServerMessage` lines only for
+    /// the pre-session PIN handshake reply; every message from the greeting
+    /// onward is envelope-wrapped and carries the daemon-minted `session_id`
+    /// this connection must echo on every outbound send (see
+    /// `OutboundEnvelopeState`).
     private struct EnvelopedServerMessage: Decodable {
+        let sessionId: String
         let payload: ServerMessage
+
+        private enum CodingKeys: String, CodingKey {
+            case sessionId = "session_id"
+            case payload
+        }
     }
 
     /// Decodes one NDJSON line from `poll_control_event` into a
-    /// `ServerMessage` (directly, or via a `TaskEnvelope` payload).
-    /// Undecodable lines are surfaced as status entries instead of vanishing.
+    /// `ServerMessage` (directly, or via a `TaskEnvelope` payload -- in which
+    /// case this connection's `sessionId` is captured/refreshed from it, so
+    /// outbound sends can be envelope-wrapped correctly; see
+    /// `ControlChannelSender.swift`'s `OutboundEnvelope`). Undecodable lines
+    /// are surfaced as status entries instead of vanishing.
     private func decodeServerLine(_ line: String) -> ServerMessage {
         let data = Data(line.utf8)
         let decoder = JSONDecoder()
+        if let enveloped = try? decoder.decode(EnvelopedServerMessage.self, from: data) {
+            sessionState.sessionId = enveloped.sessionId
+            return enveloped.payload
+        }
         if let direct = try? decoder.decode(ServerMessage.self, from: data) {
             return direct
-        }
-        if let enveloped = try? decoder.decode(EnvelopedServerMessage.self, from: data) {
-            return enveloped.payload
         }
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         return .status(text: "unrecognized control event: \(trimmed)")
@@ -346,7 +375,7 @@ final class HoloConnection: ObservableObject {
 #if canImport(HoloirohIosBridge)
 
 /// The real `ControlChannelSending`: writes each `ClientMessage`'s NDJSON
-/// wire line (the shared `encoded(_:)` helper -- byte-identical to what the
+/// wire line (the shared `encoded(_:sessionState:)` helper -- byte-identical to what the
 /// `LoggingControlChannelSender` stand-in produced) to the daemon over the
 /// bridge's control-ALPN stream via `holoiroh_ios_bridge_control_send`.
 /// Sends hop to the owning `HoloConnection`'s serial FFI queue so the
@@ -358,6 +387,10 @@ final class HoloConnection: ObservableObject {
 final class FFIControlChannelSender: ControlChannelSending {
     private let bridge: OpaquePointer
     private let queue: DispatchQueue
+    /// This connection's shared outbound envelope state (`session_id` +
+    /// sequence counter) -- the same instance `HoloConnection` populates from
+    /// the daemon's greeting in `decodeServerLine`. See `OutboundEnvelopeState`.
+    private let sessionState: OutboundEnvelopeState
     /// Called on the main thread after a successful send (message + wire line).
     private let report: (ClientMessage, String) -> Void
     /// Called on the main thread when a send fails (human-readable detail).
@@ -366,21 +399,34 @@ final class FFIControlChannelSender: ControlChannelSending {
     init(
         bridge: OpaquePointer,
         queue: DispatchQueue,
+        sessionState: OutboundEnvelopeState,
         report: @escaping (ClientMessage, String) -> Void,
         reportError: @escaping (String) -> Void
     ) {
         self.bridge = bridge
         self.queue = queue
+        self.sessionState = sessionState
         self.report = report
         self.reportError = reportError
     }
 
     func send(_ message: ClientMessage) {
-        guard let wire = encoded(message) else { return }
         let bridge = bridge
+        let sessionState = sessionState
         let report = report
         let reportError = reportError
+        // Encoding happens on `queue` too (not the caller's thread): the
+        // greeting's `session_id` is written from this same serial queue in
+        // `HoloConnection.decodeServerLine`, so reading it here as well keeps
+        // the "has the greeting arrived yet" check and the encode itself on
+        // one queue instead of racing a caller thread against it.
         queue.async {
+            guard let wire = self.encoded(message, sessionState: sessionState) else {
+                DispatchQueue.main.async {
+                    reportError("control send \(message.wireKindLabel) failed: no session_id yet (daemon greeting not received)")
+                }
+                return
+            }
             var err: UnsafeMutablePointer<CChar>?
             let status = wire.withCString { cstr in
                 holoiroh_ios_bridge_control_send(bridge, cstr, &err)
