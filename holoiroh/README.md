@@ -1,6 +1,7 @@
-# HoloIroh
+# Aro
 
-Remote-view-and-control for a Mac, over a direct P2P connection, driven by
+**Aro** (codebase name: `holoiroh`) -- remote-view-and-control for a Mac,
+over a direct P2P connection, driven by
 [H Company's Holo3](https://github.com/H-Company-AI) computer-use agent
 (`holo-desktop-cli`).
 

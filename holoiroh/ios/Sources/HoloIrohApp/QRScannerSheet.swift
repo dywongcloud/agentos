@@ -64,7 +64,7 @@ struct QRScannerSheet: View {
                 .foregroundStyle(.secondary)
             Text("Camera access is off")
                 .font(.headline)
-            Text("To scan the QR code, allow camera access for HoloIroh in Settings. You can also cancel and paste the ticket text instead.")
+            Text("To scan the QR code, allow camera access for Aro in Settings. You can also cancel and paste the ticket text instead.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

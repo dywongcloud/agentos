@@ -53,7 +53,7 @@ struct PairingView: View {
     var body: some View {
         VStack(spacing: 20) {
             VStack(spacing: 8) {
-                Text("HoloIroh")
+                Text("Aro")
                     .font(.largeTitle)
                     .fontWeight(.bold)
                 Text("Scan the QR code the Mac daemon prints, or paste its iroh ticket, to pair.")

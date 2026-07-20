@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>HoloIroh</string>
+	<string>Aro</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -21,13 +21,13 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>NSCameraUsageDescription</key>
-	<string>HoloIroh uses the camera to scan the pairing QR code your Mac displays.</string>
+	<string>Aro uses the camera to scan the pairing QR code your Mac displays.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>HoloIroh connects directly to your paired Mac over your local network for the lowest-latency screen mirroring and control, falling back to a relay when a direct connection isn't possible.</string>
+	<string>Aro connects directly to your paired Mac over your local network for the lowest-latency screen mirroring and control, falling back to a relay when a direct connection isn't possible.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>HoloIroh uses the microphone to let you speak prompts instead of typing them.</string>
+	<string>Aro uses the microphone to let you speak prompts instead of typing them.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>HoloIroh transcribes your speech on-device (when supported) to turn it into a text prompt.</string>
+	<string>Aro transcribes your speech on-device (when supported) to turn it into a text prompt.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 </dict>
