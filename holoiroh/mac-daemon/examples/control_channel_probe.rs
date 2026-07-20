@@ -16,7 +16,7 @@
 //! Run with `cargo run --example control_channel_probe`.
 
 use holoiroh_daemon::control_channel::{ClientMessage, ServerMessage, TaskEnvelope};
-use holoiroh_daemon::holo_bridge::ControlEvent;
+use holoiroh_daemon::holo_bridge::{ControlEvent, DoneStatus};
 
 fn round_trip_client(label: &str, msg: ClientMessage, expected_json: &str) {
     let json = serde_json::to_string(&msg).unwrap();
@@ -203,6 +203,33 @@ fn main() {
     let mapped = ServerMessage::from_control_event(queued_zero_event);
     println!("ControlEvent::Queued{{ahead: 0}} -> {mapped:?}");
     assert_eq!(mapped, ServerMessage::status("queued, 0 ahead"));
+
+    // A `Done{status: Failed}` must reach the wire as an `error` frame, not `status` -- a
+    // real backend failure (e.g. hosted-Holo3 429 quota exhaustion) previously arrived
+    // indistinguishable from routine progress, since both were plain `status` lines.
+    let done_failed_event = ControlEvent::Done {
+        request_id: "r1".into(),
+        context_id: None,
+        status: DoneStatus::Failed,
+        message: Some("agent backend error".into()),
+    };
+    let mapped = ServerMessage::from_control_event(done_failed_event);
+    println!("ControlEvent::Done{{status: Failed}} -> {mapped:?}");
+    assert_eq!(mapped, ServerMessage::error("agent backend error"));
+    let json = serde_json::to_string(&mapped).unwrap();
+    println!("  serialized -> {json}");
+    assert_eq!(json, r#"{"type":"error","text":"agent backend error"}"#);
+
+    // Completed/Canceled remain benign `status` frames -- only Failed changes.
+    let done_completed_event = ControlEvent::Done {
+        request_id: "r1".into(),
+        context_id: None,
+        status: DoneStatus::Completed,
+        message: None,
+    };
+    let mapped = ServerMessage::from_control_event(done_completed_event);
+    println!("ControlEvent::Done{{status: Completed}} -> {mapped:?}");
+    assert_eq!(mapped, ServerMessage::status("Completed"));
 
     println!();
     println!("control_channel_probe: OK -- all wire-schema cases witnessed via real execution");

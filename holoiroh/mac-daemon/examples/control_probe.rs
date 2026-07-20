@@ -123,11 +123,12 @@ async fn main() -> anyhow::Result<()> {
         );
 
         // Stream the turn to its end: every post-ack ServerMessage, until a
-        // `status` line arrives after at least one `task_progress` (Done maps
-        // to `status` on the wire -- see control_channel.rs's
-        // from_control_event; there is no distinct terminal type), or the
-        // overall/idle timeouts land. This turns the probe into a full
-        // phone-equivalent end-to-end witness of a live daemon turn.
+        // `status` line arrives after at least one `task_progress` (Done's
+        // Completed/Canceled cases map to `status` on the wire), an `error`
+        // line arrives (Done's Failed case -- see control_channel.rs's
+        // from_control_event), or the overall/idle timeouts land. This turns
+        // the probe into a full phone-equivalent end-to-end witness of a
+        // live daemon turn.
         let overall = tokio::time::Instant::now();
         let mut saw_progress = false;
         loop {

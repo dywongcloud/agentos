@@ -82,7 +82,7 @@ pub mod stop;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-pub use control::{ControlEvent, ControlMessage, HoloControlBridge};
+pub use control::{ControlEvent, ControlMessage, DoneStatus, HoloControlBridge};
 pub use process::HoloServeProcess;
 
 /// One place `holo serve`'s model inference can be pointed: an OpenAI-compatible base URL

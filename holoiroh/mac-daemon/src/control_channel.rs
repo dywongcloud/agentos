@@ -72,7 +72,7 @@ use crate::audit_log::{
     ActionClass, AppCategory, AuditEntry, AuditLogger, ConnectionPath, FinalStatus,
     InferenceMode, RemoteViewState, now_ms,
 };
-use crate::holo_bridge::{ControlEvent, ControlMessage, HoloBridge};
+use crate::holo_bridge::{ControlEvent, ControlMessage, DoneStatus, HoloBridge};
 
 /// ALPN identifying the control-channel protocol on the shared `iroh`
 /// `Endpoint`. Follows the same app-specific-ALPN convention as
@@ -762,7 +762,16 @@ impl ServerMessage {
                 status, message, ..
             } => {
                 let text = message.unwrap_or_else(|| format!("{status:?}"));
-                ServerMessage::status(text)
+                // `Failed` must reach the wire as an `error` frame, not `status` -- a real
+                // backend failure (e.g. the witnessed hosted-Holo3 429 quota exhaustion
+                // propagated up through hai-agent-runtime) previously arrived as a plain
+                // `{"type":"status",...}` line, visually identical to routine progress, so
+                // the iOS log panel had no way to style it as an ERROR row. `Completed` and
+                // `Canceled` are genuinely benign terminal states and stay on `status`.
+                match status {
+                    DoneStatus::Failed => ServerMessage::error(text),
+                    DoneStatus::Completed | DoneStatus::Canceled => ServerMessage::status(text),
+                }
             }
             ControlEvent::Error { message, .. } => ServerMessage::error(message),
             // Wire shape required verbatim: `{"type":"status","text":"queued, N ahead"}`.
