@@ -2307,6 +2307,7 @@ dependencies = [
  "axum",
  "clap",
  "ctrlc",
+ "data-encoding",
  "dotenvy",
  "eventsource-stream",
  "futures-util",

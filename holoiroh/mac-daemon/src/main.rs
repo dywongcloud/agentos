@@ -197,6 +197,48 @@ fn print_ticket_qr(ticket: &str) {
 /// `holoiroh-daemon` invocation with no env vars set (the exact symptom reported: "just hangs,
 /// no QR code shows up"). Set `HOLOIROH_LOCAL_MODEL=1` (or `true`/`yes`) to opt IN to local
 /// inference (Project Aro PRD P0-11's no-cloud-path mode) once that tradeoff is wanted again.
+/// The daemon's iroh identity key, STABLE across restarts.
+///
+/// `IROH_SECRET` env wins when set (iroh-live's own convention, unchanged).
+/// Otherwise the key is loaded from -- or first generated into --
+/// `~/.holoiroh/iroh_secret` (hex, 0600, same config dir as
+/// `allowlist.json`). Without this, every daemon restart minted a fresh
+/// random identity (`SecretKey::generate` inside
+/// `iroh_live::util::secret_key_from_env`), which changes the node id and
+/// therefore the pairing ticket -- silently invalidating every saved
+/// connection profile in the iOS app and forcing a QR re-scan per restart.
+fn persistent_secret_key() -> anyhow::Result<iroh::SecretKey> {
+    if std::env::var("IROH_SECRET").is_ok() {
+        return Ok(iroh_live::util::secret_key_from_env()?);
+    }
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME not set; cannot locate ~/.holoiroh/iroh_secret"))?;
+    let dir = home.join(".holoiroh");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("iroh_secret");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed
+                .parse::<iroh::SecretKey>()
+                .with_context(|| format!("parsing persisted key at {}", path.display()));
+        }
+    }
+    let key = iroh::SecretKey::generate();
+    let hex = data_encoding::HEXLOWER.encode(&key.to_bytes());
+    std::fs::write(&path, format!("{hex}\n"))
+        .with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    info!(path = %path.display(), "generated and persisted a new iroh identity key");
+    Ok(key)
+}
+
 fn local_model_enabled() -> bool {
     match std::env::var("HOLOIROH_LOCAL_MODEL") {
         Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
@@ -322,7 +364,7 @@ async fn main() -> anyhow::Result<()> {
     // so `clear_ip_transports()` can drop the IPv6 UDP socket entirely when
     // this machine has no v6 route -- skipping the dead path outright
     // instead of waiting out iroh's own path-probing/migration timeout. ---
-    let secret_key = iroh_live::util::secret_key_from_env()?;
+    let secret_key = persistent_secret_key()?;
     let mut endpoint_builder =
         iroh::Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key);
     if has_ipv6_default_route() {
@@ -440,7 +482,10 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty());
-    let (tinfoil_proxy_handle, fallback_target) = if local_model_server.is_some() {
+    // Underscore-named (not bare `_`): the binding must LIVE until main
+    // returns -- dropping it aborts the proxy task and every fallback
+    // inference call with it. A bare `_` pattern would drop it right here.
+    let (_tinfoil_proxy_handle, fallback_target) = if local_model_server.is_some() {
         info!("local (no-cloud) mode active -- tinfoil rate-limit fallback disabled by design");
         (None, None)
     } else if let Some(key) = tinfoil_key {
@@ -482,7 +527,11 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("HOLOIROH_FALLBACK_COOLDOWN_SECS")
             .ok()
             .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(600),
+            // 30 min: each cooldown expiry probes the hosted backend with a
+            // real turn (a ~15s failed-then-retried task when it is STILL
+            // rate-limited), so probe sparingly -- the fallback is fully
+            // capable in the meantime.
+            .unwrap_or(1800),
     );
 
     // --- best-effort holo_bridge startup. A missing/unhealthy `holo`

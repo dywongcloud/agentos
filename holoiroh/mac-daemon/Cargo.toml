@@ -81,6 +81,10 @@ qrcode = { version = "0.14", default-features = false }
 # already resolved transitively in Cargo.lock via iroh's dependency graph, so this promotes it
 # to a direct dep without pulling a new crate.
 sha2 = "0.10"
+# main.rs persistent_secret_key: hex-encode the generated iroh identity key for
+# ~/.holoiroh/iroh_secret. Already resolved transitively via iroh's graph (and the
+# exact crate iroh-live's own secret-key logging uses), so this promotes, not adds.
+data-encoding = "2"
 # Registers a synchronous SIGINT/SIGTERM handler in main.rs so the daemon's explicit shutdown
 # sequence (closing the iroh Live session + LocalBroadcast, terminating the tracked `holo serve`
 # child) runs on both signals -- `tokio::signal::ctrl_c()` alone only ever fires on SIGINT, not
