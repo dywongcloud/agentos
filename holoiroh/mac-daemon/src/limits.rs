@@ -393,7 +393,15 @@ pub fn clamp_task_runtime(requested: Option<Duration>) -> Duration {
 /// forwarded from `holo serve`, and the turn is aborted with a
 /// [`crate::holo_bridge::control::ControlEvent::Error`] if the cap would be
 /// exceeded).
-pub const AGENT_ACTION_CAP_DEFAULT: u32 = 100;
+/// 500, raised from the original 100: an A2A `Working` update is NOT one
+/// agent action -- holo serve streams several status updates per real step
+/// (observation, thought, tool call), and a live multi-app task on the
+/// tinfoil fallback (kimi-k2-6) was witnessed emitting 100 updates within
+/// 3.5 minutes of legitimate, non-looping work, latching the cap and (with
+/// the old suppress-everything latch) swallowing the turn's real final
+/// answer. 500 still bounds a genuinely runaway agent while giving real
+/// tasks the headroom their event volume needs.
+pub const AGENT_ACTION_CAP_DEFAULT: u32 = 500;
 
 /// Counts agent actions within one task and refuses once
 /// [`AGENT_ACTION_CAP_DEFAULT`] (or an explicit override) has been reached.

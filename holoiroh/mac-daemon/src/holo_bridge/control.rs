@@ -553,6 +553,9 @@ impl HoloControlBridge {
         // Whether this turn produced a real (non-empty) answer -- the discriminator between
         // a legitimate completion and the silent-failure shape (see TurnOutcome docs).
         let saw_real_answer = std::sync::atomic::AtomicBool::new(false);
+        // Whether ANY terminal update arrived -- decides whether a hit action cap is
+        // reported as a log-only note (turn still concluded properly) or a real error.
+        let saw_terminal = std::sync::atomic::AtomicBool::new(false);
         let actions = ActionCounter::new_default();
         // Latched once the cap is hit, so every subsequent update of *any* variant -- not just
         // further `Working` ones -- is suppressed too. Without this, an `Answer`/`Terminal`
@@ -569,8 +572,18 @@ impl HoloControlBridge {
         let client = self.client.read().expect("client lock poisoned").clone();
         let result = client
             .send_and_stream(&text, context_id, |update| {
-                if capped.load(Ordering::SeqCst) {
+                // Cap latch: once hit, further WORKING updates are suppressed -- but
+                // Answer/Terminal updates still flow. The original everything-latch was
+                // live-witnessed turning a SUCCEEDING turn into a cap error: an 11-minute
+                // kimi-k2-6 turn latched at update #100, and its real final answer
+                // (produced 8 minutes later) was swallowed with the rest.
+                if capped.load(Ordering::SeqCst)
+                    && matches!(update, TaskUpdate::Working { .. })
+                {
                     return;
+                }
+                if matches!(update, TaskUpdate::Terminal { .. }) {
+                    saw_terminal.store(true, Ordering::SeqCst);
                 }
                 if matches!(update, TaskUpdate::Working { .. }) {
                     if let Err(cap) = actions.try_record() {
@@ -636,19 +649,28 @@ impl HoloControlBridge {
                 request_id,
                 actions = actions.count(),
                 cap = actions.cap(),
-                "prompt turn hit the agent action cap (PRD 10.4)"
+                "prompt turn hit the agent action cap (PRD 10.4); progress was suppressed but the turn's answer/terminal still flowed"
             );
-            self.emit(ControlEvent::Error {
-                request_id,
-                message: format!(
-                    "agent action cap reached ({} actions, cap {}); turn's further progress was suppressed. \
-                     Note: this does not stop the backend agent from continuing to run server-side -- \
-                     see HoloControlBridge::run_prompt's doc for why a true server-side abort isn't wired yet.",
-                    actions.count(),
-                    actions.cap()
-                ),
-            });
-            return TurnOutcome::Completed;
+            // The turn's own Answer/Terminal (if any) already flowed through the latch
+            // above. When a terminal DID arrive the turn concluded properly, so this is
+            // a log-only status note -- an Error event here would let the phone re-fail
+            // a task that just succeeded. Only a stream that never reached a terminal
+            // gets the cap as its real error.
+            let note = format!(
+                "agent action cap reached ({} actions, cap {}); intermediate progress was suppressed \
+                 from that point. This does not stop the backend agent server-side -- see \
+                 HoloControlBridge::run_prompt's doc.",
+                actions.count(),
+                actions.cap()
+            );
+            if saw_terminal.load(Ordering::SeqCst) {
+                self.emit(ControlEvent::DaemonStatus { text: note });
+            } else {
+                self.emit(ControlEvent::Error {
+                    request_id: request_id.clone(),
+                    message: note,
+                });
+            }
         }
 
         match result {
