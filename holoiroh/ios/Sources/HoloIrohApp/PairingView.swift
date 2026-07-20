@@ -34,6 +34,14 @@ struct PairingView: View {
     @State private var showVerification = false
     @State private var scanError: String?
 
+    /// Saved connection profiles (sqlite-backed). Selecting one connects
+    /// immediately -- its ticket already went through phrase verification
+    /// when it was first saved, so re-verifying every reconnect would only
+    /// add friction without adding trust.
+    @StateObject private var profileStore = ConnectionProfileStore()
+    @State private var showSaveNamePrompt = false
+    @State private var newProfileName = ""
+
     private var trimmedTicket: String {
         ticketText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -125,19 +133,85 @@ struct PairingView: View {
                     .padding(.horizontal)
             }
 
+            if !profileStore.profiles.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Saved profiles")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(spacing: 8) {
+                            ForEach(profileStore.profiles) { profile in
+                                Button {
+                                    onConnect(profile.ticket, profile.pin)
+                                } label: {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(profile.name)
+                                                .font(.subheadline.weight(.semibold))
+                                                .foregroundStyle(.primary)
+                                            Text(profile.phrase)
+                                                .font(.system(.caption, design: .monospaced))
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        Image(systemName: "arrow.right.circle.fill")
+                                            .foregroundStyle(.tint)
+                                    }
+                                    .padding(10)
+                                    .background(Color(.secondarySystemBackground))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                                }
+                                .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        profileStore.delete(profile)
+                                    } label: {
+                                        Label("Delete profile", systemImage: "trash")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 190)
+                }
+                .padding(.horizontal)
+            }
+
             Spacer()
 
-            Button {
-                // Do NOT connect yet — require phrase verification first.
-                showVerification = true
-            } label: {
-                Text("Connect")
-                    .frame(maxWidth: .infinity)
+            HStack(spacing: 12) {
+                Button {
+                    // Prefill with the ticket's phrase as a recognizable
+                    // default name; the alert lets the user replace it.
+                    newProfileName = PairingPhrase.phrase(for: trimmedTicket)
+                    showSaveNamePrompt = true
+                } label: {
+                    Label("Save", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canConnect)
+
+                Button {
+                    // Do NOT connect yet — require phrase verification first.
+                    showVerification = true
+                } label: {
+                    Text("Connect")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canConnect)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!canConnect)
             .padding(.horizontal)
             .padding(.bottom, 32)
+        }
+        .alert("Save profile", isPresented: $showSaveNamePrompt) {
+            TextField("Profile name", text: $newProfileName)
+            Button("Save") {
+                profileStore.save(name: newProfileName, ticket: trimmedTicket, pin: pinText.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Saves this ticket and PIN so you can reconnect with one tap.")
         }
         // Scanner: decode -> extract the ticket -> auto-fill the field.
         .sheet(isPresented: $showScanner) {
