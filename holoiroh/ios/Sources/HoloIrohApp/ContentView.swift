@@ -19,6 +19,26 @@ struct ContentView: View {
 
     @State private var path: [Route] = []
 
+    /// Debug-only auto-pair bypass: when both env vars are set (e.g. via
+    /// `devicectl device process launch --environment-variables` for an
+    /// unattended device witness, matching this project's own
+    /// `holoiroh-redeploy-iphone-fix` verification step), skip the manual
+    /// QR-scan/paste UI entirely and jump straight to `MainView` with the
+    /// supplied ticket/PIN, exactly as if the user had pasted them in
+    /// `PairingView`. Never read outside `DEBUG` -- this must not become a
+    /// real unauthenticated pairing bypass in a shipped build.
+    private static var autoPairFromEnvironment: (ticket: String, pin: String)? {
+        #if DEBUG
+        let env = ProcessInfo.processInfo.environment
+        guard let ticket = env["HOLOIROH_AUTOPAIR_TICKET"], !ticket.isEmpty,
+              let pin = env["HOLOIROH_AUTOPAIR_PIN"], !pin.isEmpty
+        else { return nil }
+        return (ticket, pin)
+        #else
+        return nil
+        #endif
+    }
+
     var body: some View {
         NavigationStack(path: $path) {
             PairingView { ticket, pin in
@@ -32,6 +52,10 @@ struct ContentView: View {
                     }
                 }
             }
+        }
+        .onAppear {
+            guard path.isEmpty, let auto = Self.autoPairFromEnvironment else { return }
+            path.append(.main(ticket: auto.ticket, pin: auto.pin))
         }
     }
 }

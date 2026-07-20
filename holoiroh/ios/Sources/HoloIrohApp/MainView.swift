@@ -90,6 +90,11 @@ struct MainView: View {
 
     @State private var promptText: String = ""
 
+    /// Guards `sendAutoPairPromptIfNeeded()` to at most once per process
+    /// launch -- `.connected` can re-fire after a reconnect, and this must
+    /// never re-send on that path.
+    @State private var didSendAutoPairPrompt = false
+
     /// Whether the command bar's prompt field currently has keyboard focus.
     /// Binding this (rather than leaving focus implicit) is what makes the
     /// keyboard dismissible at all: SwiftUI has no built-in "tap outside to
@@ -620,6 +625,7 @@ struct MainView: View {
                 frameSource.stop()
                 frameSource = live
             }
+            sendAutoPairPromptIfNeeded()
         case .failed(let reason):
             // While the app is frontmost, a mid-session failure (daemon
             // restarted, network blipped, QUIC idle-out racing the
@@ -1139,6 +1145,26 @@ struct MainView: View {
         )
         .shadow(color: .black.opacity(0.5), radius: 20, y: 8)
         .shadow(color: Self.orbAccent.opacity(0.18), radius: 24, y: -2)
+    }
+
+    /// Debug-only unattended witness: fires exactly once per process
+    /// launch, the moment the control channel reaches `.connected`, sending
+    /// a real prompt through the exact same `sendLivePrompt()` path a tap on
+    /// the send button uses. Exists for `holoiroh-redeploy-iphone-fix`'s
+    /// device-witness step (a real `devicectl` launch has no way to tap the
+    /// on-screen UI) and any future device-only regression check -- reads
+    /// `HOLOIROH_AUTOPAIR_PROMPT` (paired with `ContentView`'s
+    /// `HOLOIROH_AUTOPAIR_TICKET`/`_PIN`, same DEBUG-only gate and rationale).
+    private func sendAutoPairPromptIfNeeded() {
+        #if DEBUG
+        guard !didSendAutoPairPrompt,
+              let prompt = ProcessInfo.processInfo.environment["HOLOIROH_AUTOPAIR_PROMPT"],
+              !prompt.isEmpty
+        else { return }
+        didSendAutoPairPrompt = true
+        promptText = prompt
+        sendLivePrompt()
+        #endif
     }
 
     /// Fullscreen live-mode send: straight to the daemon as a prompt, and
