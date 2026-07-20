@@ -191,13 +191,20 @@ struct MainView: View {
     var body: some View {
         GeometryReader { geo in
             // Shared layout math: the live-share box is ~85% of the width at
-            // a 16:10 aspect, with its top edge at ~40% of the height so the
-            // orb scene keeps the top of the screen entirely to itself. The
-            // SAME numbers drive both the box chrome and the persistent
-            // video surface so the two always coincide exactly.
+            // a 16:10 aspect, with its top edge moved down to ~60% of the
+            // height (was ~40% -- a ~20%-of-screen-height drop) so the box
+            // clears most of the Spline orb scene above it. The orb's own
+            // square canvas (SplineOrbBackground) can run up to 630pt tall
+            // pinned near the top -- on an iPhone 14-class screen (390x844)
+            // that reaches y~521, well past the old 40% box top (y~338),
+            // which is why the box read as overlapping the orb. The box's
+            // bottom edge at 60% + boxHeight still comfortably clears the
+            // command bar below it. The SAME numbers drive both the box
+            // chrome and the persistent video surface so the two always
+            // coincide exactly.
             let boxWidth = geo.size.width * 0.85
             let boxHeight = boxWidth * 10.0 / 16.0
-            let boxCenterY = geo.size.height * 0.40 + boxHeight / 2
+            let boxCenterY = geo.size.height * 0.60 + boxHeight / 2
             let isConnected = connection.phase == .connected
             // Fullscreen only ever presents while the video surface exists;
             // if the connection drops mid-fullscreen the normal layout comes
