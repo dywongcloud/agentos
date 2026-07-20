@@ -865,8 +865,25 @@ pub async fn start_holo_desktop_executor(
     // P0-11) straight through to `HoloBridge::start` -- `Some(url)` points `holo serve` at the
     // local model, `None` leaves it on its configured backend. Kept as a parameter (rather than
     // hardcoded `None`) so the executor seam never silently drops the no-cloud config a caller
-    // set up.
-    let bridge = Arc::new(HoloBridge::start(holo_bin, port, local_base_url, events_tx).await?);
+    // set up. This seam configures no rate-limit fallback backend (that wiring lives in
+    // main.rs, which owns the tinfoil proxy's lifetime); the cooldown is therefore inert.
+    let primary = local_base_url.map(|base_url| crate::holo_bridge::InferenceTarget {
+        base_url,
+        model: None,
+        label: "local llama-server".to_string(),
+    });
+    let bridge = Arc::new(
+        HoloBridge::start(
+            holo_bin,
+            port,
+            primary,
+            None,
+            std::time::Duration::from_secs(600),
+            events_tx,
+        )
+        .await?,
+    );
+    bridge.control.attach_bridge(Arc::downgrade(&bridge));
     // HoloBridge::start verified the agent card and now retains its protocolVersion; thread it
     // through so get_capabilities() reports the real backend version on the daemon path (rather
     // than None).

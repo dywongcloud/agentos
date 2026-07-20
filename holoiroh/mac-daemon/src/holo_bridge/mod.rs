@@ -85,6 +85,31 @@ use tokio::sync::mpsc;
 pub use control::{ControlEvent, ControlMessage, HoloControlBridge};
 pub use process::HoloServeProcess;
 
+/// One place `holo serve`'s model inference can be pointed: an OpenAI-compatible base URL
+/// plus (optionally) the model name to request from it. Two of these exist today:
+/// the local `llama-server` (Aro Private mode; no model override -- llama-server ignores the
+/// name) and the loopback tinfoil fallback proxy (`crate::tinfoil_proxy`; model `kimi-k2-6`,
+/// which tinfoil routes by). `label` is for logs/status events only.
+#[derive(Clone, Debug)]
+pub struct InferenceTarget {
+    pub base_url: String,
+    pub model: Option<String>,
+    pub label: String,
+}
+
+/// Outcome of [`HoloBridge::activate_fallback`], so the caller (the control bridge's
+/// rate-limit retry path) can distinguish "switched, retry the turn" from "nothing to
+/// switch to / already switched, surface the original failure".
+#[derive(Debug)]
+pub enum FallbackActivation {
+    /// Now running on the fallback backend; the A2A client has been swapped. Retry the turn.
+    Switched { label: String },
+    /// The fallback backend was already active -- the failure happened ON the fallback.
+    AlreadyActive,
+    /// No fallback is configured (no TINFOIL_API_KEY, or local-only mode).
+    Unavailable,
+}
+
 /// Owns the `holo serve` subprocess and the control bridge built on top of it. This is the
 /// type `main.rs` constructs once on daemon startup and keeps alive for the process lifetime.
 pub struct HoloBridge {
@@ -107,13 +132,26 @@ pub struct HoloBridge {
     /// covers elsewhere in this crate.
     #[allow(dead_code)]
     protocol_version: Option<String>,
-    /// OpenAI-compatible base URL of the local `llama-server` inference endpoint, when the daemon
-    /// runs in local (alpha, no-cloud) inference mode. `Some(url)` makes both the initial spawn
-    /// and every crash-restart point `holo serve` at the local model via `--base-url` +
-    /// `HAI_AGENT_RUNTIME_BASE_URL`; `None` leaves `holo serve` on its configured backend. Stored
-    /// so `restart_process` re-applies the exact same inference config the initial start used --
-    /// a restart must never silently fall back from local to cloud.
-    local_base_url: Option<String>,
+    /// The backend the daemon was STARTED on: `Some` = the local `llama-server` (alpha,
+    /// no-cloud mode); `None` = `holo serve`'s own configured hosted backend. Every
+    /// crash-restart re-applies whichever backend is CURRENTLY active (primary or fallback)
+    /// -- a restart must never silently fall back from local to cloud, and equally must not
+    /// silently hop backends on its own.
+    primary: Option<InferenceTarget>,
+    /// The rate-limit fallback backend (the loopback tinfoil proxy), when configured.
+    /// `None` disables failover entirely -- notably in local (no-cloud) mode, where routing
+    /// to a cloud fallback would violate the mode's whole point.
+    fallback: Option<InferenceTarget>,
+    /// Whether the fallback backend is the active one. Guarded by the `process` slot lock
+    /// discipline: only mutated while holding `process` (every backend swap holds it), so a
+    /// concurrent restart can never observe a half-switched state. A separate std mutex (not
+    /// a field on the tokio-mutexed slot) so sync readers (`is_on_fallback`) don't need the
+    /// async lock.
+    on_fallback: std::sync::Mutex<bool>,
+    /// When the fallback was activated, for the cooldown-based restore to primary.
+    fallback_since: std::sync::Mutex<Option<std::time::Instant>>,
+    /// How long to stay on the fallback before a new turn probes the primary backend again.
+    fallback_cooldown: std::time::Duration,
     pub control: HoloControlBridge,
 }
 
@@ -130,13 +168,20 @@ impl HoloBridge {
     pub async fn start(
         holo_bin: impl Into<String>,
         port: u16,
-        local_base_url: Option<String>,
+        primary: Option<InferenceTarget>,
+        fallback: Option<InferenceTarget>,
+        fallback_cooldown: std::time::Duration,
         events_tx: mpsc::UnboundedSender<ControlEvent>,
     ) -> Result<Self> {
         let holo_bin = holo_bin.into();
-        let process = HoloServeProcess::spawn(&holo_bin, port, local_base_url.as_deref())
-            .await
-            .context("failed to start holo serve")?;
+        let process = HoloServeProcess::spawn(
+            &holo_bin,
+            port,
+            primary.as_ref().map(|t| t.base_url.as_str()),
+            primary.as_ref().and_then(|t| t.model.as_deref()),
+        )
+        .await
+        .context("failed to start holo serve")?;
 
         let client = process.client();
         let card = client
@@ -157,9 +202,121 @@ impl HoloBridge {
             holo_bin,
             port,
             protocol_version,
-            local_base_url,
+            primary,
+            fallback,
+            on_fallback: std::sync::Mutex::new(false),
+            fallback_since: std::sync::Mutex::new(None),
+            fallback_cooldown,
             control,
         })
+    }
+
+    /// The backend a (re)spawn should use right now: the fallback while it is active, else
+    /// the primary. Cloned out so no lock is held across the spawn await.
+    fn current_target(&self) -> Option<InferenceTarget> {
+        let on_fallback = *self.on_fallback.lock().expect("on_fallback lock poisoned");
+        if on_fallback {
+            self.fallback.clone()
+        } else {
+            self.primary.clone()
+        }
+    }
+
+    /// Whether the fallback backend is currently active (for status/log surfaces).
+    pub fn is_on_fallback(&self) -> bool {
+        *self.on_fallback.lock().expect("on_fallback lock poisoned")
+    }
+
+    /// Swap the running `holo serve` onto `target` (terminate live child -> spawn replacement
+    /// -> verify agent card -> swap slot + A2A client). The whole swap holds the `process`
+    /// slot lock, same discipline as [`Self::restart_process`]. On spawn failure the dead
+    /// child stays in the slot; the health loop notices and restarts onto whatever backend
+    /// is marked active -- `on_fallback` is only flipped AFTER a successful swap, so a failed
+    /// switch self-heals back onto the backend that was last known good.
+    async fn switch_to(&self, target: Option<&InferenceTarget>, going_to_fallback: bool) -> Result<()> {
+        let mut slot = self.process.lock().await;
+
+        if let Err(err) = slot.terminate_in_place().await {
+            // Non-fatal: the spawn below is the real gate. A child that refused to die will
+            // make the port preflight fail with a clear message.
+            tracing::warn!(error = %format!("{err:#}"), "terminating holo serve for backend switch failed");
+        }
+
+        let new_process = HoloServeProcess::spawn(
+            &self.holo_bin,
+            self.port,
+            target.map(|t| t.base_url.as_str()),
+            target.and_then(|t| t.model.as_deref()),
+        )
+        .await
+        .context("failed to respawn holo serve on the new backend")?;
+        let client = new_process.client();
+        client
+            .probe_agent_card()
+            .await
+            .context("holo serve on the new backend did not present a valid A2A agent card")?;
+
+        let _old = std::mem::replace(&mut *slot, new_process);
+        *self.on_fallback.lock().expect("on_fallback lock poisoned") = going_to_fallback;
+        *self.fallback_since.lock().expect("fallback_since lock poisoned") =
+            going_to_fallback.then(std::time::Instant::now);
+        drop(slot);
+        self.control.replace_client(client);
+        Ok(())
+    }
+
+    /// Fail over to the fallback backend (tinfoil), if configured and not already active.
+    /// Called by the control bridge when a turn dies with a backend-error shape (the hosted
+    /// backend's 429s surface as `holo serve`'s generic "agent backend error" -- see
+    /// `HoloControlBridge`'s retry path).
+    pub async fn activate_fallback(&self) -> Result<FallbackActivation> {
+        let Some(target) = self.fallback.clone() else {
+            return Ok(FallbackActivation::Unavailable);
+        };
+        if self.is_on_fallback() {
+            return Ok(FallbackActivation::AlreadyActive);
+        }
+        tracing::warn!(fallback = %target.label, "switching holo serve to the fallback inference backend");
+        self.switch_to(Some(&target), true).await?;
+        Ok(FallbackActivation::Switched {
+            label: target.label,
+        })
+    }
+
+    /// If the fallback has been active longer than the cooldown, switch back to the primary
+    /// backend so the (presumably no-longer-rate-limited) hosted path gets probed again.
+    /// Called at the start of each new turn. If the hosted backend is still rate-limited,
+    /// that turn's failure re-triggers [`Self::activate_fallback`] -- one failed attempt per
+    /// cooldown window is the probe cost, and the turn itself still completes via the retry.
+    /// Returns `true` when a restore actually happened.
+    pub async fn maybe_restore_primary(&self) -> bool {
+        if !self.is_on_fallback() {
+            return false;
+        }
+        let elapsed = self
+            .fallback_since
+            .lock()
+            .expect("fallback_since lock poisoned")
+            .map(|since| since.elapsed());
+        match elapsed {
+            Some(elapsed) if elapsed >= self.fallback_cooldown => {
+                tracing::info!(
+                    ?elapsed,
+                    "fallback cooldown elapsed; switching holo serve back to the primary backend"
+                );
+                match self.switch_to(self.primary.clone().as_ref(), false).await {
+                    Ok(()) => true,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "restore to primary backend failed; staying on fallback"
+                        );
+                        false
+                    }
+                }
+            }
+            _ => false,
+        }
     }
 
     /// The A2A agent card's `protocolVersion` this bridge's `holo serve` advertised at startup,
@@ -202,14 +359,21 @@ impl HoloBridge {
         // cannot enable a second LIVE instance.)
         slot.disarm_guard();
 
-        // Re-apply the exact same inference config the initial start used: a crash-restart must
-        // never silently drop from local (no-cloud) back to a hosted backend. On failure the
-        // `?` releases the lock with the disarmed dead process still in the slot -- the next
-        // health tick observes it exited and retries this whole path (disarm is then a no-op).
-        let new_process =
-            HoloServeProcess::spawn(&self.holo_bin, self.port, self.local_base_url.as_deref())
-                .await
-                .context("failed to respawn holo serve")?;
+        // Re-apply the inference config of whichever backend is CURRENTLY active (primary, or
+        // the fallback if a rate-limit failover switched to it): a crash-restart must never
+        // silently drop from local (no-cloud) back to a hosted backend, and equally must not
+        // undo an active failover. On failure the `?` releases the lock with the disarmed dead
+        // process still in the slot -- the next health tick observes it exited and retries
+        // this whole path (disarm is then a no-op).
+        let target = self.current_target();
+        let new_process = HoloServeProcess::spawn(
+            &self.holo_bin,
+            self.port,
+            target.as_ref().map(|t| t.base_url.as_str()),
+            target.as_ref().and_then(|t| t.model.as_deref()),
+        )
+        .await
+        .context("failed to respawn holo serve")?;
         let client = new_process.client();
         client
             .probe_agent_card()

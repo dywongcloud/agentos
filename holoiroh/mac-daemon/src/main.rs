@@ -31,6 +31,7 @@ mod holo_bridge;
 mod instance_guard;
 mod limits;
 mod local_model;
+mod tinfoil_proxy;
 mod pairing_phrase;
 mod permissions;
 mod policy;
@@ -413,12 +414,76 @@ async fn main() -> anyhow::Result<()> {
         info!("HOLOIROH_LOCAL_MODEL disabled -- not starting a local llama-server; holo serve uses its configured backend");
         None
     };
-    // The base URL to hand `holo serve`: the local server's when it came up,
-    // else `None` (holo serve keeps its own configured backend, which in a
-    // correctly-configured local-only alpha means it will fail to reach a
-    // model and the control channel reports that, rather than silently
-    // reaching a cloud endpoint).
-    let local_base_url = local_model_server.as_ref().map(|s| s.base_url());
+    // The PRIMARY inference backend to hand `holo serve`: the local server's
+    // when it came up, else `None` (holo serve keeps its own configured hosted
+    // backend, which in a correctly-configured local-only alpha means it will
+    // fail to reach a model and the control channel reports that, rather than
+    // silently reaching a cloud endpoint).
+    let primary_target = local_model_server.as_ref().map(|s| holo_bridge::InferenceTarget {
+        base_url: s.base_url(),
+        // llama-server serves whatever model it loaded regardless of the
+        // requested name; no override needed.
+        model: None,
+        label: "local llama-server".to_string(),
+    });
+
+    // --- rate-limit FALLBACK backend (tinfoil kimi-k2-6, a vision model, via
+    // a loopback auth-injecting proxy -- see tinfoil_proxy.rs for why a proxy
+    // is the only workable auth path). Configured whenever TINFOIL_API_KEY is
+    // present in the environment (mac-daemon/.env), EXCEPT in local (no-cloud)
+    // mode, where failing over to a cloud endpoint would defeat the mode. When
+    // the hosted H backend rate-limits (its 429s surface as `holo serve`'s
+    // generic "agent backend error"), the bridge switches `holo serve` onto
+    // this backend and retries the failed turn once automatically; after a
+    // cooldown (default 10 min) the next turn probes the hosted path again. ---
+    let tinfoil_key = std::env::var("TINFOIL_API_KEY")
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    let (tinfoil_proxy_handle, fallback_target) = if local_model_server.is_some() {
+        info!("local (no-cloud) mode active -- tinfoil rate-limit fallback disabled by design");
+        (None, None)
+    } else if let Some(key) = tinfoil_key {
+        let upstream = std::env::var("HOLOIROH_FALLBACK_UPSTREAM")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| tinfoil_proxy::DEFAULT_UPSTREAM.to_string());
+        let model = std::env::var("HOLOIROH_FALLBACK_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "kimi-k2-6".to_string());
+        match tinfoil_proxy::TinfoilProxy::spawn(&upstream, key).await {
+            Ok(proxy) => {
+                let target = holo_bridge::InferenceTarget {
+                    // OpenAI-compatible routes live under /v1 upstream; the proxy
+                    // forwards paths verbatim, so point holo at <proxy>/v1 exactly
+                    // like the local llama-server convention.
+                    base_url: format!("{}/v1", proxy.local_url()),
+                    model: Some(model.clone()),
+                    label: format!("{model} ({upstream})"),
+                };
+                info!(model = %model, upstream = %upstream, proxy = %proxy.local_url(),
+                    "tinfoil rate-limit fallback backend configured");
+                (Some(proxy), Some(target))
+            }
+            Err(err) => {
+                warn!(error = %format!("{err:#}"),
+                    "tinfoil fallback proxy failed to start -- no rate-limit fallback this run");
+                (None, None)
+            }
+        }
+    } else {
+        info!("TINFOIL_API_KEY not set -- no rate-limit fallback backend");
+        (None, None)
+    };
+    let fallback_cooldown = std::time::Duration::from_secs(
+        std::env::var("HOLOIROH_FALLBACK_COOLDOWN_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(600),
+    );
 
     // --- best-effort holo_bridge startup. A missing/unhealthy `holo`
     // binary must not prevent the daemon from publishing its broadcast or
@@ -431,7 +496,9 @@ async fn main() -> anyhow::Result<()> {
     let bridge = match HoloBridge::start(
         holo_bin(),
         holo_serve_port(),
-        local_base_url,
+        primary_target,
+        fallback_target,
+        fallback_cooldown,
         bridge_events_tx,
     )
     .await
@@ -439,6 +506,9 @@ async fn main() -> anyhow::Result<()> {
         Ok(bridge) => {
             info!(pid = ?bridge.holo_serve_pid().await, "holo_bridge started");
             let bridge = Arc::new(bridge);
+            // Failover backref: the control bridge detects backend-error turns but the
+            // process-swap machinery lives on HoloBridge -- see HoloControlBridge::attach_bridge.
+            bridge.control.attach_bridge(Arc::downgrade(&bridge));
             // Ongoing supervisor: `HoloBridge::start`'s own health wait only runs once, at
             // startup. This background loop keeps polling for the rest of the daemon's
             // lifetime and restarts `holo serve` on crash -- see `holo_bridge::health`'s

@@ -220,6 +220,41 @@ pub struct HoloControlBridge {
     /// together under `queue`'s own mutex so "is anything running" and "what's queued" never
     /// observe a torn state relative to each other.
     queue: Mutex<VecDeque<QueuedPrompt>>,
+    /// Weak backref to the owning [`super::HoloBridge`], installed by `main.rs` right after
+    /// the bridge is `Arc`-wrapped (see [`Self::attach_bridge`]). Weak, not `Arc`: the bridge
+    /// OWNS this control bridge, so a strong ref here would be a cycle. Used by the
+    /// rate-limit failover in [`Self::run_prompt`] -- backend switching (terminate + respawn
+    /// `holo serve`) lives on the bridge, which owns the process slot. Empty (never attached,
+    /// or upgrade fails during shutdown) simply disables failover for the turn.
+    bridge: std::sync::OnceLock<std::sync::Weak<super::HoloBridge>>,
+}
+
+/// What one streaming attempt of a turn produced -- see [`HoloControlBridge::run_prompt`]'s
+/// retry loop.
+enum TurnOutcome {
+    /// The turn ran to its natural end (success, cancel, cap, or a failure that was already
+    /// emitted to the peer). Nothing further to do.
+    Completed,
+    /// The turn died with a backend-error shape (the hosted backend's rate-limit 429s reach
+    /// this bridge as `holo serve`'s generic `"agent backend error"` terminal -- serve.py
+    /// swallows the HTTP detail) and its terminal event was SUPPRESSED, not emitted. The
+    /// caller decides: switch backends and retry, or emit `original` after all.
+    BackendFailure { original: ControlEvent },
+}
+
+/// Does this failure text look like the agent backend (rather than this daemon or the A2A
+/// transport) died? `"agent backend error"` is `holo serve`'s literal, generic message for
+/// ANY failed agent-API call (serve.py wraps `httpx.HTTPError` -- the hosted 429 detail is
+/// swallowed before it reaches A2A, so a broader retry-once-on-the-other-backend is the
+/// best available response). The 429/rate-limit forms cover transport-level errors that DO
+/// carry detail.
+fn is_backend_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("agent backend error")
+        || lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("too many requests")
 }
 
 impl HoloControlBridge {
@@ -234,7 +269,15 @@ impl HoloControlBridge {
             holo_bin: holo_bin.into(),
             busy: Mutex::new(false),
             queue: Mutex::new(VecDeque::new()),
+            bridge: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the weak backref to the owning bridge (see the `bridge` field). Idempotent:
+    /// a second call is ignored (`OnceLock::set`), which cannot happen today -- `main.rs`
+    /// attaches exactly once, right after `Arc::new(bridge)`.
+    pub fn attach_bridge(&self, bridge: std::sync::Weak<super::HoloBridge>) {
+        let _ = self.bridge.set(bridge);
     }
 
     /// Swap in a freshly-built `A2aClient` pointed at a respawned `holo serve` process. See
@@ -408,7 +451,88 @@ impl HoloControlBridge {
     /// `holo_bridge` doc-level "what could not be confirmed" convention:
     /// this is the same kind of honestly-scoped gap, not a silent one).
     async fn run_prompt(&self, request_id: String, text: String, context_id: Option<&str>) {
+        // Failover pre-step: if the fallback backend has outlived its cooldown, hop back to
+        // the primary so the hosted path gets probed again (its rate limit has likely reset).
+        let bridge = self.bridge.get().and_then(std::sync::Weak::upgrade);
+        if let Some(bridge) = &bridge {
+            if bridge.maybe_restore_primary().await {
+                self.emit_daemon_status(
+                    "fallback cooldown elapsed; inference is back on the primary backend",
+                );
+            }
+        }
+
+        // At most ONE failover retry per turn: attempt 0 may suppress a backend failure and
+        // switch to the fallback; attempt 1 runs with failover disabled, so its failure --
+        // whatever the shape -- is emitted for real. No unbounded retry loops.
+        let mut attempt = 0u32;
+        loop {
+            let failover_armed = attempt == 0 && bridge.is_some();
+            match self
+                .run_prompt_once(&request_id, &text, context_id, failover_armed)
+                .await
+            {
+                TurnOutcome::Completed => return,
+                TurnOutcome::BackendFailure { original } => {
+                    let Some(bridge) = &bridge else {
+                        self.emit(original);
+                        return;
+                    };
+                    match bridge.activate_fallback().await {
+                        Ok(super::FallbackActivation::Switched { label }) => {
+                            tracing::warn!(
+                                request_id,
+                                fallback = %label,
+                                "agent backend failed (rate-limit shape); switched to fallback backend, retrying turn"
+                            );
+                            self.emit(ControlEvent::Progress {
+                                request_id: request_id.clone(),
+                                context_id: None,
+                                text: Some(format!(
+                                    "agent backend unavailable (likely rate-limited) -- retrying via fallback model {label}"
+                                )),
+                                raw_event: None,
+                            });
+                            attempt += 1;
+                        }
+                        Ok(super::FallbackActivation::AlreadyActive
+                        | super::FallbackActivation::Unavailable) => {
+                            self.emit(original);
+                            return;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                request_id,
+                                error = %format!("{err:#}"),
+                                "fallback backend switch failed; surfacing the original turn failure"
+                            );
+                            self.emit(original);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One streaming attempt of a turn. With `failover_armed`, a terminal `Failed` whose
+    /// message matches [`is_backend_error_message`] is captured and returned as
+    /// [`TurnOutcome::BackendFailure`] INSTEAD of being emitted -- the caller either retries
+    /// on the fallback backend (peer sees a Progress note, then the retry's own events; no
+    /// spurious failure) or, if it can't switch, emits the captured event unchanged.
+    async fn run_prompt_once(
+        &self,
+        request_id: &str,
+        text: &str,
+        context_id: Option<&str>,
+        failover_armed: bool,
+    ) -> TurnOutcome {
+        let request_id = request_id.to_owned();
         let request_id_for_updates = request_id.clone();
+        // The suppressed backend-failure terminal, if any (see the callback below). A mutex
+        // (not a Cell) only because the callback is `Fn`-shaped from the borrow checker's
+        // perspective across the stream; contention is impossible (updates are serial).
+        let suppressed: std::sync::Mutex<Option<ControlEvent>> = std::sync::Mutex::new(None);
         let actions = ActionCounter::new_default();
         // Latched once the cap is hit, so every subsequent update of *any* variant -- not just
         // further `Working` ones -- is suppressed too. Without this, an `Answer`/`Terminal`
@@ -439,6 +563,24 @@ impl HoloControlBridge {
                         return;
                     }
                 }
+                // Failover interception: a Failed terminal with a backend-error shape is the
+                // signal the retry loop switches backends on. Capture it instead of emitting
+                // -- if the switch succeeds, the peer never sees a failure for a turn that
+                // then succeeds on the fallback; if it can't switch, the caller emits this
+                // exact event, so nothing is ever lost.
+                if failover_armed {
+                    if let TaskUpdate::Terminal {
+                        state: TerminalState::Failed,
+                        message: Some(message),
+                    } = &update
+                    {
+                        if is_backend_error_message(message) {
+                            *suppressed.lock().expect("suppressed lock poisoned") =
+                                Some(translate_update(&request_id_for_updates, update));
+                            return;
+                        }
+                    }
+                }
                 self.emit(translate_update(&request_id_for_updates, update));
             })
             .await;
@@ -460,23 +602,43 @@ impl HoloControlBridge {
                     actions.cap()
                 ),
             });
-            return;
+            return TurnOutcome::Completed;
         }
 
         match result {
             Ok(resolved_context_id) => {
+                if let Some(original) = suppressed
+                    .lock()
+                    .expect("suppressed lock poisoned")
+                    .take()
+                {
+                    return TurnOutcome::BackendFailure { original };
+                }
                 tracing::debug!(
                     request_id,
                     context_id = %resolved_context_id,
                     "prompt turn finished"
                 );
+                TurnOutcome::Completed
             }
             Err(err) => {
+                let message = err.to_string();
+                if failover_armed && is_backend_error_message(&message) {
+                    // Transport-level rate-limit shape (these DO carry the HTTP detail,
+                    // unlike serve.py's swallowed terminal): same failover treatment.
+                    return TurnOutcome::BackendFailure {
+                        original: ControlEvent::Error {
+                            request_id,
+                            message,
+                        },
+                    };
+                }
                 tracing::warn!(request_id, error = %err, "prompt turn failed before a terminal A2A state");
                 self.emit(ControlEvent::Error {
                     request_id,
-                    message: err.to_string(),
+                    message,
                 });
+                TurnOutcome::Completed
             }
         }
     }

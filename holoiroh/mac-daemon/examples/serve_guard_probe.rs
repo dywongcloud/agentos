@@ -57,7 +57,7 @@ async fn main() {
     // must fire BEFORE any binary lookup).
     let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
     let port = squatter.local_addr().expect("addr").port();
-    let err = match HoloServeProcess::spawn("holoiroh-nonexistent-binary-for-probe", port, None).await {
+    let err = match HoloServeProcess::spawn("holoiroh-nonexistent-binary-for-probe", port, None, None).await {
         Ok(_) => panic!("spawn against a squatted port must fail"),
         Err(err) => err,
     };
@@ -80,7 +80,7 @@ async fn main() {
         let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
         l.local_addr().expect("addr").port()
     };
-    let err = match HoloServeProcess::spawn("holoiroh-nonexistent-binary-for-probe", probe_port, None).await {
+    let err = match HoloServeProcess::spawn("holoiroh-nonexistent-binary-for-probe", probe_port, None, None).await {
         Ok(_) => panic!("spawn with a nonexistent binary must fail"),
         Err(err) => err,
     };

@@ -118,6 +118,73 @@ pub const HOLO_AUTH_TOKEN_ENV: &str = "HOLO_AUTH_TOKEN";
 /// See [`crate::local_model`]'s module doc for the full citation chain.
 pub const HAI_RUNTIME_BASE_URL_ENV: &str = crate::local_model::RUNTIME_BASE_URL_ENV;
 
+/// Env var naming the port `holo serve`'s underlying `hai-agent-runtime` child binds
+/// (`settings.py`: `runtime.port`, read via `HAI_AGENT_RUNTIME_PORT`; default 18795).
+///
+/// The daemon ALWAYS sets this to its own private port ([`daemon_runtime_port`]): the
+/// launcher (`launcher.py::ensure_running`) ATTACHES to any healthy runtime already on the
+/// port instead of spawning, and spawn-time knobs -- `--base-url`, `--model` -- "only reach
+/// a freshly spawned process" (SpawnConfig's own doc). Without a private port, a runtime
+/// left over from the operator's own `holo run` on the default port would be silently
+/// attached and every inference-backend setting this daemon passes would be IGNORED --
+/// which would make the rate-limit fallback (and local no-cloud mode) silent no-ops.
+pub const HAI_RUNTIME_PORT_ENV: &str = "HAI_AGENT_RUNTIME_PORT";
+
+/// The daemon's private `hai-agent-runtime` port. Env-overridable via
+/// `HOLOIROH_AGENT_RUNTIME_PORT`; defaults to 18899 (distinct from the runtime's own 18795
+/// default so operator-run `holo` CLI sessions and this daemon never share a runtime).
+pub fn daemon_runtime_port() -> u16 {
+    std::env::var("HOLOIROH_AGENT_RUNTIME_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(18899)
+}
+
+/// Best-effort teardown of a stale `hai-agent-runtime` on the daemon's private port before
+/// (re)spawning `holo serve`. Needed because a SIGKILLed `holo serve` (the escalation path
+/// in [`HoloServeProcess::shutdown`]) can orphan the runtime child it spawned; the NEXT
+/// `holo serve` would then attach to that still-healthy runtime and inherit its OLD
+/// inference-backend config (see [`HAI_RUNTIME_PORT_ENV`] -- attach ignores spawn knobs).
+/// The pid comes from the launcher's own `~/.holo/agent-pid-<port>` file; the port is
+/// daemon-private by construction, so any process recorded there is ours to reap.
+fn reap_stale_runtime(runtime_port: u16) {
+    let pid_path = dirs_home().join(format!(".holo/agent-pid-{runtime_port}"));
+    let Ok(contents) = std::fs::read_to_string(&pid_path) else {
+        return;
+    };
+    let Ok(pid) = contents.trim().parse::<i32>() else {
+        return;
+    };
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: kill(pid, 0) only probes liveness; SIGTERM/SIGKILL on a pid recorded in
+        // the daemon-private port's pid file targets a process this daemon's own earlier
+        // `holo serve` spawned.
+        if libc::kill(pid, 0) != 0 {
+            return; // already gone; the launcher will overwrite the stale pid file
+        }
+        tracing::warn!(
+            pid,
+            runtime_port,
+            "stale hai-agent-runtime found on the daemon's private port; terminating so the fresh spawn's backend config applies"
+        );
+        libc::kill(pid, libc::SIGTERM);
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if libc::kill(pid, 0) != 0 {
+                return;
+            }
+        }
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
 /// Default A2A port per `serve.py`'s `A2A_DEFAULT_PORT`. The daemon does not have to use this
 /// default -- `main.rs` picks its own port explicitly (env-overridable, defaulting to a
 /// different value to avoid colliding with a `holo serve` an operator might run by hand
@@ -161,15 +228,25 @@ impl HoloServeProcess {
     /// and `HAI_AGENT_RUNTIME_BASE_URL` (not `HAI_BASE_URL`) is set for the local path.
     ///
     /// `local_base_url` is `Some(url)` when inference should go to a local OpenAI-compatible server
-    /// (alpha's local `llama-server`); `None` leaves `holo serve` on its own configured (hosted)
+    /// (alpha's local `llama-server`, or the loopback tinfoil fallback proxy -- see
+    /// `crate::tinfoil_proxy`); `None` leaves `holo serve` on its own configured (hosted)
     /// backend. When `Some`, this both appends `--base-url <url>` to the args **and** sets
     /// `HAI_AGENT_RUNTIME_BASE_URL=<url>` in the child env -- either alone suffices per
     /// `holo-desktop-cli`'s source, but setting both is belt-and-suspenders and makes the intent
-    /// obvious in the argv. `auth_token` is the bearer token to export via `HOLO_AUTH_TOKEN`.
+    /// obvious in the argv.
+    ///
+    /// `model_override` names the model the agent runtime should request from that endpoint
+    /// (`holo serve --model`, threaded to the runtime as `HAI_AGENT_RUNTIME_MODEL` -- same
+    /// flag-plus-env pattern as the base URL). `None` keeps the runtime's own default. Only
+    /// meaningful alongside a custom base URL: the endpoint routes by model name (the local
+    /// llama-server ignores it; tinfoil requires `kimi-k2-6`).
+    ///
+    /// `auth_token` is the bearer token to export via `HOLO_AUTH_TOKEN`.
     pub fn build_command(
         holo_bin: &str,
         port: u16,
         local_base_url: Option<&str>,
+        model_override: Option<&str>,
         auth_token: &str,
     ) -> Command {
         let mut cmd = Command::new(holo_bin);
@@ -185,6 +262,16 @@ impl HoloServeProcess {
             cmd.env(HAI_RUNTIME_BASE_URL_ENV, url);
             cmd.env_remove("HAI_API_KEY");
         }
+        if let Some(model) = model_override {
+            // `--model` maps to HAI_AGENT_RUNTIME_MODEL in cli/serve.py -> SpawnConfig.model ->
+            // launcher.py::_spawn, identical shape to the base-url plumbing above.
+            cmd.arg("--model").arg(model);
+            cmd.env("HAI_AGENT_RUNTIME_MODEL", model);
+        }
+        // Always pin the runtime child to the daemon's private port -- see
+        // HAI_RUNTIME_PORT_ENV's doc for why sharing the default port with operator-run
+        // `holo` sessions silently discards every backend setting above.
+        cmd.env(HAI_RUNTIME_PORT_ENV, daemon_runtime_port().to_string());
         cmd.env(HOLO_AUTH_TOKEN_ENV, auth_token);
         cmd
     }
@@ -197,7 +284,12 @@ impl HoloServeProcess {
     /// `PATH` by `tokio::process::Command` when it's a bare name like `"holo"`. `local_base_url`
     /// points inference at a local OpenAI-compatible server when `Some` (alpha's local path);
     /// see [`Self::build_command`].
-    pub async fn spawn(holo_bin: &str, port: u16, local_base_url: Option<&str>) -> Result<Self> {
+    pub async fn spawn(
+        holo_bin: &str,
+        port: u16,
+        local_base_url: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<Self> {
         // Refuse to double-spawn: at most one `holo serve` child may be tracked as running by
         // this daemon at a time (see `HOLO_SERVE_RUNNING` / `GuardClaim` docs). The claim is an
         // owned token: any early `?`/`bail!` below drops it, releasing the guard automatically --
@@ -208,12 +300,17 @@ impl HoloServeProcess {
             );
         };
 
-        let mut process = Self::spawn_inner(holo_bin, port, local_base_url).await?;
+        let mut process = Self::spawn_inner(holo_bin, port, local_base_url, model_override).await?;
         process.guard = Some(guard);
         Ok(process)
     }
 
-    async fn spawn_inner(holo_bin: &str, port: u16, local_base_url: Option<&str>) -> Result<Self> {
+    async fn spawn_inner(
+        holo_bin: &str,
+        port: u16,
+        local_base_url: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<Self> {
         let auth_token = generate_token();
         let base_url = format!("http://127.0.0.1:{port}");
 
@@ -237,7 +334,7 @@ impl HoloServeProcess {
         const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(1200);
         let mut last_spawn_err = None;
         for attempt in 1..=MAX_SPAWN_ATTEMPTS {
-            match Self::spawn_attempt(holo_bin, port, local_base_url, &auth_token, &base_url).await
+            match Self::spawn_attempt(holo_bin, port, local_base_url, model_override, &auth_token, &base_url).await
             {
                 Ok(child) => return Ok(child),
                 Err(err) => {
@@ -265,6 +362,7 @@ impl HoloServeProcess {
         holo_bin: &str,
         port: u16,
         local_base_url: Option<&str>,
+        model_override: Option<&str>,
         auth_token: &str,
         base_url: &str,
     ) -> Result<Self> {
@@ -287,9 +385,13 @@ impl HoloServeProcess {
             );
         }
 
+        // A stale runtime on the daemon's private port would be silently ATTACHED (backend
+        // config discarded) -- reap it so this spawn's config actually applies.
+        reap_stale_runtime(daemon_runtime_port());
+
         // Build the exact command via the shared builder (also used by the verification example),
         // then add only the stdio/kill-on-drop settings that don't affect the argv/env contract.
-        let mut cmd = Self::build_command(holo_bin, port, local_base_url, auth_token);
+        let mut cmd = Self::build_command(holo_bin, port, local_base_url, model_override, auth_token);
         cmd
             // Inherit the parent's env otherwise (HAI_API_KEY when NOT local, etc. from
             // mac-daemon/.env / the launching shell) so `holo serve`'s own settings loader
@@ -372,6 +474,21 @@ impl HoloServeProcess {
     /// best-effort synchronous safety net for the case where this was never called (early
     /// return, panic unwind), not a replacement for it -- calling this explicitly is always
     /// preferred since it can actually wait for exit.
+    /// Terminate the (possibly still-LIVE) child in place, releasing its single-instance
+    /// guard claim, without consuming `self`. This is the backend-switch primitive
+    /// (`HoloBridge::switch_backend`): unlike the crash-restart path -- where the child is
+    /// already dead and `disarm_guard` alone suffices -- switching inference backends must
+    /// first stop a healthy running `holo serve` so its replacement can bind the same port
+    /// and acquire the guard. The dead process object stays in its slot afterwards; the
+    /// caller swaps in the replacement (exactly the `restart_process` slot discipline).
+    pub async fn terminate_in_place(&mut self) -> Result<()> {
+        let result = self.terminate_and_wait().await;
+        // Dropping the claim is the release (same rationale as `shutdown`): the replacement's
+        // `GuardClaim::try_acquire` must not be refused by this now-dead process's claim.
+        self.guard.take();
+        result
+    }
+
     pub async fn shutdown(mut self) -> Result<()> {
         let result = self.terminate_and_wait().await;
         // Release this process's claim regardless of outcome, so a later `spawn()` isn't

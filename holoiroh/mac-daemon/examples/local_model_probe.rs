@@ -164,7 +164,7 @@ fn main() {
     let holo_port: u16 = 8765;
     let fake_token = "fake-token-for-inspection-only";
     let holo_cmd =
-        HoloServeProcess::build_command("holo", holo_port, Some(base_url.as_str()), fake_token);
+        HoloServeProcess::build_command("holo", holo_port, Some(base_url.as_str()), None, fake_token);
     print_command(
         "holo serve command (pointed at the LOCAL model)",
         &holo_cmd,
@@ -213,7 +213,7 @@ fn main() {
     //    NOT drop HAI_API_KEY -- proving the local branch is what enforces no-cloud, and that the
     //    hosted path is a real, separate shape (not accidentally always-on).
     // ---------------------------------------------------------------------------------------
-    let cloud_cmd = HoloServeProcess::build_command("holo", holo_port, None, fake_token);
+    let cloud_cmd = HoloServeProcess::build_command("holo", holo_port, None, None, fake_token);
     print_command(
         "holo serve command (NO local base_url -- hosted/default shape, for contrast)",
         &cloud_cmd,

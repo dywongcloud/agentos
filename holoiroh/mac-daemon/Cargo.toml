@@ -54,6 +54,14 @@ serde_json = "1"
 toml = "0.8"
 # Parses the `text/event-stream` body of the A2A `message/stream` JSON-RPC response frame-by-frame.
 eventsource-stream = "0.2"
+# src/tinfoil_proxy.rs: loopback HTTP server that forwards `holo serve`'s inference calls to
+# the Tinfoil OpenAI-compatible endpoint with the real `Authorization: Bearer <key>` injected.
+# A proxy (rather than handing the key to the runtime via env) is load-bearing, not a
+# convenience: the hai-agent-runtime's only header env (HAI_EXTRA_HEADERS) parses
+# space-separated `k=v` pairs, so a `Bearer <key>` value -- which contains a space -- is
+# structurally inexpressible there (witnessed live: `Illegal header name` from httpx), and the
+# runtime ignores OPENAI_API_KEY for its vLLM path (witnessed live: 401 with the key set).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
