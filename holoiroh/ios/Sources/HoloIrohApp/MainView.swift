@@ -369,15 +369,40 @@ struct MainView: View {
             .fill(Color.black)
             .overlay(
                 RoundedRectangle(cornerRadius: 28)
-                    .stroke(Color.white.opacity(0.35), lineWidth: 1)
+                    .stroke(
+                        LinearGradient(
+                            colors: [.white.opacity(0.40), .white.opacity(0.10)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 1
+                    )
             )
             .overlay {
                 if !isConnected {
-                    Text("Live Screen Share here")
-                        .font(.system(size: 22))
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 16)
+                    VStack(spacing: 10) {
+                        Image(systemName: "rectangle.on.rectangle")
+                            .font(.system(size: 30, weight: .light))
+                            .foregroundStyle(.white.opacity(0.45))
+                        Text("Live screen share")
+                            .font(.headline)
+                            .foregroundStyle(.white.opacity(0.85))
+                        if connection.phase == .connecting {
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .tint(Self.orbAccent)
+                                    .scaleEffect(0.7)
+                                Text("Connecting…")
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.6))
+                            }
+                        } else {
+                            Text("Appears when your Mac connects")
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.45))
+                        }
+                    }
+                    .padding(.horizontal, 16)
                 }
             }
             .frame(width: width, height: height)
@@ -388,6 +413,8 @@ struct MainView: View {
                     isVideoFullscreen.toggle()
                 }
             }
+            .shadow(color: .black.opacity(0.6), radius: 24, y: 10)
+            .shadow(color: Self.orbAccent.opacity(0.12), radius: 32)
             .accessibilityLabel("Live screen share")
     }
 
@@ -754,25 +781,35 @@ struct MainView: View {
                                   ? "arrow.down.right.and.arrow.up.left"
                                   : "arrow.up.left.and.arrow.down.right")
                                 .font(.footnote.weight(.bold))
-                                .padding(8)
+                                .contentTransition(.symbolEffect(.replace))
+                                .padding(10)
                                 .background(.ultraThinMaterial, in: Circle())
                         }
                         .padding(10)
+                        .sensoryFeedback(.impact(weight: .medium), trigger: isVideoFullscreen)
                         .accessibilityLabel(isVideoFullscreen ? "Exit fullscreen" : "Fullscreen live view")
                     }
                     .overlay(alignment: .bottomLeading) {
                         // Zoom badge, only while zoomed: current factor +
                         // an affordance hint that double-tap resets.
                         if liveScale > 1.01 {
-                            Text(String(format: "%.1f\u{00D7}", liveScale))
-                                .font(.caption.weight(.semibold).monospacedDigit())
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(.ultraThinMaterial, in: Capsule())
-                                .padding(10)
-                                .accessibilityLabel("Zoom \(String(format: "%.1f", liveScale))x, double tap to reset")
+                            HStack(spacing: 4) {
+                                Text(String(format: "%.1f\u{00D7}", liveScale))
+                                    .font(.caption.weight(.semibold).monospacedDigit())
+                                Image(systemName: "arrow.counterclockwise")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .overlay(Capsule().stroke(.white.opacity(0.12), lineWidth: 1))
+                            .padding(10)
+                            .transition(.scale(scale: 0.8).combined(with: .opacity))
+                            .accessibilityLabel("Zoom \(String(format: "%.1f", liveScale))x, double tap to reset")
                         }
                     }
+                    .animation(.easeOut(duration: 0.18), value: liveScale > 1.01)
                     .contentShape(Rectangle())
                     // Pinch to zoom. `simultaneousGesture` so it composes
                     // with the pan drag below and never blocks the taps.
@@ -858,16 +895,27 @@ struct MainView: View {
                             .lineLimit(2)
                     }
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial.opacity(0.9), in: RoundedRectangle(cornerRadius: 10))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(.white.opacity(0.06), lineWidth: 1)
+                    )
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .animation(.spring(response: 0.3, dampingFraction: 0.9), value: logEntries.count)
 
             commandBar(fullscreen: true)
         }
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
+        .background(
+            LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea(edges: .bottom)
+                .allowsHitTesting(false)
+        )
     }
 
     // MARK: - Status / log panel
@@ -955,28 +1003,54 @@ struct MainView: View {
     /// `fullscreen: true` (the live-mirror overlay) sends prompts DIRECTLY
     /// to the daemon -- fullscreen is the live-driving mode, no Reviewing
     /// detour -- while `false` keeps the existing stage-then-confirm flow.
+    /// Accent blue echoing the Spline orb's own coloring, used across the command bar / pairing
+    /// flow / saved-profile rows for a cohesive "glowing orb over deep space" look.
+    private static let orbAccent = Color(red: 0.30, green: 0.56, blue: 1.0)
+
     private func commandBar(fullscreen: Bool) -> some View {
-        HStack(spacing: 10) {
+        let hasPrompt = !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return HStack(spacing: 10) {
             Button {
                 showControls.toggle()
             } label: {
                 Image(systemName: "sparkles")
                     .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [.white, Color(red: 0.45, green: 0.70, blue: 1.0)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .symbolEffect(.bounce, value: showControls)
                     .frame(width: 38, height: 38)
-                    .background(Color(white: 0.15), in: RoundedRectangle(cornerRadius: 12))
+                    .background(
+                        showControls ? Self.orbAccent.opacity(0.22) : Color(white: 0.15),
+                        in: RoundedRectangle(cornerRadius: 12)
+                    )
+                    .animation(.easeOut(duration: 0.15), value: showControls)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Toggle session controls")
 
-            TextField("What do you want to do?", text: $promptText, axis: .vertical)
+            TextField(
+                "",
+                text: $promptText,
+                prompt: Text("What do you want to do?").foregroundStyle(.white.opacity(0.35)),
+                axis: .vertical
+            )
                 .textFieldStyle(.plain)
                 .lineLimit(1...4)
                 .foregroundStyle(.white)
                 .tint(.white)
+                .submitLabel(.send)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(Color(white: 0.13), in: RoundedRectangle(cornerRadius: 14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .stroke(.white.opacity(0.08), lineWidth: 1)
+                )
                 // ALWAYS direct-send, both modes: the minimal UI hides the
                 // Reviewing panel inside the controls sheet, so the old
                 // stage-then-confirm flow silently swallowed every prompt
@@ -992,9 +1066,15 @@ struct MainView: View {
                 Image(systemName: voice.isRecording ? "mic.fill" : "mic")
                     .font(.system(size: 17))
                     .foregroundStyle(voice.isRecording ? Color.red : Color(white: 0.75))
+                    .symbolEffect(.pulse, isActive: voice.isRecording)
                     .frame(width: 30, height: 38)
+                    .overlay(
+                        Circle()
+                            .stroke(Color.red.opacity(voice.isRecording ? 0.5 : 0), lineWidth: 1.5)
+                    )
             }
             .buttonStyle(.plain)
+            .sensoryFeedback(.impact(weight: .light), trigger: voice.isRecording)
             .accessibilityLabel(voice.isRecording ? "Stop recording" : "Start voice prompt")
 
             Button {
@@ -1002,17 +1082,32 @@ struct MainView: View {
                 // staged-review-swallowed-prompts bug this closes.
                 sendLivePrompt()
             } label: {
-                Image(systemName: "paperplane")
+                Image(systemName: "paperplane.fill")
                     .font(.system(size: 17))
-                    .foregroundStyle(Color(white: 0.75))
+                    .foregroundStyle(hasPrompt ? Self.orbAccent : Color(white: 0.35))
                     .frame(width: 30, height: 38)
+                    .background(Color.white.opacity(0.06), in: Circle())
+                    .animation(.easeOut(duration: 0.15), value: hasPrompt)
             }
             .buttonStyle(.plain)
-            .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(!hasPrompt)
             .accessibilityLabel("Send prompt")
         }
         .padding(12)
         .background(Color(white: 0.09), in: RoundedRectangle(cornerRadius: 24))
+        .overlay(
+            RoundedRectangle(cornerRadius: 24)
+                .stroke(
+                    LinearGradient(
+                        colors: [.white.opacity(0.16), .white.opacity(0.04)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: 1
+                )
+        )
+        .shadow(color: .black.opacity(0.5), radius: 20, y: 8)
+        .shadow(color: Self.orbAccent.opacity(0.18), radius: 24, y: -2)
     }
 
     /// Fullscreen live-mode send: straight to the daemon as a prompt, and

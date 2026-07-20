@@ -50,18 +50,31 @@ struct PairingView: View {
         !trimmedTicket.isEmpty
     }
 
+    private static let orbAccent = Color(red: 0.30, green: 0.56, blue: 1.0)
+
     var body: some View {
         VStack(spacing: 20) {
             VStack(spacing: 8) {
                 Text("Aro")
-                    .font(.largeTitle)
-                    .fontWeight(.bold)
+                    .font(.system(size: 40, weight: .bold, design: .rounded))
+                    .foregroundStyle(
+                        LinearGradient(colors: [.white, Self.orbAccent], startPoint: .top, endPoint: .bottom)
+                    )
                 Text("Scan the QR code the Mac daemon prints, or paste its iroh ticket, to pair.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
             .padding(.top, 32)
+            .background(
+                RadialGradient(
+                    colors: [Self.orbAccent.opacity(0.28), .clear],
+                    center: .top,
+                    startRadius: 0,
+                    endRadius: 260
+                )
+                .allowsHitTesting(false)
+            )
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("Iroh ticket")
@@ -126,11 +139,22 @@ struct PairingView: View {
             .padding(.horizontal)
 
             if let scanError {
-                Text(scanError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text(scanError)
+                }
+                .font(.caption)
+                .foregroundStyle(.red)
+                .multilineTextAlignment(.center)
+                .padding(10)
+                .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.red.opacity(0.3), lineWidth: 1)
+                )
+                .padding(.horizontal)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+                .animation(.easeOut(duration: 0.2), value: scanError)
             }
 
             if !profileStore.profiles.isEmpty {
@@ -144,22 +168,34 @@ struct PairingView: View {
                                 Button {
                                     onConnect(profile.ticket, profile.pin)
                                 } label: {
-                                    HStack {
+                                    HStack(spacing: 10) {
+                                        RoundedRectangle(cornerRadius: 9)
+                                            .fill(Self.orbAccent.opacity(0.15))
+                                            .frame(width: 36, height: 36)
+                                            .overlay(
+                                                Image(systemName: "desktopcomputer")
+                                                    .font(.system(size: 16, weight: .medium))
+                                                    .foregroundStyle(Self.orbAccent)
+                                            )
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text(profile.name)
                                                 .font(.subheadline.weight(.semibold))
                                                 .foregroundStyle(.primary)
                                             Text(profile.phrase)
-                                                .font(.system(.caption, design: .monospaced))
+                                                .font(.system(.caption2, design: .monospaced))
                                                 .foregroundStyle(.secondary)
                                         }
                                         Spacer()
-                                        Image(systemName: "arrow.right.circle.fill")
-                                            .foregroundStyle(.tint)
+                                        Image(systemName: "chevron.right")
+                                            .foregroundStyle(.tertiary)
                                     }
                                     .padding(10)
                                     .background(Color(.secondarySystemBackground))
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(.white.opacity(0.07), lineWidth: 1)
+                                    )
                                 }
                                 .buttonStyle(.plain)
                                 .contextMenu {
@@ -199,11 +235,16 @@ struct PairingView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .buttonBorderShape(.roundedRectangle(radius: 14))
+                .tint(Self.orbAccent)
                 .disabled(!canConnect)
             }
             .padding(.horizontal)
             .padding(.bottom, 32)
         }
+        .preferredColorScheme(.dark)
+        .background(Color.black.ignoresSafeArea())
         .alert("Save profile", isPresented: $showSaveNamePrompt) {
             TextField("Profile name", text: $newProfileName)
             Button("Save") {

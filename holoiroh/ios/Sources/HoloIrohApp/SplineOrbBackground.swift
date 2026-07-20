@@ -37,10 +37,12 @@ struct SplineOrbBackground: View {
             // near the top, frames the blob exactly like the reference
             // render (orb top-center, black field everywhere else).
             GeometryReader { geo in
-                // 1.2x zoom on the base 0.85-width square (user-requested
-                // "20% larger"): the scene renders natively at the bigger
-                // size, so the orb grows without post-render scaling blur.
-                let side = min(geo.size.width * 1.02, 504)
+                // 1.25x on top of the prior 1.2x zoom (user-requested "25%
+                // larger" on top of the current size -- base 0.85-width
+                // square x 1.2 x 1.25 = x1.275, cap 420 x 1.2 x 1.25 = 630):
+                // the scene renders natively at the bigger size, so the orb
+                // grows without post-render scaling blur.
+                let side = min(geo.size.width * 1.275, 630)
                 Group {
                     #if canImport(SplineRuntime)
                     NativeSplineOrb()
