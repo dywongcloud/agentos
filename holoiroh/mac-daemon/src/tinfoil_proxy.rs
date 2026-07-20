@@ -157,6 +157,10 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Reque
                     if obj.remove("logit_bias").is_some() {
                         tracing::debug!("tinfoil proxy stripped logit_bias (holo-tokenizer-specific) from request");
                     }
+                    let is_kimi = obj.get("model").and_then(|m| m.as_str()) == Some("kimi-k2-6");
+                    if is_kimi {
+                        apply_kimi_tuning(obj);
+                    }
                 }
                 serde_json::to_vec(&json).unwrap_or_else(|_| bytes.to_vec())
             }
@@ -197,6 +201,81 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Reque
         .unwrap_or_else(|_| {
             status_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
         })
+}
+
+/// Kimi K2-specific request tuning, applied only when `model == "kimi-k2-6"` (never touches
+/// the primary Holo3-35B request shape). Every change here is a measured fix for a real,
+/// reproduced failure on this exact tinfoil deployment, not a speculative tweak -- probed
+/// directly against `https://inference.tinfoil.sh/v1/chat/completions` with the real
+/// `mac-daemon/.env` key on 2026-07-20:
+///
+/// 1. **`chat_template_kwargs: {"thinking": false}`** -- a real vLLM chat-template parameter
+///    (not `extra_body`-wrapped; wrapping it there was measured to have no effect). Kimi K2 is
+///    a heavy reasoner: a trivial "say ok" prompt burned ~1100-1300 *reasoning* tokens before
+///    the model even started its answer (measured completion_tokens with `thinking` unset).
+///    With `thinking: false` the same prompt dropped to 191 completion tokens and 3s latency
+///    (from ~17s), while still returning real content at `finish_reason: "stop"`.
+/// 2. **`guided_json` -> `response_format: {type: "json_schema", ...}`.** The daemon's own
+///    desktop-agent runtime requests structured tool-call output via vLLM's `guided_json`
+///    parameter. Measured directly: Kimi's vLLM deployment does NOT honor `guided_json` --
+///    it returns the JSON wrapped in a markdown code fence (`` ```json\n{...}\n``` ``) instead
+///    of raw structured output, which is a real, silent tool-call-parsing hazard (the same
+///    "silent empty/malformed completion" shape `control.rs`'s failover logic already treats
+///    as a backend failure). The OpenAI-standard `response_format: json_schema` parameter WAS
+///    measured to work correctly on this same endpoint (clean unwrapped JSON, no fence) --
+///    translating the request to it is a straightforward, verified fix, not a workaround.
+/// 3. **`max_tokens` floor of 6000** (only raised, never lowered, so an explicit larger
+///    request from the runtime is respected). The runtime's shipped desktop-agent config caps
+///    every model at 2048 completion tokens (tuned for Holo3-35B, `mac-daemon`'s own captured
+///    runtime logs confirm this literal value reaches Kimi unmodified). Measured directly: a
+///    genuinely complex multi-step prompt (open Mail -> Notes -> Calendar -> reply) exhausted
+///    2048 tokens on reasoning alone with ZERO answer content and `finish_reason: "length"` --
+///    a real, reproduced silent-truncation failure, not a hypothetical one. Combined with fix
+///    1 (`thinking: false`), 6000 tokens was measured sufficient for this exact prompt to reach
+///    `finish_reason: "stop"` with full content.
+fn apply_kimi_tuning(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    obj.entry("chat_template_kwargs".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(ctk) = obj.get_mut("chat_template_kwargs").and_then(|v| v.as_object_mut()) {
+        ctk.entry("thinking".to_string()).or_insert(serde_json::Value::Bool(false));
+    }
+
+    if let Some(guided_json) = obj.remove("guided_json") {
+        obj.insert(
+            "response_format".to_string(),
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "computer_use_action",
+                    "schema": guided_json,
+                    "strict": true
+                }
+            }),
+        );
+        tracing::debug!("tinfoil proxy: translated guided_json -> response_format json_schema for kimi-k2-6");
+    }
+
+    // The runtime sends `max_completion_tokens` (confirmed in captured logs: the shipped
+    // desktop-agent config's literal `max_completion_tokens: 2048` reaches this proxy
+    // unmodified) -- NOT the bare `max_tokens` field this same tinfoil endpoint also accepts
+    // when called directly (as this module's probes did). Raise whichever field is actually
+    // present; if somehow neither is set, add `max_completion_tokens` (the field this
+    // deployment's real traffic uses).
+    const MIN_MAX_TOKENS: u64 = 6000;
+    for field in ["max_completion_tokens", "max_tokens"] {
+        if let Some(current) = obj.get(field).and_then(|v| v.as_u64()) {
+            if current < MIN_MAX_TOKENS {
+                obj.insert(field.to_string(), serde_json::json!(MIN_MAX_TOKENS));
+                tracing::debug!(
+                    field,
+                    previous = current,
+                    "tinfoil proxy: raised {field} to {MIN_MAX_TOKENS} floor for kimi-k2-6"
+                );
+            }
+            return;
+        }
+    }
+    obj.insert("max_completion_tokens".to_string(), serde_json::json!(MIN_MAX_TOKENS));
 }
 
 fn status_response(status: StatusCode, msg: &'static str) -> Response {
