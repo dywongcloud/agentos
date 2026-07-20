@@ -42,6 +42,7 @@ final class ConnectionProfileStore: ObservableObject {
             createTableIfNeeded()
             seedDevProfileIfNeeded()
             reload()
+            refreshDevProfileIfPresent()
         } else {
             NSLog("ConnectionProfileStore: failed to open sqlite db at \(url.path): \(String(cString: sqlite3_errmsg(handle)))")
             sqlite3_close(handle)
@@ -80,10 +81,46 @@ final class ConnectionProfileStore: ObservableObject {
         guard !UserDefaults.standard.bool(forKey: seedFlag) else { return }
         save(
             name: "Dev Mac",
-            ticket: "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwCAQDAqAFMldEDAQDAqEABldED/holoiroh",
-            pin: "453373"
+            ticket: Self.currentDevTicket,
+            pin: Self.currentDevPin
         )
         UserDefaults.standard.set(true, forKey: seedFlag)
+    }
+
+    /// The ticket/PIN a fresh install seeds as "Dev Mac" -- kept as named constants (rather
+    /// than inlined) so [`refreshDevProfileIfPresent`] can reuse the exact same values to
+    /// update an ALREADY-seeded install's row in place, without duplicating the literals.
+    private static let currentDevTicket =
+        "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwCAQDAqAFMmOwDAQDAqEABmOwD/holoiroh"
+    private static let currentDevPin = "394299"
+
+    /// One-time in-place refresh of an ALREADY-seeded "Dev Mac" row's ticket/PIN to the
+    /// current daemon identity, for installs where `seedDevProfileIfNeeded` already ran (and
+    /// so the seed flag blocks re-seeding) against a now-stale ticket. Unlike `save`, which
+    /// dedups by TICKET (a changed ticket would insert a second row, not replace the first),
+    /// this updates by NAME -- "replace the current default profile" means the same named
+    /// slot, refreshed, not an additional saved connection. Guarded by its own one-time flag
+    /// so it never fights a user who has since renamed or intentionally repointed "Dev Mac".
+    func refreshDevProfileIfPresent() {
+        let refreshFlag = "ConnectionProfileStore.didRefreshDevProfile_2026-07-20"
+        guard !UserDefaults.standard.bool(forKey: refreshFlag) else { return }
+        defer { UserDefaults.standard.set(true, forKey: refreshFlag) }
+        guard let db else { return }
+        guard profiles.contains(where: { $0.name == "Dev Mac" }) else { return }
+        var stmt: OpaquePointer?
+        let sql = "UPDATE profiles SET ticket = ?1, pin = ?2 WHERE name = 'Dev Mac';"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            logError("prepare refresh dev profile")
+            return
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, Self.currentDevTicket, -1, Self.transient)
+        sqlite3_bind_text(stmt, 2, Self.currentDevPin, -1, Self.transient)
+        if sqlite3_step(stmt) != SQLITE_DONE {
+            logError("step refresh dev profile")
+            return
+        }
+        reload()
     }
 
     // MARK: - CRUD
