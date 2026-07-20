@@ -776,7 +776,14 @@ struct MainView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(Color(white: 0.13), in: RoundedRectangle(cornerRadius: 14))
-                .onSubmit { fullscreen ? sendLivePrompt() : sendPrompt() }
+                // ALWAYS direct-send, both modes: the minimal UI hides the
+                // Reviewing panel inside the controls sheet, so the old
+                // stage-then-confirm flow silently swallowed every prompt
+                // (live-witnessed: user typed a Slack task, daemon log shows
+                // zero inbound prompts -- it was staged into a panel that is
+                // no longer visible). Staged review remains reachable via
+                // the sheet's SessionView for flows that enter it there.
+                .onSubmit { sendLivePrompt() }
 
             Button {
                 toggleMicrophone()
@@ -790,7 +797,9 @@ struct MainView: View {
             .accessibilityLabel(voice.isRecording ? "Stop recording" : "Start voice prompt")
 
             Button {
-                fullscreen ? sendLivePrompt() : sendPrompt()
+                // Direct send in both modes -- see .onSubmit above for the
+                // staged-review-swallowed-prompts bug this closes.
+                sendLivePrompt()
             } label: {
                 Image(systemName: "paperplane")
                     .font(.system(size: 17))
