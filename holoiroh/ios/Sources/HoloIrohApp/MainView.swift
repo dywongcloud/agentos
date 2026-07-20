@@ -89,6 +89,16 @@ struct MainView: View {
     @State private var lastSentTask: ClientMessage?
 
     @State private var promptText: String = ""
+
+    /// Whether the command bar's prompt field currently has keyboard focus.
+    /// Binding this (rather than leaving focus implicit) is what makes the
+    /// keyboard dismissible at all: SwiftUI has no built-in "tap outside to
+    /// dismiss" or "Done button closes the keyboard" behavior for a bare
+    /// `TextField` -- both are driven by setting this to `false`. Also
+    /// cleared on every send (`sendLivePrompt`) so hitting the paperplane
+    /// button or the keyboard's own Send key closes the keyboard instead of
+    /// leaving it open with an now-empty field beneath it.
+    @FocusState private var isPromptFocused: Bool
     @StateObject private var voice = VoiceTranscriberModel()
     @State private var logEntries: [LogEntry] = [
         LogEntry(message: .status(text: "paired -- control channel not yet connected"))
@@ -194,8 +204,16 @@ struct MainView: View {
                 // scene (see SplineOrbBackground's doc for the web-runtime
                 // rationale + offline gradient fallback). The orb renders
                 // its own top-area layout; nothing is overlaid on the top
-                // ~40% of the screen so it stays clear.
+                // ~40% of the screen so it stays clear. The backdrop also
+                // doubles as the tap-outside-to-dismiss-keyboard target --
+                // safe because SplineOrbBackground is `.allowsHitTesting(false)`
+                // and this tap only ever clears text-field focus, never
+                // interferes with the live-share box's own tap-to-fullscreen
+                // gesture (a distinct view, hit-tested first since it's later
+                // in the ZStack).
                 Color.black.ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture { isPromptFocused = false }
                 SplineOrbBackground()
 
                 if !isFullscreenActive {
@@ -1044,6 +1062,7 @@ struct MainView: View {
                 .foregroundStyle(.white)
                 .tint(.white)
                 .submitLabel(.send)
+                .focused($isPromptFocused)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(Color(white: 0.13), in: RoundedRectangle(cornerRadius: 14))
@@ -1051,6 +1070,18 @@ struct MainView: View {
                     RoundedRectangle(cornerRadius: 14)
                         .stroke(.white.opacity(0.08), lineWidth: 1)
                 )
+                // Escape hatch for the keyboard's own "return"/multi-line
+                // behavior swallowing a plain tap on the keyboard's chrome:
+                // a toolbar "Done" button above the keyboard, the standard
+                // iOS affordance for dismissing a keyboard with no visible
+                // return-to-send key (this field uses `axis: .vertical` +
+                // multi-line, so "return" inserts a newline, not submit).
+                .toolbar {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button("Done") { isPromptFocused = false }
+                    }
+                }
                 // ALWAYS direct-send, both modes: the minimal UI hides the
                 // Reviewing panel inside the controls sheet, so the old
                 // stage-then-confirm flow silently swallowed every prompt
@@ -1116,6 +1147,7 @@ struct MainView: View {
         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         promptText = ""
+        isPromptFocused = false
         lastSentTask = .prompt(text: trimmed)
         sendControlMessage(.prompt(text: trimmed))
         log(.status(text: "→ live prompt: \(trimmed)"))
@@ -1124,6 +1156,7 @@ struct MainView: View {
     private func sendPrompt() {
         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        isPromptFocused = false
 
         // Capturing a prompt only *stages* it: nothing reaches the daemon
         // until the user confirms with the Reviewing panel's Send control
