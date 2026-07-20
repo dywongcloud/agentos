@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Main screen shown once the app has paired (see `ContentView`'s navigation
 /// wiring). On appear it opens the real connection: one shared
@@ -104,6 +105,19 @@ struct MainView: View {
     /// button or the keyboard's own Send key closes the keyboard instead of
     /// leaving it open with an now-empty field beneath it.
     @FocusState private var isPromptFocused: Bool
+
+    /// Live keyboard height, tracked via `UIResponder.keyboardWill{Show,Hide}Notification`
+    /// rather than derived from `isPromptFocused`/safe-area insets: this view's root backdrop
+    /// uses `ignoresSafeArea()`, so SwiftUI's automatic keyboard-avoidance (which relies on the
+    /// view responding to safe-area changes) never kicks in here, and `@FocusState` alone carries
+    /// no height information anyway. Read directly from the notification's own
+    /// `UIResponder.keyboardFrameEndUserInfoKey` so this always reflects the REAL animating
+    /// keyboard height for the device/orientation/keyboard-type in use, not a guessed constant.
+    /// Drives `liveShareBox`/`videoOverlay`'s upward shift in `body` so the live-share box and
+    /// command bar move up together, in sync, as the keyboard rises -- fixing the box visually
+    /// colliding with the command bar the moment the keyboard opens (see `body`'s `keyboardShift`
+    /// comment for the exact offset math).
+    @State private var keyboardHeight: CGFloat = 0
     @StateObject private var voice = VoiceTranscriberModel()
     @State private var logEntries: [LogEntry] = [
         LogEntry(message: .status(text: "paired -- control channel not yet connected"))
@@ -211,6 +225,21 @@ struct MainView: View {
             // straight back instead of leaving a black screen.
             let isFullscreenActive = isVideoFullscreen && isConnected
 
+            // How far to shift the box + command bar up while the keyboard is
+            // open, so the command bar's `TextField` is never covered (fixes
+            // "the screenshare kinda blocks my text view" when typing). Only
+            // the amount by which the keyboard actually eats into the space
+            // below the box needs to be recovered -- shifting by the FULL
+            // keyboard height would be needlessly aggressive and push the box
+            // up under the orb again. `spaceBelowBox` is what's left between
+            // the box's bottom edge and the screen bottom today (where the
+            // command bar + its padding already live); once the keyboard
+            // claims more than that, the excess is exactly how far both need
+            // to move up to keep the command bar clear of it.
+            let boxBottomY = boxCenterY + boxHeight / 2
+            let spaceBelowBox = geo.size.height - boxBottomY
+            let keyboardShift = max(0, keyboardHeight - spaceBelowBox)
+
             ZStack {
                 // Layer 0: full-black backdrop + the blue blob orb Spline
                 // scene (see SplineOrbBackground's doc for the web-runtime
@@ -233,15 +262,20 @@ struct MainView: View {
                     // only -- the video itself is the persistent
                     // `videoOverlay` surface below, framed to this box).
                     liveShareBox(width: boxWidth, height: boxHeight)
-                        .position(x: geo.size.width / 2, y: boxCenterY)
+                        .position(x: geo.size.width / 2, y: boxCenterY - keyboardShift)
 
-                    // BOTTOM: the single command bar.
+                    // BOTTOM: the single command bar. Rides up with the same
+                    // keyboardShift as the box (see keyboardShift's own doc)
+                    // so the two move in lockstep -- the command bar clears
+                    // the keyboard, and the box keeps the same visual gap
+                    // above it instead of the two colliding mid-shift.
                     VStack(spacing: 0) {
                         Spacer()
                         commandBar
                             .padding(.horizontal, 16)
                             .padding(.bottom, 8)
                     }
+                    .offset(y: -keyboardShift)
                 }
 
                 // Topmost: the persistent live-share video surface -- ONE
@@ -252,9 +286,32 @@ struct MainView: View {
                     in: geo.size,
                     boxWidth: boxWidth,
                     boxHeight: boxHeight,
-                    boxCenterY: boxCenterY
+                    boxCenterY: boxCenterY - keyboardShift
                 )
             }
+            // Smooth, organic upward motion as the keyboard rises/falls,
+            // rather than the box+command bar snapping to their new position
+            // the instant `keyboardHeight` changes. A spring (not a fixed-
+            // duration easing curve) so the motion still feels responsive if
+            // the keyboard's own show/hide animation timing varies slightly
+            // by device/iOS version, matching this app's existing spring-first
+            // animation style elsewhere (e.g. the zoom/pan gestures).
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: keyboardShift)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
+            guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+            keyboardHeight = frame.height
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+            guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+            // A visible-but-resized keyboard (e.g. QuickType bar toggling,
+            // switching to a different keyboard layout) fires this instead
+            // of a fresh will-show -- keep the tracked height in sync so the
+            // shift doesn't freeze at a stale value.
+            keyboardHeight = max(0, UIScreen.main.bounds.height - frame.origin.y)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            keyboardHeight = 0
         }
         .toolbar(.hidden, for: .navigationBar)
         // Hidden-by-default controls: the SessionView state panel, the
@@ -276,6 +333,7 @@ struct MainView: View {
         // Real transport lifecycle: connect the shared bridge on appear,
         // reflect its phase changes, and tear it down when the screen goes.
         .onAppear(perform: configureConnectionIfNeeded)
+        .onAppear(perform: autoFocusPromptIfNeeded)
         .onDisappear { connection.shutdown() }
         .onChange(of: connection.phase) { _, newPhase in
             handleConnectionPhase(newPhase)
@@ -1171,6 +1229,35 @@ struct MainView: View {
         didSendAutoPairPrompt = true
         promptText = prompt
         sendLivePrompt()
+        #endif
+    }
+
+    /// Debug-only unattended witness for keyboard-avoidance UI changes (the
+    /// live-share box/command bar shifting up as the keyboard opens):
+    /// `devicectl`/`simctl` have no real UI-input capability to simulate a
+    /// tap on the prompt field, so `HOLOIROH_AUTOFOCUS_PROMPT=1` focuses it
+    /// programmatically on appear -- the exact same `isPromptFocused = true`
+    /// a real tap would trigger, driving the real keyboard notifications and
+    /// therefore the real `keyboardShift` animation in `body`. Independent of
+    /// pairing/connection state (unlike `sendAutoPairPromptIfNeeded`, which
+    /// needs `.connected`) since this only exercises the layout, not a send.
+    private func autoFocusPromptIfNeeded() {
+        #if DEBUG
+        if let heightStr = ProcessInfo.processInfo.environment["HOLOIROH_DEBUG_KEYBOARD_HEIGHT"],
+           let height = Double(heightStr) {
+            // Isolated layout-only witness: sets keyboardHeight directly,
+            // bypassing @FocusState/UIResponder notifications entirely, to
+            // verify keyboardShift's math/animation independent of whether
+            // the simulator's software keyboard or focus plumbing behaves.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                keyboardHeight = CGFloat(height)
+            }
+            return
+        }
+        guard ProcessInfo.processInfo.environment["HOLOIROH_AUTOFOCUS_PROMPT"] == "1" else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            isPromptFocused = true
+        }
         #endif
     }
 
