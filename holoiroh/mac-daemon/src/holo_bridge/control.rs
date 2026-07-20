@@ -235,11 +235,21 @@ enum TurnOutcome {
     /// The turn ran to its natural end (success, cancel, cap, or a failure that was already
     /// emitted to the peer). Nothing further to do.
     Completed,
-    /// The turn died with a backend-error shape (the hosted backend's rate-limit 429s reach
-    /// this bridge as `holo serve`'s generic `"agent backend error"` terminal -- serve.py
-    /// swallows the HTTP detail) and its terminal event was SUPPRESSED, not emitted. The
-    /// caller decides: switch backends and retry, or emit `original` after all.
-    BackendFailure { original: ControlEvent },
+    /// The turn died with a backend-error shape and its tail events were SUPPRESSED, not
+    /// emitted. The caller decides: switch backends and retry, or emit `original` (in
+    /// order) after all. TWO real shapes arm this, both probe-witnessed:
+    ///
+    /// 1. `Failed` terminal matching [`is_backend_error_message`] -- the hosted backend's
+    ///    rate-limit 429s reach this bridge as `holo serve`'s generic `"agent backend
+    ///    error"` (serve.py swallows the HTTP detail).
+    /// 2. `Completed` terminal with NO answer text at all -- when the runtime's model calls
+    ///    all error (witnessed against a dead inference endpoint), the runtime "finishes"
+    ///    the run anyway and holo serve reports success with an empty answer. The phone
+    ///    would see a task that silently did nothing. An armed turn treats that empty
+    ///    completion as the failure it is; the retry's own (possibly legitimately empty)
+    ///    result is emitted as-is, so a genuinely-empty turn costs one extra attempt, never
+    ///    a lost result.
+    BackendFailure { original: Vec<ControlEvent> },
 }
 
 /// Does this failure text look like the agent backend (rather than this daemon or the A2A
@@ -475,7 +485,9 @@ impl HoloControlBridge {
                 TurnOutcome::Completed => return,
                 TurnOutcome::BackendFailure { original } => {
                     let Some(bridge) = &bridge else {
-                        self.emit(original);
+                        for event in original {
+                            self.emit(event);
+                        }
                         return;
                     };
                     match bridge.activate_fallback().await {
@@ -497,7 +509,9 @@ impl HoloControlBridge {
                         }
                         Ok(super::FallbackActivation::AlreadyActive
                         | super::FallbackActivation::Unavailable) => {
-                            self.emit(original);
+                            for event in original {
+                                self.emit(event);
+                            }
                             return;
                         }
                         Err(err) => {
@@ -506,7 +520,9 @@ impl HoloControlBridge {
                                 error = %format!("{err:#}"),
                                 "fallback backend switch failed; surfacing the original turn failure"
                             );
-                            self.emit(original);
+                            for event in original {
+                                self.emit(event);
+                            }
                             return;
                         }
                     }
@@ -529,10 +545,14 @@ impl HoloControlBridge {
     ) -> TurnOutcome {
         let request_id = request_id.to_owned();
         let request_id_for_updates = request_id.clone();
-        // The suppressed backend-failure terminal, if any (see the callback below). A mutex
-        // (not a Cell) only because the callback is `Fn`-shaped from the borrow checker's
+        // The suppressed backend-failure tail (terminal, and the empty Answer preceding it
+        // in the silent-failure shape), if any -- see the callback below. A mutex (not a
+        // Cell) only because the callback is `Fn`-shaped from the borrow checker's
         // perspective across the stream; contention is impossible (updates are serial).
-        let suppressed: std::sync::Mutex<Option<ControlEvent>> = std::sync::Mutex::new(None);
+        let suppressed: std::sync::Mutex<Vec<ControlEvent>> = std::sync::Mutex::new(Vec::new());
+        // Whether this turn produced a real (non-empty) answer -- the discriminator between
+        // a legitimate completion and the silent-failure shape (see TurnOutcome docs).
+        let saw_real_answer = std::sync::atomic::AtomicBool::new(false);
         let actions = ActionCounter::new_default();
         // Latched once the cap is hit, so every subsequent update of *any* variant -- not just
         // further `Working` ones -- is suppressed too. Without this, an `Answer`/`Terminal`
@@ -563,22 +583,48 @@ impl HoloControlBridge {
                         return;
                     }
                 }
-                // Failover interception: a Failed terminal with a backend-error shape is the
-                // signal the retry loop switches backends on. Capture it instead of emitting
-                // -- if the switch succeeds, the peer never sees a failure for a turn that
-                // then succeeds on the fallback; if it can't switch, the caller emits this
-                // exact event, so nothing is ever lost.
+                // Failover interception (armed turns only): capture instead of emitting --
+                // if the switch succeeds, the peer never sees a failure/no-op for a turn
+                // that then succeeds on the fallback; if it can't switch, the caller emits
+                // these exact events in order, so nothing is ever lost.
                 if failover_armed {
-                    if let TaskUpdate::Terminal {
-                        state: TerminalState::Failed,
-                        message: Some(message),
-                    } = &update
-                    {
-                        if is_backend_error_message(message) {
-                            *suppressed.lock().expect("suppressed lock poisoned") =
-                                Some(translate_update(&request_id_for_updates, update));
+                    match &update {
+                        // Shape 1: explicit backend-error failure.
+                        TaskUpdate::Terminal {
+                            state: TerminalState::Failed,
+                            message: Some(message),
+                        } if is_backend_error_message(message) => {
+                            suppressed
+                                .lock()
+                                .expect("suppressed lock poisoned")
+                                .push(translate_update(&request_id_for_updates, update));
                             return;
                         }
+                        // Shape 2 groundwork: hold back an EMPTY answer -- it only becomes
+                        // a failure if the terminal confirms nothing else happened.
+                        TaskUpdate::Answer { text } if text.trim().is_empty() => {
+                            suppressed
+                                .lock()
+                                .expect("suppressed lock poisoned")
+                                .push(translate_update(&request_id_for_updates, update));
+                            return;
+                        }
+                        TaskUpdate::Answer { .. } => {
+                            saw_real_answer.store(true, Ordering::SeqCst);
+                        }
+                        // Shape 2: Completed with no real answer = the silent-failure
+                        // completion (runtime errored every model call, "finished" anyway).
+                        TaskUpdate::Terminal {
+                            state: TerminalState::Completed,
+                            ..
+                        } if !saw_real_answer.load(Ordering::SeqCst) => {
+                            suppressed
+                                .lock()
+                                .expect("suppressed lock poisoned")
+                                .push(translate_update(&request_id_for_updates, update));
+                            return;
+                        }
+                        _ => {}
                     }
                 }
                 self.emit(translate_update(&request_id_for_updates, update));
@@ -607,12 +653,21 @@ impl HoloControlBridge {
 
         match result {
             Ok(resolved_context_id) => {
-                if let Some(original) = suppressed
-                    .lock()
-                    .expect("suppressed lock poisoned")
-                    .take()
-                {
-                    return TurnOutcome::BackendFailure { original };
+                let held = std::mem::take(
+                    &mut *suppressed.lock().expect("suppressed lock poisoned"),
+                );
+                // Held events only count as a backend failure when a TERMINAL is among
+                // them (an empty Answer alone followed by a real Failed took shape 1's
+                // path; an empty Answer with no terminal at all means the stream ended
+                // oddly -- emit what was held and let the transport error path speak).
+                let has_terminal = held
+                    .iter()
+                    .any(|e| matches!(e, ControlEvent::Done { .. }));
+                if has_terminal {
+                    return TurnOutcome::BackendFailure { original: held };
+                }
+                for event in held {
+                    self.emit(event);
                 }
                 tracing::debug!(
                     request_id,
@@ -627,10 +682,10 @@ impl HoloControlBridge {
                     // Transport-level rate-limit shape (these DO carry the HTTP detail,
                     // unlike serve.py's swallowed terminal): same failover treatment.
                     return TurnOutcome::BackendFailure {
-                        original: ControlEvent::Error {
+                        original: vec![ControlEvent::Error {
                             request_id,
                             message,
-                        },
+                        }],
                     };
                 }
                 tracing::warn!(request_id, error = %err, "prompt turn failed before a terminal A2A state");
