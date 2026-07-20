@@ -127,6 +127,25 @@ tokenizers = "0.23"
 # `#![cfg(target_arch = "wasm32")]`) and not vendorable into a native project.
 libsql = "0.9"
 
+# src/privacy.rs: the browser/screenshot privacy-redaction layer applied to outbound
+# chat-completion image_url payloads in tinfoil_proxy.rs, ported as a PATTERN from
+# dael-amz/browser-agent-privacy-layer ("PLVA") -- that repo is Python/JS, unlicensed (no
+# LICENSE file at all, confirmed via `gh api .../license` 404), and an explicitly early-stage
+# hackathon showcase (0 issues, 4 contributors, all activity in a 48-hour window), so vendoring
+# it was never viable; this reimplements its OCR+regex+vault/token architecture natively. `image`
+# and `regex` were already transitive dependencies in this workspace's Cargo.lock (via iroh-live/
+# moq-media's own graph) -- promoted to direct deps rather than adding a second copy. `imageproc`
+# + `ab_glyph` are new: `image` alone can decode/encode/draw filled rects but cannot render text
+# (confirmed no text-drawing API on `image::ImageBuffer`), and the placeholder-token label
+# (`«EMAIL_1_a3f9»`) painted over each redacted region needs real glyph rendering, not just a
+# solid block -- `imageproc::drawing::draw_text_mut` (font rasterization via `ab_glyph`) is the
+# standard image-rs-org combination for this, actively maintained alongside `image` itself.
+image = "0.25"
+imageproc = "0.25"
+ab_glyph = "0.2"
+regex = "1"
+base64 = "0.22"
+
 [target.'cfg(unix)'.dependencies]
 # Used only to send SIGTERM (graceful shutdown) to the `holo serve` child before falling back
 # to SIGKILL; this daemon is macOS-only per holoiroh/README.md so `cfg(unix)` always applies.
@@ -152,3 +171,20 @@ libc = "0.2"
 #     symbol with only "AXUIElement" enabled, tracing the module-level cfg gate directly.
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow"] }
 objc2-application-services = { version = "0.3", default-features = false, features = ["HIServices", "AXUIElement"] }
+# src/privacy.rs: on-device OCR for the browser/screenshot privacy-redaction layer, via
+# Apple's Vision framework (VNImageRequestHandler + VNRecognizeTextRequest). Verified directly
+# against the crate's own generated source + doc pages (docs.rs/objc2-vision 0.3.2): the raw-
+# bytes `VNImageRequestHandler::initWithData_options` constructor needs no CGImage interop, so
+# this needs no `objc2-core-graphics`-mediated conversion path -- just NSData in, observations
+# out. Feature set is the crate's own documented minimal gate list for
+# VNImageRequestHandler/VNRecognizeTextRequest/VNObservation/VNTypes (each symbol's doc page
+# states its exact required feature(s) verbatim, e.g. VNRecognizeTextRequest's struct itself is
+# gated on `VNRequest`, its `results()` accessor separately on `VNObservation`).
+objc2-vision = { version = "0.3", default-features = false, features = [
+    "VNRequestHandler", "VNRequest", "VNRecognizeTextRequest", "VNObservation", "VNTypes",
+] }
+# NSData (wrapping raw image bytes for Vision), NSArray (request lists, observation lists),
+# NSString (recognized text). objc2-vision's own features pull most Foundation types in
+# transitively, but NSData/NSArray/NSString are named directly in privacy.rs so they need to be
+# real, nameable types at this crate's own dependency-resolution level too.
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSArray", "NSString", "NSDictionary", "NSError", "NSObject", "NSGeometry"] }

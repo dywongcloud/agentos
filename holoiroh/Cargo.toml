@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["mac-daemon", "ios-bridge", "holoiroh-wire"]
+members = ["mac-daemon", "ios-bridge", "holoiroh-wire", "rust_db_project"]
 
 # Local patch of the pinned iroh-live commit (5f95758, see mac-daemon/Cargo.toml
 # and ios-bridge/Cargo.toml's own comments on the git-pin rationale): upstream
