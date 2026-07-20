@@ -54,7 +54,16 @@ let package = Package(
                 .product(name: "SplineRuntime", package: "spline-ios", condition: .when(platforms: [.iOS]))
             ],
             path: "Sources/HoloIrohApp",
-            exclude: ["REQUIRED_INFO_PLIST_KEYS.md"]
+            exclude: ["REQUIRED_INFO_PLIST_KEYS.md"],
+            resources: [
+                // The blue-orb Spline scene, BUNDLED so the background
+                // renders with zero runtime network dependency -- the
+                // remote scene.splinecode load silently failed on-device
+                // (blank orb) while the same URL fetched fine from the Mac.
+                // `.copy` (not `.process`): an opaque binary blob the Spline
+                // runtime parses itself.
+                .copy("Resources/orb.splinecode")
+            ]
         )
     ]
 )

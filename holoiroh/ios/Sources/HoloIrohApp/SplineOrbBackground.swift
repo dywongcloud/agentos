@@ -55,11 +55,19 @@ struct SplineOrbBackground: View {
 }
 
 #if canImport(SplineRuntime)
-/// The native-runtime orb. `SplineView(sceneFileURL:)` is throwing; a load
-/// failure (offline, scene URL gone) falls through to the gradient
-/// underlay -- never an error surface on a background element.
+/// The native-runtime orb. Loads the BUNDLED scene file first
+/// (`Resources/orb.splinecode`, shipped in the app -- zero network
+/// dependency; the remote-URL load silently failed on-device while the
+/// identical URL fetched fine from a Mac), falling back to the remote URL
+/// only if the bundle resource is somehow missing. A load failure falls
+/// through to the black/gradient underlay -- never an error surface on a
+/// background element.
 private struct NativeSplineOrb: View {
-    private let sceneURL = URL(string: "https://prod.spline.design/EEXJWT2Sfje1M4iS/scene.splinecode")!
+    private static let remoteURL = URL(string: "https://prod.spline.design/EEXJWT2Sfje1M4iS/scene.splinecode")!
+
+    private var sceneURL: URL {
+        Bundle.module.url(forResource: "orb", withExtension: "splinecode") ?? Self.remoteURL
+    }
 
     var body: some View {
         if let view = try? SplineView(sceneFileURL: sceneURL) {
