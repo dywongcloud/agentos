@@ -227,6 +227,12 @@ pub struct HoloControlBridge {
     /// `holo serve`) lives on the bridge, which owns the process slot. Empty (never attached,
     /// or upgrade fails during shutdown) simply disables failover for the turn.
     bridge: std::sync::OnceLock<std::sync::Weak<super::HoloBridge>>,
+    /// Per-task PLAN/EXECUTE/VERIFY/DONE phase tracking -- see `crate::task_fsm`'s module doc
+    /// for the design rationale (a native reimplementation of `rs-plugkit`'s phase-FSM
+    /// pattern, grounded in this daemon's own real A2A `TrajectoryEvent` signal). Owned here
+    /// (not a daemon-wide singleton) since every task this bridge runs is already serialized
+    /// through `busy`/`queue` above.
+    tasks: crate::task_fsm::TaskRegistry,
 }
 
 /// What one streaming attempt of a turn produced -- see [`HoloControlBridge::run_prompt`]'s
@@ -280,6 +286,7 @@ impl HoloControlBridge {
             busy: Mutex::new(false),
             queue: Mutex::new(VecDeque::new()),
             bridge: std::sync::OnceLock::new(),
+            tasks: crate::task_fsm::TaskRegistry::new(),
         }
     }
 
@@ -461,6 +468,22 @@ impl HoloControlBridge {
     /// `holo_bridge` doc-level "what could not be confirmed" convention:
     /// this is the same kind of honestly-scoped gap, not a silent one).
     async fn run_prompt(&self, request_id: String, text: String, context_id: Option<&str>) {
+        // Phase-FSM lifecycle: begin tracking once per TASK (not per failover-retry attempt --
+        // a retry is still the same task continuing, so `run_prompt_once` observations across
+        // attempts accumulate onto the one FSM `begin` creates here), conclude on every exit
+        // path via the guard below. See `crate::task_fsm`'s module doc.
+        self.tasks.begin(&request_id);
+        struct ConcludeOnDrop<'a> {
+            tasks: &'a crate::task_fsm::TaskRegistry,
+            request_id: &'a str,
+        }
+        impl Drop for ConcludeOnDrop<'_> {
+            fn drop(&mut self) {
+                self.tasks.conclude(self.request_id);
+            }
+        }
+        let _conclude_task = ConcludeOnDrop { tasks: &self.tasks, request_id: &request_id };
+
         // Failover pre-step: if the fallback backend has outlived its cooldown, hop back to
         // the primary so the hosted path gets probed again (its rate limit has likely reset).
         let bridge = self.bridge.get().and_then(std::sync::Weak::upgrade);
@@ -600,6 +623,26 @@ impl HoloControlBridge {
                 if matches!(update, TaskUpdate::Terminal { .. }) {
                     saw_terminal.store(true, Ordering::SeqCst);
                 }
+                // Phase-FSM observation: fed BEFORE the cap/failover suppression logic below
+                // decides what reaches the phone, so phase tracking reflects what the backend
+                // actually did on this attempt, not what got shown. A phase change is folded
+                // into a Progress status line for the CURRENT emit below (not a separate
+                // event) rather than re-plumbing a new ControlEvent variant through
+                // `control_channel`'s wire mapping -- see `phase_status_text`'s doc.
+                let phase_change_text: Option<String> = self.tasks.with_task(&request_id_for_updates, |fsm| {
+                    let changed = match &update {
+                        TaskUpdate::Working { raw_event, .. } => fsm.observe_working(raw_event.as_ref()),
+                        TaskUpdate::Answer { text } => fsm.observe_answer(text),
+                        TaskUpdate::Terminal { state, .. } => {
+                            fsm.advance_terminal(*state);
+                            false
+                        }
+                    };
+                    changed.then(|| fsm.phase_status_text())
+                }).flatten();
+                if let Some(text) = phase_change_text {
+                    self.emit(ControlEvent::DaemonStatus { text });
+                }
                 if matches!(update, TaskUpdate::Working { .. }) {
                     if let Err(cap) = actions.try_record() {
                         tracing::warn!(
@@ -726,6 +769,7 @@ impl HoloControlBridge {
                     };
                 }
                 tracing::warn!(request_id, error = %err, "prompt turn failed before a terminal A2A state");
+                self.tasks.with_task(&request_id, |fsm| fsm.fail());
                 self.emit(ControlEvent::Error {
                     request_id,
                     message,
