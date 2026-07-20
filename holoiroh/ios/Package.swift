@@ -56,13 +56,15 @@ let package = Package(
             path: "Sources/HoloIrohApp",
             exclude: ["REQUIRED_INFO_PLIST_KEYS.md"],
             resources: [
-                // The blue-orb Spline scene, BUNDLED so the background
-                // renders with zero runtime network dependency -- the
-                // remote scene.splinecode load silently failed on-device
-                // (blank orb) while the same URL fetched fine from the Mac.
-                // `.copy` (not `.process`): an opaque binary blob the Spline
-                // runtime parses itself.
-                .copy("Resources/orb.splinecode")
+                // The blue-orb Spline scene in the iOS runtime's REAL input
+                // format: `.splineswift`, from the editor's Export -> Mobile
+                // Platform -> Apple local export. (The previously-bundled
+                // `.splinecode` was the WEB runtime's format -- accepted by
+                // the URL loader, silently rejected by format validation:
+                // the invisible-orb bug.) Bundled so the background renders
+                // with zero runtime network dependency. `.copy` (not
+                // `.process`): an opaque binary blob the runtime parses.
+                .copy("Resources/orb.splineswift")
             ]
         )
     ]

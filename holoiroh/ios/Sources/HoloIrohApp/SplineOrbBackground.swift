@@ -76,11 +76,12 @@ struct SplineOrbBackground: View {
 ///    a candidate in case a future runtime accepts it.
 /// 3. Remote scene.splinecode URL, same caveat.
 private struct NativeSplineOrb: View {
-    private static let remoteURL = URL(string: "https://prod.spline.design/EEXJWT2Sfje1M4iS/scene.splinecode")!
+    /// The user's real Apple-platform export of this scene (Export ->
+    /// Mobile Platform -> Apple), NOT the web `.splinecode` URL.
+    private static let remoteURL = URL(string: "https://build.spline.design/FxpXnkTaazJVlLqe096P/scene.splineswift")!
 
     private var sceneURL: URL {
         Bundle.module.url(forResource: "orb", withExtension: "splineswift")
-            ?? Bundle.module.url(forResource: "orb", withExtension: "splinecode")
             ?? Self.remoteURL
     }
 
