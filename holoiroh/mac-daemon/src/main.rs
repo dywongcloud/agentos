@@ -32,6 +32,7 @@ mod instance_guard;
 mod limits;
 mod local_model;
 mod router;
+mod env_context;
 mod task_fsm;
 mod tinfoil_proxy;
 mod pairing_phrase;

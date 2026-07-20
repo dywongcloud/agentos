@@ -92,6 +92,32 @@ data-encoding = "2"
 # that path entirely.
 ctrlc = { version = "3", features = ["termination"] }
 
+# src/env_context.rs: native BGE-small-en-v1.5 embedding + libsql vector storage for the
+# environment/user-context memory store (see that module's doc for the design -- ported as a
+# PATTERN from AnEntrypoint/gm's rs-plugkit, not vendored: rs-plugkit's own embed.rs and
+# agentplug-libsql are both wasm32-only, confirmed by direct inspection, so this daemon
+# implements the same architecture (candle + BGE-small, libsql F32_BLOB + vector_top_k)
+# natively instead). candle-core/-nn/-transformers pinned to 0.11 (crates.io max_stable as of
+# this addition) -- rs-plugkit's own Cargo.toml pins 0.8 specifically because 0.11 fails to
+# compile for ITS wasm32-wasip1 target; this daemon is a normal native binary, so that
+# constraint does not apply here.
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+tokenizers = "0.23"
+# NOTE: no `hf-hub` dependency here. Both of its 0.3.2 API surfaces (sync/`ureq` and
+# tokio/`reqwest`) share a real, live bug in their redirect-following `metadata()`: they pass
+# the response's `Location` header straight into a fresh request as if it were always an
+# absolute URL, but HuggingFace's current CDN returns a genuinely RELATIVE `Location` header
+# for this model's files (confirmed directly via `curl -I` against the real endpoint -- see
+# env_context.rs::ensure_embedder's doc). `reqwest` (already a dependency, see below) resolves
+# relative redirects correctly on its own, so env_context.rs fetches model files directly via
+# `reqwest::get` instead of through hf_hub at all.
+# Real, native libsql (the actual Turso/libsql-rs crate from crates.io) -- NOT
+# agentplug-libsql, which was confirmed wasm32-only (its whole crate body is behind
+# `#![cfg(target_arch = "wasm32")]`) and not vendorable into a native project.
+libsql = "0.9"
+
 [target.'cfg(unix)'.dependencies]
 # Used only to send SIGTERM (graceful shutdown) to the `holo serve` child before falling back
 # to SIGKILL; this daemon is macOS-only per holoiroh/README.md so `cfg(unix)` always applies.

@@ -30,5 +30,6 @@ pub mod registry;
 pub mod sensitive_categories;
 pub mod task_state;
 pub mod router;
+pub mod env_context;
 pub mod task_fsm;
 pub mod tinfoil_proxy;

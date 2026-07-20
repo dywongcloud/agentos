@@ -233,6 +233,11 @@ pub struct HoloControlBridge {
     /// (not a daemon-wide singleton) since every task this bridge runs is already serialized
     /// through `busy`/`queue` above.
     tasks: crate::task_fsm::TaskRegistry,
+    /// Environment/user-context memory (see `crate::env_context`'s module doc). `None` when
+    /// the store failed to open (e.g. `$HOME` unset in some unusual launch environment) --
+    /// degrade-don't-crash, matching every other best-effort subsystem in this bridge; a
+    /// missing store just means no context gets prepended, never a turn failure.
+    env_context: Option<crate::env_context::EnvContextStore>,
 }
 
 /// What one streaming attempt of a turn produced -- see [`HoloControlBridge::run_prompt`]'s
@@ -287,6 +292,16 @@ impl HoloControlBridge {
             queue: Mutex::new(VecDeque::new()),
             bridge: std::sync::OnceLock::new(),
             tasks: crate::task_fsm::TaskRegistry::new(),
+            env_context: match crate::env_context::EnvContextStore::open() {
+                Ok(store) => Some(store),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %format!("{err:#}"),
+                        "env_context store failed to open; turns will run without environment-context injection"
+                    );
+                    None
+                }
+            },
         }
     }
 
@@ -510,6 +525,32 @@ impl HoloControlBridge {
             }
         }
 
+        // Environment-context injection: prepend the most relevant durable facts about THIS
+        // user's setup (see `crate::env_context`'s module doc -- the concrete motivating bug
+        // was the agent opening a new terminal instead of finding the existing Ghostty
+        // session). Runs AFTER route_model intentionally: the router's complexity classifier
+        // should score the user's actual words, not text padded with a context block, which
+        // could skew the heuristic toward "complex" on every turn. Best-effort: retrieval
+        // failure (model not yet cached, embedding error) logs and falls through to the
+        // unmodified prompt -- a missing context block should never fail a turn.
+        let augmented_text = match &self.env_context {
+            Some(store) => match store.retrieve(&text, 5).await {
+                Ok(facts) => match crate::env_context::format_context_block(&facts) {
+                    Some(block) => format!("{block}\n{text}"),
+                    None => text.clone(),
+                },
+                Err(err) => {
+                    tracing::debug!(
+                        request_id,
+                        error = %format!("{err:#}"),
+                        "env_context retrieval failed; sending prompt without environment context"
+                    );
+                    text.clone()
+                }
+            },
+            None => text.clone(),
+        };
+
         // At most ONE failover retry per turn: attempt 0 may suppress a backend failure and
         // switch to the fallback; attempt 1 runs with failover disabled, so its failure --
         // whatever the shape -- is emitted for real. No unbounded retry loops.
@@ -517,7 +558,7 @@ impl HoloControlBridge {
         loop {
             let failover_armed = attempt == 0 && bridge.is_some();
             match self
-                .run_prompt_once(&request_id, &text, context_id, failover_armed)
+                .run_prompt_once(&request_id, &augmented_text, context_id, failover_armed)
                 .await
             {
                 TurnOutcome::Completed => return,
