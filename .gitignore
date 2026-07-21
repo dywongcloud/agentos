@@ -42,6 +42,7 @@ holoiroh/ios-app/build/
 holoiroh/.gm/
 holoiroh/.agentplug-kv/
 holoiroh/.agentplug/
-# Unrelated local exercise living inside the holoiroh tree; excluded from the
+# Unrelated local exercises living inside the holoiroh tree; excluded from the
 # cargo workspace (see holoiroh/Cargo.toml) and from version control alike.
 holoiroh/rust_db_project/
+holoiroh/hello_world/

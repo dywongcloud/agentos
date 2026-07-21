@@ -1399,16 +1399,11 @@ struct MainView: View {
                 )
                 // Escape hatch for the keyboard's own "return"/multi-line
                 // behavior swallowing a plain tap on the keyboard's chrome:
-                // a toolbar "Done" button above the keyboard, the standard
-                // iOS affordance for dismissing a keyboard with no visible
+                // the shared Done bar above the keyboard, the standard iOS
+                // affordance for dismissing a keyboard with no visible
                 // return-to-send key (this field uses `axis: .vertical` +
                 // multi-line, so "return" inserts a newline, not submit).
-                .toolbar {
-                    ToolbarItemGroup(placement: .keyboard) {
-                        Spacer()
-                        Button("Done") { isPromptFocused = false }
-                    }
-                }
+                .keyboardDoneToolbar { isPromptFocused = false }
                 // ALWAYS direct-send, both modes: the minimal UI hides the
                 // Reviewing panel inside the controls sheet, so the old
                 // stage-then-confirm flow silently swallowed every prompt

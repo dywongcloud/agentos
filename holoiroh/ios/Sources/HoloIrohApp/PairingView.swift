@@ -268,14 +268,10 @@ struct PairingView: View {
                 .onTapGesture { focusedField = nil }
         )
         // The standard iOS affordance for keyboards with no dismiss key
-        // (multi-line editor + number pad): a Done button riding above the
-        // keyboard, shared by both fields.
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("Done") { focusedField = nil }
-            }
-        }
+        // (multi-line editor + number pad): the shared Done bar riding above
+        // the keyboard, clearing focus for whichever field owns it. One
+        // merged keyboard toolbar is shown for both fields.
+        .keyboardDoneToolbar { focusedField = nil }
         .alert("Save profile", isPresented: $showSaveNamePrompt) {
             TextField("Profile name", text: $newProfileName)
             Button("Save") {
