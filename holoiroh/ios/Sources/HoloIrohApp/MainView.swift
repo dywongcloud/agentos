@@ -1516,19 +1516,6 @@ struct MainView: View {
         session = .connecting
     }
 
-    private func sendPrompt() {
-        let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        isPromptFocused = false
-
-        // Capturing a prompt only *stages* it: nothing reaches the daemon
-        // until the user confirms with the Reviewing panel's Send control
-        // (`advanceFromReviewToWorking`), which performs the real
-        // control-channel send. Acks now come from the daemon, not a local
-        // synthesized entry.
-        beginReview(from: trimmed)
-    }
-
     private func toggleMicrophone() {
         // Real on-device transcription via `VoiceTranscriberModel` (Speech
         // framework). `ClientMessage.voiceTranscript` control-channel send

@@ -81,9 +81,10 @@ async fn main() -> anyhow::Result<()> {
 
     let expect_hard_block =
         std::env::var("CONSENT_PROBE_EXPECT").as_deref() == Ok("hard_block");
-    // Which consent option to answer with ("Allow once" default; set
-    // CONSENT_PROBE_ANSWER="Stop task" to witness the deny arm: the parked
-    // turn is discarded and the daemon reports the task stopped).
+    // Which consent option to answer with ("Allow once" default; "Stop task"
+    // witnesses the deny arm; the literal "none" witnesses the EXPIRY arm --
+    // no answer is sent, and the probe waits out the daemon's 120s consent
+    // TTL expecting the safe-pause status).
     let answer =
         std::env::var("CONSENT_PROBE_ANSWER").unwrap_or_else(|_| "Allow once".to_string());
 
@@ -160,6 +161,79 @@ async fn main() -> anyhow::Result<()> {
     }
     let (consent_id, _) = consent.unwrap();
     println!("PASS(gate): sensitive-app watchdog paused the turn and asked for consent");
+
+    if answer == "none" {
+        // Expiry arm: send NOTHING and wait out the daemon's consent TTL
+        // (120s) plus margin. The daemon's bridge-side timer must clear the
+        // pending consent and emit the standard safe-pause status ("expired
+        // with no response -- task safely paused"), leaving the task parked.
+        println!("expiry mode: not answering; waiting out the 120s consent TTL...");
+        let expiry_deadline = tokio::time::Instant::now() + Duration::from_secs(150);
+        loop {
+            if tokio::time::Instant::now() > expiry_deadline {
+                panic!("no expiry safe-pause status within 150s of the consent ask");
+            }
+            let Ok(Ok(Some(line))) =
+                tokio::time::timeout(Duration::from_secs(150), lines.next_line()).await
+            else {
+                continue;
+            };
+            let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) else {
+                continue;
+            };
+            if let ServerMessage::Status { text: Some(t) } = &env.payload {
+                if t.contains("expired with no response") {
+                    println!("<- {t}");
+                    break;
+                }
+            }
+        }
+        println!("PASS(expiry): unanswered consent lapsed into the safe-pause state");
+        // The parked turn must still be resumable after expiry.
+        let env = TaskEnvelope::<ClientMessage>::wrap(
+            session_id.clone(),
+            Some(uuid::Uuid::new_v4().to_string()),
+            seq,
+            ClientMessage::Resume,
+        );
+        seq += 1;
+        write_line(&mut send, &env).await?;
+        let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if tokio::time::Instant::now() > resume_deadline {
+                panic!("no 'resuming' status within 30s of post-expiry resume");
+            }
+            let Ok(Ok(Some(line))) =
+                tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await
+            else {
+                continue;
+            };
+            let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) else {
+                continue;
+            };
+            if let ServerMessage::Status { text: Some(t) } = &env.payload {
+                if t.contains("resuming") {
+                    println!("<- {t}");
+                    break;
+                }
+            }
+        }
+        println!("PASS(post-expiry resume): the parked turn resumed after the ask lapsed");
+        // Cleanup: stop the resumed turn; close System Settings.
+        let env = TaskEnvelope::<ClientMessage>::wrap(
+            session_id.clone(),
+            Some(uuid::Uuid::new_v4().to_string()),
+            seq,
+            ClientMessage::Stop,
+        );
+        write_line(&mut send, &env).await?;
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", "tell application \"System Settings\" to quit"])
+            .status();
+        println!();
+        println!("consent_probe: OK -- expiry arm witnessed live: unanswered consent safe-paused, then resumed.");
+        return Ok(());
+    }
 
     // Answer with the configured option.
     let env = TaskEnvelope::<ClientMessage>::wrap(
