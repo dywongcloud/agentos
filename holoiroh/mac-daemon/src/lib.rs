@@ -27,6 +27,7 @@ pub mod local_model;
 pub mod pairing_phrase;
 pub mod permissions;
 pub mod policy;
+pub mod process_awareness;
 pub mod registry;
 pub mod sensitive_categories;
 pub mod task_state;

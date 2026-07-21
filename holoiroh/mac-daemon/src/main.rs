@@ -39,6 +39,7 @@ mod tinfoil_proxy;
 mod pairing_phrase;
 mod permissions;
 mod policy;
+mod process_awareness;
 mod registry;
 mod sensitive_categories;
 mod task_state;

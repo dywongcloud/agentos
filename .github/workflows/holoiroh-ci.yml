@@ -84,7 +84,8 @@ jobs:
             local_model_edge_probe \
             serve_guard_probe \
             pause_redirect_probe \
-            frontmost_app_probe
+            frontmost_app_probe \
+            process_awareness_probe
           do
             # duration parsing is witnessed by ticket_rotation_probe; skip the alias
             [ "$probe" = "duration_probe_via_ticket_rotation" ] && continue

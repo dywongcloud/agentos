@@ -311,7 +311,7 @@ pub struct HoloControlBridge {
     /// the store failed to open (e.g. `$HOME` unset in some unusual launch environment) --
     /// degrade-don't-crash, matching every other best-effort subsystem in this bridge; a
     /// missing store just means no context gets prepended, never a turn failure.
-    env_context: Option<crate::env_context::EnvContextStore>,
+    env_context: Option<Arc<crate::env_context::EnvContextStore>>,
     /// The turn currently inside [`Self::run_prompt`], if any -- set on entry, `context_id`
     /// upgraded mid-stream via `send_and_stream`'s `on_context`, cleared by the same guard
     /// that concludes the task FSM. This is what Stop/Pause/Redirect and the sensitive-app
@@ -386,7 +386,25 @@ impl HoloControlBridge {
             bridge: std::sync::OnceLock::new(),
             tasks: crate::task_fsm::TaskRegistry::new(),
             env_context: match crate::env_context::EnvContextStore::open() {
-                Ok(store) => Some(store),
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    // Seed the built-in environment facts (Ghostty default terminal, never
+                    // interrupt Claude Code, this project) on startup so the soft semantic
+                    // layer always has them, not just after a manual seeding step. Spawned so
+                    // the first-run embedding-model download never blocks bridge construction;
+                    // idempotent upsert-by-key, so re-seeding every start is cheap.
+                    let seed_store = store.clone();
+                    tokio::spawn(async move {
+                        match seed_store.seed_defaults().await {
+                            Ok(n) => tracing::info!(facts = n, "env_context: seeded default environment facts"),
+                            Err(err) => tracing::warn!(
+                                error = %format!("{err:#}"),
+                                "env_context: seeding default facts failed (the hard process-awareness guard still carries the same rules)"
+                            ),
+                        }
+                    });
+                    Some(store)
+                }
                 Err(err) => {
                     tracing::warn!(
                         error = %format!("{err:#}"),
@@ -709,22 +727,40 @@ impl HoloControlBridge {
         // could skew the heuristic toward "complex" on every turn. Best-effort: retrieval
         // failure (model not yet cached, embedding error) logs and falls through to the
         // unmodified prompt -- a missing context block should never fail a turn.
-        let augmented_text = match &self.env_context {
+        let env_block = match &self.env_context {
             Some(store) => match store.retrieve(&text, 5).await {
-                Ok(facts) => match crate::env_context::format_context_block(&facts) {
-                    Some(block) => format!("{block}\n{text}"),
-                    None => text.clone(),
-                },
+                Ok(facts) => crate::env_context::format_context_block(&facts),
                 Err(err) => {
                     tracing::debug!(
                         request_id,
                         error = %format!("{err:#}"),
                         "env_context retrieval failed; sending prompt without environment context"
                     );
-                    text.clone()
+                    None
                 }
             },
-            None => text.clone(),
+            None => None,
+        };
+
+        // Process-awareness / do-not-touch guard (issue 2): the HARD, UNCONDITIONAL rules
+        // (never interrupt an existing Claude Code session, default terminal is Ghostty) plus
+        // a LIVE snapshot of the protected processes running right now. Injected on every turn
+        // ahead of the softer semantically-retrieved env facts and the user's own prompt, so
+        // the agent is always told exactly what is running and what it must not disturb. Runs
+        // synchronously (a quick `ps`); best-effort inside the module (empty on failure).
+        let guard_block = crate::process_awareness::guard_block_now();
+
+        // Order: hard guard first (highest authority), then durable env facts, then the user's
+        // instruction. `run_prompt_once` sends this whole string to the backend.
+        let augmented_text = {
+            let mut s = guard_block;
+            if let Some(block) = env_block {
+                s.push('\n');
+                s.push_str(&block);
+            }
+            s.push('\n');
+            s.push_str(&text);
+            s
         };
 
         // At most ONE failover retry per turn: attempt 0 may suppress a backend failure and
@@ -1090,6 +1126,16 @@ impl HoloControlBridge {
             request_id: request_id.clone(),
         });
 
+        // The request_id of the turn actually running when this Stop arrived -- captured now
+        // so the force-escalation below can tell "the turn we asked to stop is STILL running"
+        // from "it stopped and a different turn started". `None` if nothing was running.
+        let stopped_turn_request_id = self
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .as_ref()
+            .map(|t| t.request_id.clone());
+
         // A stop discards any paused turn outright -- "stop" means stop everything, and a
         // stash silently surviving it would resurrect a task the user just killed on the
         // next Resume. Also drop any outstanding consent request tied to it.
@@ -1111,13 +1157,20 @@ impl HoloControlBridge {
         // wire message carried no context_id (the iOS client never has one): lower blast
         // radius and a faster terminal than waiting on the global kill switch's 250ms file
         // poll alone. The global `holo stop` below still runs for the no-context case.
+        // Debug-only witness hook (see the block further down): when set, skip BOTH the
+        // scoped A2A cancel and the graceful holo stop so the turn genuinely survives and the
+        // force escalation is forced to fire. Never set in production.
+        let skip_graceful = std::env::var("HOLOIROH_DEBUG_STOP_SKIP_GRACEFUL")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
         let current_ids = self
             .current_turn
             .lock()
             .expect("current_turn lock poisoned")
             .as_ref()
             .and_then(|t| t.context_id.clone().map(|ctx| (ctx, t.a2a_task_id.clone())));
-        if context_id.is_none() {
+        if context_id.is_none() && !skip_graceful {
             if let Some((ctx, task_id)) = current_ids {
                 let client = self.client.read().expect("client lock poisoned").clone();
                 if let Err(err) = client.cancel(&ctx, task_id.as_deref()).await {
@@ -1165,10 +1218,19 @@ impl HoloControlBridge {
             }
         }
 
+        // Debug-only witness hook: `HOLOIROH_DEBUG_STOP_SKIP_GRACEFUL=1` makes this Stop skip
+        // the scoped A2A cancel (above) AND the graceful `holo stop` (below), so the running
+        // turn survives and the force escalation is forced to fire against a genuinely-
+        // still-running turn -- the only way to witness the escalation path end-to-end without
+        // a real runaway desktop agent. Never set in production.
+        if skip_graceful {
+            tracing::warn!("HOLOIROH_DEBUG_STOP_SKIP_GRACEFUL set -- skipping scoped cancel + graceful holo stop to exercise force escalation");
+        }
+
         // Global `holo stop` kill switch: always issued when no context_id was given (the
         // caller wants "stop whatever is running"), or when `force` was requested (force
         // implies a process-level SIGKILL that only the CLI path performs -- see stop.rs).
-        if context_id.is_none() || force {
+        if (context_id.is_none() || force) && !skip_graceful {
             if let Err(err) = crate::holo_bridge::stop::holo_stop(&self.holo_bin, force).await {
                 tracing::warn!(request_id, error = %err, "holo stop failed");
                 self.emit(ControlEvent::Error {
@@ -1176,6 +1238,54 @@ impl HoloControlBridge {
                     message: format!("holo stop failed: {err}"),
                 });
                 return;
+            }
+        }
+
+        // FORCE ESCALATION (the fix for "I pressed Stop and the agent kept going"): graceful
+        // `holo stop` is best-effort -- it files `~/.holo/stop` and relies on the running
+        // turn's own 250ms poll to pause-then-cancel the backend session. For a real agent
+        // mid-tool-execution that can fail to actually halt, which is exactly what the user
+        // witnessed. A user-initiated Stop is an explicit "kill it NOW", so if the SAME turn
+        // is still running a short moment after the graceful stop, escalate to
+        // `holo stop --force` (SIGKILL of `hai-agent-runtime`); the health loop respawns
+        // `holo serve` for the next prompt. Skipped when this stop was already `force`, or
+        // when nothing was running.
+        if !force {
+            if let (Some(stopped_id), Some(bridge)) = (
+                stopped_turn_request_id.clone(),
+                self.bridge.get().and_then(std::sync::Weak::upgrade),
+            ) {
+                tokio::spawn(async move {
+                    // 3s (not a snappy 1.5s): the scoped A2A cancel + graceful `holo stop`
+                    // above genuinely halt the backend for normal turns (witnessed: 0 progress
+                    // after the canceled terminal), so a turn STILL running 3s after an
+                    // explicit user Stop is a real runaway that earns the hammer. The generous
+                    // window makes a spurious force-kill of an about-to-finish turn (which
+                    // would cost an unnecessary `holo serve` restart) very unlikely.
+                    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+                    let still_running = bridge
+                        .control
+                        .current_turn
+                        .lock()
+                        .expect("current_turn lock poisoned")
+                        .as_ref()
+                        .is_some_and(|t| t.request_id == stopped_id);
+                    if still_running {
+                        tracing::warn!(
+                            request_id = stopped_id,
+                            "stop: turn still running 3s after graceful holo stop; escalating to `holo stop --force`"
+                        );
+                        if let Err(err) =
+                            crate::holo_bridge::stop::holo_stop(&bridge.control.holo_bin, true).await
+                        {
+                            tracing::warn!(error = %err, "forced holo stop failed");
+                        } else {
+                            bridge.control.emit_daemon_status(
+                                "stop escalated to force -- the agent was still running and has been killed",
+                            );
+                        }
+                    }
+                });
             }
         }
 

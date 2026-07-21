@@ -500,3 +500,49 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// The built-in environment facts every daemon should know about THIS user's setup, seeded on
+/// startup so the terminal/Claude-Code awareness is always present rather than depending on a
+/// human having run some prior seeding step. `remember` is upsert-by-key, so re-seeding on
+/// every start is idempotent (unchanged text is a cheap no-op re-embed). Best-effort at the
+/// call site (`main.rs`): a seeding failure (e.g. the embedding model can't download offline)
+/// must never block daemon startup -- the hard `process_awareness` guard block still carries
+/// the same rules unconditionally even if these softer semantic facts aren't indexed.
+pub const DEFAULT_ENV_FACTS: &[(&str, &str)] = &[
+    (
+        "terminal-app-ghostty",
+        "The user's default terminal application is Ghostty, not Apple's Terminal.app or iTerm2 \
+         (Terminal.app is an acceptable alternative if Ghostty is unavailable). When asked to \
+         open, use, or go to a terminal or an existing CLI session (e.g. Claude Code), check for \
+         an already-running Ghostty window first (Mission Control / Cmd+Tab / the Dock) instead \
+         of opening a new terminal application.",
+    ),
+    (
+        "never-interrupt-claude-code",
+        "Never interrupt, close, quit, Ctrl-C, or type into an existing Claude Code session (a \
+         `claude` CLI process, usually running inside a Ghostty or Terminal window) unless the \
+         user explicitly asks. Claude Code sessions are the user's active work and disturbing \
+         one loses their state. If a task needs a terminal but one already has Claude Code \
+         running, open a separate terminal window instead of reusing that one.",
+    ),
+    (
+        "project-aro-holoiroh",
+        "This computer-use daemon's own source project is called Aro (internal codename \
+         holoiroh, directory ~/Documents/agentOS/holoiroh); it is a git repository the user edits \
+         via Claude Code, typically already running in an existing Ghostty terminal window \
+         rather than needing a fresh one opened.",
+    ),
+];
+
+impl EnvContextStore {
+    /// Seed [`DEFAULT_ENV_FACTS`] into the corpus + vector index (upsert-by-key). Idempotent;
+    /// call once on daemon startup. Returns the number of facts seeded.
+    pub async fn seed_defaults(&self) -> Result<usize> {
+        let mut n = 0;
+        for (key, text) in DEFAULT_ENV_FACTS {
+            self.remember(key, text).await?;
+            n += 1;
+        }
+        Ok(n)
+    }
+}
