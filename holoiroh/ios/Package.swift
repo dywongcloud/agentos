@@ -64,7 +64,13 @@ let package = Package(
                 // the invisible-orb bug.) Bundled so the background renders
                 // with zero runtime network dependency. `.copy` (not
                 // `.process`): an opaque binary blob the runtime parses.
-                .copy("Resources/orb.splineswift")
+                .copy("Resources/orb.splineswift"),
+                // Real app icons for the orb's orbiting badges
+                // (OrbEffects.swift) -- 128px PNGs, loaded by filename from
+                // this copied directory. `.copy` keeps the directory
+                // structure so Bundle.module lookups can use
+                // subdirectory: "AppIcons".
+                .copy("Resources/AppIcons")
             ]
         )
     ]

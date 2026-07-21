@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The orb's "thinking" reaction: state + overlay effects layered over the
 /// Spline blob when a message is sent, plus small app badges orbiting the
@@ -16,32 +17,43 @@ import SwiftUI
 // MARK: - App catalog
 
 /// One recognizable app/tool the orbit effect can represent: match
-/// keywords (word-boundary, case-insensitive, against the sent prompt), a
-/// brand-ish tile color, and an SF Symbol glyph standing in for the app's
-/// mark (bundling real third-party app icons would drag trademarked
-/// artwork into the repo; a colored rounded square + glyph reads clearly
-/// at 28pt).
+/// keywords (word-boundary, case-insensitive, against the sent prompt).
+/// Apps with a bundled REAL icon (`iconAsset` -> Resources/AppIcons/<name>.png,
+/// 128px, user-supplied artwork) render it directly; the rest fall back to
+/// a brand-colored rounded square + SF Symbol glyph.
 struct OrbitApp: Identifiable, Equatable {
     let id: String
     let displayName: String
     let symbol: String
     let color: Color
     let keywords: [String]
+    /// Filename (sans extension) of a bundled real icon in
+    /// `Resources/AppIcons`, when one exists.
+    var iconAsset: String? = nil
 
     /// The catalog of recognizable apps, in match-priority order.
     static let catalog: [OrbitApp] = [
         OrbitApp(id: "slack", displayName: "Slack", symbol: "number",
                  color: Color(red: 0.29, green: 0.08, blue: 0.29),
-                 keywords: ["slack"]),
+                 keywords: ["slack"], iconAsset: "slack"),
         OrbitApp(id: "chrome", displayName: "Chrome", symbol: "globe",
                  color: Color(red: 0.26, green: 0.52, blue: 0.96),
-                 keywords: ["chrome", "google chrome"]),
+                 keywords: ["chrome", "google chrome"], iconAsset: "chrome"),
         OrbitApp(id: "safari", displayName: "Safari", symbol: "safari",
                  color: Color(red: 0.0, green: 0.48, blue: 1.0),
                  keywords: ["safari", "browser"]),
         OrbitApp(id: "vscode", displayName: "VS Code", symbol: "chevron.left.forwardslash.chevron.right",
                  color: Color(red: 0.0, green: 0.48, blue: 0.80),
-                 keywords: ["vscode", "vs code", "visual studio code"]),
+                 keywords: ["vscode", "vs code", "visual studio code"], iconAsset: "vscode"),
+        OrbitApp(id: "docker", displayName: "Docker", symbol: "shippingbox",
+                 color: Color(red: 0.11, green: 0.56, blue: 0.95),
+                 keywords: ["docker", "container", "dockerfile"], iconAsset: "docker"),
+        OrbitApp(id: "kubernetes", displayName: "Kubernetes", symbol: "helm",
+                 color: Color(red: 0.20, green: 0.45, blue: 0.84),
+                 keywords: ["kubernetes", "k8s", "kubectl"], iconAsset: "kubernetes"),
+        OrbitApp(id: "claude", displayName: "Claude", symbol: "sparkles",
+                 color: Color(red: 0.85, green: 0.45, blue: 0.25),
+                 keywords: ["claude", "claude code"], iconAsset: "claude"),
         OrbitApp(id: "terminal", displayName: "Terminal", symbol: "terminal",
                  color: Color(red: 0.12, green: 0.12, blue: 0.14),
                  keywords: ["ghostty", "ghosty", "terminal", "shell", "zsh", "bash", "command line"]),
@@ -270,24 +282,53 @@ private struct OrbitingBadges: View {
     }
 }
 
-/// One 28pt rounded-square app tile: brand color, white glyph, soft shadow.
+/// One 28pt app tile: the REAL bundled icon when the catalog entry carries
+/// one (Resources/AppIcons/<asset>.png), else the brand-color + SF-glyph
+/// stand-in. Icons are cached per asset name so the orbit's per-frame
+/// re-render never re-reads the file from disk.
 private struct AppBadge: View {
     let app: OrbitApp
 
+    /// Loaded once per asset name for the process lifetime -- badge views
+    /// are recreated every TimelineView frame, so caching here is what
+    /// keeps real-icon rendering as cheap as the old vector stand-ins.
+    private static var iconCache: [String: UIImage] = [:]
+
+    private static func bundledIcon(named asset: String) -> UIImage? {
+        if let cached = iconCache[asset] { return cached }
+        guard
+            let url = Bundle.module.url(
+                forResource: asset, withExtension: "png", subdirectory: "AppIcons"),
+            let image = UIImage(contentsOfFile: url.path)
+        else { return nil }
+        iconCache[asset] = image
+        return image
+    }
+
     var body: some View {
-        RoundedRectangle(cornerRadius: 7, style: .continuous)
-            .fill(app.color)
-            .frame(width: 28, height: 28)
-            .overlay(
-                Image(systemName: app.symbol)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.white)
-            )
-            .overlay(
+        Group {
+            if let asset = app.iconAsset, let icon = Self.bundledIcon(named: asset) {
+                Image(uiImage: icon)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 28, height: 28)
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            } else {
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(.white.opacity(0.25), lineWidth: 0.8)
-            )
-            .shadow(color: .black.opacity(0.55), radius: 5, y: 2)
-            .accessibilityLabel("\(app.displayName) involved in this task")
+                    .fill(app.color)
+                    .frame(width: 28, height: 28)
+                    .overlay(
+                        Image(systemName: app.symbol)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(.white.opacity(0.25), lineWidth: 0.8)
+                    )
+            }
+        }
+        .shadow(color: .black.opacity(0.55), radius: 5, y: 2)
+        .accessibilityLabel("\(app.displayName) involved in this task")
     }
 }

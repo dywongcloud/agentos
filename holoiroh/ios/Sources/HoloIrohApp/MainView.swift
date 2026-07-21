@@ -240,7 +240,13 @@ struct MainView: View {
             // coincide exactly.
             let boxWidth = geo.size.width * 0.85
             let boxHeight = boxWidth * 10.0 / 16.0
-            let boxCenterY = geo.size.height * 0.60 + boxHeight / 2
+            // Box top at 56% of screen height (was 60% -- live-witnessed on
+            // device: the box's bottom edge physically covered the
+            // pause/stop task pill), PLUS a dynamic clearance for the pill's
+            // own footprint whenever it is showing, so the mid-task controls
+            // are never obscured by the live share.
+            let pillClearance: CGFloat = (isTaskActive || isTaskPaused) ? 58 : 0
+            let boxCenterY = geo.size.height * 0.56 + boxHeight / 2 - pillClearance
             let isConnected = connection.phase == .connected
             // Fullscreen only ever presents while the video surface exists;
             // if the connection drops mid-fullscreen the normal layout comes
@@ -340,6 +346,9 @@ struct MainView: View {
             // Keyed on `keyboardHeight` -- both barShift and boxShift derive
             // from it, so one animation covers both surfaces.
             .animation(.spring(response: 0.35, dampingFraction: 0.85), value: keyboardHeight)
+            // The box glides (not snaps) when the task pill appears/vanishes
+            // and shifts its position via pillClearance.
+            .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isTaskActive || isTaskPaused)
             // Manual keyboard avoidance is the ONLY authority here: without
             // this, SwiftUI's automatic safe-area keyboard avoidance ALSO
             // raises the layout on some iOS versions and STACKS with the
