@@ -99,7 +99,7 @@ final class ConnectionProfileStore: ObservableObject {
     // saved ticket with stale port hints still connects; this constant just gets
     // re-synced to the live daemon's printout whenever a deploy touches it.
     private static let currentDevTicket =
-        "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwFACNodHRwczovL3VzdzEtMS5yZWxheS5uMC5pcm9oLmxpbmsuLwEALTJiaazUAwEALTJiacnpAwEAwKgBTP2iAwEAwKj_Cv2iAw/holoiroh"
+        "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwFACNodHRwczovL3VzdzEtMS5yZWxheS5uMC5pcm9oLmxpbmsuLwEALTJiadi2AgEALTJiaYnGAwEAwKgBTO6IAwEAwKj_Cu6IAw/holoiroh"
     private static let currentDevPin = "394299"
 
     /// One-time in-place refresh of an ALREADY-seeded "Dev Mac" row's ticket/PIN to the
@@ -113,7 +113,7 @@ final class ConnectionProfileStore: ObservableObject {
         // Flag key carries a serial, not just a date: bump it every time the
         // seeded ticket/PIN constants change so ALREADY-refreshed installs
         // (whose previous flag is set) pick up the new values too.
-        let refreshFlag = "ConnectionProfileStore.didRefreshDevProfile_2026-07-20.2"
+        let refreshFlag = "ConnectionProfileStore.didRefreshDevProfile_2026-07-20.3"
         guard !UserDefaults.standard.bool(forKey: refreshFlag) else { return }
         defer { UserDefaults.standard.set(true, forKey: refreshFlag) }
         guard let db else { return }
@@ -133,6 +133,44 @@ final class ConnectionProfileStore: ObservableObject {
         }
         NSLog("ConnectionProfileStore: refreshed 'Dev Mac' profile to the current daemon ticket/PIN")
         reload()
+    }
+
+    /// Pins the "Dev Mac" default profile to the ticket/PIN a control-channel
+    /// connection just SUCCEEDED with -- called from `MainView` on every
+    /// `.connected`. This is what keeps the sqlite default profile pointed at
+    /// the daemon's CURRENT identity without hand-syncing the seed constants
+    /// after every daemon restart (a ticket's trailing direct-address hints
+    /// drift per restart; whatever actually connected is by definition the
+    /// freshest working value). Updates by NAME (same "refresh the default
+    /// slot" semantics as `refreshDevProfileIfPresent`); inserts the row if a
+    /// user deleted it and then connected manually. No-ops when the stored
+    /// values already match, so routine reconnects don't churn the DB.
+    func upsertDefaultProfile(ticket: String, pin: String) {
+        let trimmedTicket = ticket.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPin = pin.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTicket.isEmpty else { return }
+        guard let db else { return }
+
+        if let existing = profiles.first(where: { $0.name == "Dev Mac" }) {
+            if existing.ticket == trimmedTicket && existing.pin == trimmedPin { return }
+            var stmt: OpaquePointer?
+            let sql = "UPDATE profiles SET ticket = ?1, pin = ?2 WHERE name = 'Dev Mac';"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                logError("prepare upsert default profile")
+                return
+            }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_text(stmt, 1, trimmedTicket, -1, Self.transient)
+            sqlite3_bind_text(stmt, 2, trimmedPin, -1, Self.transient)
+            guard sqlite3_step(stmt) == SQLITE_DONE else {
+                logError("step upsert default profile")
+                return
+            }
+            reload()
+        } else {
+            save(name: "Dev Mac", ticket: trimmedTicket, pin: trimmedPin)
+        }
+        NSLog("ConnectionProfileStore: default 'Dev Mac' profile pinned to the connected daemon identity")
     }
 
     // MARK: - CRUD
