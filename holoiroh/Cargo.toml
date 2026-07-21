@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["mac-daemon", "ios-bridge", "holoiroh-wire", "rust_db_project"]
+members = ["mac-daemon", "ios-bridge", "holoiroh-wire"]
+# `rust_db_project/` is an unrelated local exercise living inside this tree; it
+# was briefly a workspace member, which broke fresh clones (the directory is
+# untracked, so the workspace referenced a member that doesn't exist in git).
+# `exclude` keeps it buildable standalone (its own Cargo.toml as root) without
+# holoiroh's build depending on it.
+exclude = ["rust_db_project"]
 
 # Local patch of the pinned iroh-live commit (5f95758, see mac-daemon/Cargo.toml
 # and ios-bridge/Cargo.toml's own comments on the git-pin rationale): upstream

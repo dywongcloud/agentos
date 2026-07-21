@@ -214,14 +214,17 @@ entire bare message body):
 { "type": "prompt", "text": "open safari and check my calendar" }
 { "type": "voice_transcript", "text": "what's on my screen right now" }
 { "type": "stop" }
+{ "type": "pause" }
+{ "type": "resume" }
+{ "type": "redirect", "text": "actually, draft it as an email instead" }
 { "type": "pin", "pin": "123456" }
 { "type": "input_response", "request_id": "d290f1ee-6c54-4b01-90e6-d701748f0851", "selected_option": "Work calendar" }
 ```
 
 | Field             | Type                                                                        | Required | Meaning |
 |-------------------|------------------------------------------------------------------------------|----------|---------|
-| `type`            | `"prompt"` \| `"voice_transcript"` \| `"stop"` \| `"pin"` \| `"input_response"` | yes | Discriminant. |
-| `text`            | `string`                                                                    | only for `prompt` / `voice_transcript` | The instruction text. Voice input is always transcribed client-side before sending — the wire format is never raw audio (see README's "Prompts" section). |
+| `type`            | `"prompt"` \| `"voice_transcript"` \| `"stop"` \| `"pause"` \| `"resume"` \| `"redirect"` \| `"pin"` \| `"input_response"` | yes | Discriminant. |
+| `text`            | `string`                                                                    | only for `prompt` / `voice_transcript` / `redirect` | The instruction text. Voice input is always transcribed client-side before sending — the wire format is never raw audio (see README's "Prompts" section). |
 | `pin`             | `string`                                                                    | only for `pin` | The PIN the user was shown out-of-band (Mac terminal, alongside the ticket) and typed/scanned into the client. |
 | `request_id`      | `string`                                                                    | only for `input_response` | Echoes the `request_id` of the `input_request` this answers. |
 | `selected_option` | `string`                                                                    | only for `input_response` | The user's chosen option, expected to be one of the original `input_request.response_options`. |
@@ -245,6 +248,27 @@ entire bare message body):
   running") rather than a scoped A2A `tasks/cancel`; a future schema revision
   that threads a `context_id`/`task_id` through would let a client scope the
   stop to one specific turn.
+- `pause`: parks the in-flight turn so `resume` can continue it. The Holo
+  backend exposes **no pause RPC** over A2A (its own kill switch is
+  pause-then-cancel — see `mac-daemon/src/holo_bridge/stop.rs`'s source
+  notes), so the daemon implements pause as the only honest primitive
+  available: it **cancels** the running turn (scoped A2A `tasks/cancel` when
+  the turn's `contextId` has resolved, else the graceful global `holo stop`)
+  while stashing the turn's original instruction text and `contextId`. The
+  canceled turn still produces its normal `task_done` (`canceled`) — a
+  client showing a "paused" state should expect and tolerate that terminal.
+  Pausing with nothing running, or pausing twice, is a polite `status`
+  reply, never an error.
+- `resume`: re-dispatches the parked turn on the **same** `contextId`, so
+  the backend session's history carries the task forward from where it was
+  interrupted. The resumed turn runs under the `resume` envelope's own
+  `task_id`. Resuming with nothing parked is a polite `status` reply.
+- `redirect`: replaces whatever is running/queued with a new instruction —
+  the daemon cancels the in-flight turn, drains the queue (each queued
+  prompt gets its own `task_done`/`Done{Canceled}`), discards any parked
+  (paused) turn, and runs `text`, reusing the canceled turn's `contextId`
+  when known so the agent keeps the task history it had built up. An empty
+  `text` is rejected with an `error`.
 - `pin`: presents a PIN for first-connection auth (see
   `mac-daemon/PAIRING.md`'s "Auth beyond ticket possession" section). Must
   be the **first** message sent by a client whose device id is not already
@@ -280,6 +304,7 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
 { "type": "ack" }
 { "type": "status", "text": "connected to holo-desktop-cli" }
 { "type": "task_progress", "text": "clicked Safari icon in the Dock" }
+{ "type": "task_done", "status": "completed", "text": "drafted the message" }
 { "type": "error", "text": "holo-desktop-cli exited unexpectedly (code 1)" }
 { "type": "auth_rejected", "text": "incorrect PIN" }
 { "type": "input_request", "request_id": "d290f1ee-6c54-4b01-90e6-d701748f0851", "kind": "ambiguous_choice", "context": "Two calendars match 'team standup' -- which one?", "response_options": ["Work calendar", "Personal calendar"], "expires_at": 1800000120000 }
@@ -287,8 +312,9 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
 
 | Field              | Type                                                                                          | Required | Meaning |
 |--------------------|-------------------------------------------------------------------------------------------------|----------|---------|
-| `type`             | `"ack"` \| `"status"` \| `"error"` \| `"task_progress"` \| `"auth_rejected"` \| `"input_request"` | yes | Discriminant. |
-| `text`             | `string`                                                                                       | optional on `ack`/`status`/`error`/`task_progress`/`auth_rejected` | Human-readable detail. |
+| `type`             | `"ack"` \| `"status"` \| `"error"` \| `"task_progress"` \| `"task_done"` \| `"auth_rejected"` \| `"input_request"` | yes | Discriminant. |
+| `text`             | `string`                                                                                       | optional on `ack`/`status`/`error`/`task_progress`/`task_done`/`auth_rejected` | Human-readable detail. |
+| `status`           | `"completed"` \| `"failed"` \| `"canceled"`                                                     | only for `task_done` | Which terminal state the task reached. |
 | `request_id`       | `string`                                                                                       | only for `input_request` | Correlates this request with the eventual `ClientMessage.input_response`. |
 | `kind`             | `"credential"` \| `"mfa"` \| `"ambiguous_choice"` \| `"missing_info"` \| `"sensitive_access_consent"` | only for `input_request` | Classifies *why* input is needed — see below. |
 | `context`          | `string`                                                                                       | only for `input_request` | Human-readable explanation of what's needed and why. **Never contains the credential/secret value itself** — see the `input_request` section below. |
@@ -306,6 +332,14 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
   while it's carrying out a `prompt`/`voice_transcript` (per README's "Holo
   bridge" section — "Progress/results are relayed back over the control
   channel").
+- `task_done`: the terminal lifecycle signal for one task — the turn named
+  by the envelope's `task_id` reached `status` (`completed` / `failed` /
+  `canceled`), with optional human-readable detail in `text`. Added
+  (additively) so a client's task controls have a reliable end-of-task
+  signal to key off; previously a terminal was folded into free-text
+  `status`/`error` lines. Note the pause interaction: pausing a task
+  cancels its running turn (see `pause` above), so a `task_done` with
+  `"canceled"` arrives even for a task the user considers merely paused.
 - `error`: something failed (bad envelope, malformed payload, envelope
   rejected per the rules above, bridge process crashed, capture failure,
   etc.). `text` should contain enough detail to show the user, not
@@ -335,6 +369,20 @@ to ask the user something. Its `kind` is one of:
 | `ambiguous_choice`           | The agent found more than one plausible way to proceed. | The candidate options, e.g. `["Work calendar", "Personal calendar"]`. |
 | `missing_info`                | The agent is missing information it cannot infer or safely guess. | Often `[]` (an open question like "which recipient email?"), but may list options when the answer is itself a closed set. |
 | `sensitive_access_consent`   | The next step touches something sensitive (a payment, a destructive action, private data) and needs explicit consent first. | Typically a yes/no pair, e.g. `["Yes, proceed", "No, cancel"]`. |
+
+**Live producer (PRD §9 sensitive-app gate).** As of this revision the
+daemon actually emits `sensitive_access_consent` requests: a per-turn
+watchdog polls the Mac's frontmost application while the agent acts and
+classifies its bundle id against the user-editable class-5 category config
+(`~/.holoiroh/sensitive_categories.toml` — see
+`mac-daemon/src/sensitive_categories.rs`). An `always_ask` category match
+pauses the turn (same park-the-turn mechanics as the wire `pause`) and
+sends an `input_request` with `response_options`
+`["Allow once", "Stop task"]`; `Allow once` resumes the turn and covers
+that category for the rest of the SAME task, anything else (or expiry
+after 120s) leaves the task safely stopped/paused. A `hard_block` category
+cancels the turn outright with a `status` explaining why; `always_allow`
+proceeds silently.
 
 **Credentials never travel on this channel — hard requirement, not a
 convention.** `input_request`'s `context`/`response_options` fields are

@@ -20,6 +20,7 @@ pub mod capture;
 pub mod control_channel;
 pub mod duration;
 pub mod executor;
+pub mod frontmost_app;
 pub mod holo_bridge;
 pub mod limits;
 pub mod local_model;

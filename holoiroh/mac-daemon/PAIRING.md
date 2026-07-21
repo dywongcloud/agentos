@@ -277,6 +277,16 @@ significant blast radius for a bare string being the only credential.
    `main.rs` prints it right after the ticket on every startup (unless
    `--no-pin-auth` is passed). The PIN is never persisted to disk -- only
    the *result* of a successful PIN check (the paired device's id) is.
+
+   **Stable-PIN override for dev Macs (`HOLOIROH_PIN`).** Setting the
+   `HOLOIROH_PIN` env var makes the daemon use that exact PIN instead of a
+   fresh random one every run. Rationale: the iOS app's saved connection
+   profiles (sqlite) store ticket + PIN; the ticket is already stable
+   across restarts (`~/.holoiroh/iroh_secret`), but a per-run random PIN
+   silently invalidated the saved PIN on every daemon restart -- harmless
+   for an already-allowlisted device (which skips the PIN gate entirely)
+   but exactly wrong for a fresh install reconnecting via a saved profile.
+   An env var, not a CLI flag, so the PIN never appears in `ps` output.
 2. **Persisted device allowlist at `~/.holoiroh/allowlist.json`.**
    `allowlist::Allowlist` is a real struct, its behavior witnessed by
    `cargo run --example allowlist_probe`: `load`/`save` round-trip

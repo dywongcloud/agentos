@@ -441,6 +441,18 @@ final class FFIControlChannelSender: ControlChannelSending {
     }
 
     func send(_ message: ClientMessage) {
+        sendWithRetry(message, retriesLeft: 20)
+    }
+
+    /// The greeting that carries the daemon-minted `session_id` races any
+    /// send fired the instant the connection reports `.connected` (the event
+    /// pump only polls every 150ms) -- live-witnessed: the auto-pair prompt
+    /// silently dropped with "no session_id yet" because the one send
+    /// attempt happened a few ms before the greeting was decoded. A send
+    /// that arrives before the greeting therefore RETRIES briefly (100ms *
+    /// 20 = up to 2s) instead of dropping; a genuinely missing greeting
+    /// still surfaces the error after the window.
+    private func sendWithRetry(_ message: ClientMessage, retriesLeft: Int) {
         let bridge = bridge
         let sessionState = sessionState
         let report = report
@@ -452,8 +464,14 @@ final class FFIControlChannelSender: ControlChannelSending {
         // one queue instead of racing a caller thread against it.
         queue.async {
             guard let wire = self.encoded(message, sessionState: sessionState) else {
-                DispatchQueue.main.async {
-                    reportError("control send \(message.wireKindLabel) failed: no session_id yet (daemon greeting not received)")
+                if retriesLeft > 0 {
+                    self.queue.asyncAfter(deadline: .now() + 0.1) {
+                        self.sendWithRetry(message, retriesLeft: retriesLeft - 1)
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        reportError("control send \(message.wireKindLabel) failed: no session_id yet (daemon greeting not received)")
+                    }
                 }
                 return
             }

@@ -34,6 +34,18 @@ struct PairingView: View {
     @State private var showVerification = false
     @State private var scanError: String?
 
+    /// Which pairing field owns the keyboard. Neither field can dismiss the
+    /// keyboard on its own -- the ticket editor is a multi-line `TextEditor`
+    /// (return inserts a newline, never submits) and the PIN field uses the
+    /// `.numberPad` keyboard (which has no return key at all) -- so a
+    /// keyboard-toolbar Done button plus tap-outside-to-dismiss, both driven
+    /// by clearing this focus, are the ONLY ways off the keyboard here.
+    private enum Field: Hashable {
+        case ticket
+        case pin
+    }
+    @FocusState private var focusedField: Field?
+
     /// Saved connection profiles (sqlite-backed). Selecting one connects
     /// immediately -- its ticket already went through phrase verification
     /// when it was first saved, so re-verifying every reconnect would only
@@ -89,6 +101,7 @@ struct PairingView: View {
                 // the bottom of the layout.
                 TextEditor(text: $ticketText)
                     .font(.system(.footnote, design: .monospaced))
+                    .focused($focusedField, equals: .ticket)
                     .frame(height: 120)
                     .scrollContentBackground(.hidden)
                     .padding(8)
@@ -124,6 +137,7 @@ struct PairingView: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
                     .keyboardType(.numberPad)
+                    .focused($focusedField, equals: .pin)
                     .accessibilityLabel("Pairing PIN field")
             }
             .padding(.horizontal)
@@ -244,7 +258,24 @@ struct PairingView: View {
             .padding(.bottom, 32)
         }
         .preferredColorScheme(.dark)
-        .background(Color.black.ignoresSafeArea())
+        // Backdrop doubles as tap-outside-to-dismiss for the keyboard: the
+        // tap only ever clears field focus, and buttons/fields hit-test
+        // first, so nothing else on the screen changes behavior.
+        .background(
+            Color.black
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture { focusedField = nil }
+        )
+        // The standard iOS affordance for keyboards with no dismiss key
+        // (multi-line editor + number pad): a Done button riding above the
+        // keyboard, shared by both fields.
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") { focusedField = nil }
+            }
+        }
         .alert("Save profile", isPresented: $showSaveNamePrompt) {
             TextField("Profile name", text: $newProfileName)
             Button("Save") {
@@ -278,6 +309,22 @@ struct PairingView: View {
                 }
             )
         }
+        .onAppear(perform: autoFocusForWitnessIfNeeded)
+    }
+
+    /// Debug-only unattended witness (same pattern as `MainView`'s
+    /// `HOLOIROH_AUTOFOCUS_PROMPT`): `simctl`/`devicectl` cannot tap the
+    /// ticket editor, so `HOLOIROH_AUTOFOCUS_TICKET=1` focuses it
+    /// programmatically -- the exact `focusedField = .ticket` a real tap
+    /// performs -- driving the real keyboard and therefore the real
+    /// keyboard-toolbar Done bar for a screenshot witness.
+    private func autoFocusForWitnessIfNeeded() {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment["HOLOIROH_AUTOFOCUS_TICKET"] == "1" else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            focusedField = .ticket
+        }
+        #endif
     }
 }
 

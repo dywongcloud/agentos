@@ -668,7 +668,9 @@ fn translate_control_event(event: ControlEvent) -> Option<ExecutorEvent> {
             message,
         }),
         // Out-of-band, not scoped to a run: no place in a per-run observe stream.
-        ControlEvent::DaemonStatus { .. } => None,
+        // `InputRequested`'s request_id is the CONSENT request's own id, not a run id (the
+        // paused run is tracked separately by the bridge), so it is out-of-band here too.
+        ControlEvent::DaemonStatus { .. } | ControlEvent::InputRequested { .. } => None,
     }
 }
 

@@ -89,6 +89,17 @@ struct MainView: View {
     /// kept so the Failed panel's Retry re-sends the same request.
     @State private var lastSentTask: ClientMessage?
 
+    /// Whether the user has paused the active task (wire `.pause` sent, no
+    /// `.resume` yet). Drives the task-control pill's Pause/Resume toggle and
+    /// keeps a pause-cancel `task_done(canceled)` from being mistaken for a
+    /// real end-of-task (see `applyTaskDone`).
+    @State private var isTaskPaused = false
+
+    /// The `request_id` of the daemon's outstanding `input_request` (today:
+    /// the sensitive-app consent ask), so the Choose control can echo it back
+    /// as `.inputResponse`. `nil` when nothing is outstanding.
+    @State private var activeInputRequestID: String?
+
     @State private var promptText: String = ""
 
     /// Guards `sendAutoPairPromptIfNeeded()` to at most once per process
@@ -113,10 +124,8 @@ struct MainView: View {
     /// no height information anyway. Read directly from the notification's own
     /// `UIResponder.keyboardFrameEndUserInfoKey` so this always reflects the REAL animating
     /// keyboard height for the device/orientation/keyboard-type in use, not a guessed constant.
-    /// Drives `liveShareBox`/`videoOverlay`'s upward shift in `body` so the live-share box and
-    /// command bar move up together, in sync, as the keyboard rises -- fixing the box visually
-    /// colliding with the command bar the moment the keyboard opens (see `body`'s `keyboardShift`
-    /// comment for the exact offset math).
+    /// Drives the command bar's full-height rise and the live-share box's
+    /// clear-the-bar shift in `body` (see the `barShift`/`boxShift` derivation there).
     @State private var keyboardHeight: CGFloat = 0
     @StateObject private var voice = VoiceTranscriberModel()
     @State private var logEntries: [LogEntry] = [
@@ -225,20 +234,29 @@ struct MainView: View {
             // straight back instead of leaving a black screen.
             let isFullscreenActive = isVideoFullscreen && isConnected
 
-            // How far to shift the box + command bar up while the keyboard is
-            // open, so the command bar's `TextField` is never covered (fixes
-            // "the screenshare kinda blocks my text view" when typing). Only
-            // the amount by which the keyboard actually eats into the space
-            // below the box needs to be recovered -- shifting by the FULL
-            // keyboard height would be needlessly aggressive and push the box
-            // up under the orb again. `spaceBelowBox` is what's left between
-            // the box's bottom edge and the screen bottom today (where the
-            // command bar + its padding already live); once the keyboard
-            // claims more than that, the excess is exactly how far both need
-            // to move up to keep the command bar clear of it.
+            // Keyboard avoidance, DECOUPLED (live-witnessed bug in the joint
+            // version: shifting bar and box together by `keyboardHeight -
+            // spaceBelowBox` left the command bar UNDER the keyboard -- i.e.
+            // invisible while typing -- whenever the box sat high enough that
+            // `spaceBelowBox` swallowed most of the keyboard height):
+            //
+            // - The COMMAND BAR must always clear the keyboard completely, so
+            //   it rises by the FULL keyboard height (`barShift`) and sits
+            //   just above it -- the whole point of typing is seeing the bar.
+            // - The BOX only moves by however much it needs to stay clear of
+            //   the risen bar (`boxShift`): the bar's top lands at
+            //   `H - keyboardHeight - barClearance`, and the box's bottom
+            //   must stay above that. On small screens this can push the box
+            //   toward the orb; the bar's visibility wins while the keyboard
+            //   is up (it drops back the moment the keyboard closes).
             let boxBottomY = boxCenterY + boxHeight / 2
             let spaceBelowBox = geo.size.height - boxBottomY
-            let keyboardShift = max(0, keyboardHeight - spaceBelowBox)
+            let barShift = keyboardHeight
+            // Command bar height + its paddings + a visual gap above it.
+            let barClearance: CGFloat = 96
+            let boxShift = keyboardHeight > 0
+                ? max(0, keyboardHeight + barClearance - spaceBelowBox)
+                : 0
 
             ZStack {
                 // Layer 0: full-black backdrop + the blue blob orb Spline
@@ -262,20 +280,26 @@ struct MainView: View {
                     // only -- the video itself is the persistent
                     // `videoOverlay` surface below, framed to this box).
                     liveShareBox(width: boxWidth, height: boxHeight)
-                        .position(x: geo.size.width / 2, y: boxCenterY - keyboardShift)
+                        .position(x: geo.size.width / 2, y: boxCenterY - boxShift)
 
-                    // BOTTOM: the single command bar. Rides up with the same
-                    // keyboardShift as the box (see keyboardShift's own doc)
-                    // so the two move in lockstep -- the command bar clears
-                    // the keyboard, and the box keeps the same visual gap
-                    // above it instead of the two colliding mid-shift.
-                    VStack(spacing: 0) {
+                    // BOTTOM: the task-control pill (only while a task is
+                    // active/paused) over the single command bar. Rises by the
+                    // FULL keyboard height so the bar is always visible above
+                    // the keyboard; the box shifts independently (see the
+                    // barShift/boxShift derivation above).
+                    VStack(spacing: 8) {
                         Spacer()
+                        if isTaskActive || isTaskPaused {
+                            taskControlBar
+                                .padding(.horizontal, 16)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
                         commandBar
                             .padding(.horizontal, 16)
                             .padding(.bottom, 8)
                     }
-                    .offset(y: -keyboardShift)
+                    .offset(y: -barShift)
+                    .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isTaskActive || isTaskPaused)
                 }
 
                 // Topmost: the persistent live-share video surface -- ONE
@@ -286,17 +310,25 @@ struct MainView: View {
                     in: geo.size,
                     boxWidth: boxWidth,
                     boxHeight: boxHeight,
-                    boxCenterY: boxCenterY - keyboardShift
+                    boxCenterY: boxCenterY - boxShift
                 )
             }
             // Smooth, organic upward motion as the keyboard rises/falls,
-            // rather than the box+command bar snapping to their new position
+            // rather than the box/command bar snapping to their new position
             // the instant `keyboardHeight` changes. A spring (not a fixed-
             // duration easing curve) so the motion still feels responsive if
             // the keyboard's own show/hide animation timing varies slightly
             // by device/iOS version, matching this app's existing spring-first
             // animation style elsewhere (e.g. the zoom/pan gestures).
-            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: keyboardShift)
+            // Keyed on `keyboardHeight` -- both barShift and boxShift derive
+            // from it, so one animation covers both surfaces.
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: keyboardHeight)
+            // Manual keyboard avoidance is the ONLY authority here: without
+            // this, SwiftUI's automatic safe-area keyboard avoidance ALSO
+            // raises the layout on some iOS versions and STACKS with the
+            // manual `barShift` offset -- live-witnessed as the command bar
+            // flying to the very top of the screen when the keyboard opened.
+            .ignoresSafeArea(.keyboard)
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
             guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
@@ -599,17 +631,9 @@ struct MainView: View {
             },
             cancel: {
                 // Remote kill-switch: the Cancel control (shown in the Working,
-                // Connecting, Input-needed, and Draft-ready panels) is the
-                // "Stop" the user hits to halt whatever the agent is doing on the
-                // Mac. Send the actual `ClientMessage.stop` over the control
-                // channel *before* the local transition, so the daemon's
-                // `handle_stop` -> `holo stop` kill-switch path fires (once the
-                // transport is real). The local `.idle` transition + log entry is
-                // the stand-in for the daemon's `Done { Canceled }` response until
-                // the real channel streams it back.
-                sendStop()
-                log(.status(text: "task cancelled"))
-                session = .idle
+                // Connecting, Input-needed, and Draft-ready panels) is the same
+                // Stop the task pill exposes on the main screen.
+                stopActiveTask()
             },
             pause: { togglePause() },
             takeControl: { log(.status(text: "take control -- manual input handed to user")) },
@@ -620,7 +644,18 @@ struct MainView: View {
             },
             choose: { option in
                 log(.status(text: "chose: \(option)"))
-                session = .working(Self.demoWorking)
+                if let requestID = activeInputRequestID {
+                    // A REAL daemon input request (sensitive-app consent):
+                    // echo the selection back verbatim. The daemon resumes
+                    // (allow) or stops (deny) the task and its own frames
+                    // settle the session state; connecting is the honest
+                    // in-between.
+                    sendControlMessage(.inputResponse(requestId: requestID, selectedOption: option))
+                    activeInputRequestID = nil
+                    session = option.lowercased().contains("stop") ? .idle : .connecting
+                } else {
+                    session = .working(Self.demoWorking)
+                }
             },
             review: { log(.status(text: "reviewing draft in Remote View")) },
             requestSend: {
@@ -653,12 +688,36 @@ struct MainView: View {
         )
     }
 
-    /// Toggle the Working panel's pause flag in place.
+    /// Pause/Resume over the REAL wire (the old version only toggled a local
+    /// flag -- the agent on the Mac kept acting). Pause sends `.pause` (the
+    /// daemon parks the turn); Resume sends `.resume` (the daemon re-dispatches
+    /// it on the same backend session). Local state mirrors optimistically;
+    /// the daemon's own status/`task_done` frames are the source of truth in
+    /// the log.
     private func togglePause() {
-        guard case .working(var payload) = session else { return }
-        payload.isPaused.toggle()
-        session = .working(payload)
-        log(.status(text: payload.isPaused ? "paused" : "resumed"))
+        if isTaskPaused {
+            sendControlMessage(.resume)
+            isTaskPaused = false
+            log(.status(text: "→ resume"))
+            if case .working(var payload) = session {
+                payload.isPaused = false
+                session = .working(payload)
+            } else {
+                session = .connecting
+            }
+        } else {
+            guard isTaskActive else {
+                log(.status(text: "no active task to pause"))
+                return
+            }
+            sendControlMessage(.pause)
+            isTaskPaused = true
+            log(.status(text: "→ pause"))
+            if case .working(var payload) = session {
+                payload.isPaused = true
+                session = .working(payload)
+            }
+        }
     }
 
     // MARK: - Real connection wiring
@@ -722,7 +781,86 @@ struct MainView: View {
             applyTaskProgress(text)
         case .error(let text):
             failActiveTask(cause: text)
+        case .taskDone(let status, let text):
+            applyTaskDone(status: status, text: text)
+        case .authRejected(let text):
+            failActiveTask(cause: text ?? "The daemon rejected this device's authentication.")
+        case .inputRequest(let requestId, let kind, let context, let responseOptions, _):
+            presentInputRequest(
+                requestId: requestId,
+                kind: kind,
+                context: context,
+                responseOptions: responseOptions
+            )
         }
+    }
+
+    /// `task_done` is the daemon's real end-of-task signal (completed /
+    /// failed / canceled). One subtlety: pausing a task IS a cancel on the
+    /// wire (the daemon parks the turn by canceling it -- see the daemon's
+    /// pause semantics), so a `canceled` arriving while `isTaskPaused` keeps
+    /// the paused pill up instead of dismissing the task.
+    private func applyTaskDone(status: String, text: String?) {
+        switch status {
+        case "failed":
+            isTaskPaused = false
+            failActiveTask(cause: text)
+        case "canceled":
+            if !isTaskPaused, isTaskActive {
+                session = .idle
+            }
+        default: // "completed"
+            isTaskPaused = false
+            if isTaskActive {
+                session = .idle
+            }
+        }
+    }
+
+    /// Projects a daemon `input_request` (today: the sensitive-app consent
+    /// gate) onto the PRD 6.1 Input-needed state with its REAL payload, and
+    /// opens the controls sheet so the Choose buttons are actually on screen.
+    private func presentInputRequest(
+        requestId: String,
+        kind: String,
+        context: String,
+        responseOptions: [String]
+    ) {
+        let uiKind: InputRequestKind
+        switch kind {
+        case "credential": uiKind = .credentialNeeded
+        case "mfa": uiKind = .mfaNeeded
+        case "ambiguous_choice": uiKind = .ambiguousChoice
+        case "missing_info": uiKind = .missingInfo
+        default: uiKind = .sensitiveAccess
+        }
+        activeInputRequestID = requestId
+        isTaskPaused = false
+        session = .inputNeeded(InputRequestPayload(
+            kind: uiKind,
+            whatIsNeeded: context,
+            why: "The task is paused until you decide.",
+            currentFrame: "See the live view above.",
+            responseOptions: responseOptions
+        ))
+        showControls = true
+
+        #if DEBUG
+        // Unattended consent witness (same env-hook family as
+        // HOLOIROH_AUTOPAIR_*): devicectl cannot tap the Choose buttons, so
+        // HOLOIROH_AUTOCONSENT="Allow once" answers the request through the
+        // exact same wire path a real tap takes, 1s after it appears.
+        if let auto = ProcessInfo.processInfo.environment["HOLOIROH_AUTOCONSENT"],
+           responseOptions.contains(auto) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                guard activeInputRequestID == requestId else { return }
+                log(.status(text: "auto-consent (debug): \(auto)"))
+                sendControlMessage(.inputResponse(requestId: requestId, selectedOption: auto))
+                activeInputRequestID = nil
+                session = auto.lowercased().contains("stop") ? .idle : .connecting
+            }
+        }
+        #endif
     }
 
     /// `task_progress` drives Connecting → Working (the daemon accepted the
@@ -996,6 +1134,9 @@ struct MainView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .animation(.spring(response: 0.3, dampingFraction: 0.9), value: logEntries.count)
 
+            if isTaskActive || isTaskPaused {
+                taskControlBar
+            }
             commandBar(fullscreen: true)
         }
         .padding(.horizontal, 12)
@@ -1075,8 +1216,86 @@ struct MainView: View {
         case .ack: return .secondary
         case .status: return .blue
         case .taskProgress: return .orange
-        case .error: return .red
+        case .error, .authRejected: return .red
+        case .taskDone(let status, _):
+            return status == "failed" ? .red : .green
+        case .inputRequest: return .yellow
         }
+    }
+
+    // MARK: - Task controls (stop / pause / redirect surface)
+
+    /// Whether a task is currently live from this screen's point of view --
+    /// the states in which the task-control pill (Pause/Stop) is shown and a
+    /// sent prompt becomes a REDIRECT of the running task rather than a new
+    /// one.
+    private var isTaskActive: Bool {
+        switch session {
+        case .connecting, .working, .inputNeeded: return true
+        case .idle, .reviewing, .draftReady, .awaitingApproval, .failed: return false
+        }
+    }
+
+    /// The always-visible-while-active task control pill: live status label +
+    /// Pause/Resume toggle + Stop. This is the main-screen control surface
+    /// the PRD 6.1 Working panel's Pause/Cancel buttons used to be the only
+    /// home for -- but that panel lives inside the hidden controls sheet, so
+    /// mid-task control had no visible affordance at all.
+    private var taskControlBar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(isTaskPaused ? Color.yellow : Color.green)
+                    .frame(width: 7, height: 7)
+                Text(isTaskPaused ? "Paused" : "Task running")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.85))
+            }
+
+            Spacer()
+
+            Button {
+                togglePause()
+            } label: {
+                Label(isTaskPaused ? "Resume" : "Pause",
+                      systemImage: isTaskPaused ? "play.fill" : "pause.fill")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Color.white.opacity(0.10), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .accessibilityLabel(isTaskPaused ? "Resume task" : "Pause task")
+
+            Button {
+                stopActiveTask()
+            } label: {
+                Label("Stop", systemImage: "stop.fill")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Color.red.opacity(0.28), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.red.opacity(0.95))
+            .accessibilityLabel("Stop task")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color(white: 0.09).opacity(0.92), in: Capsule())
+        .overlay(Capsule().stroke(.white.opacity(0.10), lineWidth: 1))
+        .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+    }
+
+    /// The Stop control: remote kill-switch plus local state reset, shared by
+    /// the pill and the SessionView Cancel actions.
+    private func stopActiveTask() {
+        sendStop()
+        isTaskPaused = false
+        activeInputRequestID = nil
+        log(.status(text: "task cancelled"))
+        session = .idle
     }
 
     // MARK: - Command bar
@@ -1238,7 +1457,7 @@ struct MainView: View {
     /// tap on the prompt field, so `HOLOIROH_AUTOFOCUS_PROMPT=1` focuses it
     /// programmatically on appear -- the exact same `isPromptFocused = true`
     /// a real tap would trigger, driving the real keyboard notifications and
-    /// therefore the real `keyboardShift` animation in `body`. Independent of
+    /// therefore the real keyboard-avoidance animation in `body`. Independent of
     /// pairing/connection state (unlike `sendAutoPairPromptIfNeeded`, which
     /// needs `.connected`) since this only exercises the layout, not a send.
     private func autoFocusPromptIfNeeded() {
@@ -1247,7 +1466,7 @@ struct MainView: View {
            let height = Double(heightStr) {
             // Isolated layout-only witness: sets keyboardHeight directly,
             // bypassing @FocusState/UIResponder notifications entirely, to
-            // verify keyboardShift's math/animation independent of whether
+            // verify the barShift/boxShift math/animation independent of whether
             // the simulator's software keyboard or focus plumbing behaves.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 keyboardHeight = CGFloat(height)
@@ -1261,16 +1480,29 @@ struct MainView: View {
         #endif
     }
 
-    /// Fullscreen live-mode send: straight to the daemon as a prompt, and
-    /// straight into the feed -- no Reviewing stage.
+    /// Live send: straight to the daemon, straight into the feed -- no
+    /// Reviewing stage. While a task is ACTIVE, a sent prompt REDIRECTS it
+    /// (the daemon cancels the running turn, keeps its session history, and
+    /// runs the new instruction) rather than queueing a second task behind
+    /// it; from idle it starts a fresh task. Either way the session enters
+    /// `.connecting` so the task controls appear and the daemon's own
+    /// `task_progress`/`task_done` frames drive it from there.
     private func sendLivePrompt() {
         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         promptText = ""
         isPromptFocused = false
         lastSentTask = .prompt(text: trimmed)
-        sendControlMessage(.prompt(text: trimmed))
-        log(.status(text: "→ live prompt: \(trimmed)"))
+        if isTaskActive || isTaskPaused {
+            sendControlMessage(.redirect(text: trimmed))
+            log(.status(text: "→ redirect: \(trimmed)"))
+        } else {
+            sendControlMessage(.prompt(text: trimmed))
+            log(.status(text: "→ live prompt: \(trimmed)"))
+        }
+        isTaskPaused = false
+        activeInputRequestID = nil
+        session = .connecting
     }
 
     private func sendPrompt() {

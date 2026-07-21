@@ -343,6 +343,23 @@ pub enum ClientMessage {
     },
     /// Cancel/interrupt whatever is currently running.
     Stop,
+    /// Pause the in-flight turn. The Holo backend exposes no pause RPC over
+    /// A2A, so the daemon implements this as a scoped cancel of the running
+    /// turn while remembering its instruction text and `contextId`; a later
+    /// [`ClientMessage::Resume`] re-dispatches on the SAME `contextId`, so
+    /// the backend session's history carries the task forward. Additive per
+    /// `PROTOCOL.md`'s extension policy.
+    Pause,
+    /// Resume the turn a previous [`ClientMessage::Pause`] stashed. A no-op
+    /// (polite status reply) when nothing is paused.
+    Resume,
+    /// Replace whatever is running/queued with a new instruction: the daemon
+    /// cancels the in-flight turn, drops the queue, and runs `text` --
+    /// reusing the canceled turn's `contextId` when known so the agent keeps
+    /// the task history it had built up.
+    Redirect {
+        text: String,
+    },
     /// Presents a PIN for first-connection auth (see `holoiroh/PAIRING.md`'s
     /// "Auth beyond ticket possession" section and `ControlChannel::accept`'s
     /// gate). Added additive-only per `PROTOCOL.md`'s extension policy: an
@@ -432,6 +449,9 @@ impl ClientMessage {
             ClientMessage::Prompt { .. } => "prompt",
             ClientMessage::VoiceTranscript { .. } => "voice_transcript",
             ClientMessage::Stop => "stop",
+            ClientMessage::Pause => "pause",
+            ClientMessage::Resume => "resume",
+            ClientMessage::Redirect { .. } => "redirect",
             ClientMessage::Pin { .. } => "pin",
             ClientMessage::InputResponse { .. } => "input_response",
         }
@@ -462,6 +482,18 @@ pub enum ServerMessage {
     },
     /// An in-progress update from the `holo-desktop-cli` bridge.
     TaskProgress {
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        text: Option<String>,
+    },
+    /// Terminal lifecycle signal for one task: the turn identified by the
+    /// envelope's `task_id` reached `status` (`"completed"` / `"failed"` /
+    /// `"canceled"`). Added so the client can distinguish "the task ended"
+    /// from routine `status`/`task_progress` text -- previously a terminal
+    /// `Done` was folded into a plain `status` line the UI could not key
+    /// off, which left the phone's task controls with no reliable
+    /// end-of-task signal. Additive per `PROTOCOL.md`'s extension policy.
+    TaskDone {
+        status: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         text: Option<String>,
     },
@@ -551,6 +583,7 @@ impl ServerMessage {
             ServerMessage::Status { .. } => "status",
             ServerMessage::Error { .. } => "error",
             ServerMessage::TaskProgress { .. } => "task_progress",
+            ServerMessage::TaskDone { .. } => "task_done",
             ServerMessage::AuthRejected { .. } => "auth_rejected",
             ServerMessage::InputRequest { .. } => "input_request",
         }
@@ -579,6 +612,17 @@ impl ServerMessage {
     pub fn task_progress(text: impl Into<String>) -> Self {
         ServerMessage::TaskProgress {
             text: Some(text.into()),
+        }
+    }
+
+    /// Convenience constructor for a `task_done` terminal-lifecycle message.
+    /// `status` is the snake_case terminal name (`"completed"` / `"failed"`
+    /// / `"canceled"`), matching `DoneStatus`'s serde casing on the daemon
+    /// side.
+    pub fn task_done(status: impl Into<String>, text: Option<String>) -> Self {
+        ServerMessage::TaskDone {
+            status: status.into(),
+            text,
         }
     }
 

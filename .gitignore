@@ -35,3 +35,11 @@ tsconfig.tsbuildinfo
 *.patch
 holoiroh/ios/Artifacts/
 holoiroh/ios-app/HoloIroh.xcodeproj/
+# holoiroh's own gm/agentplug session state (same rationale as the root .gm/
+# ignores above -- volatile orchestrator state, never source).
+holoiroh/.gm/
+holoiroh/.agentplug-kv/
+holoiroh/.agentplug/
+# Unrelated local exercise living inside the holoiroh tree; excluded from the
+# cargo workspace (see holoiroh/Cargo.toml) and from version control alike.
+holoiroh/rust_db_project/

@@ -212,13 +212,26 @@ impl A2aClient {
     /// and pass it back in on the *next* prompt to continue the same `hai-agent-runtime`
     /// session rather than starting a new one each time (mirrors how `holo-desktop-cli`'s own
     /// `HoloExecutor._sessions` keys sessions by `contextId`).
-    pub async fn send_and_stream<F>(
+    ///
+    /// `on_ids` fires as soon as the stream reveals the resolved `contextId` and/or the A2A
+    /// `Task.id` (and again if the other resolves later) -- long before the turn's terminal
+    /// state. This is what makes a scoped mid-turn `tasks/cancel` (stop/pause/redirect while
+    /// the turn is still streaming) possible at all: the return value above only becomes
+    /// available after the stream ends, which is exactly too late for anything that wants to
+    /// interrupt it. Capturing the real `Task.id` specifically matters because `tasks/cancel`
+    /// is keyed by task id per the A2A spec, and this holo serve build genuinely rejects a
+    /// context-id stand-in with JSON-RPC `-32603` "Task not found" (live-witnessed 2026-07-21,
+    /// falsifying this module's earlier assumption that `HoloExecutor.cancel` resolves by
+    /// context -- see [`Self::cancel`]).
+    pub async fn send_and_stream<C, F>(
         &self,
         text: &str,
         context_id: Option<&str>,
+        mut on_ids: C,
         mut on_update: F,
     ) -> Result<String>
     where
+        C: FnMut(ResolvedTurnIds<'_>),
         F: FnMut(TaskUpdate),
     {
         let request_id = Uuid::new_v4().to_string();
@@ -266,6 +279,7 @@ impl A2aClient {
         }
 
         let mut resolved_context_id = context_id.map(str::to_owned);
+        let mut resolved_task_id: Option<String> = None;
         let mut byte_stream = resp.bytes_stream().eventsource();
         let mut terminal_reached = false;
 
@@ -285,11 +299,31 @@ impl A2aClient {
                 .get("result")
                 .ok_or_else(|| anyhow!("SSE frame had neither `result` nor `error`: {frame}"))?;
 
+            let mut ids_advanced = false;
             if resolved_context_id.is_none() {
                 resolved_context_id = result
                     .get("contextId")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                ids_advanced |= resolved_context_id.is_some();
+            }
+            if resolved_task_id.is_none() {
+                // The bare initial `Task` object carries its id as `id`; every
+                // subsequent status/artifact update event carries it as `taskId`.
+                let task_id = match result.get("kind").and_then(Value::as_str) {
+                    Some("task") => result.get("id").and_then(Value::as_str),
+                    _ => result.get("taskId").and_then(Value::as_str),
+                };
+                if let Some(id) = task_id {
+                    resolved_task_id = Some(id.to_owned());
+                    ids_advanced = true;
+                }
+            }
+            if ids_advanced {
+                on_ids(ResolvedTurnIds {
+                    context_id: resolved_context_id.as_deref(),
+                    task_id: resolved_task_id.as_deref(),
+                });
             }
 
             if let Some(update) = parse_task_event(result)? {
@@ -315,13 +349,14 @@ impl A2aClient {
     /// module doc).
     pub async fn cancel(&self, context_id: &str, task_id: Option<&str>) -> Result<()> {
         let request_id = Uuid::new_v4().to_string();
-        // Per the public A2A spec, tasks/cancel takes a TaskIdParams keyed by task id. This
-        // daemon's control-channel layer tracks context_id as the primary continuity key
-        // (matching HoloExecutor's own session map), so when no task_id was captured for the
-        // in-flight turn we fall back to context_id -- HoloExecutor's cancel() resolves the
-        // Session via context_id first and only uses the A2A Task object for the status-event
-        // envelope, so this fallback reaches the same server-side effect for this backend
-        // even though it is not the literal spec-documented lookup key.
+        // Per the public A2A spec, tasks/cancel takes a TaskIdParams keyed by TASK id --
+        // callers should always pass the real `task_id` captured via `send_and_stream`'s
+        // `on_ids`. The context-id fallback below is kept only for callers that genuinely
+        // never saw a task id, and is now KNOWN not to work against the current holo serve:
+        // live-witnessed 2026-07-21, a context-id cancel returns JSON-RPC -32603
+        // "Task not found" (this module's earlier claim that HoloExecutor.cancel resolves by
+        // context was wrong for this build). Callers therefore treat a cancel error as
+        // "fall back to the global `holo stop`", which always works.
         let id_for_cancel = task_id.unwrap_or(context_id);
         let body = json!({
             "jsonrpc": "2.0",
@@ -350,6 +385,16 @@ impl A2aClient {
         }
         Ok(())
     }
+}
+
+/// The turn-identifying ids [`A2aClient::send_and_stream`] has resolved so far, delivered via
+/// its `on_ids` callback the moment either advances: `context_id` (the session-continuity key,
+/// for continuing the conversation on a later turn) and `task_id` (the A2A `Task.id`, the key
+/// `tasks/cancel` actually requires).
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedTurnIds<'a> {
+    pub context_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
 }
 
 pub struct AgentCardSummary {

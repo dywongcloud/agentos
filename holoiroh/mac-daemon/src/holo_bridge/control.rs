@@ -23,13 +23,16 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
+
+use holoiroh_wire::InputRequestKind;
 
 use crate::holo_bridge::a2a_client::{A2aClient, TaskUpdate, TerminalState};
 use crate::limits::ActionCounter;
+use crate::sensitive_categories::{CategorySetting, SensitiveCategories};
 
 /// One incoming control-channel message, keyed by the `type` discriminator the task
 /// description names explicitly (`"prompt"`, `"voice_transcript"`, `"stop"`).
@@ -76,6 +79,16 @@ pub enum ControlMessage {
         #[serde(default)]
         force: bool,
     },
+    /// Pause the in-flight turn: scoped-cancel it (the backend exposes no real pause RPC --
+    /// see `ClientMessage::Pause`'s doc in `holoiroh-wire`) while stashing its instruction
+    /// text and resolved `contextId` so a later `Resume` continues the same backend session.
+    Pause { request_id: String },
+    /// Resume the turn a previous `Pause` (or a sensitive-app consent gate) stashed.
+    Resume { request_id: String },
+    /// Replace whatever is running/queued with `text`: cancel the in-flight turn, drop the
+    /// queue, then run `text` -- reusing the canceled turn's `contextId` when known so the
+    /// agent keeps the history it had built up.
+    Redirect { request_id: String, text: String },
 }
 
 impl ControlMessage {
@@ -87,7 +100,10 @@ impl ControlMessage {
         match self {
             ControlMessage::Prompt { request_id, .. }
             | ControlMessage::VoiceTranscript { request_id, .. }
-            | ControlMessage::Stop { request_id, .. } => request_id,
+            | ControlMessage::Stop { request_id, .. }
+            | ControlMessage::Pause { request_id }
+            | ControlMessage::Resume { request_id }
+            | ControlMessage::Redirect { request_id, .. } => request_id,
         }
     }
 }
@@ -139,6 +155,19 @@ pub enum ControlEvent {
     /// `holo_bridge::health`'s crash-detected/restarting/restarted notifications. Carries no
     /// `request_id` since it isn't a response to a specific prompt.
     DaemonStatus { text: String },
+    /// The daemon needs structured user input before the paused turn can continue --
+    /// today produced only by the sensitive-app consent gate (see the sensitive-app
+    /// watchdog in this module). Translated by `control_channel::from_control_event` into
+    /// the wire `ServerMessage::InputRequest` (P0-14). `request_id` here is the CONSENT
+    /// request's own id (echoed back by `ClientMessage::InputResponse`), distinct from the
+    /// paused task's id, which the pending-consent state tracks internally.
+    InputRequested {
+        request_id: String,
+        kind: InputRequestKind,
+        context: String,
+        response_options: Vec<String>,
+        expires_at: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -168,6 +197,51 @@ struct QueuedPrompt {
     text: String,
     context_id: Option<String>,
 }
+
+/// The turn currently inside `run_prompt`, tracked so Stop/Pause/Redirect (and the
+/// sensitive-app watchdog) can scope-cancel it mid-stream. `text` is the ORIGINAL
+/// instruction (pre-env-context augmentation) so a pause stash can honestly replay it;
+/// `context_id` starts as whatever the caller passed and is upgraded to the stream's
+/// resolved `contextId` the moment `send_and_stream`'s `on_context` fires.
+#[derive(Clone)]
+struct CurrentTurn {
+    request_id: String,
+    text: String,
+    context_id: Option<String>,
+    /// The A2A `Task.id` the stream resolved for this turn -- the id
+    /// `tasks/cancel` actually requires (a context-id stand-in returns
+    /// "Task not found" on the current holo serve; see `A2aClient::cancel`).
+    a2a_task_id: Option<String>,
+}
+
+/// A turn parked by `Pause` (or by the sensitive-app consent gate): everything `Resume`
+/// needs to continue it -- the original instruction plus the backend session (`contextId`)
+/// whose history carries the task's progress so far.
+#[derive(Clone)]
+struct PausedTurn {
+    request_id: String,
+    text: String,
+    context_id: Option<String>,
+}
+
+/// One outstanding sensitive-app consent request (`ControlEvent::InputRequested`,
+/// kind `sensitive_access_consent`), resolved by a matching
+/// `ClientMessage::InputResponse` (see [`HoloControlBridge::resolve_consent`]) or by the
+/// expiry timer spawned alongside it.
+struct PendingConsent {
+    consent_request_id: String,
+    category_id: String,
+}
+
+/// Consent response option meaning "let the agent continue in this app category for the
+/// rest of the current task". Shared between the request's `response_options` and
+/// `resolve_consent`'s match so the two can never drift apart.
+const CONSENT_ALLOW_ONCE: &str = "Allow once";
+/// Consent response option meaning "abandon the paused task".
+const CONSENT_STOP_TASK: &str = "Stop task";
+/// How long a sensitive-app consent request stays answerable before it expires into the
+/// standard safe-pause state (the task simply stays paused; `Resume` re-asks).
+const CONSENT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Bridges control-channel messages to `holo serve`'s A2A endpoint and CLI-level stop
 /// handling. Holds no transport of its own -- the caller owns receiving `ControlMessage`s
@@ -238,6 +312,25 @@ pub struct HoloControlBridge {
     /// degrade-don't-crash, matching every other best-effort subsystem in this bridge; a
     /// missing store just means no context gets prepended, never a turn failure.
     env_context: Option<crate::env_context::EnvContextStore>,
+    /// The turn currently inside [`Self::run_prompt`], if any -- set on entry, `context_id`
+    /// upgraded mid-stream via `send_and_stream`'s `on_context`, cleared by the same guard
+    /// that concludes the task FSM. This is what Stop/Pause/Redirect and the sensitive-app
+    /// watchdog scope their cancels to.
+    current_turn: Mutex<Option<CurrentTurn>>,
+    /// The turn parked by `Pause`/consent-gate, waiting for `Resume` (or discarded by
+    /// `Stop`/`Redirect`). At most one -- pausing while paused is a polite no-op.
+    paused: Mutex<Option<PausedTurn>>,
+    /// PRD section-9 class-5 sensitive-app categories, loaded once from
+    /// `~/.holoiroh/sensitive_categories.toml` (seeded with defaults on first run). This is
+    /// the live wiring the `sensitive_categories` module's own doc used to disclaim -- the
+    /// per-turn watchdog consults it against the REAL frontmost app while the agent acts.
+    sensitive_categories: Mutex<SensitiveCategories>,
+    /// Category ids the user has consented to ("Allow once") for the CURRENT turn only;
+    /// cleared every time a fresh turn starts so consent never silently outlives the task
+    /// it was granted for.
+    turn_allowances: Mutex<HashSet<String>>,
+    /// The outstanding sensitive-app consent request, if any.
+    pending_consent: Mutex<Option<PendingConsent>>,
 }
 
 /// What one streaming attempt of a turn produced -- see [`HoloControlBridge::run_prompt`]'s
@@ -302,6 +395,28 @@ impl HoloControlBridge {
                     None
                 }
             },
+            current_turn: Mutex::new(None),
+            paused: Mutex::new(None),
+            sensitive_categories: Mutex::new(
+                match SensitiveCategories::load_or_init_default() {
+                    Ok(cats) => {
+                        tracing::info!(
+                            categories = cats.categories.len(),
+                            "sensitive-app categories loaded (privacy layer live)"
+                        );
+                        cats
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "failed to load sensitive-app categories config; using built-in defaults for this run"
+                        );
+                        SensitiveCategories::default_categories()
+                    }
+                },
+            ),
+            turn_allowances: Mutex::new(HashSet::new()),
+            pending_consent: Mutex::new(None),
         }
     }
 
@@ -388,6 +503,15 @@ impl HoloControlBridge {
             } => {
                 self.handle_stop(request_id, context_id, force).await;
             }
+            ControlMessage::Pause { request_id } => {
+                self.handle_pause(request_id).await;
+            }
+            ControlMessage::Resume { request_id } => {
+                self.handle_resume(request_id).await;
+            }
+            ControlMessage::Redirect { request_id, text } => {
+                self.handle_redirect(request_id, text).await;
+            }
         }
     }
 
@@ -401,7 +525,19 @@ impl HoloControlBridge {
         self.emit(ControlEvent::Ack {
             request_id: request_id.clone(),
         });
+        // A fresh task never inherits a previous task's sensitive-app consent.
+        self.turn_allowances
+            .lock()
+            .expect("turn_allowances lock poisoned")
+            .clear();
+        self.run_or_queue(request_id, text, context_id).await;
+    }
 
+    /// The busy/queue discipline shared by every turn-starting path (`handle_prompt`,
+    /// `handle_resume`, `handle_redirect`, consent-allow resume): run the turn now if no
+    /// turn is in flight, else queue it. Factored out of `handle_prompt` when pause/resume/
+    /// redirect grew their own turn-starting call sites.
+    async fn run_or_queue(&self, request_id: String, text: String, context_id: Option<String>) {
         {
             // Single critical section: observe-and-flip `busy` and (if already busy)
             // push onto `queue` atomically, so a second `handle_prompt` call racing in
@@ -488,16 +624,56 @@ impl HoloControlBridge {
         // attempts accumulate onto the one FSM `begin` creates here), conclude on every exit
         // path via the guard below. See `crate::task_fsm`'s module doc.
         self.tasks.begin(&request_id);
+        // Current-turn tracking for Stop/Pause/Redirect + the sensitive-app watchdog: `text`
+        // here is still the ORIGINAL instruction (env-context augmentation happens below), so
+        // a pause stash replays what the user actually asked for. Per-turn consent allowances
+        // reset with the turn they were granted for.
+        *self.current_turn.lock().expect("current_turn lock poisoned") = Some(CurrentTurn {
+            request_id: request_id.clone(),
+            text: text.clone(),
+            context_id: context_id.map(str::to_owned),
+            a2a_task_id: None,
+        });
+        // NOTE: `turn_allowances` is deliberately NOT cleared here. A resumed/consent-allowed
+        // turn re-enters through this same path, and clearing at run start would wipe the
+        // allowance `resolve_consent` just granted -- the watchdog would re-ask on its very
+        // next tick, an ask-allow-ask loop (latent-bug shape caught during the live consent
+        // witness). Allowances are cleared where a genuinely NEW task begins instead:
+        // `handle_prompt` and `handle_redirect`.
         struct ConcludeOnDrop<'a> {
             tasks: &'a crate::task_fsm::TaskRegistry,
             request_id: &'a str,
+            current_turn: &'a Mutex<Option<CurrentTurn>>,
         }
         impl Drop for ConcludeOnDrop<'_> {
             fn drop(&mut self) {
                 self.tasks.conclude(self.request_id);
+                let mut current = self
+                    .current_turn
+                    .lock()
+                    .expect("current_turn lock poisoned");
+                if current
+                    .as_ref()
+                    .is_some_and(|t| t.request_id == self.request_id)
+                {
+                    *current = None;
+                }
             }
         }
-        let _conclude_task = ConcludeOnDrop { tasks: &self.tasks, request_id: &request_id };
+        let _conclude_task = ConcludeOnDrop {
+            tasks: &self.tasks,
+            request_id: &request_id,
+            current_turn: &self.current_turn,
+        };
+
+        // Sensitive-app watchdog (the PRD section-9 privacy layer's live interception
+        // point): polls the frontmost app for this turn's lifetime and pauses/blocks when
+        // it enters a configured class-5 category. Needs an `Arc` to outlive this call
+        // frame, which only exists once `main.rs` has attached the bridge backref --
+        // probe/bare-lib callers simply run without the watchdog (degrade-don't-crash).
+        if let Some(bridge) = self.bridge.get().and_then(std::sync::Weak::upgrade) {
+            tokio::spawn(sensitive_watchdog(bridge, request_id.clone()));
+        }
 
         // Failover pre-step: if the fallback backend has outlived its cooldown, hop back to
         // the primary so the hosted path gets probed again (its rate limit has likely reset).
@@ -584,6 +760,25 @@ impl HoloControlBridge {
                                 )),
                                 raw_event: None,
                             });
+                            // The retry runs against a RESPAWNED holo serve: attempt 0's
+                            // resolved contextId/Task.id are meaningless there (live-hit:
+                            // a scoped cancel against the new process with the stale task
+                            // id returned "Task not found" and had to fall back to the
+                            // global stop). Reset so the retry's own stream re-resolves
+                            // fresh ids for any later Stop/Pause/Redirect to target.
+                            {
+                                let mut current = self
+                                    .current_turn
+                                    .lock()
+                                    .expect("current_turn lock poisoned");
+                                if let Some(turn) = current
+                                    .as_mut()
+                                    .filter(|t| t.request_id == request_id)
+                                {
+                                    turn.context_id = None;
+                                    turn.a2a_task_id = None;
+                                }
+                            }
                             attempt += 1;
                         }
                         Ok(super::FallbackActivation::AlreadyActive
@@ -650,7 +845,42 @@ impl HoloControlBridge {
         let capped = std::sync::atomic::AtomicBool::new(false);
         let client = self.client.read().expect("client lock poisoned").clone();
         let result = client
-            .send_and_stream(&text, context_id, |update| {
+            .send_and_stream(
+                &text,
+                context_id,
+                |ids| {
+                    // Scoped-cancel enablement: record the resolved contextId AND the A2A
+                    // Task.id the moment the stream reveals them, so Stop/Pause/Redirect
+                    // arriving mid-turn can issue a targeted `tasks/cancel` (keyed by task
+                    // id -- the only key this holo serve accepts) instead of only the
+                    // global kill switch.
+                    let mut current = self
+                        .current_turn
+                        .lock()
+                        .expect("current_turn lock poisoned");
+                    if let Some(turn) = current
+                        .as_mut()
+                        .filter(|t| t.request_id == request_id_for_updates)
+                    {
+                        if turn.context_id.is_none() {
+                            if let Some(ctx) = ids.context_id {
+                                turn.context_id = Some(ctx.to_string());
+                            }
+                        }
+                        if turn.a2a_task_id.is_none() {
+                            if let Some(tid) = ids.task_id {
+                                turn.a2a_task_id = Some(tid.to_string());
+                            }
+                        }
+                        tracing::debug!(
+                            request_id = request_id_for_updates,
+                            context_id = ?turn.context_id,
+                            a2a_task_id = ?turn.a2a_task_id,
+                            "turn ids resolved mid-stream"
+                        );
+                    }
+                },
+                |update| {
                 // Cap latch: once hit, further WORKING updates are suppressed -- but
                 // Answer/Terminal updates still flow. The original everything-latch was
                 // live-witnessed turning a SUCCEEDING turn into a cap error: an 11-minute
@@ -831,9 +1061,14 @@ impl HoloControlBridge {
     async fn drain_queue(&self) {
         loop {
             let next = {
+                // Lock ORDER matters and must match `run_or_queue`'s (busy, then queue):
+                // the original queue-then-busy order here was a latent AB-BA deadlock that
+                // only stayed unreachable while the control channel's read loop serialized
+                // every `handle` call -- now that turns are spawned and control verbs run
+                // concurrently, two lock takers genuinely race.
+                let mut busy = self.busy.lock().expect("busy lock poisoned");
                 let mut queue = self.queue.lock().expect("queue lock poisoned");
                 let next = queue.pop_front();
-                let mut busy = self.busy.lock().expect("busy lock poisoned");
                 *busy = next.is_some();
                 next
             };
@@ -854,6 +1089,42 @@ impl HoloControlBridge {
         self.emit(ControlEvent::Ack {
             request_id: request_id.clone(),
         });
+
+        // A stop discards any paused turn outright -- "stop" means stop everything, and a
+        // stash silently surviving it would resurrect a task the user just killed on the
+        // next Resume. Also drop any outstanding consent request tied to it.
+        if self
+            .paused
+            .lock()
+            .expect("paused lock poisoned")
+            .take()
+            .is_some()
+        {
+            *self
+                .pending_consent
+                .lock()
+                .expect("pending_consent lock poisoned") = None;
+            self.emit_daemon_status("stop: discarded the paused task");
+        }
+
+        // Scoped cancel of the CURRENT turn when its contextId is already known, even if the
+        // wire message carried no context_id (the iOS client never has one): lower blast
+        // radius and a faster terminal than waiting on the global kill switch's 250ms file
+        // poll alone. The global `holo stop` below still runs for the no-context case.
+        let current_ids = self
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .as_ref()
+            .and_then(|t| t.context_id.clone().map(|ctx| (ctx, t.a2a_task_id.clone())));
+        if context_id.is_none() {
+            if let Some((ctx, task_id)) = current_ids {
+                let client = self.client.read().expect("client lock poisoned").clone();
+                if let Err(err) = client.cancel(&ctx, task_id.as_deref()).await {
+                    tracing::warn!(request_id, context_id = %ctx, error = %err, "scoped cancel of current turn failed (global stop still follows)");
+                }
+            }
+        }
 
         // `holo stop` (below) only reaches the *currently running* turn -- it polls
         // `~/.holo/stop` from inside `session_runner.run_turn`, which a still-queued prompt
@@ -918,6 +1189,392 @@ impl HoloControlBridge {
                 "stop requested".to_owned()
             }),
         });
+    }
+
+    /// Cancel the in-flight turn as gracefully as its known state allows: a scoped A2A
+    /// `tasks/cancel` when the turn's `contextId` has resolved, else the graceful (non-force)
+    /// global `holo stop` kill switch. Shared by Pause, Redirect, and the sensitive-app
+    /// watchdog's HardBlock arm. Best-effort by design: a failed cancel is logged and
+    /// surfaced, never a panic -- the turn's own stream error/terminal handling remains the
+    /// backstop.
+    async fn cancel_current_turn(&self, why: &str) {
+        let current = self
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .clone();
+        let Some(turn) = current else { return };
+        match turn.context_id.as_deref() {
+            Some(ctx) => {
+                let client = self.client.read().expect("client lock poisoned").clone();
+                if let Err(err) = client.cancel(ctx, turn.a2a_task_id.as_deref()).await {
+                    tracing::warn!(request_id = turn.request_id, context_id = ctx, error = %err, why, "scoped cancel failed; falling back to global holo stop");
+                    if let Err(err) = crate::holo_bridge::stop::holo_stop(&self.holo_bin, false).await {
+                        tracing::warn!(error = %err, why, "global holo stop also failed");
+                        self.emit_daemon_status(format!("{why}: could not stop the running turn: {err}"));
+                    }
+                }
+            }
+            None => {
+                if let Err(err) = crate::holo_bridge::stop::holo_stop(&self.holo_bin, false).await {
+                    tracing::warn!(error = %err, why, "holo stop failed");
+                    self.emit_daemon_status(format!("{why}: could not stop the running turn: {err}"));
+                }
+            }
+        }
+    }
+
+    /// `Pause`: park the in-flight turn so `Resume` can continue it. The Holo backend has no
+    /// pause RPC (its own kill switch is pause-then-cancel -- see `stop.rs`'s source notes),
+    /// so the only honest pause available is: cancel the running turn NOW, remember its
+    /// instruction + backend session (`contextId`), and let Resume re-dispatch on that same
+    /// session, whose history carries the progress made so far.
+    async fn handle_pause(&self, request_id: String) {
+        self.emit(ControlEvent::Ack {
+            request_id: request_id.clone(),
+        });
+
+        if self.paused.lock().expect("paused lock poisoned").is_some() {
+            self.emit_daemon_status("already paused -- send resume to continue, or redirect/stop to replace it");
+            return;
+        }
+        let current = self
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .clone();
+        let Some(turn) = current else {
+            self.emit_daemon_status("nothing is running -- no task to pause");
+            return;
+        };
+
+        *self.paused.lock().expect("paused lock poisoned") = Some(PausedTurn {
+            request_id: turn.request_id.clone(),
+            text: turn.text.clone(),
+            context_id: turn.context_id.clone(),
+        });
+        self.cancel_current_turn("pause").await;
+        self.emit_daemon_status("task paused -- send resume to continue");
+    }
+
+    /// `Resume`: continue the parked turn on the SAME backend session. The resumed turn runs
+    /// under `request_id` (the resume message's own id) so the client's log/UI correlates
+    /// events with the action it just took.
+    async fn handle_resume(&self, request_id: String) {
+        self.emit(ControlEvent::Ack {
+            request_id: request_id.clone(),
+        });
+
+        let Some(parked) = self.paused.lock().expect("paused lock poisoned").take() else {
+            self.emit_daemon_status("nothing is paused -- no task to resume");
+            return;
+        };
+        // A pending consent request attached to the parked turn is now moot -- resuming IS
+        // the user's decision to continue (the watchdog re-asks if the sensitive app is
+        // still frontmost).
+        *self
+            .pending_consent
+            .lock()
+            .expect("pending_consent lock poisoned") = None;
+        self.emit_daemon_status("resuming the paused task");
+        let resume_text = format!(
+            "Continue the previous task from where it was paused. Original instruction: {}",
+            parked.text
+        );
+        self.run_or_queue(request_id, resume_text, parked.context_id)
+            .await;
+    }
+
+    /// `Redirect`: replace everything in flight/queued with a new instruction, keeping the
+    /// backend session so the agent retains what it had already learned/done for this task.
+    async fn handle_redirect(&self, request_id: String, text: String) {
+        self.emit(ControlEvent::Ack {
+            request_id: request_id.clone(),
+        });
+
+        let trimmed = text.trim().to_owned();
+        if trimmed.is_empty() {
+            self.emit(ControlEvent::Error {
+                request_id,
+                message: "redirect requires a non-empty prompt".to_owned(),
+            });
+            return;
+        }
+
+        // Queued prompts are superseded, same drain-with-terminal treatment as Stop.
+        let dropped: Vec<QueuedPrompt> = {
+            let mut queue = self.queue.lock().expect("queue lock poisoned");
+            queue.drain(..).collect()
+        };
+        for dropped_prompt in dropped {
+            self.emit(ControlEvent::Done {
+                request_id: dropped_prompt.request_id,
+                context_id: dropped_prompt.context_id,
+                status: DoneStatus::Canceled,
+                message: Some("canceled: superseded by a redirect".to_owned()),
+            });
+        }
+
+        // A parked (paused) turn is simply replaced, and a redirect is a new
+        // instruction -- prior consent does not carry over.
+        let parked = self.paused.lock().expect("paused lock poisoned").take();
+        *self
+            .pending_consent
+            .lock()
+            .expect("pending_consent lock poisoned") = None;
+        self.turn_allowances
+            .lock()
+            .expect("turn_allowances lock poisoned")
+            .clear();
+
+        // Inherit the session: prefer the RUNNING turn's contextId, else a parked turn's --
+        // whichever task the user is steering, its history should carry into the new
+        // instruction.
+        let inherited_context = self
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .as_ref()
+            .and_then(|t| t.context_id.clone())
+            .or_else(|| parked.and_then(|p| p.context_id));
+
+        let had_active = self
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .is_some();
+        if had_active {
+            self.cancel_current_turn("redirect").await;
+            self.emit_daemon_status(
+                "redirecting: canceling the current task, your new instruction runs next",
+            );
+        }
+
+        // `run_or_queue` handles the still-busy window naturally: the redirect prompt queues
+        // behind the dying turn and `drain_queue` starts it the moment the cancel's terminal
+        // lands -- no race, no sleep.
+        self.run_or_queue(request_id, trimmed, inherited_context)
+            .await;
+    }
+
+    /// Resolve a wire `InputResponse` against the outstanding sensitive-app consent request,
+    /// if any. Returns `true` when this response WAS that consent decision (the control
+    /// channel then acks it and does not fall through to its generic pending-input logic).
+    ///
+    /// Associated fn taking the owning [`super::HoloBridge`] `Arc` (rather than `&self`)
+    /// because the allow path re-dispatches the parked turn -- a whole streaming turn that
+    /// must outlive the control channel's read-loop iteration, so it is spawned onto its own
+    /// task holding a real `Arc`.
+    pub fn resolve_consent(
+        bridge: &Arc<super::HoloBridge>,
+        request_id: &str,
+        selected_option: &str,
+    ) -> bool {
+        let ctrl = &bridge.control;
+        let pending = {
+            let mut guard = ctrl
+                .pending_consent
+                .lock()
+                .expect("pending_consent lock poisoned");
+            match guard.as_ref() {
+                Some(p) if p.consent_request_id == request_id => guard.take(),
+                _ => None,
+            }
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+
+        if selected_option == CONSENT_ALLOW_ONCE {
+            ctrl.turn_allowances
+                .lock()
+                .expect("turn_allowances lock poisoned")
+                .insert(pending.category_id.clone());
+            let parked = ctrl.paused.lock().expect("paused lock poisoned").take();
+            match parked {
+                Some(parked) => {
+                    ctrl.emit_daemon_status(format!(
+                        "consent granted for {} -- resuming the task",
+                        pending.category_id
+                    ));
+                    let bridge = bridge.clone();
+                    tokio::spawn(async move {
+                        let resume_text = format!(
+                            "Continue the previous task from where it was paused. Original instruction: {}",
+                            parked.text
+                        );
+                        bridge
+                            .control
+                            .run_or_queue(parked.request_id, resume_text, parked.context_id)
+                            .await;
+                    });
+                }
+                None => {
+                    // Consent arrived but the stash is gone (a Stop/Redirect raced it) --
+                    // nothing to resume; the allowance still stands for any current turn.
+                    ctrl.emit_daemon_status(format!(
+                        "consent granted for {}, but the paused task is gone (stopped or redirected meanwhile)",
+                        pending.category_id
+                    ));
+                }
+            }
+        } else {
+            // Anything other than the allow option -- including the explicit stop option --
+            // is a deny: the parked turn is discarded (it was already canceled when the gate
+            // paused it).
+            *ctrl.paused.lock().expect("paused lock poisoned") = None;
+            ctrl.emit_daemon_status(format!(
+                "consent denied for {} -- task stopped",
+                pending.category_id
+            ));
+        }
+        true
+    }
+}
+
+/// Per-turn sensitive-app watchdog: the live interception point wiring
+/// [`crate::sensitive_categories`] (data model) + [`crate::frontmost_app`] (live signal)
+/// into the PRD section-9 behavior its module docs used to disclaim as unimplemented.
+/// Polls the frontmost app once a second for the turn's lifetime:
+///
+/// - `AlwaysAllow` category (or no category): keep watching.
+/// - `HardBlock` category: announce + cancel the turn. Terminal for the watchdog.
+/// - `AlwaysAsk` category (the PRD default): pause the turn (same stash `Resume` uses) and
+///   emit a `sensitive_access_consent` input request; the user's `InputResponse` resolves it
+///   via [`HoloControlBridge::resolve_consent`]. One "Allow once" covers that category for
+///   the REST of the same turn (`turn_allowances`), so the gate doesn't re-fire every tick.
+///
+/// Frontmost-app granularity is an honest heuristic, not a per-screen classifier -- see
+/// `frontmost_app`'s and `sensitive_categories`' module docs for exactly what it can and
+/// cannot distinguish.
+async fn sensitive_watchdog(bridge: Arc<super::HoloBridge>, request_id: String) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let ctrl = &bridge.control;
+
+        // Turn over (or replaced by a newer one)? Watchdog dies with it.
+        let still_ours = ctrl
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .as_ref()
+            .is_some_and(|t| t.request_id == request_id);
+        if !still_ours {
+            return;
+        }
+
+        let Some(bundle_id) = crate::frontmost_app::frontmost_bundle_id().await else {
+            continue;
+        };
+        let classified = {
+            let cats = ctrl
+                .sensitive_categories
+                .lock()
+                .expect("sensitive_categories lock poisoned");
+            cats.classify(&bundle_id)
+                .map(|c| (c.id.clone(), c.display_name.clone(), c.setting))
+        };
+        let Some((category_id, display_name, setting)) = classified else {
+            continue;
+        };
+
+        match setting {
+            CategorySetting::AlwaysAllow => continue,
+            CategorySetting::HardBlock => {
+                tracing::warn!(
+                    request_id,
+                    bundle_id,
+                    category = category_id,
+                    "sensitive-app watchdog: hard-blocked category frontmost; stopping the turn"
+                );
+                ctrl.emit_daemon_status(format!(
+                    "privacy: {display_name} ({bundle_id}) is hard-blocked -- stopping the task"
+                ));
+                ctrl.cancel_current_turn("privacy hard-block").await;
+                return;
+            }
+            CategorySetting::AlwaysAsk => {
+                if ctrl
+                    .turn_allowances
+                    .lock()
+                    .expect("turn_allowances lock poisoned")
+                    .contains(&category_id)
+                {
+                    continue;
+                }
+                tracing::info!(
+                    request_id,
+                    bundle_id,
+                    category = category_id,
+                    "sensitive-app watchdog: ask-gated category frontmost; pausing for consent"
+                );
+
+                // Park the turn exactly the way `Pause` does, then ask.
+                let current = ctrl
+                    .current_turn
+                    .lock()
+                    .expect("current_turn lock poisoned")
+                    .clone();
+                let Some(turn) = current else { return };
+                *ctrl.paused.lock().expect("paused lock poisoned") = Some(PausedTurn {
+                    request_id: turn.request_id.clone(),
+                    text: turn.text.clone(),
+                    context_id: turn.context_id.clone(),
+                });
+                ctrl.cancel_current_turn("privacy consent gate").await;
+
+                let consent_request_id = uuid::Uuid::new_v4().to_string();
+                *ctrl
+                    .pending_consent
+                    .lock()
+                    .expect("pending_consent lock poisoned") = Some(PendingConsent {
+                    consent_request_id: consent_request_id.clone(),
+                    category_id: category_id.clone(),
+                });
+                let expires_at = holoiroh_wire::epoch_millis_now()
+                    .saturating_add(CONSENT_TTL.as_millis() as u64);
+                ctrl.emit(ControlEvent::InputRequested {
+                    request_id: consent_request_id.clone(),
+                    kind: InputRequestKind::SensitiveAccessConsent,
+                    context: format!(
+                        "The agent is about to work in {display_name} ({bundle_id}), a sensitive app category. The task is paused -- allow it to continue there?"
+                    ),
+                    response_options: vec![
+                        CONSENT_ALLOW_ONCE.to_string(),
+                        CONSENT_STOP_TASK.to_string(),
+                    ],
+                    expires_at,
+                });
+
+                // Consent expiry: if unanswered, the request lapses into the standard
+                // safe-pause state -- the task simply STAYS paused (Resume re-asks if the
+                // app is still sensitive-frontmost). Never an error, per the wire schema's
+                // own expiry-to-safe-pause contract.
+                let expiry_bridge = bridge.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(CONSENT_TTL).await;
+                    let ctrl = &expiry_bridge.control;
+                    let expired = {
+                        let mut guard = ctrl
+                            .pending_consent
+                            .lock()
+                            .expect("pending_consent lock poisoned");
+                        match guard.as_ref() {
+                            Some(p) if p.consent_request_id == consent_request_id => {
+                                guard.take().is_some()
+                            }
+                            _ => false,
+                        }
+                    };
+                    if expired {
+                        ctrl.emit_daemon_status(holoiroh_wire::input_request_expired_text(
+                            &consent_request_id,
+                        ));
+                    }
+                });
+                return;
+            }
+        }
     }
 }
 

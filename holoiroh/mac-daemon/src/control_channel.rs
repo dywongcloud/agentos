@@ -87,7 +87,7 @@ use crate::audit_log::{
     ActionClass, AppCategory, AuditEntry, AuditLogger, ConnectionPath, FinalStatus,
     InferenceMode, RemoteViewState, now_ms,
 };
-use crate::holo_bridge::{ControlEvent, ControlMessage, DoneStatus, HoloBridge};
+use crate::holo_bridge::{ControlEvent, ControlMessage, DoneStatus, HoloBridge, HoloControlBridge};
 
 // Wire-protocol types/constants/framing helpers: these used to be defined
 // in this module, but now live in `holoiroh-wire` (a pure-serde, no-iroh,
@@ -212,17 +212,19 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
         ControlEvent::Done {
             status, message, ..
         } => {
-            let text = message.unwrap_or_else(|| format!("{status:?}"));
-            // `Failed` must reach the wire as an `error` frame, not `status` -- a real
-            // backend failure (e.g. the witnessed hosted-Holo3 429 quota exhaustion
-            // propagated up through hai-agent-runtime) previously arrived as a plain
-            // `{"type":"status",...}` line, visually identical to routine progress, so
-            // the iOS log panel had no way to style it as an ERROR row. `Completed` and
-            // `Canceled` are genuinely benign terminal states and stay on `status`.
-            match status {
-                DoneStatus::Failed => ServerMessage::error(text),
-                DoneStatus::Completed | DoneStatus::Canceled => ServerMessage::status(text),
-            }
+            // Terminal lifecycle now reaches the wire as a first-class `task_done` frame
+            // (additive `ServerMessage::TaskDone`) instead of being folded into a generic
+            // `status`/`error` line: the phone's task controls (stop/pause/redirect UI)
+            // need a reliable "this task ended, and how" signal to key off, which free
+            // text never was. `status` carries the snake_case `DoneStatus` name, matching
+            // its serde casing (`completed`/`failed`/`canceled`); the client styles
+            // `failed` as an error row itself.
+            let status_str = match status {
+                DoneStatus::Completed => "completed",
+                DoneStatus::Failed => "failed",
+                DoneStatus::Canceled => "canceled",
+            };
+            ServerMessage::task_done(status_str, message)
         }
         ControlEvent::Error { message, .. } => ServerMessage::error(message),
         // Wire shape required verbatim: `{"type":"status","text":"queued, N ahead"}`.
@@ -232,7 +234,41 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
             ServerMessage::status(format!("queued, {ahead} ahead"))
         }
         ControlEvent::DaemonStatus { text } => ServerMessage::status(text),
+        // The sensitive-app consent gate's ask, verbatim onto the wire's P0-14 shape.
+        ControlEvent::InputRequested {
+            request_id,
+            kind,
+            context,
+            response_options,
+            expires_at,
+        } => ServerMessage::InputRequest {
+            request_id,
+            kind,
+            context,
+            response_options,
+            expires_at,
+        },
     }
+}
+
+/// The `request_id` a [`ControlEvent`] itself carries, when it names a real one -- used by
+/// the writer task to stamp the correct envelope `task_id` on each outbound event. Before
+/// turns were spawned off the read loop, the last-inbound-envelope's task_id was a safe
+/// stand-in (one turn at a time, strictly request/response); with concurrent turns, an event
+/// must correlate by its OWN id, else e.g. a mid-turn `Stop`'s inbound envelope would
+/// re-stamp the still-streaming prompt's progress events with the stop's task_id.
+fn event_request_id(event: &ControlEvent) -> Option<String> {
+    let id = match event {
+        ControlEvent::Ack { request_id }
+        | ControlEvent::Progress { request_id, .. }
+        | ControlEvent::Answer { request_id, .. }
+        | ControlEvent::Done { request_id, .. }
+        | ControlEvent::Error { request_id, .. }
+        | ControlEvent::Queued { request_id, .. }
+        | ControlEvent::InputRequested { request_id, .. } => request_id,
+        ControlEvent::DaemonStatus { .. } => return None,
+    };
+    if id.is_empty() { None } else { Some(id.clone()) }
 }
 
 /// Converts a wire [`ClientMessage`] plus a synthesized `request_id` into
@@ -283,6 +319,9 @@ pub fn to_control_message(request_id: String, msg: ClientMessage) -> Option<Cont
             context_id: None,
             force: false,
         }),
+        ClientMessage::Pause => Some(ControlMessage::Pause { request_id }),
+        ClientMessage::Resume => Some(ControlMessage::Resume { request_id }),
+        ClientMessage::Redirect { text } => Some(ControlMessage::Redirect { request_id, text }),
         ClientMessage::Pin { .. } => None,
         ClientMessage::InputResponse { .. } => None,
     }
@@ -901,11 +940,16 @@ impl ProtocolHandler for ControlChannel {
                         &mut action_counts,
                         &event,
                     );
+                    // Correlate by the event's OWN request_id first (concurrent turns are
+                    // real now that the read loop spawns them); the last-inbound-envelope
+                    // fallback only covers events that genuinely carry no id of their own.
+                    let task_id = event_request_id(&event).or_else(|| {
+                        current_task_id
+                            .lock()
+                            .expect("current_task_id lock poisoned")
+                            .clone()
+                    });
                     let msg = from_control_event(event);
-                    let task_id = current_task_id
-                        .lock()
-                        .expect("current_task_id lock poisoned")
-                        .clone();
                     if let Err(err) =
                         send_envelope(&mut send, &mut outbound_state, &session_id, task_id, msg)
                             .await
@@ -1091,6 +1135,26 @@ impl ProtocolHandler for ControlChannel {
                     }
                 }
                 Ok(ClientMessage::InputResponse { request_id, selected_option }) => {
+                    // Sensitive-app consent decisions are resolved by the bridge itself
+                    // (it owns the paused turn + allowance state); everything else falls
+                    // through to this connection's generic pending-input tracking.
+                    if HoloControlBridge::resolve_consent(&self.bridge, &request_id, &selected_option) {
+                        debug!(
+                            peer = %remote,
+                            request_id = %request_id,
+                            selected_option = %selected_option,
+                            "control channel: sensitive-app consent resolved"
+                        );
+                        if events_tx
+                            .send(ControlEvent::Ack {
+                                request_id: request_id.clone(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     match &pending_input_request {
                         Some(pending) if pending.request_id == request_id => {
                             debug!(
@@ -1167,7 +1231,17 @@ impl ProtocolHandler for ControlChannel {
                     if let Some(action_class) = match &msg {
                         ClientMessage::Prompt { .. } => Some(ActionClass::Prompt),
                         ClientMessage::VoiceTranscript { .. } => Some(ActionClass::VoiceTranscript),
+                        // Redirect and Resume both start a real turn whose eventual `Done`
+                        // closes the audit entry, exactly like a prompt -- audited under the
+                        // Prompt class rather than growing the on-disk audit schema for what
+                        // is semantically "a prompt that replaced/continued another".
+                        ClientMessage::Redirect { .. } | ClientMessage::Resume => {
+                            Some(ActionClass::Prompt)
+                        }
+                        // Pause has no terminal of its own (the paused turn's cancel closes
+                        // the original entry), same rationale as Stop.
                         ClientMessage::Stop
+                        | ClientMessage::Pause
                         | ClientMessage::Pin { .. }
                         | ClientMessage::InputResponse { .. } => None,
                     } {
@@ -1185,12 +1259,21 @@ impl ProtocolHandler for ControlChannel {
                     let Some(control_message) = to_control_message(request_id, msg) else {
                         continue;
                     };
-                    // Register this connection's event sink for the
-                    // duration of this call. `handle_message` drives the
-                    // whole turn (streaming progress) and returns once
-                    // terminal, per HoloControlBridge::handle's contract.
+                    // Register this connection's event sink, then SPAWN the handling
+                    // rather than awaiting it inline. The old inline `.await` was the
+                    // root cause of "stop can't stop a running task": a prompt turn
+                    // streams for its whole lifetime inside `handle_message`, and this
+                    // read loop -- the only reader of the stream -- was parked inside
+                    // that await, so a mid-turn `Stop`/`Pause`/`Redirect` line sat
+                    // unread in the QUIC buffer until the turn it was meant to
+                    // interrupt had already finished. The bridge's own `busy`/`queue`
+                    // discipline (built for exactly this concurrency) serializes the
+                    // actual A2A turns; control verbs now process immediately.
                     self.bridge.replace_event_sink(events_tx.clone());
-                    self.bridge.handle_message(control_message).await;
+                    let bridge = self.bridge.clone();
+                    tokio::spawn(async move {
+                        bridge.handle_message(control_message).await;
+                    });
                 }
                 Err(parse_err) => {
                     warn!(peer = %remote, error = %parse_err, line = %line, "control channel: malformed payload");

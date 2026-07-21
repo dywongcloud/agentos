@@ -27,6 +27,7 @@ mod duration;
 // is intentionally out of this pass's scope. Declaring `mod executor;` in the binary target too
 // would compile the whole seam as dead code here (25 warnings), since nothing in `main.rs`
 // references it yet -- so it lives in the lib target only until that wiring lands.
+mod frontmost_app;
 mod holo_bridge;
 mod instance_guard;
 mod limits;
@@ -589,7 +590,20 @@ async fn main() -> anyhow::Result<()> {
     let pin = if cli.no_pin_auth {
         None
     } else {
-        Some(generate_default_pin())
+        // HOLOIROH_PIN pins a STABLE pairing PIN across daemon restarts. Without it the
+        // per-run random PIN silently invalidates the iOS app's saved connection profiles
+        // (the sqlite "Dev Mac" profile stores ticket + PIN; the ticket is already stable
+        // via ~/.holoiroh/iroh_secret, but the PIN changed every run) -- an allowlisted
+        // device never re-sends the PIN so this only bites fresh installs/devices, which
+        // is exactly when it's most confusing. Env var, not a CLI flag, so the PIN never
+        // shows up in `ps` output.
+        match std::env::var("HOLOIROH_PIN") {
+            Ok(v) if !v.trim().is_empty() => {
+                info!("using stable pairing PIN from HOLOIROH_PIN");
+                Some(v.trim().to_string())
+            }
+            _ => Some(generate_default_pin()),
+        }
     };
 
     // --- build the shared Router: Live's own protocols (MoQ, gossip if

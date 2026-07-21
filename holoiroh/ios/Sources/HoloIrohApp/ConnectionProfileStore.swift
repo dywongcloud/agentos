@@ -85,13 +85,21 @@ final class ConnectionProfileStore: ObservableObject {
             pin: Self.currentDevPin
         )
         UserDefaults.standard.set(true, forKey: seedFlag)
+        NSLog("ConnectionProfileStore: seeded default 'Dev Mac' profile (ticket %d chars, pin set: %@)",
+              Self.currentDevTicket.count, Self.currentDevPin.isEmpty ? "no" : "yes")
     }
 
     /// The ticket/PIN a fresh install seeds as "Dev Mac" -- kept as named constants (rather
     /// than inlined) so [`refreshDevProfileIfPresent`] can reuse the exact same values to
     /// update an ALREADY-seeded install's row in place, without duplicating the literals.
+    // NOTE on ticket drift: the trailing bytes of an iroh-live ticket encode the
+    // daemon's CURRENT direct-address hints (ephemeral UDP ports), which change on
+    // every daemon restart -- only the node id + relay URL parts are stable. iroh
+    // connects via node id + relay and discovers fresh direct paths itself, so a
+    // saved ticket with stale port hints still connects; this constant just gets
+    // re-synced to the live daemon's printout whenever a deploy touches it.
     private static let currentDevTicket =
-        "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwCAQDAqAFMmOwDAQDAqEABmOwD/holoiroh"
+        "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwFACNodHRwczovL3VzdzEtMS5yZWxheS5uMC5pcm9oLmxpbmsuLwEALTJiaazUAwEALTJiacnpAwEAwKgBTP2iAwEAwKj_Cv2iAw/holoiroh"
     private static let currentDevPin = "394299"
 
     /// One-time in-place refresh of an ALREADY-seeded "Dev Mac" row's ticket/PIN to the
@@ -102,7 +110,10 @@ final class ConnectionProfileStore: ObservableObject {
     /// slot, refreshed, not an additional saved connection. Guarded by its own one-time flag
     /// so it never fights a user who has since renamed or intentionally repointed "Dev Mac".
     func refreshDevProfileIfPresent() {
-        let refreshFlag = "ConnectionProfileStore.didRefreshDevProfile_2026-07-20"
+        // Flag key carries a serial, not just a date: bump it every time the
+        // seeded ticket/PIN constants change so ALREADY-refreshed installs
+        // (whose previous flag is set) pick up the new values too.
+        let refreshFlag = "ConnectionProfileStore.didRefreshDevProfile_2026-07-20.2"
         guard !UserDefaults.standard.bool(forKey: refreshFlag) else { return }
         defer { UserDefaults.standard.set(true, forKey: refreshFlag) }
         guard let db else { return }
@@ -120,6 +131,7 @@ final class ConnectionProfileStore: ObservableObject {
             logError("step refresh dev profile")
             return
         }
+        NSLog("ConnectionProfileStore: refreshed 'Dev Mac' profile to the current daemon ticket/PIN")
         reload()
     }
 

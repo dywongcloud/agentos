@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
         .send_and_stream(
             "Do not click or type anything. Immediately finish and answer with the single word: ping",
             None,
+            |ids| println!("turn ids resolved: {ids:?}"),
             |update| println!("update: {update:?}"),
         )
         .await;
@@ -121,6 +122,7 @@ async fn main() -> Result<()> {
              reminder for the due date, then reply in Mail confirming you saw it. When your \
              description is complete, stop -- do not act on it.",
             None,
+            |ids| println!("turn ids resolved (stage 2): {ids:?}"),
             |update| {
                 match &update {
                     holoiroh_daemon::holo_bridge::a2a_client::TaskUpdate::Answer { text } => {
