@@ -35,6 +35,8 @@ tsconfig.tsbuildinfo
 *.patch
 holoiroh/ios/Artifacts/
 holoiroh/ios-app/HoloIroh.xcodeproj/
+# xcodebuild -derivedDataPath output from device deploys (regenerable, ~GBs).
+holoiroh/ios-app/build/
 # holoiroh's own gm/agentplug session state (same rationale as the root .gm/
 # ignores above -- volatile orchestrator state, never source).
 holoiroh/.gm/
