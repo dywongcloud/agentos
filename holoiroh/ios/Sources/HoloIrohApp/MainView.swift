@@ -690,6 +690,12 @@ struct MainView: View {
             },
             retry: {
                 if let lastSentTask {
+                    // A retry is a user-message send too -- the orb reacts.
+                    if case .prompt(let text) = lastSentTask {
+                        orbEffects.react(to: text)
+                    } else if case .voiceTranscript(let text) = lastSentTask {
+                        orbEffects.react(to: text)
+                    }
                     sendControlMessage(lastSentTask)
                     log(.status(text: "retrying task"))
                     session = .connecting
@@ -954,6 +960,8 @@ struct MainView: View {
             ? .voiceTranscript(text: payload.transcript)
             : .prompt(text: payload.transcript)
         lastSentTask = message
+        // Staged sends are user-message sends too -- the orb reacts.
+        orbEffects.react(to: payload.transcript)
         sendControlMessage(message)
         log(.status(text: "sent -- waiting for the daemon"))
         session = .connecting
