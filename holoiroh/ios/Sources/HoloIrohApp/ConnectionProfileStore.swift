@@ -40,9 +40,8 @@ final class ConnectionProfileStore: ObservableObject {
         if sqlite3_open(url.path, &handle) == SQLITE_OK {
             db = handle
             createTableIfNeeded()
-            seedDevProfileIfNeeded()
             reload()
-            refreshDevProfileIfPresent()
+            ensureDefaultProfile()
         } else {
             NSLog("ConnectionProfileStore: failed to open sqlite db at \(url.path): \(String(cString: sqlite3_errmsg(handle)))")
             sqlite3_close(handle)
@@ -73,25 +72,9 @@ final class ConnectionProfileStore: ObservableObject {
         """)
     }
 
-    /// The development profile for the Mac daemon, seeded exactly once.
-    /// Guarded by a UserDefaults flag rather than INSERT OR IGNORE so a
-    /// deliberately deleted profile stays deleted on later launches.
-    private func seedDevProfileIfNeeded() {
-        let seedFlag = "ConnectionProfileStore.didSeedDevProfile"
-        guard !UserDefaults.standard.bool(forKey: seedFlag) else { return }
-        save(
-            name: "Dev Mac",
-            ticket: Self.currentDevTicket,
-            pin: Self.currentDevPin
-        )
-        UserDefaults.standard.set(true, forKey: seedFlag)
-        NSLog("ConnectionProfileStore: seeded default 'Dev Mac' profile (ticket %d chars, pin set: %@)",
-              Self.currentDevTicket.count, Self.currentDevPin.isEmpty ? "no" : "yes")
-    }
-
-    /// The ticket/PIN a fresh install seeds as "Dev Mac" -- kept as named constants (rather
-    /// than inlined) so [`refreshDevProfileIfPresent`] can reuse the exact same values to
-    /// update an ALREADY-seeded install's row in place, without duplicating the literals.
+    /// The built-in ticket/PIN for the dev Mac's daemon -- the values
+    /// [`ensureDefaultProfile`] guarantees are on hand when no working "Dev
+    /// Mac" row exists.
     // NOTE on ticket drift: the trailing bytes of an iroh-live ticket encode the
     // daemon's CURRENT direct-address hints (ephemeral UDP ports), which change on
     // every daemon restart -- only the node id + relay URL parts are stable. iroh
@@ -102,37 +85,48 @@ final class ConnectionProfileStore: ObservableObject {
         "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwFACNodHRwczovL3VzdzEtMS5yZWxheS5uMC5pcm9oLmxpbmsuLwEALTJiadi2AgEALTJiaYnGAwEAwKgBTO6IAwEAwKj_Cu6IAw/holoiroh"
     private static let currentDevPin = "394299"
 
-    /// One-time in-place refresh of an ALREADY-seeded "Dev Mac" row's ticket/PIN to the
-    /// current daemon identity, for installs where `seedDevProfileIfNeeded` already ran (and
-    /// so the seed flag blocks re-seeding) against a now-stale ticket. Unlike `save`, which
-    /// dedups by TICKET (a changed ticket would insert a second row, not replace the first),
-    /// this updates by NAME -- "replace the current default profile" means the same named
-    /// slot, refreshed, not an additional saved connection. Guarded by its own one-time flag
-    /// so it never fights a user who has since renamed or intentionally repointed "Dev Mac".
-    func refreshDevProfileIfPresent() {
-        // Flag key carries a serial, not just a date: bump it every time the
-        // seeded ticket/PIN constants change so ALREADY-refreshed installs
-        // (whose previous flag is set) pick up the new values too.
-        let refreshFlag = "ConnectionProfileStore.didRefreshDevProfile_2026-07-20.3"
-        guard !UserDefaults.standard.bool(forKey: refreshFlag) else { return }
-        defer { UserDefaults.standard.set(true, forKey: refreshFlag) }
-        guard let db else { return }
-        guard profiles.contains(where: { $0.name == "Dev Mac" }) else { return }
-        var stmt: OpaquePointer?
-        let sql = "UPDATE profiles SET ticket = ?1, pin = ?2 WHERE name = 'Dev Mac';"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            logError("prepare refresh dev profile")
-            return
+    /// The iroh node-id portion of a ticket: the first 43 characters after
+    /// the `iroh-live:` scheme (a 32-byte node key, base64url unpadded).
+    /// Everything after it is address/relay hint data that drifts per daemon
+    /// restart; the node id IS the daemon's identity.
+    private static func nodeIdPrefix(of ticket: String) -> Substring? {
+        let scheme = "iroh-live:"
+        guard ticket.hasPrefix(scheme) else { return nil }
+        let body = ticket.dropFirst(scheme.count)
+        guard body.count >= 43 else { return nil }
+        return body.prefix(43)
+    }
+
+    /// Guarantees the "Dev Mac" default profile EXISTS on every launch --
+    /// deterministically, with no one-time flags. This replaced the old
+    /// seed-once-then-refresh-once design after it was live-witnessed
+    /// leaving a real phone with an EMPTY profiles table: the UserDefaults
+    /// seed flag survives app upgrades, the row had been deleted, and the
+    /// refresh path only updated an existing row -- an unreachable state no
+    /// flag-bump could repair. The requirement is that the current daemon's
+    /// ticket/PIN profile is ALWAYS present, so:
+    ///
+    /// - no "Dev Mac" row -> insert the built-in constants, every launch
+    ///   that finds it missing;
+    /// - row exists with the SAME iroh node id as the constants -> leave it
+    ///   (its address hints may be fresher; `upsertDefaultProfile` pins it
+    ///   to whatever actually connects);
+    /// - row exists pointing at a DIFFERENT node id -> repoint the default
+    ///   slot at the dev daemon's identity.
+    private func ensureDefaultProfile() {
+        guard db != nil else { return }
+        if let existing = profiles.first(where: { $0.name == "Dev Mac" }) {
+            let existingNode = Self.nodeIdPrefix(of: existing.ticket)
+            let builtinNode = Self.nodeIdPrefix(of: Self.currentDevTicket)
+            if existingNode != nil && existingNode == builtinNode {
+                return
+            }
+            NSLog("ConnectionProfileStore: 'Dev Mac' pointed at a different/invalid node id -- repointing at the built-in daemon identity")
+            upsertDefaultProfile(ticket: Self.currentDevTicket, pin: Self.currentDevPin)
+        } else {
+            NSLog("ConnectionProfileStore: default 'Dev Mac' profile missing -- inserting the built-in daemon identity")
+            save(name: "Dev Mac", ticket: Self.currentDevTicket, pin: Self.currentDevPin)
         }
-        defer { sqlite3_finalize(stmt) }
-        sqlite3_bind_text(stmt, 1, Self.currentDevTicket, -1, Self.transient)
-        sqlite3_bind_text(stmt, 2, Self.currentDevPin, -1, Self.transient)
-        if sqlite3_step(stmt) != SQLITE_DONE {
-            logError("step refresh dev profile")
-            return
-        }
-        NSLog("ConnectionProfileStore: refreshed 'Dev Mac' profile to the current daemon ticket/PIN")
-        reload()
     }
 
     /// Pins the "Dev Mac" default profile to the ticket/PIN a control-channel
@@ -141,8 +135,8 @@ final class ConnectionProfileStore: ObservableObject {
     /// the daemon's CURRENT identity without hand-syncing the seed constants
     /// after every daemon restart (a ticket's trailing direct-address hints
     /// drift per restart; whatever actually connected is by definition the
-    /// freshest working value). Updates by NAME (same "refresh the default
-    /// slot" semantics as `refreshDevProfileIfPresent`); inserts the row if a
+    /// freshest working value). Updates by NAME ("refresh the default slot",
+    /// same semantics `ensureDefaultProfile` repoints by); inserts the row if a
     /// user deleted it and then connected manually. No-ops when the stored
     /// values already match, so routine reconnects don't churn the DB.
     func upsertDefaultProfile(ticket: String, pin: String) {
