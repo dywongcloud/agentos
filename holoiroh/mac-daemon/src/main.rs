@@ -17,6 +17,8 @@
 mod agent_guidance;
 mod allowlist;
 mod audit_log;
+mod auto_yield;
+mod user_activity;
 mod auth;
 mod capture;
 mod control_channel;
@@ -572,6 +574,11 @@ async fn main() -> anyhow::Result<()> {
                 bridge.clone(),
                 health_check_shutdown.clone(),
             ));
+            // Cooperative auto-yield: step the agent aside while the user is
+            // actively using the Mac, resume when they go idle (see
+            // `crate::auto_yield`). Starts its own physical-input CGEventTap;
+            // degrades to inactive if Input-Monitoring permission is absent.
+            auto_yield::spawn_monitor(bridge.clone());
             Some(bridge)
         }
         Err(err) => {

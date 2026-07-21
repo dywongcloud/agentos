@@ -32,7 +32,13 @@ pub fn task_framing_block() -> &'static str {
      - Only skip or adapt the action if the user explicitly said to (e.g. \
      \"only if it isn't already there\"). When it is genuinely unclear whether \
      duplicating is wanted, prefer completing the requested action; ask only if \
-     truly ambiguous."
+     truly ambiguous.\n\
+     - You SHARE this Mac with the user. You may be automatically paused mid-task \
+     the moment they start using the mouse or keyboard, and resumed when they go \
+     idle. If a turn tells you it is resuming after such an interruption, look at \
+     the current on-screen state and CONTINUE from where you left off -- do not \
+     restart the task or repeat steps you already completed. Avoid stealing the \
+     user's frontmost window when you don't need it."
 }
 
 /// A short, stable substring of [`task_framing_block`] that witnesses (in a

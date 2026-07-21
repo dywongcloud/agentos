@@ -155,6 +155,12 @@ pub enum ControlEvent {
     /// `holo_bridge::health`'s crash-detected/restarting/restarted notifications. Carries no
     /// `request_id` since it isn't a response to a specific prompt.
     DaemonStatus { text: String },
+    /// Live task-control state change, not tied to a single request: emitted by
+    /// cooperative auto-yield (`crate::auto_yield`) when it steps the agent
+    /// aside (`paused: true`) or resumes it (`paused: false`), so the phone's
+    /// Pause/Stop pill reflects the yield in real time. Maps to the wire
+    /// `ServerMessage::TaskActive` (the same message used on reconnect).
+    TaskActive { paused: bool, queued: usize },
     /// The daemon needs structured user input before the paused turn can continue --
     /// today produced only by the sensitive-app consent gate (see the sensitive-app
     /// watchdog in this module). Translated by `control_channel::from_control_event` into
@@ -222,6 +228,11 @@ struct PausedTurn {
     request_id: String,
     text: String,
     context_id: Option<String>,
+    /// True if this pause was created by cooperative auto-yield (the user
+    /// started using the Mac) rather than a deliberate user Pause. Only an
+    /// auto pause is auto-resumed; a user pause stays paused until the user
+    /// resumes it. See `crate::auto_yield`.
+    auto: bool,
 }
 
 /// One outstanding sensitive-app consent request (`ControlEvent::InputRequested`,
@@ -472,6 +483,77 @@ impl HoloControlBridge {
     /// pill (in its Paused state) rather than vanishing.
     pub fn is_paused(&self) -> bool {
         self.paused.lock().expect("paused lock poisoned").is_some()
+    }
+
+    /// Whether the current pause was created by cooperative auto-yield (vs a
+    /// deliberate user Pause). `crate::auto_yield`'s monitor uses this to know
+    /// which pauses it may auto-resume, and to avoid overriding a user pause.
+    pub fn is_auto_yielded(&self) -> bool {
+        self.paused
+            .lock()
+            .expect("paused lock poisoned")
+            .as_ref()
+            .is_some_and(|p| p.auto)
+    }
+
+    /// Auto-yield: step the running turn aside because the user is actively
+    /// using the Mac. Like [`handle_pause`](Self::handle_pause) but tagged
+    /// `auto` (so only [`auto_yield_resume`](Self::auto_yield_resume) brings it
+    /// back) and it emits `TaskActive{paused:true}` so the phone's pill reflects
+    /// the yield live. No-op if nothing is running or something is already
+    /// paused (never double-parks, never fights an existing user pause).
+    pub async fn auto_yield_pause(&self) {
+        if self.paused.lock().expect("paused lock poisoned").is_some() {
+            return;
+        }
+        let current = self
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .clone();
+        let Some(turn) = current else { return };
+        *self.paused.lock().expect("paused lock poisoned") = Some(PausedTurn {
+            request_id: turn.request_id.clone(),
+            text: turn.text.clone(),
+            context_id: turn.context_id.clone(),
+            auto: true,
+        });
+        self.cancel_current_turn("auto-yield").await;
+        let queued = self.queue.lock().expect("queue lock poisoned").len();
+        self.emit(ControlEvent::TaskActive { paused: true, queued });
+        self.emit_daemon_status(
+            "stepping aside while you use the Mac -- I'll resume when you're idle",
+        );
+    }
+
+    /// Auto-yield: the user has gone idle, so resume the auto-parked turn on its
+    /// original backend session (`context_id` preserved -> history intact).
+    /// Resumes ONLY an auto-yield pause (a user pause stays paused). Adds a
+    /// "continue without repeating completed steps" note to blunt duplicate
+    /// side-effects, and emits `TaskActive{paused:false}` so the pill flips back.
+    pub async fn auto_yield_resume(&self) {
+        // Take the parked turn only if it is an auto-yield pause.
+        let parked = {
+            let mut guard = self.paused.lock().expect("paused lock poisoned");
+            match guard.as_ref() {
+                Some(p) if p.auto => guard.take(),
+                _ => None,
+            }
+        };
+        let Some(parked) = parked else { return };
+        let queued = self.queue.lock().expect("queue lock poisoned").len();
+        self.emit(ControlEvent::TaskActive { paused: false, queued });
+        self.emit_daemon_status("you're idle again -- resuming the task");
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.redispatch_parked(
+            request_id,
+            parked.text,
+            parked.context_id,
+            "You were interrupted mid-task because the user started using the Mac, and are now \
+             resuming on the SAME session. Look at the current on-screen state and CONTINUE the \
+             task from where you left off -- do NOT repeat any step you already completed.",
+        )
+        .await;
     }
 
     /// Swaps the sink that [`emit`](Self::emit) sends
@@ -1380,6 +1462,7 @@ impl HoloControlBridge {
             request_id: turn.request_id.clone(),
             text: turn.text.clone(),
             context_id: turn.context_id.clone(),
+            auto: false,
         });
         self.cancel_current_turn("pause").await;
         self.emit_daemon_status("task paused -- send resume to continue");
@@ -1405,12 +1488,28 @@ impl HoloControlBridge {
             .lock()
             .expect("pending_consent lock poisoned") = None;
         self.emit_daemon_status("resuming the paused task");
-        let resume_text = format!(
-            "Continue the previous task from where it was paused. Original instruction: {}",
-            parked.text
-        );
-        self.run_or_queue(request_id, resume_text, parked.context_id)
-            .await;
+        self.redispatch_parked(
+            request_id,
+            parked.text,
+            parked.context_id,
+            "Continue the previous task from where it was paused.",
+        )
+        .await;
+    }
+
+    /// Re-dispatch a parked turn on its original backend session (`context_id`
+    /// preserved -> history intact), prefixing `preamble` to the original
+    /// instruction. Shared by user Resume and cooperative auto-yield resume so
+    /// the two re-dispatch paths can never drift apart.
+    async fn redispatch_parked(
+        &self,
+        request_id: String,
+        parked_text: String,
+        parked_context: Option<String>,
+        preamble: &str,
+    ) {
+        let text = format!("{preamble} Original instruction: {parked_text}");
+        self.run_or_queue(request_id, text, parked_context).await;
     }
 
     /// `Redirect`: replace everything in flight/queued with a new instruction, keeping the
@@ -1648,6 +1747,9 @@ async fn sensitive_watchdog(bridge: Arc<super::HoloBridge>, request_id: String) 
                     request_id: turn.request_id.clone(),
                     text: turn.text.clone(),
                     context_id: turn.context_id.clone(),
+                    // Consent-gate safe-pause, not cooperative auto-yield: the user
+                    // must make the consent decision, so this is never auto-resumed.
+                    auto: false,
                 });
                 ctrl.cancel_current_turn("privacy consent gate").await;
 

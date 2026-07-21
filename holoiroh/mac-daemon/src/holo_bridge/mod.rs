@@ -525,6 +525,24 @@ impl HoloBridge {
         self.control.is_paused()
     }
 
+    /// Whether the current pause was created by cooperative auto-yield. See
+    /// [`HoloControlBridge::is_auto_yielded`].
+    pub fn is_auto_yielded(&self) -> bool {
+        self.control.is_auto_yielded()
+    }
+
+    /// Step the running turn aside because the user is active. See
+    /// [`HoloControlBridge::auto_yield_pause`].
+    pub async fn auto_yield_pause(&self) {
+        self.control.auto_yield_pause().await
+    }
+
+    /// Resume an auto-yielded turn once the user is idle. See
+    /// [`HoloControlBridge::auto_yield_resume`].
+    pub async fn auto_yield_resume(&self) {
+        self.control.auto_yield_resume().await
+    }
+
     /// PID of the managed `holo serve` process, for diagnostics/health reporting.
     pub async fn holo_serve_pid(&self) -> Option<u32> {
         self.process.lock().await.pid()

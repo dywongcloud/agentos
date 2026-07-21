@@ -234,6 +234,11 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
             ServerMessage::status(format!("queued, {ahead} ahead"))
         }
         ControlEvent::DaemonStatus { text } => ServerMessage::status(text),
+        // Live auto-yield pause/resume -> the same wire message the reconnect
+        // path uses, so the phone's Pause/Stop pill updates in real time.
+        ControlEvent::TaskActive { paused, queued } => {
+            ServerMessage::TaskActive { paused, queued }
+        }
         // The sensitive-app consent gate's ask, verbatim onto the wire's P0-14 shape.
         ControlEvent::InputRequested {
             request_id,
@@ -266,7 +271,7 @@ fn event_request_id(event: &ControlEvent) -> Option<String> {
         | ControlEvent::Error { request_id, .. }
         | ControlEvent::Queued { request_id, .. }
         | ControlEvent::InputRequested { request_id, .. } => request_id,
-        ControlEvent::DaemonStatus { .. } => return None,
+        ControlEvent::DaemonStatus { .. } | ControlEvent::TaskActive { .. } => return None,
     };
     if id.is_empty() { None } else { Some(id.clone()) }
 }

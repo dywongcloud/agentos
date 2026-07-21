@@ -3030,6 +3030,7 @@ dependencies = [
  "libc",
  "libsql",
  "objc2-application-services",
+ "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-foundation",
  "objc2-vision",

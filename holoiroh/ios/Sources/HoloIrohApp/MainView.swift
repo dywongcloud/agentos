@@ -932,14 +932,24 @@ struct MainView: View {
     /// isn't clobbered by a late reconnect notice.
     private func restoreTaskControls(paused: Bool) {
         if paused {
+            // Reconnected to a paused task, OR auto-yield stepped the agent aside
+            // because the user is active: show the pill in its Paused state.
             isTaskPaused = true
-        } else if !isTaskActive {
-            session = .working(WorkingPayload(
-                app: macName,
-                status: "running from before you reconnected",
-                lastAction: "reconnected",
-                nextAction: "in progress"
-            ))
+        } else {
+            // Running: reconnect to a live task, or auto-yield resuming now the
+            // user is idle. Clear the paused flag so the pill flips Paused ->
+            // running (unconditionally, since during a live task isTaskActive is
+            // already true), and make the task active if we weren't showing it
+            // (the reconnect-into-idle case).
+            isTaskPaused = false
+            if !isTaskActive {
+                session = .working(WorkingPayload(
+                    app: macName,
+                    status: "running",
+                    lastAction: "resumed",
+                    nextAction: "in progress"
+                ))
+            }
         }
     }
 

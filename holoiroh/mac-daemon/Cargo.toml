@@ -169,7 +169,15 @@ libc = "0.2"
 #     (gates the individual re-export within that module --
 #     generated/HIServices/mod.rs:124). Confirmed by `cargo build` still failing to find the
 #     symbol with only "AXUIElement" enabled, tracing the module-level cfg gate directly.
-objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow"] }
+# CGWindow: permissions.rs (see above). CGEvent + CGEventTypes: src/user_activity.rs's
+# physical-input CGEventTap for cooperative auto-yield (CGEventTapCreate, the tap
+# location/placement/option enums, CGEventField::EventSourceUnixProcessID, CGEventMask).
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGWindow", "CGEvent", "CGEventTypes"] }
+# src/user_activity.rs runs the tap on a dedicated CFRunLoop thread: CFRunLoop
+# (current/add_source/run + kCFRunLoopCommonModes) and CFMachPort
+# (CFMachPortCreateRunLoopSource for the tap's run-loop source). Already in the graph
+# transitively via objc2-core-graphics; promoted to a direct dep since it's named here.
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFRunLoop", "CFMachPort"] }
 objc2-application-services = { version = "0.3", default-features = false, features = ["HIServices", "AXUIElement"] }
 # src/privacy.rs: on-device OCR for the browser/screenshot privacy-redaction layer, via
 # Apple's Vision framework (VNImageRequestHandler + VNRecognizeTextRequest). Verified directly
