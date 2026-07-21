@@ -497,6 +497,22 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         text: Option<String>,
     },
+    /// Sent immediately after the greeting on a (re)connect when a task from
+    /// before the connection drop is still live, so the client can restore its
+    /// task-control surface (the Pause/Stop pill) instead of only showing a
+    /// human `Status` line it cannot key UI state off. Emitted by
+    /// `ControlChannel::accept` when the bridge reports the task is running,
+    /// parked (`paused`), or has prompts queued behind it. `paused`
+    /// distinguishes a running task from one the user parked before
+    /// disconnecting; `queued` is how many prompts wait behind it. Additive per
+    /// `PROTOCOL.md`'s extension policy -- older clients that don't know this
+    /// type fall back to their generic "unrecognized control event" handling.
+    TaskActive {
+        #[serde(default)]
+        paused: bool,
+        #[serde(default)]
+        queued: usize,
+    },
     /// Sent immediately before the daemon closes the connection because the
     /// peer failed the auth gate in `ControlChannel::accept` (unknown
     /// device id and no/wrong PIN, or auth is required but not yet
@@ -584,6 +600,7 @@ impl ServerMessage {
             ServerMessage::Error { .. } => "error",
             ServerMessage::TaskProgress { .. } => "task_progress",
             ServerMessage::TaskDone { .. } => "task_done",
+            ServerMessage::TaskActive { .. } => "task_active",
             ServerMessage::AuthRejected { .. } => "auth_rejected",
             ServerMessage::InputRequest { .. } => "input_request",
         }

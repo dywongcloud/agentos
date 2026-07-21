@@ -305,6 +305,7 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
 { "type": "status", "text": "connected to holo-desktop-cli" }
 { "type": "task_progress", "text": "clicked Safari icon in the Dock" }
 { "type": "task_done", "status": "completed", "text": "drafted the message" }
+{ "type": "task_active", "paused": false, "queued": 0 }
 { "type": "error", "text": "holo-desktop-cli exited unexpectedly (code 1)" }
 { "type": "auth_rejected", "text": "incorrect PIN" }
 { "type": "input_request", "request_id": "d290f1ee-6c54-4b01-90e6-d701748f0851", "kind": "ambiguous_choice", "context": "Two calendars match 'team standup' -- which one?", "response_options": ["Work calendar", "Personal calendar"], "expires_at": 1800000120000 }
@@ -312,9 +313,11 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
 
 | Field              | Type                                                                                          | Required | Meaning |
 |--------------------|-------------------------------------------------------------------------------------------------|----------|---------|
-| `type`             | `"ack"` \| `"status"` \| `"error"` \| `"task_progress"` \| `"task_done"` \| `"auth_rejected"` \| `"input_request"` | yes | Discriminant. |
+| `type`             | `"ack"` \| `"status"` \| `"error"` \| `"task_progress"` \| `"task_done"` \| `"task_active"` \| `"auth_rejected"` \| `"input_request"` | yes | Discriminant. |
 | `text`             | `string`                                                                                       | optional on `ack`/`status`/`error`/`task_progress`/`task_done`/`auth_rejected` | Human-readable detail. |
 | `status`           | `"completed"` \| `"failed"` \| `"canceled"`                                                     | only for `task_done` | Which terminal state the task reached. |
+| `paused`           | `bool`                                                                                          | only for `task_active` (defaults `false`) | Whether the still-live task is parked (Resume/Stop) vs running (Pause/Stop). |
+| `queued`           | `number`                                                                                        | only for `task_active` (defaults `0`) | How many prompts are queued behind the still-live task. |
 | `request_id`       | `string`                                                                                       | only for `input_request` | Correlates this request with the eventual `ClientMessage.input_response`. |
 | `kind`             | `"credential"` \| `"mfa"` \| `"ambiguous_choice"` \| `"missing_info"` \| `"sensitive_access_consent"` | only for `input_request` | Classifies *why* input is needed — see below. |
 | `context`          | `string`                                                                                       | only for `input_request` | Human-readable explanation of what's needed and why. **Never contains the credential/secret value itself** — see the `input_request` section below. |
@@ -340,6 +343,15 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
   `status`/`error` lines. Note the pause interaction: pausing a task
   cancels its running turn (see `pause` above), so a `task_done` with
   `"canceled"` arrives even for a task the user considers merely paused.
+- `task_active`: sent right after the greeting on a **(re)connect** when a task
+  from before the connection drop is still live — running, parked (`paused`),
+  or with prompts `queued` behind it. It exists so a reconnecting client can
+  **restore its task-control surface** (the Pause/Stop pill) from a structured
+  signal instead of trying to key UI state off a free-text `status` line. A
+  parked task is not otherwise "busy", so this is the only reconnect signal
+  that surfaces a *paused* task at all. Additive/optional: older clients that
+  don't recognize `task_active` fall back to their generic "unrecognized
+  control event" handling and simply don't restore the pill.
 - `error`: something failed (bad envelope, malformed payload, envelope
   rejected per the rules above, bridge process crashed, capture failure,
   etc.). `text` should contain enough detail to show the user, not

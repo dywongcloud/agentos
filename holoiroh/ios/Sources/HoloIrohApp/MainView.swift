@@ -818,6 +818,8 @@ struct MainView: View {
             failActiveTask(cause: text)
         case .taskDone(let status, let text):
             applyTaskDone(status: status, text: text)
+        case .taskActive(let paused, _):
+            restoreTaskControls(paused: paused)
         case .authRejected(let text):
             failActiveTask(cause: text ?? "The daemon rejected this device's authentication.")
         case .inputRequest(let requestId, let kind, let context, let responseOptions, _):
@@ -917,6 +919,27 @@ struct MainView: View {
             session = .working(payload)
         default:
             break
+        }
+    }
+
+    /// Reconnect restoration (issue-2): the daemon's `task_active` told us a task
+    /// from before the connection drop is still live, so bring the Pause/Stop
+    /// task-control pill back. A running task moves `session` to `.working`
+    /// (making `isTaskActive` true -> pill shows "Task running" + Pause/Stop); a
+    /// paused task sets `isTaskPaused` (pill shows "Paused" + Resume/Stop). Never
+    /// downgrades a fresher local state: the running branch only fires when we
+    /// aren't already showing an active task, so a live turn's own progress
+    /// isn't clobbered by a late reconnect notice.
+    private func restoreTaskControls(paused: Bool) {
+        if paused {
+            isTaskPaused = true
+        } else if !isTaskActive {
+            session = .working(WorkingPayload(
+                app: macName,
+                status: "running from before you reconnected",
+                lastAction: "reconnected",
+                nextAction: "in progress"
+            ))
         }
     }
 
@@ -1252,7 +1275,7 @@ struct MainView: View {
         switch message {
         case .ack: return .secondary
         case .status: return .blue
-        case .taskProgress: return .orange
+        case .taskProgress, .taskActive: return .orange
         case .error, .authRejected: return .red
         case .taskDone(let status, _):
             return status == "failed" ? .red : .green

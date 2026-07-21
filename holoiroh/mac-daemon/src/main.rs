@@ -14,6 +14,7 @@
 //! broadcast's video source before publish. System/mic audio capture is not
 //! wired up yet.
 
+mod agent_guidance;
 mod allowlist;
 mod audit_log;
 mod auth;

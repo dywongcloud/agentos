@@ -464,6 +464,16 @@ impl HoloControlBridge {
         (busy, queued)
     }
 
+    /// Whether a task is currently PARKED (paused) awaiting `Resume`. A parked
+    /// turn is not `busy` (it was canceled on the backend when paused -- see
+    /// `handle_pause`), so `busy_state` alone reports `false` for it; the
+    /// reconnect-visibility path in `crate::control_channel` checks this too so
+    /// a paused task from before a drop still restores the client's Pause/Stop
+    /// pill (in its Paused state) rather than vanishing.
+    pub fn is_paused(&self) -> bool {
+        self.paused.lock().expect("paused lock poisoned").is_some()
+    }
+
     /// Swaps the sink that [`emit`](Self::emit) sends
     /// [`ControlEvent`]s to. Used when a new control-channel connection is
     /// accepted (see `crate::control_channel::ControlChannel::accept`) so
@@ -749,11 +759,19 @@ impl HoloControlBridge {
         // the agent is always told exactly what is running and what it must not disturb. Runs
         // synchronously (a quick `ps`); best-effort inside the module (empty on failure).
         let guard_block = crate::process_awareness::guard_block_now();
+        // Task-execution framing (see `crate::agent_guidance`): tells the agent to
+        // ACT on the request in full and that pre-existing similar content (e.g. the
+        // user's own earlier "hi" messages on Slack) is NOT task completion. Injected
+        // unconditionally every turn, like the guard block.
+        let task_framing = crate::agent_guidance::task_framing_block();
 
-        // Order: hard guard first (highest authority), then durable env facts, then the user's
-        // instruction. `run_prompt_once` sends this whole string to the backend.
+        // Order: hard guard first (highest authority), then task-execution framing,
+        // then durable env facts, then the user's instruction. `run_prompt_once`
+        // sends this whole string to the backend.
         let augmented_text = {
             let mut s = guard_block;
+            s.push('\n');
+            s.push_str(task_framing);
             if let Some(block) = env_block {
                 s.push('\n');
                 s.push_str(&block);

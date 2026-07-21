@@ -28,6 +28,11 @@ enum ServerMessage: Codable, Equatable {
     /// `"failed"`, or `"canceled"` (the daemon's `DoneStatus` snake_case).
     /// This is the signal the task-control UI keys off to know a task ended.
     case taskDone(status: String, text: String?)
+    /// Sent right after the greeting on a (re)connect when a task from before
+    /// the connection drop is still live, so the app can restore its Pause/Stop
+    /// task-control pill (in the paused state when `paused`). `queued` is how
+    /// many prompts wait behind it. See PROTOCOL.md `task_active`.
+    case taskActive(paused: Bool, queued: Int)
     /// The daemon rejected this connection's auth (unknown device / wrong
     /// PIN) and is about to close it.
     case authRejected(text: String?)
@@ -53,6 +58,8 @@ enum ServerMessage: Codable, Equatable {
         case context
         case responseOptions = "response_options"
         case expiresAt = "expires_at"
+        case paused
+        case queued
     }
 
     private enum Kind: String, Codable {
@@ -61,6 +68,7 @@ enum ServerMessage: Codable, Equatable {
         case error
         case taskProgress = "task_progress"
         case taskDone = "task_done"
+        case taskActive = "task_active"
         case authRejected = "auth_rejected"
         case inputRequest = "input_request"
     }
@@ -81,6 +89,11 @@ enum ServerMessage: Codable, Equatable {
             self = .taskDone(
                 status: try container.decode(String.self, forKey: .status),
                 text: try container.decodeIfPresent(String.self, forKey: .text)
+            )
+        case .taskActive:
+            self = .taskActive(
+                paused: try container.decodeIfPresent(Bool.self, forKey: .paused) ?? false,
+                queued: try container.decodeIfPresent(Int.self, forKey: .queued) ?? 0
             )
         case .authRejected:
             self = .authRejected(text: try container.decodeIfPresent(String.self, forKey: .text))
@@ -114,6 +127,10 @@ enum ServerMessage: Codable, Equatable {
             try container.encode(Kind.taskDone, forKey: .type)
             try container.encode(status, forKey: .status)
             try container.encodeIfPresent(text, forKey: .text)
+        case .taskActive(let paused, let queued):
+            try container.encode(Kind.taskActive, forKey: .type)
+            try container.encode(paused, forKey: .paused)
+            try container.encode(queued, forKey: .queued)
         case .authRejected(let text):
             try container.encode(Kind.authRejected, forKey: .type)
             try container.encodeIfPresent(text, forKey: .text)
@@ -139,6 +156,9 @@ enum ServerMessage: Codable, Equatable {
         case .taskDone(let status, let text):
             if let text, !text.isEmpty { return "\(status): \(text)" }
             return status
+        case .taskActive(let paused, let queued):
+            let base = paused ? "task paused from before" : "task still running from before"
+            return queued > 0 ? "\(base) (\(queued) queued)" : base
         case .authRejected(let text): return text ?? "authentication rejected"
         case .inputRequest(_, _, let context, _, _): return context
         }
@@ -153,6 +173,7 @@ enum ServerMessage: Codable, Equatable {
         case .error: return "ERROR"
         case .taskProgress: return "PROGRESS"
         case .taskDone: return "DONE"
+        case .taskActive: return "TASK"
         case .authRejected: return "AUTH"
         case .inputRequest: return "INPUT"
         }

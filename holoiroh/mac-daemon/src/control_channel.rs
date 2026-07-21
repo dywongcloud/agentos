@@ -838,14 +838,26 @@ impl ProtocolHandler for ControlChannel {
         // "a stale in-flight Holo task should not be silently abandoned -- surface its
         // last-known state on reconnect".
         let (busy, queued) = self.bridge.busy_state();
-        if busy || queued > 0 {
-            let text = match (busy, queued) {
-                (true, 0) => "reconnected: a Holo task is still running from before".to_string(),
-                (true, n) => format!(
+        // A PARKED (paused) task is not `busy` -- pausing cancels the backend turn
+        // and keeps it in the bridge's `paused` slot -- so without this check a
+        // paused task from before the drop would trigger NO reconnect notice at
+        // all, leaving the phone with no way to resume or stop it.
+        let paused = self.bridge.is_paused();
+        if busy || paused || queued > 0 {
+            let text = match (busy, paused, queued) {
+                (true, _, 0) => "reconnected: a Holo task is still running from before".to_string(),
+                (true, _, n) => format!(
                     "reconnected: a Holo task is still running from before, {n} more queued behind it"
                 ),
-                (false, n) => format!("reconnected: {n} queued Holo task(s) waiting to run"),
+                (false, true, 0) => {
+                    "reconnected: a Holo task is paused from before -- resume or stop it".to_string()
+                }
+                (false, true, n) => format!(
+                    "reconnected: a Holo task is paused from before, {n} more queued behind it"
+                ),
+                (false, false, n) => format!("reconnected: {n} queued Holo task(s) waiting to run"),
             };
+            // Human status for the log panel (unchanged behaviour).
             if let Err(err) = send_envelope(
                 &mut send,
                 &mut outbound_state,
@@ -856,6 +868,22 @@ impl ProtocolHandler for ControlChannel {
             .await
             {
                 warn!(peer = %remote, error = %err, "control channel: failed to send reconnect status");
+            }
+            // Plus a STRUCTURED signal the client keys its task-control pill off,
+            // so the Pause/Stop taskbar reappears on reconnect -- a free-text
+            // status line cannot reliably drive UI state. `paused` is true only
+            // when the task is parked (running takes precedence): the app then
+            // shows the pill in its Paused state, otherwise the running state.
+            if let Err(err) = send_envelope(
+                &mut send,
+                &mut outbound_state,
+                &session_id,
+                None,
+                ServerMessage::TaskActive { paused: paused && !busy, queued },
+            )
+            .await
+            {
+                warn!(peer = %remote, error = %err, "control channel: failed to send reconnect task_active");
             }
         }
 

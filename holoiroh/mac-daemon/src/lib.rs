@@ -13,6 +13,7 @@
 //! exact same source files -- both targets compile the same `.rs` files,
 //! just under two different crate roots).
 
+pub mod agent_guidance;
 pub mod allowlist;
 pub mod audit_log;
 pub mod auth;

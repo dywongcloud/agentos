@@ -517,6 +517,14 @@ impl HoloBridge {
         self.control.busy_state()
     }
 
+    /// Whether a task is currently PARKED (paused) awaiting `Resume`. See
+    /// [`HoloControlBridge::is_paused`] -- surfaced through the control channel's
+    /// on-connect greeting so a reconnecting peer restores the Pause/Stop pill
+    /// even for a paused task (which `busy_state` alone reports as not busy).
+    pub fn is_paused(&self) -> bool {
+        self.control.is_paused()
+    }
+
     /// PID of the managed `holo serve` process, for diagnostics/health reporting.
     pub async fn holo_serve_pid(&self) -> Option<u32> {
         self.process.lock().await.pid()
