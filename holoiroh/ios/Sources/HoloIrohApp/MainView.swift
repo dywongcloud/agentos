@@ -93,6 +93,11 @@ struct MainView: View {
     /// all access on the main actor.
     @StateObject private var profileStore = ConnectionProfileStore()
 
+    /// Orb reaction driver (`OrbEffects.swift`): every real send kicks the
+    /// blob's thinking pulse, and prompts that mention known apps put their
+    /// badges in orbit around it.
+    @StateObject private var orbEffects = OrbEffectsState()
+
     /// The last task-committing message sent (`advanceFromReviewToWorking`),
     /// kept so the Failed panel's Retry re-sends the same request.
     @State private var lastSentTask: ClientMessage?
@@ -282,6 +287,10 @@ struct MainView: View {
                     .contentShape(Rectangle())
                     .onTapGesture { isPromptFocused = false }
                 SplineOrbBackground()
+                // The orb's reaction layer (pulse rings, breathing glow,
+                // orbiting app badges) -- positioned by the same canvas math
+                // as the orb itself, never hit-testable.
+                OrbReactionOverlay(state: orbEffects)
 
                 if !isFullscreenActive {
                     // CENTER: the live-screen-share box (chrome + placeholder
@@ -1473,6 +1482,16 @@ struct MainView: View {
     /// needs `.connected`) since this only exercises the layout, not a send.
     private func autoFocusPromptIfNeeded() {
         #if DEBUG
+        // Deterministic orb-reaction witness: trigger the full reaction
+        // (pulse + glow + orbiting badges parsed from the given text) with
+        // no connection needed, on a long window so screenshot bursts can
+        // catch the badges at multiple orbital angles.
+        if let reactText = ProcessInfo.processInfo.environment["HOLOIROH_DEBUG_ORB_REACT"],
+           !reactText.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                orbEffects.react(to: reactText, duration: 20)
+            }
+        }
         if let heightStr = ProcessInfo.processInfo.environment["HOLOIROH_DEBUG_KEYBOARD_HEIGHT"],
            let height = Double(heightStr) {
             // Isolated layout-only witness: sets keyboardHeight directly,
@@ -1504,6 +1523,9 @@ struct MainView: View {
         promptText = ""
         isPromptFocused = false
         lastSentTask = .prompt(text: trimmed)
+        // The orb visibly reacts to every send; apps named in the prompt
+        // orbit it while it "thinks" (OrbEffects.swift).
+        orbEffects.react(to: trimmed)
         if isTaskActive || isTaskPaused {
             sendControlMessage(.redirect(text: trimmed))
             log(.status(text: "→ redirect: \(trimmed)"))
