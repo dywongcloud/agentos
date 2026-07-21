@@ -208,9 +208,10 @@ fn main() {
     println!("ControlEvent::Queued{{ahead: 0}} -> {mapped:?}");
     assert_eq!(mapped, ServerMessage::status("queued, 0 ahead"));
 
-    // A `Done{status: Failed}` must reach the wire as an `error` frame, not `status` -- a
-    // real backend failure (e.g. hosted-Holo3 429 quota exhaustion) previously arrived
-    // indistinguishable from routine progress, since both were plain `status` lines.
+    // Terminal lifecycle reaches the wire as first-class `task_done` frames (the phone's
+    // task controls key off them) -- `status` carries the snake_case DoneStatus name and
+    // the client styles `failed` as an error row itself. This replaced the older
+    // Failed->error / Completed->status folding.
     let done_failed_event = ControlEvent::Done {
         request_id: "r1".into(),
         context_id: None,
@@ -219,12 +220,17 @@ fn main() {
     };
     let mapped = control_channel::from_control_event(done_failed_event);
     println!("ControlEvent::Done{{status: Failed}} -> {mapped:?}");
-    assert_eq!(mapped, ServerMessage::error("agent backend error"));
+    assert_eq!(
+        mapped,
+        ServerMessage::task_done("failed", Some("agent backend error".into()))
+    );
     let json = serde_json::to_string(&mapped).unwrap();
     println!("  serialized -> {json}");
-    assert_eq!(json, r#"{"type":"error","text":"agent backend error"}"#);
+    assert_eq!(
+        json,
+        r#"{"type":"task_done","status":"failed","text":"agent backend error"}"#
+    );
 
-    // Completed/Canceled remain benign `status` frames -- only Failed changes.
     let done_completed_event = ControlEvent::Done {
         request_id: "r1".into(),
         context_id: None,
@@ -233,7 +239,20 @@ fn main() {
     };
     let mapped = control_channel::from_control_event(done_completed_event);
     println!("ControlEvent::Done{{status: Completed}} -> {mapped:?}");
-    assert_eq!(mapped, ServerMessage::status("Completed"));
+    assert_eq!(mapped, ServerMessage::task_done("completed", None));
+
+    let done_canceled_event = ControlEvent::Done {
+        request_id: "r1".into(),
+        context_id: None,
+        status: DoneStatus::Canceled,
+        message: Some("stop requested".into()),
+    };
+    let mapped = control_channel::from_control_event(done_canceled_event);
+    println!("ControlEvent::Done{{status: Canceled}} -> {mapped:?}");
+    assert_eq!(
+        mapped,
+        ServerMessage::task_done("canceled", Some("stop requested".into()))
+    );
 
     println!();
     println!("control_channel_probe: OK -- all wire-schema cases witnessed via real execution");

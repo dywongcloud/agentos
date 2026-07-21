@@ -14,33 +14,24 @@
 //! load/save against a user-editable file at `~/.holoiroh/sensitive_categories.toml`
 //! (or `.json` -- see [`ConfigFormat`]).
 //!
-//! ## What this module is *not*
+//! ## Live wiring status (updated 2026-07-21)
 //!
-//! This is a config-file row, not a policy-enforcement row. Nothing in this
-//! codebase currently calls into this module from a live interception
-//! point -- there is no `ComputerUseExecutor`/policy-wrapper equivalent
-//! built yet in this Rust daemon (`holo_bridge` forwards prompts straight
-//! through to `holo serve`; see that module's own docs). Wiring "pause
-//! before any input into a sensitive surface" into a real interception
-//! point requires:
+//! This module is now consulted from a REAL interception point: the
+//! per-turn sensitive-app watchdog in `crate::holo_bridge::control`
+//! (`sensitive_watchdog`) polls the frontmost application via
+//! `crate::frontmost_app` while a turn runs, classifies its bundle id
+//! through [`SensitiveCategories::classify`], and enforces the per-category
+//! setting live -- `always_ask` pauses the turn and raises a
+//! `sensitive_access_consent` P0-14 `input_request` over the control
+//! channel (answered by the iOS app), `hard_block` cancels the turn
+//! outright, `always_allow` proceeds. All three arms are witnessed live by
+//! `examples/consent_probe.rs` (`CONSENT_PROBE_EXPECT`/`CONSENT_PROBE_ANSWER`
+//! variants) against a running daemon.
 //!
-//! 1. A foregrounded-app / target-app classifier (this module only offers
-//!    a **bundle-ID lookup**, see [`SensitiveCategories::classify`]'s doc
-//!    for exactly how heuristic that is).
-//! 2. The not-yet-built approval-request round trip to the iPhone app (the
-//!    PRD's `sensitive_access_requested` interactive-waiting state, P0-14
-//!    input-request payloads, manual_input/pairing UI) -- none of that
-//!    exists in this repo yet (see `holoiroh/README.md`'s "Status" section:
-//!    the iOS app is a SwiftUI skeleton with no real transport).
-//! 3. A hook inside whatever eventually plays the role of "the executor"
-//!    in this Rust codebase, to actually consult [`SensitiveCategories`]
-//!    before an action runs and to actually pause/reject/allow based on
-//!    the result.
-//!
-//! None of that exists after this change. This module only makes it
-//! possible to *ask* "is `com.1password.1password` in a sensitive category,
-//! and what's the configured setting for that category" and to persist a
-//! user's edits to that configuration -- it does not make anything ask.
+//! What remains heuristic: the classifier input is the FRONTMOST APP's
+//! bundle id (the closest real proxy for "the surface the agent is about
+//! to act on" -- the agent drives the frontmost app), not a per-window or
+//! per-URL classifier; see "Why bundle-ID matching is a heuristic" below.
 //!
 //! ## Why bundle-ID matching is a heuristic, not a classifier
 //!

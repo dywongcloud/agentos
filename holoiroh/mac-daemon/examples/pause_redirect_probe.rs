@@ -225,6 +225,17 @@ async fn main() {
         statuses(&events).iter().any(|t| t.contains("discarded the paused task")),
         "stop must announce it discarded the paused stash"
     );
+    // The stop's own terminal depends on the environment: with a real `holo`
+    // binary on PATH the global kill switch succeeds and a Done{Canceled}
+    // follows; on a headless runner with no `holo`, the stop honestly reports
+    // an Error instead. Either is a correct account of what happened -- the
+    // stash-discard assertions above and the empty-stash resume below are
+    // this section's actual claims.
+    let stop_concluded = events.iter().any(|e| {
+        matches!(e, ControlEvent::Done { request_id, status: DoneStatus::Canceled, .. } if request_id == "stop-b")
+            || matches!(e, ControlEvent::Error { request_id, message } if request_id == "stop-b" && message.contains("holo stop"))
+    });
+    assert!(stop_concluded, "stop must conclude with Done{{Canceled}} or an honest holo-stop Error");
     bridge
         .handle(ControlMessage::Resume {
             request_id: "resume-b".into(),

@@ -202,8 +202,9 @@ fn main() {
     println!("All sensitive_categories probes passed.");
     println!();
     println!(
-        "NOTE: this probe only witnesses the data model and file I/O added in this pass. \
-         No live policy-interception point exists yet to actually pause an agent action \
-         before a sensitive app -- see sensitive_categories.rs's module doc."
+        "NOTE: this probe witnesses the data model and file I/O. The LIVE interception \
+         point (the per-turn sensitive-app watchdog in holo_bridge::control, fed by \
+         frontmost_app) is witnessed separately by consent_probe against a running \
+         daemon -- see sensitive_categories.rs's module doc's live-wiring section."
     );
 }
