@@ -531,6 +531,12 @@ impl HoloBridge {
         self.control.is_auto_yielded()
     }
 
+    /// True while the user is in hands-on remote control. See
+    /// [`HoloControlBridge::is_remote_control_active`].
+    pub fn is_remote_control_active(&self) -> bool {
+        self.control.is_remote_control_active()
+    }
+
     /// Step the running turn aside because the user is active. See
     /// [`HoloControlBridge::auto_yield_pause`].
     pub async fn auto_yield_pause(&self) {

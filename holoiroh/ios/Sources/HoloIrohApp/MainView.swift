@@ -152,6 +152,13 @@ struct MainView: View {
     /// stopped/restarted by going fullscreen.
     @State private var isVideoFullscreen = false
 
+    /// True while the user has escalated to hands-on control: a touch surface
+    /// over the live view injects their taps/drags/scrolls as remote input, and
+    /// the daemon has paused any active agent turn. Entering sends `takeControl`
+    /// (and resets zoom so touches map 1:1 to the video); exiting sends
+    /// `releaseControl`. See `RemoteControl.swift`.
+    @State private var isControllingRemotely = false
+
     /// Whether the hidden controls sheet (the per-state SessionView panel,
     /// the status/log panel, and Disconnect) is presented. Toggled by the
     /// command bar's sparkle button; hidden by default.
@@ -1106,7 +1113,34 @@ struct MainView: View {
                             .accessibilityLabel("Zoom \(String(format: "%.1f", liveScale))x, double tap to reset")
                         }
                     }
+                    // Hands-on control: a touch surface over the video that
+                    // injects the user's taps/drags/scrolls as remote input,
+                    // plus a toggle and a banner. The surface (a UIView) consumes
+                    // all touches while active, so the zoom/pan/pinch gestures
+                    // below never fire during control.
+                    .overlay {
+                        if isControllingRemotely {
+                            RemoteControlSurface(frameSize: frameSource.lastFrameSize) { ev in
+                                sendControlMessage(.remoteControl(ev))
+                            }
+                            .frame(width: viewport.width, height: viewport.height)
+                            .clipShape(RoundedRectangle(cornerRadius: isVideoFullscreen ? 0 : 28))
+                        }
+                    }
+                    .overlay(alignment: .topLeading) { remoteControlToggle }
+                    .overlay(alignment: .top) {
+                        if isControllingRemotely {
+                            Text("You're in control \u{2014} the agent is paused")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Color.orange.opacity(0.92), in: Capsule())
+                                .padding(.top, 10)
+                        }
+                    }
                     .animation(.easeOut(duration: 0.18), value: liveScale > 1.01)
+                    .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isControllingRemotely)
                     .contentShape(Rectangle())
                     // Pinch to zoom. `simultaneousGesture` so it composes
                     // with the pan drag below and never blocks the taps.
@@ -1562,9 +1596,52 @@ struct MainView: View {
     /// it; from idle it starts a fresh task. Either way the session enters
     /// `.connecting` so the task controls appear and the daemon's own
     /// `task_progress`/`task_done` frames drive it from there.
+    /// The Take-control / Release-control toggle shown on the live view.
+    private var remoteControlToggle: some View {
+        Button {
+            toggleRemoteControl()
+        } label: {
+            Image(systemName: isControllingRemotely ? "hand.raised.fill" : "hand.point.up.left")
+                .font(.footnote.weight(.bold))
+                .foregroundStyle(isControllingRemotely ? Color.orange : .white)
+                .padding(10)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .padding(10)
+        .sensoryFeedback(.impact(weight: .medium), trigger: isControllingRemotely)
+        .accessibilityLabel(isControllingRemotely ? "Release control" : "Take control of the Mac")
+    }
+
+    /// Enter/exit hands-on control: send `takeControl`/`releaseControl`, and on
+    /// entry reset zoom/pan so touch coordinates map 1:1 to the video (the
+    /// daemon pauses any active agent turn on `takeControl`).
+    private func toggleRemoteControl() {
+        isControllingRemotely.toggle()
+        if isControllingRemotely {
+            withAnimation(.easeOut(duration: 0.2)) {
+                zoomScale = 1
+                panOffset = .zero
+            }
+            sendControlMessage(.remoteControl(.takeControl))
+            log(.status(text: "\u{2192} took control of the Mac"))
+        } else {
+            sendControlMessage(.remoteControl(.releaseControl))
+            log(.status(text: "\u{2192} released control"))
+        }
+    }
+
     private func sendLivePrompt() {
         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // While in hands-on control the command bar types INTO the Mac (as remote
+        // keyboard input) rather than prompting the agent; keep focus so the user
+        // can keep typing.
+        if isControllingRemotely {
+            promptText = ""
+            sendControlMessage(.remoteControl(.text(trimmed)))
+            log(.status(text: "\u{2192} typed to Mac: \(trimmed)"))
+            return
+        }
         promptText = ""
         isPromptFocused = false
         lastSentTask = .prompt(text: trimmed)

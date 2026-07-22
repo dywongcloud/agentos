@@ -18,6 +18,7 @@ mod agent_guidance;
 mod allowlist;
 mod audit_log;
 mod auto_yield;
+mod remote_input;
 mod user_activity;
 mod auth;
 mod capture;

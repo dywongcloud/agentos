@@ -44,4 +44,5 @@ pub fn task_framing_block() -> &'static str {
 /// A short, stable substring of [`task_framing_block`] that witnesses (in a
 /// probe or the run_prompt assembly) that the guidance is actually present in a
 /// composed prompt -- kept here so the witness and the text share one source.
+#[allow(dead_code)] // used by examples/task_framing_probe.rs, not the bin target
 pub const TASK_FRAMING_MARKER: &str = "Pre-existing similar content is NOT completion";

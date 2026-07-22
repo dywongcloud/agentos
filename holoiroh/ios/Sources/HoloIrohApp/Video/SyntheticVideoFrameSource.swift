@@ -35,6 +35,9 @@ final class SyntheticVideoFrameSource: VideoFrameSource {
     /// See `VideoFrameSource.lastFrameAt`. Timer-driven on the main thread,
     /// but locked anyway so the protocol's any-thread-read promise holds.
     private let lastFrameLock = NSLock()
+    /// Fixed synthetic frame size (this source draws at a constant resolution).
+    var lastFrameSize: CGSize? { CGSize(width: width, height: height) }
+
     private var _lastFrameAt: Date?
     var lastFrameAt: Date? {
         lastFrameLock.lock()

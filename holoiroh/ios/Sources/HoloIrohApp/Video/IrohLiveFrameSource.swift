@@ -63,14 +63,21 @@ final class IrohLiveFrameSource: VideoFrameSource {
     /// check) -- hence the lock, not a bare stored property.
     private let lastFrameLock = NSLock()
     private var _lastFrameAt: Date?
+    private var _lastFrameSize: CGSize?
     var lastFrameAt: Date? {
         lastFrameLock.lock()
         defer { lastFrameLock.unlock() }
         return _lastFrameAt
     }
-    private func markFrameDelivered() {
+    var lastFrameSize: CGSize? {
+        lastFrameLock.lock()
+        defer { lastFrameLock.unlock() }
+        return _lastFrameSize
+    }
+    private func markFrameDelivered(size: CGSize) {
         lastFrameLock.lock()
         _lastFrameAt = Date()
+        _lastFrameSize = size
         lastFrameLock.unlock()
     }
 
@@ -342,7 +349,8 @@ final class IrohLiveFrameSource: VideoFrameSource {
         // `.invalid` pts -> the render view tags it display-immediately (the
         // low-latency live-mirror path). The frame's own timestamp_us is
         // available on `frame` if in-order scheduling is ever wanted instead.
-        markFrameDelivered()
+        markFrameDelivered(size: CGSize(
+            width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb)))
         handler(.pixelBuffer(pb, pts: .invalid))
     }
 

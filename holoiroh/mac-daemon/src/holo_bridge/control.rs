@@ -24,11 +24,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
-use holoiroh_wire::InputRequestKind;
+use holoiroh_wire::{InputRequestKind, MouseButton, RemoteControlEvent};
 
 use crate::holo_bridge::a2a_client::{A2aClient, TaskUpdate, TerminalState};
 use crate::limits::ActionCounter;
@@ -89,6 +89,11 @@ pub enum ControlMessage {
     /// queue, then run `text` -- reusing the canceled turn's `contextId` when known so the
     /// agent keeps the history it had built up.
     Redirect { request_id: String, text: String },
+    /// A hands-on remote-control action the user performed by touching the iOS
+    /// live-share view -- an escalation to direct control. `TakeControl`/
+    /// `ReleaseControl` pause/resume the agent; the other actions are injected
+    /// as real CGEvents on the Mac (see `crate::remote_input`).
+    RemoteControl { event: RemoteControlEvent },
 }
 
 impl ControlMessage {
@@ -104,7 +109,28 @@ impl ControlMessage {
             | ControlMessage::Pause { request_id }
             | ControlMessage::Resume { request_id }
             | ControlMessage::Redirect { request_id, .. } => request_id,
+            // Remote-control input events are not correlated to a turn/request.
+            ControlMessage::RemoteControl { .. } => "",
         }
+    }
+}
+
+/// Inject a non-take/release remote-control action as real CGEvents on the Mac
+/// (see `crate::remote_input`). `TakeControl`/`ReleaseControl` are handled by
+/// the caller (they pause/resume the agent, not inject input).
+fn inject_remote_input(event: RemoteControlEvent) {
+    match event {
+        RemoteControlEvent::Move { x, y } => crate::remote_input::move_cursor(x, y),
+        RemoteControlEvent::Button { x, y, button, down } => {
+            crate::remote_input::button(x, y, matches!(button, MouseButton::Right), down)
+        }
+        RemoteControlEvent::Click { x, y, button, count } => {
+            crate::remote_input::click(x, y, matches!(button, MouseButton::Right), count)
+        }
+        RemoteControlEvent::Scroll { x, y, dx, dy } => crate::remote_input::scroll(x, y, dx, dy),
+        RemoteControlEvent::Text { text } => crate::remote_input::text(&text),
+        RemoteControlEvent::Key { key, down } => crate::remote_input::key(&key, down),
+        RemoteControlEvent::TakeControl | RemoteControlEvent::ReleaseControl => {}
     }
 }
 
@@ -331,6 +357,11 @@ pub struct HoloControlBridge {
     /// The turn parked by `Pause`/consent-gate, waiting for `Resume` (or discarded by
     /// `Stop`/`Redirect`). At most one -- pausing while paused is a polite no-op.
     paused: Mutex<Option<PausedTurn>>,
+    /// True while the user has escalated to hands-on remote control (between a
+    /// `RemoteControl::TakeControl` and its `ReleaseControl`). Cooperative
+    /// auto-yield stands down while this is set, so the two don't race over the
+    /// pause slot -- the user is deliberately driving.
+    remote_control_active: AtomicBool,
     /// PRD section-9 class-5 sensitive-app categories, loaded once from
     /// `~/.holoiroh/sensitive_categories.toml` (seeded with defaults on first run). This is
     /// the live wiring the `sensitive_categories` module's own doc used to disclaim -- the
@@ -426,6 +457,7 @@ impl HoloControlBridge {
             },
             current_turn: Mutex::new(None),
             paused: Mutex::new(None),
+            remote_control_active: AtomicBool::new(false),
             sensitive_categories: Mutex::new(
                 match SensitiveCategories::load_or_init_default() {
                     Ok(cats) => {
@@ -494,6 +526,12 @@ impl HoloControlBridge {
             .expect("paused lock poisoned")
             .as_ref()
             .is_some_and(|p| p.auto)
+    }
+
+    /// True while the user is in hands-on remote control (see
+    /// `handle_remote_control`); cooperative auto-yield stands down while set.
+    pub fn is_remote_control_active(&self) -> bool {
+        self.remote_control_active.load(Ordering::SeqCst)
     }
 
     /// Auto-yield: step the running turn aside because the user is actively
@@ -621,6 +659,87 @@ impl HoloControlBridge {
             }
             ControlMessage::Redirect { request_id, text } => {
                 self.handle_redirect(request_id, text).await;
+            }
+            ControlMessage::RemoteControl { event } => {
+                self.handle_remote_control(event).await;
+            }
+        }
+    }
+
+    /// Route a remote-control action from the iOS live-share view: `TakeControl`
+    /// pauses the agent for the duration (a USER pause -- cooperative auto-yield
+    /// won't auto-resume it -- so the agent doesn't fight the user's hands-on
+    /// control); `ReleaseControl` resumes it; every other action is injected as a
+    /// real CGEvent on the Mac via `crate::remote_input`, gated on Accessibility.
+    async fn handle_remote_control(&self, event: RemoteControlEvent) {
+        match event {
+            RemoteControlEvent::TakeControl => {
+                // Cooperative auto-yield stands down while the user is driving,
+                // so the two don't race over the pause slot.
+                self.remote_control_active.store(true, Ordering::SeqCst);
+                // If auto-yield already parked the turn, convert it to a USER
+                // pause so auto-yield can't resume it mid-control.
+                if let Some(p) = self.paused.lock().expect("paused lock poisoned").as_mut() {
+                    p.auto = false;
+                }
+                // Otherwise, park the running turn now.
+                if self.paused.lock().expect("paused lock poisoned").is_none() {
+                    let current = self
+                        .current_turn
+                        .lock()
+                        .expect("current_turn lock poisoned")
+                        .clone();
+                    if let Some(turn) = current {
+                        *self.paused.lock().expect("paused lock poisoned") = Some(PausedTurn {
+                            request_id: turn.request_id.clone(),
+                            text: turn.text.clone(),
+                            context_id: turn.context_id.clone(),
+                            auto: false,
+                        });
+                        self.cancel_current_turn("remote control").await;
+                    }
+                }
+                if self.paused.lock().expect("paused lock poisoned").is_some() {
+                    let queued = self.queue.lock().expect("queue lock poisoned").len();
+                    self.emit(ControlEvent::TaskActive { paused: true, queued });
+                }
+                self.emit_daemon_status("you took control -- the agent is paused while you drive");
+            }
+            RemoteControlEvent::ReleaseControl => {
+                self.remote_control_active.store(false, Ordering::SeqCst);
+                let parked = self.paused.lock().expect("paused lock poisoned").take();
+                if let Some(parked) = parked {
+                    let queued = self.queue.lock().expect("queue lock poisoned").len();
+                    self.emit(ControlEvent::TaskActive { paused: false, queued });
+                    self.emit_daemon_status("you released control -- resuming the agent");
+                    let request_id = uuid::Uuid::new_v4().to_string();
+                    self.redispatch_parked(
+                        request_id,
+                        parked.text,
+                        parked.context_id,
+                        "The user took manual control and has now released it; resume on the SAME \
+                         session and continue where you left off without repeating completed steps.",
+                    )
+                    .await;
+                } else {
+                    self.emit_daemon_status("you released control");
+                }
+            }
+            input => {
+                if crate::remote_input::is_permitted() {
+                    inject_remote_input(input);
+                } else {
+                    // Emit the Accessibility grant hint once, so a missing grant
+                    // is actionable rather than a silent no-op.
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        self.emit_daemon_status(
+                            "to control the Mac from your phone, grant this daemon Accessibility \
+                             in System Settings > Privacy & Security > Accessibility",
+                        );
+                    }
+                }
             }
         }
     }

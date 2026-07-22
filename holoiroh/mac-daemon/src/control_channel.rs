@@ -108,8 +108,8 @@ use crate::holo_bridge::{ControlEvent, ControlMessage, DoneStatus, HoloBridge, H
 #[allow(unused_imports)]
 pub use holoiroh_wire::{
     CONTROL_ALPN, ClientMessage, DEFAULT_EXPIRY_MS, EnvelopeRejection, InboundEnvelopeState,
-    InputRequestKind, PROTOCOL_VERSION, ServerMessage, TaskEnvelope, epoch_millis_now,
-    input_request_expired_text, read_line, write_line,
+    InputRequestKind, MouseButton, PROTOCOL_VERSION, RemoteControlEvent, ServerMessage,
+    TaskEnvelope, epoch_millis_now, input_request_expired_text, read_line, write_line,
 };
 
 /// Per-connection *outbound* envelope state: this connection's minted
@@ -327,6 +327,7 @@ pub fn to_control_message(request_id: String, msg: ClientMessage) -> Option<Cont
         ClientMessage::Pause => Some(ControlMessage::Pause { request_id }),
         ClientMessage::Resume => Some(ControlMessage::Resume { request_id }),
         ClientMessage::Redirect { text } => Some(ControlMessage::Redirect { request_id, text }),
+        ClientMessage::RemoteControl { event } => Some(ControlMessage::RemoteControl { event }),
         ClientMessage::Pin { .. } => None,
         ClientMessage::InputResponse { .. } => None,
     }
@@ -1276,7 +1277,10 @@ impl ProtocolHandler for ControlChannel {
                         ClientMessage::Stop
                         | ClientMessage::Pause
                         | ClientMessage::Pin { .. }
-                        | ClientMessage::InputResponse { .. } => None,
+                        | ClientMessage::InputResponse { .. }
+                        // Remote-control input events are not agent turns; they
+                        // inject direct user input and produce no audit entry.
+                        | ClientMessage::RemoteControl { .. } => None,
                     } {
                         audit_starts.lock().expect("audit_starts lock poisoned").insert(
                             request_id.clone(),

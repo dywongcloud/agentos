@@ -330,7 +330,9 @@ impl Default for InboundEnvelopeState {
 /// channel.
 ///
 /// Wire schema: see `holoiroh/PROTOCOL.md` ("ClientMessage").
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: `RemoteControl` carries `RemoteControlEvent`, which has `f64`
+// normalized coordinates (`f64: !Eq`). `PartialEq` is retained.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// A typed text instruction for the `holo-desktop-cli` bridge.
@@ -397,6 +399,63 @@ pub enum ClientMessage {
         /// a free-text or credential value (see variant doc above).
         selected_option: String,
     },
+    /// The user escalated to hands-on control from the iOS app and is driving
+    /// the Mac directly by touching the live-share view. `event` is one
+    /// normalized, touch-derived action; see [`RemoteControlEvent`]. Additive
+    /// per `PROTOCOL.md`'s extension policy.
+    RemoteControl { event: RemoteControlEvent },
+}
+
+/// Which mouse button a [`RemoteControlEvent`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    Left,
+    Right,
+}
+
+/// One hands-on remote-control action the user performs by touching the iOS
+/// live-share view (see [`ClientMessage::RemoteControl`]).
+///
+/// Coordinates are NORMALIZED to `0.0..=1.0` within the captured display, so the
+/// daemon maps them to real display points regardless of the phone's screen size
+/// or the video's letterboxing -- the phone never needs to know the Mac's
+/// resolution. A nested tagged enum (`{"action": ...}`) so adding a future
+/// action is a one-place change that leaves the outer `ClientMessage`/
+/// `ControlMessage` mapping untouched.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum RemoteControlEvent {
+    /// The user is escalating to hands-on control; the daemon pauses any active
+    /// agent turn for the duration.
+    TakeControl,
+    /// The user released control; the daemon resumes the paused turn.
+    ReleaseControl,
+    /// Move the cursor to the normalized point.
+    Move { x: f64, y: f64 },
+    /// Press or release a mouse button at the normalized point (`down: true` is
+    /// a press). A press, some `Move`s, then a release is a drag.
+    Button {
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        down: bool,
+    },
+    /// A full click (down+up) at the point; `count: 2` is a double-click.
+    Click {
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        count: u32,
+    },
+    /// Scroll at the point by `(dx, dy)` wheel deltas (line units; negative dy
+    /// scrolls content up, matching natural touch).
+    Scroll { x: f64, y: f64, dx: f64, dy: f64 },
+    /// Type a string of text at the current keyboard focus.
+    Text { text: String },
+    /// Press or release a named special key (e.g. `"return"`, `"delete"`,
+    /// `"escape"`, `"tab"`, `"up"`, `"down"`, `"left"`, `"right"`).
+    Key { key: String, down: bool },
 }
 
 /// Classifies *why* the daemon is asking the user for input via
@@ -454,6 +513,7 @@ impl ClientMessage {
             ClientMessage::Redirect { .. } => "redirect",
             ClientMessage::Pin { .. } => "pin",
             ClientMessage::InputResponse { .. } => "input_response",
+            ClientMessage::RemoteControl { .. } => "remote_control",
         }
     }
 }

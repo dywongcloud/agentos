@@ -219,11 +219,18 @@ entire bare message body):
 { "type": "redirect", "text": "actually, draft it as an email instead" }
 { "type": "pin", "pin": "123456" }
 { "type": "input_response", "request_id": "d290f1ee-6c54-4b01-90e6-d701748f0851", "selected_option": "Work calendar" }
+{ "type": "remote_control", "event": { "action": "take_control" } }
+{ "type": "remote_control", "event": { "action": "move", "x": 0.5, "y": 0.4 } }
+{ "type": "remote_control", "event": { "action": "click", "x": 0.5, "y": 0.4, "button": "left", "count": 1 } }
+{ "type": "remote_control", "event": { "action": "scroll", "x": 0.5, "y": 0.4, "dx": 0.0, "dy": -3.0 } }
+{ "type": "remote_control", "event": { "action": "text", "text": "hello team" } }
+{ "type": "remote_control", "event": { "action": "release_control" } }
 ```
 
 | Field             | Type                                                                        | Required | Meaning |
 |-------------------|------------------------------------------------------------------------------|----------|---------|
-| `type`            | `"prompt"` \| `"voice_transcript"` \| `"stop"` \| `"pause"` \| `"resume"` \| `"redirect"` \| `"pin"` \| `"input_response"` | yes | Discriminant. |
+| `type`            | `"prompt"` \| `"voice_transcript"` \| `"stop"` \| `"pause"` \| `"resume"` \| `"redirect"` \| `"pin"` \| `"input_response"` \| `"remote_control"` | yes | Discriminant. |
+| `event`           | `RemoteControlEvent`                                                          | only for `remote_control` | The touch-derived action, itself tagged by `action` (see below). |
 | `text`            | `string`                                                                    | only for `prompt` / `voice_transcript` / `redirect` | The instruction text. Voice input is always transcribed client-side before sending — the wire format is never raw audio (see README's "Prompts" section). |
 | `pin`             | `string`                                                                    | only for `pin` | The PIN the user was shown out-of-band (Mac terminal, alongside the ticket) and typed/scanned into the client. |
 | `request_id`      | `string`                                                                    | only for `input_response` | Echoes the `request_id` of the `input_request` this answers. |
@@ -294,6 +301,22 @@ entire bare message body):
   this document's general "malformed input" philosophy below. See
   `input_request`'s own entry for the full contract, including why real
   credential/MFA/manual entry is **not** carried by this message at all.
+- `remote_control`: the user escalated to **hands-on control** and is driving
+  the Mac directly by touching the iOS live-share view. The `event` object is a
+  nested tagged action (`{"action": ...}`):
+  - `take_control` / `release_control` — enter/leave control; the daemon PAUSES
+    any active agent turn on `take_control` (a user pause, so cooperative
+    auto-yield won't auto-resume it) and RESUMES it on `release_control`.
+  - `move`/`button`/`click`/`scroll` — pointer actions at a **normalized**
+    point (`x`,`y` in `0.0..=1.0` within the captured display; the daemon maps
+    them to real display points). `button` carries `button` (`"left"`/`"right"`)
+    and `down`; `click` carries `button` and `count` (2 = double-click);
+    `scroll` carries `dx`/`dy` wheel deltas.
+  - `text` — types a unicode string; `key` — presses/releases a named special
+    key (`"return"`, `"delete"`, `"escape"`, arrows, …).
+  Injection requires macOS Accessibility (`AXIsProcessTrusted`); without it the
+  daemon emits a one-time `status` asking the user to grant it and no-ops the
+  input. Additive per this document's extension policy.
 
 ## `ServerMessage` (Mac daemon → iOS)
 

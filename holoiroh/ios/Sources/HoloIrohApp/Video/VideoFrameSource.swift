@@ -59,6 +59,12 @@ protocol VideoFrameSource: AnyObject {
     /// restart alone cannot heal it (a full reconnect can). Implementations
     /// must make this safe to read from any thread.
     var lastFrameAt: Date? { get }
+
+    /// The pixel dimensions of the most recent frame, or `nil` if none yet.
+    /// Used by remote-control touch mapping (`normalizedInVideo`) to compute the
+    /// aspect-fit video rect within the view for letterbox-correct coordinates.
+    /// Must be safe to read from the main thread.
+    var lastFrameSize: CGSize? { get }
 }
 
 /// One decoded frame handed from a `VideoFrameSource` to `VideoRenderView`.

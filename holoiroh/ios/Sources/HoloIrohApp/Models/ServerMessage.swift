@@ -198,12 +198,16 @@ enum ClientMessage: Codable, Equatable {
     /// or a credential (see the daemon's wire-schema doc: this is a
     /// structured selection only).
     case inputResponse(requestId: String, selectedOption: String)
+    /// The user escalated to hands-on control and is driving the Mac directly by
+    /// touching the live-share view; `event` is one normalized touch action.
+    case remoteControl(RemoteControlEvent)
 
     private enum CodingKeys: String, CodingKey {
         case type
         case text
         case requestId = "request_id"
         case selectedOption = "selected_option"
+        case event
     }
 
     private enum Kind: String, Codable {
@@ -214,6 +218,7 @@ enum ClientMessage: Codable, Equatable {
         case resume
         case redirect
         case inputResponse = "input_response"
+        case remoteControl = "remote_control"
     }
 
     init(from decoder: Decoder) throws {
@@ -237,6 +242,8 @@ enum ClientMessage: Codable, Equatable {
                 requestId: try container.decode(String.self, forKey: .requestId),
                 selectedOption: try container.decode(String.self, forKey: .selectedOption)
             )
+        case .remoteControl:
+            self = .remoteControl(try container.decode(RemoteControlEvent.self, forKey: .event))
         }
     }
 
@@ -262,6 +269,9 @@ enum ClientMessage: Codable, Equatable {
             try container.encode(Kind.inputResponse, forKey: .type)
             try container.encode(requestId, forKey: .requestId)
             try container.encode(selectedOption, forKey: .selectedOption)
+        case .remoteControl(let event):
+            try container.encode(Kind.remoteControl, forKey: .type)
+            try container.encode(event, forKey: .event)
         }
     }
 
@@ -277,6 +287,7 @@ enum ClientMessage: Codable, Equatable {
         case .resume: return "resume"
         case .redirect: return "redirect"
         case .inputResponse: return "input_response"
+        case .remoteControl: return "remote_control"
         }
     }
 }

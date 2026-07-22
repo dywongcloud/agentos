@@ -151,6 +151,11 @@ pub fn spawn_monitor(bridge: Arc<HoloBridge>) {
         }
         loop {
             tokio::time::sleep(cfg.poll).await;
+            // Stand down entirely while the user is in hands-on remote control:
+            // take-control owns the pause slot then, and the two must not race.
+            if bridge.is_remote_control_active() {
+                continue;
+            }
             let (busy, _queued) = bridge.busy_state();
             let auto_yielded = bridge.is_auto_yielded();
             let paused = bridge.is_paused();
