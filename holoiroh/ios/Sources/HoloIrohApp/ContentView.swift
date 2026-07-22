@@ -19,6 +19,23 @@ struct ContentView: View {
 
     @State private var path: [Route] = []
 
+    /// First-launch brand intro gate. Versioned key ("V1") so a future
+    /// redesigned intro can re-show for everyone by bumping the suffix. New
+    /// users see `IntroView` once; returning users go straight to pairing.
+    @AppStorage("hasSeenIntroV1") private var hasSeenIntro = false
+    @State private var showIntro: Bool
+
+    init() {
+        let seen = UserDefaults.standard.bool(forKey: "hasSeenIntroV1")
+        var force = false
+        #if DEBUG
+        // Force the intro for an on-device / headless witness, regardless of
+        // the persisted flag (parallels the other DEBUG env hooks here).
+        force = ProcessInfo.processInfo.environment["HOLOIROH_FORCE_INTRO"] == "1"
+        #endif
+        _showIntro = State(initialValue: force || !seen)
+    }
+
     /// Debug-only auto-pair bypass: when both env vars are set (e.g. via
     /// `devicectl device process launch --environment-variables` for an
     /// unattended device witness, matching this project's own
@@ -40,22 +57,38 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationStack(path: $path) {
-            PairingView { ticket, pin in
-                path.append(.main(ticket: ticket, pin: pin))
-            }
-            .navigationDestination(for: Route.self) { route in
-                switch route {
-                case .main(let ticket, let pin):
-                    MainView(ticket: ticket, pin: pin) {
-                        path.removeAll()
+        ZStack {
+            NavigationStack(path: $path) {
+                PairingView { ticket, pin in
+                    path.append(.main(ticket: ticket, pin: pin))
+                }
+                .navigationDestination(for: Route.self) { route in
+                    switch route {
+                    case .main(let ticket, let pin):
+                        MainView(ticket: ticket, pin: pin) {
+                            path.removeAll()
+                        }
                     }
                 }
             }
-        }
-        .onAppear {
-            guard path.isEmpty, let auto = Self.autoPairFromEnvironment else { return }
-            path.append(.main(ticket: auto.ticket, pin: auto.pin))
+            .onAppear {
+                guard path.isEmpty, let auto = Self.autoPairFromEnvironment else { return }
+                path.append(.main(ticket: auto.ticket, pin: auto.pin))
+            }
+
+            // The intro plays over the (already-loaded) pairing screen, then
+            // scales/fades away to reveal it -- one continuous motion, so the
+            // orb the intro built up hands off into the pairing header glow.
+            if showIntro {
+                IntroView {
+                    hasSeenIntro = true
+                    withAnimation(.easeInOut(duration: 0.6)) {
+                        showIntro = false
+                    }
+                }
+                .transition(.opacity.combined(with: .scale(scale: 1.08, anchor: .top)))
+                .zIndex(1)
+            }
         }
     }
 }

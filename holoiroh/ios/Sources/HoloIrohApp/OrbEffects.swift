@@ -188,8 +188,8 @@ private struct BreathingGlow: View {
             .fill(
                 RadialGradient(
                     colors: [
-                        Color(red: 0.30, green: 0.56, blue: 1.0).opacity(0.34),
-                        Color(red: 0.30, green: 0.56, blue: 1.0).opacity(0.10),
+                        Color.aroAccent.opacity(0.34),
+                        Color.aroAccent.opacity(0.10),
                         .clear,
                     ],
                     center: .center,
@@ -231,7 +231,7 @@ private struct PulseRing: View {
     var body: some View {
         Circle()
             .stroke(
-                Color(red: 0.45, green: 0.70, blue: 1.0).opacity(expanded ? 0.0 : 0.55),
+                Color.aroAccentBright.opacity(expanded ? 0.0 : 0.55),
                 lineWidth: expanded ? 1 : 2.5
             )
             .frame(width: startRadius * 2, height: startRadius * 2)
