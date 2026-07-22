@@ -75,14 +75,19 @@ final class ConnectionProfileStore: ObservableObject {
     /// The built-in ticket/PIN for the dev Mac's daemon -- the values
     /// [`ensureDefaultProfile`] guarantees are on hand when no working "Dev
     /// Mac" row exists.
-    // NOTE on ticket drift: the trailing bytes of an iroh-live ticket encode the
-    // daemon's CURRENT direct-address hints (ephemeral UDP ports), which change on
-    // every daemon restart -- only the node id + relay URL parts are stable. iroh
-    // connects via node id + relay and discovers fresh direct paths itself, so a
-    // saved ticket with stale port hints still connects; this constant just gets
-    // re-synced to the live daemon's printout whenever a deploy touches it.
+    // A NODE-ID-ONLY ticket, on purpose: the daemon's identity key is stable
+    // (~/.holoiroh/iroh_secret), and both the daemon and this app's iroh endpoint
+    // use n0's default relay+discovery preset (presets::N0) -- so the phone
+    // resolves this node id to the daemon's CURRENT relay + direct paths via pkarr
+    // discovery. A full ticket's trailing bytes are ephemeral direct-address hints
+    // that drift on every daemon restart; carrying them here made this constant go
+    // stale. Stripping to node id + broadcast name gives the drift-proof form that
+    // ALWAYS reaches the live daemon and never needs re-syncing.
+    //
+    // Derived + witnessed live via `mac-daemon/examples/print_current_ticket.rs`
+    // (node id 9e15ae39...; CONNECT_OK against the running daemon with PIN 394299).
     private static let currentDevTicket =
-        "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwFACNodHRwczovL3VzdzEtMS5yZWxheS5uMC5pcm9oLmxpbmsuLwEALTJiadi2AgEALTJiaYnGAwEAwKgBTO6IAwEAwKj_Cu6IAw/holoiroh"
+        "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwA/holoiroh"
     private static let currentDevPin = "394299"
 
     /// The iroh node-id portion of a ticket: the first 43 characters after

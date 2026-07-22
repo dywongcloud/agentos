@@ -144,7 +144,6 @@ struct OrbReactionOverlay: View {
             // The blob itself fills roughly the middle ~55% of the canvas;
             // rings start just outside it and the badges orbit clear of it.
             let blobRadius = side * 0.26
-            let orbitRadius = side * 0.34
 
             ZStack {
                 if state.isReacting {
@@ -161,11 +160,15 @@ struct OrbReactionOverlay: View {
                         .transition(.opacity)
                 }
 
-                // Orbiting app badges (only when the prompt named apps).
+                // Orbiting app badges (only when the prompt named apps): a 3D
+                // horizontal ring that sweeps from behind the orb to the front.
                 if !state.orbitingApps.isEmpty {
                     OrbitingBadges(
                         apps: state.orbitingApps,
-                        radius: orbitRadius,
+                        radiusX: side * 0.40,
+                        tiltY: side * 0.12,
+                        blobRadius: blobRadius,
+                        badgeSize: 44,
                         active: state.isReacting
                     )
                     .position(center)
@@ -244,41 +247,73 @@ private struct PulseRing: View {
     }
 }
 
-/// The app badges circling the orb. A `TimelineView(.animation)` recomputes
-/// each badge's angle from wall-clock time every frame -- smooth, cheap,
-/// and it pauses itself when inactive so nothing burns battery once the
-/// badges have faded out.
+/// The app badges circling the orb in a 3D HORIZONTAL ring. A
+/// `TimelineView(.animation)` advances the ring phase from wall-clock every
+/// frame (pausing itself when inactive so nothing burns battery once the badges
+/// have faded out); the actual per-badge placement is the pure
+/// `orbitBadgePlacement`, so the same geometry renders identically off-device.
 private struct OrbitingBadges: View {
     let apps: [OrbitApp]
-    let radius: CGFloat
+    /// Horizontal half-width of the ring (its wide axis).
+    let radiusX: CGFloat
+    /// Vertical half-height (small -> shallow, 3D-looking tilt).
+    let tiltY: CGFloat
+    /// The orb's on-screen radius, for back-of-ring occlusion.
+    let blobRadius: CGFloat
+    /// Size of each badge tile.
+    let badgeSize: CGFloat
     let active: Bool
 
     /// Radians per second the constellation sweeps.
-    private let angularSpeed = 1.1
+    private let angularSpeed = 1.0
 
     var body: some View {
         TimelineView(.animation(minimumInterval: nil, paused: !active)) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
-            ZStack {
-                ForEach(Array(apps.enumerated()), id: \.element.id) { index, app in
-                    let angle = t * angularSpeed
-                        + (Double(index) / Double(max(apps.count, 1))) * 2 * .pi
-                    // Slightly elliptical path (y compressed) so the ring
-                    // reads as circling the orb in space, not a flat dial.
-                    let x = cos(angle) * radius
-                    let y = sin(angle) * radius * 0.88
-                    // Badges "behind" the orb (upper half of the path) fall
-                    // back slightly: smaller + dimmer.
-                    let depth = (sin(angle) + 1) / 2 // 0 = back/top, 1 = front/bottom
-                    AppBadge(app: app)
-                        .scaleEffect(0.82 + 0.18 * depth)
-                        .opacity(0.65 + 0.35 * depth)
-                        .offset(x: x, y: y)
-                }
-            }
+            let phase = context.date.timeIntervalSinceReferenceDate * angularSpeed
+            OrbitingBadgesRing(
+                apps: apps,
+                radiusX: radiusX,
+                tiltY: tiltY,
+                blobRadius: blobRadius,
+                badgeSize: badgeSize,
+                phase: phase
+            )
         }
         .opacity(active ? 1 : 0)
         .animation(.easeInOut(duration: 0.5), value: active)
+    }
+}
+
+/// One frame of the orbit at a fixed `phase` -- the placement comes from the
+/// pure `orbitBadgePlacement`, so front badges are drawn over back ones
+/// (`zIndex`), and back-center badges fade behind the blob.
+private struct OrbitingBadgesRing: View {
+    let apps: [OrbitApp]
+    let radiusX: CGFloat
+    let tiltY: CGFloat
+    let blobRadius: CGFloat
+    let badgeSize: CGFloat
+    let phase: Double
+
+    var body: some View {
+        ZStack {
+            ForEach(Array(apps.enumerated()), id: \.element.id) { index, app in
+                let p = orbitBadgePlacement(
+                    index: index,
+                    count: apps.count,
+                    phase: phase,
+                    radiusX: radiusX,
+                    tiltY: tiltY,
+                    blobRadius: blobRadius
+                )
+                AppBadge(app: app, size: badgeSize)
+                    .scaleEffect(p.scale)
+                    .blur(radius: p.blur)
+                    .opacity(p.opacity)
+                    .offset(x: p.offset.width, y: p.offset.height)
+                    .zIndex(p.z)
+            }
+        }
     }
 }
 
@@ -288,6 +323,9 @@ private struct OrbitingBadges: View {
 /// re-render never re-reads the file from disk.
 private struct AppBadge: View {
     let app: OrbitApp
+    /// Tile edge length in points (the orbit passes this in; bigger than the
+    /// old fixed 28pt so the icons read clearly as they circle).
+    var size: CGFloat = 44
 
     /// Loaded once per asset name for the process lifetime -- badge views
     /// are recreated every TimelineView frame, so caching here is what
@@ -311,24 +349,24 @@ private struct AppBadge: View {
                 Image(uiImage: icon)
                     .resizable()
                     .scaledToFit()
-                    .frame(width: 28, height: 28)
-                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
             } else {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
                     .fill(app.color)
-                    .frame(width: 28, height: 28)
+                    .frame(width: size, height: size)
                     .overlay(
                         Image(systemName: app.symbol)
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(.system(size: size * 0.5, weight: .semibold))
                             .foregroundStyle(.white)
                     )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
                             .stroke(.white.opacity(0.25), lineWidth: 0.8)
                     )
             }
         }
-        .shadow(color: .black.opacity(0.55), radius: 5, y: 2)
+        .shadow(color: .black.opacity(0.55), radius: size * 0.14, y: 2)
         .accessibilityLabel("\(app.displayName) involved in this task")
     }
 }
