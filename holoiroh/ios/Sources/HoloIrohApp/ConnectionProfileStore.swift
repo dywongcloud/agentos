@@ -35,18 +35,43 @@ final class ConnectionProfileStore: ObservableObject {
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     init(databaseURL: URL? = nil) {
-        let url = databaseURL ?? Self.defaultDatabaseURL()
-        var handle: OpaquePointer?
-        if sqlite3_open(url.path, &handle) == SQLITE_OK {
-            db = handle
+        let primary = databaseURL ?? Self.defaultDatabaseURL()
+        // Try the primary path first. If it can't be opened -- which would
+        // otherwise leave the store SILENTLY EMPTY (db == nil ->
+        // `ensureDefaultProfile` early-returns, so the default profile is never
+        // seeded, the exact "no saved profile on device" symptom) -- fall back
+        // to a Documents-dir path so the default is still seeded somewhere.
+        if !openDatabase(primary), databaseURL == nil {
+            let fallback = Self.fallbackDatabaseURL()
+            NSLog("ConnectionProfileStore: primary db open failed -- falling back to \(fallback.path)")
+            _ = openDatabase(fallback)
+        }
+        if db != nil {
             createTableIfNeeded()
             reload()
             ensureDefaultProfile()
-        } else {
-            NSLog("ConnectionProfileStore: failed to open sqlite db at \(url.path): \(String(cString: sqlite3_errmsg(handle)))")
-            sqlite3_close(handle)
-            db = nil
         }
+        // Launch diagnostic: the macOS harness proves the seeding LOGIC; this
+        // line proves the actual DEVICE state (pull it from the console). If a
+        // real phone ever shows `opened=false` or `devMac=false`, the root
+        // cause is right here rather than in the UI.
+        let dev = profiles.first(where: { $0.name == "Dev Mac" })
+        NSLog("ConnectionProfileStore: opened=\(db != nil) profiles=\(profiles.count) devMac=\(dev != nil) pin=\(dev?.pin ?? "-")")
+    }
+
+    /// Opens `url` into `db`; returns whether it succeeded (and logs the
+    /// concrete sqlite error on failure).
+    @discardableResult
+    private func openDatabase(_ url: URL) -> Bool {
+        var handle: OpaquePointer?
+        if sqlite3_open(url.path, &handle) == SQLITE_OK {
+            db = handle
+            return true
+        }
+        NSLog("ConnectionProfileStore: failed to open sqlite db at \(url.path): \(String(cString: sqlite3_errmsg(handle)))")
+        sqlite3_close(handle)
+        db = nil
+        return false
     }
 
     deinit {
@@ -58,6 +83,16 @@ final class ConnectionProfileStore: ObservableObject {
             .appendingPathComponent("HoloIroh", isDirectory: true)
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         return support.appendingPathComponent("profiles.sqlite")
+    }
+
+    /// Last-resort DB location if Application Support can't be opened: the
+    /// Documents dir (always present + writable in the app sandbox). Keeping
+    /// the default profile seeded matters more than the exact file location.
+    private static func fallbackDatabaseURL() -> URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("HoloIroh", isDirectory: true)
+        try? FileManager.default.createDirectory(at: docs, withIntermediateDirectories: true)
+        return docs.appendingPathComponent("profiles.sqlite")
     }
 
     private func createTableIfNeeded() {

@@ -50,7 +50,11 @@ struct PairingView: View {
     /// immediately -- its ticket already went through phrase verification
     /// when it was first saved, so re-verifying every reconnect would only
     /// add friction without adding trust.
-    @StateObject private var profileStore = ConnectionProfileStore()
+    /// The app-wide store, injected by `HoloIrohApp` (seeded at launch). Read
+    /// via `@EnvironmentObject` -- NOT a per-view `@StateObject` -- so the
+    /// default profile is guaranteed present regardless of when/whether this
+    /// view's own lifecycle would have created + seeded a store.
+    @EnvironmentObject private var profileStore: ConnectionProfileStore
     @State private var showSaveNamePrompt = false
     @State private var newProfileName = ""
 
@@ -63,34 +67,45 @@ struct PairingView: View {
     }
 
     var body: some View {
-        VStack(spacing: 18) {
-            header
-                .padding(.top, 36)
+        // A ScrollView, not a fixed VStack: the header + saved profiles + two
+        // glass input cards + scan + actions exceed a phone's usable height, and
+        // in a fixed VStack that overflow pushed the saved-profiles section off
+        // the bottom -- the "I open the app and don't see the saved profile"
+        // symptom. Scrolling guarantees every section, especially the seeded
+        // "Dev Mac" reconnect, is always reachable.
+        ScrollView {
+            VStack(spacing: 18) {
+                header
+                    .padding(.top, 36)
 
-            inputCard
-                .padding(.horizontal, 20)
+                // Saved profiles FIRST when present: opening the app surfaces
+                // the current-daemon "Dev Mac" one-tap reconnect immediately,
+                // above the manual scan/paste inputs.
+                if !profileStore.profiles.isEmpty {
+                    savedProfilesSection
+                        .padding(.horizontal, 20)
+                }
 
-            scanButton
-                .padding(.horizontal, 20)
-
-            if let scanError {
-                scanErrorBanner(scanError)
+                inputCard
                     .padding(.horizontal, 20)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                    .animation(.easeOut(duration: 0.2), value: scanError)
-            }
 
-            if !profileStore.profiles.isEmpty {
-                savedProfilesSection
+                scanButton
                     .padding(.horizontal, 20)
+
+                if let scanError {
+                    scanErrorBanner(scanError)
+                        .padding(.horizontal, 20)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                        .animation(.easeOut(duration: 0.2), value: scanError)
+                }
+
+                actionBar
+                    .padding(.horizontal, 20)
+                    .padding(.top, 4)
+                    .padding(.bottom, 30)
             }
-
-            Spacer(minLength: 8)
-
-            actionBar
-                .padding(.horizontal, 20)
-                .padding(.bottom, 30)
         }
+        .scrollDismissesKeyboard(.interactively)
         .preferredColorScheme(.dark)
         // Backdrop doubles as tap-outside-to-dismiss for the keyboard: the
         // tap only ever clears field focus, and buttons/fields hit-test
@@ -266,8 +281,7 @@ struct PairingView: View {
     private var savedProfilesSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             AroFieldLabel(title: "Saved profiles", systemImage: "bookmark")
-            ScrollView {
-                VStack(spacing: 10) {
+            VStack(spacing: 10) {
                     ForEach(profileStore.profiles) { profile in
                         Button {
                             onConnect(profile.ticket, profile.pin)
@@ -311,8 +325,6 @@ struct PairingView: View {
                         }
                     }
                 }
-            }
-            .frame(maxHeight: 180)
         }
     }
 
@@ -360,9 +372,10 @@ struct PairingView: View {
 
 #Preview("Pairing - empty") {
     PairingView(onConnect: { _, _ in })
+        .environmentObject(ConnectionProfileStore())
 }
 
 #Preview("Pairing - filled") {
     PairingView(onConnect: { _, _ in })
-        .onAppear {}
+        .environmentObject(ConnectionProfileStore())
 }

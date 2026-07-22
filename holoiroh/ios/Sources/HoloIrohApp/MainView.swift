@@ -91,7 +91,7 @@ struct MainView: View {
     /// default always tracks the daemon's current identity. A second store
     /// instance alongside `PairingView`'s is fine -- same tiny sqlite file,
     /// all access on the main actor.
-    @StateObject private var profileStore = ConnectionProfileStore()
+    @EnvironmentObject private var profileStore: ConnectionProfileStore
 
     /// Orb reaction driver (`OrbEffects.swift`): every real send kicks the
     /// blob's thinking pulse, and prompts that mention known apps put their
@@ -1749,4 +1749,5 @@ private extension MainView {
     NavigationStack {
         MainView(ticket: "iroh-live:example-ticket", pin: "123456", onDisconnect: {})
     }
+    .environmentObject(ConnectionProfileStore())
 }
