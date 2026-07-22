@@ -29,6 +29,9 @@
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Aro transcribes your speech on-device (when supported) to turn it into a text prompt.</string>
 	<key>UILaunchScreen</key>
-	<dict/>
+	<dict>
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+	</dict>
 </dict>
 </plist>
