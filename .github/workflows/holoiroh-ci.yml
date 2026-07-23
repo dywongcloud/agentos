@@ -98,3 +98,12 @@ jobs:
             echo "::endgroup::"
           done
           echo "All pure-logic holoiroh probes passed as real-execution witnesses."
+
+      - name: Witness iOS ConnectionProfileRepository conformance (macOS Swift)
+        run: |
+          set -euo pipefail
+          # Compiles the REAL ConnectionProfileRepository + ConnectionProfileStore
+          # and asserts the always-present-default invariants (fresh / reopen /
+          # delete-reseed / stale-filter / broken-sqlite). Exits non-zero on any
+          # regression -- a permanent guard on the hard-won device-confirmed fix.
+          bash ios/Tools/RepositoryConformanceCheck/run.sh
