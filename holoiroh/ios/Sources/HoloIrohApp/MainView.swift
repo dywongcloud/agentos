@@ -85,14 +85,6 @@ struct MainView: View {
     /// per screen; `onAppear` connects it with this session's ticket + PIN.
     @StateObject private var connection = HoloConnection()
 
-    /// Profile persistence, used for one thing here: pinning the "Dev Mac"
-    /// default profile to whatever ticket/PIN a connection just SUCCEEDED
-    /// with (`ConnectionProfileStore.upsertDefaultProfile`), so the sqlite
-    /// default always tracks the daemon's current identity. A second store
-    /// instance alongside `PairingView`'s is fine -- same tiny sqlite file,
-    /// all access on the main actor.
-    @EnvironmentObject private var profileStore: ConnectionProfileStore
-
     /// Orb reaction driver (`OrbEffects.swift`): every real send kicks the
     /// blob's thinking pulse, and prompts that mention known apps put their
     /// badges in orbit around it.
@@ -788,9 +780,6 @@ struct MainView: View {
                 frameSource.stop()
                 frameSource = live
             }
-            // This ticket/PIN pair just demonstrably worked -- make it the
-            // sqlite default profile so reconnects survive daemon restarts.
-            profileStore.upsertDefaultProfile(ticket: ticket, pin: pin)
             sendAutoPairPromptIfNeeded()
         case .failed(let reason):
             // While the app is frontmost, a mid-session failure (daemon

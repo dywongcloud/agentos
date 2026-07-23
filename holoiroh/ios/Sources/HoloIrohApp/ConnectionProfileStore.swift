@@ -36,11 +36,11 @@ final class ConnectionProfileStore: ObservableObject {
 
     init(databaseURL: URL? = nil) {
         let primary = databaseURL ?? Self.defaultDatabaseURL()
-        // Try the primary path first. If it can't be opened -- which would
-        // otherwise leave the store SILENTLY EMPTY (db == nil ->
-        // `ensureDefaultProfile` early-returns, so the default profile is never
-        // seeded, the exact "no saved profile on device" symptom) -- fall back
-        // to a Documents-dir path so the default is still seeded somewhere.
+        // Try the primary path first; fall back to a Documents-dir path if it
+        // can't be opened, so USER-saved profiles still persist. (The "Dev Mac"
+        // default itself no longer depends on sqlite at all -- reload()
+        // synthesizes it in-memory -- but a working DB still matters for
+        // everything the user saves.)
         if !openDatabase(primary), databaseURL == nil {
             let fallback = Self.fallbackDatabaseURL()
             NSLog("ConnectionProfileStore: primary db open failed -- falling back to \(fallback.path)")
@@ -109,9 +109,8 @@ final class ConnectionProfileStore: ObservableObject {
         """)
     }
 
-    /// The built-in ticket/PIN for the dev Mac's daemon -- the values
-    /// [`ensureDefaultProfile`] guarantees are on hand when no working "Dev
-    /// Mac" row exists.
+    /// The built-in ticket/PIN for the dev Mac's daemon -- the constant that
+    /// `reload()` synthesizes as the always-present "Dev Mac" default profile.
     // A NODE-ID-ONLY ticket, on purpose: the daemon's identity key is stable
     // (~/.holoiroh/iroh_secret), and both the daemon and this app's iroh endpoint
     // use n0's default relay+discovery preset (presets::N0) -- so the phone
@@ -126,44 +125,6 @@ final class ConnectionProfileStore: ObservableObject {
     private static let currentDevTicket =
         "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwA/holoiroh"
     private static let currentDevPin = "394299"
-
-    /// Pins the "Dev Mac" default profile to the ticket/PIN a control-channel
-    /// connection just SUCCEEDED with -- called from `MainView` on every
-    /// `.connected`. This is what keeps the sqlite default profile pointed at
-    /// the daemon's CURRENT identity without hand-syncing the seed constants
-    /// after every daemon restart (a ticket's trailing direct-address hints
-    /// drift per restart; whatever actually connected is by definition the
-    /// freshest working value). Updates by NAME ("refresh the default slot",
-    /// same semantics `ensureDefaultProfile` repoints by); inserts the row if a
-    /// user deleted it and then connected manually. No-ops when the stored
-    /// values already match, so routine reconnects don't churn the DB.
-    func upsertDefaultProfile(ticket: String, pin: String) {
-        let trimmedTicket = ticket.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedPin = pin.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedTicket.isEmpty else { return }
-        guard let db else { return }
-
-        if let existing = profiles.first(where: { $0.name == "Dev Mac" }) {
-            if existing.ticket == trimmedTicket && existing.pin == trimmedPin { return }
-            var stmt: OpaquePointer?
-            let sql = "UPDATE profiles SET ticket = ?1, pin = ?2 WHERE name = 'Dev Mac';"
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-                logError("prepare upsert default profile")
-                return
-            }
-            defer { sqlite3_finalize(stmt) }
-            sqlite3_bind_text(stmt, 1, trimmedTicket, -1, Self.transient)
-            sqlite3_bind_text(stmt, 2, trimmedPin, -1, Self.transient)
-            guard sqlite3_step(stmt) == SQLITE_DONE else {
-                logError("step upsert default profile")
-                return
-            }
-            reload()
-        } else {
-            save(name: "Dev Mac", ticket: trimmedTicket, pin: trimmedPin)
-        }
-        NSLog("ConnectionProfileStore: default 'Dev Mac' profile pinned to the connected daemon identity")
-    }
 
     // MARK: - CRUD
 

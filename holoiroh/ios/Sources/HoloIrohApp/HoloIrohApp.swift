@@ -17,9 +17,9 @@ struct HoloIrohApp: App {
     /// iroh ticket + PIN -- is seeded the instant the app launches, guaranteed
     /// and independent of any view's lifecycle (the always-on intro overlay,
     /// the NavigationStack root's `@StateObject` init timing, etc.). Both
-    /// `PairingView` and `MainView` read it via `@EnvironmentObject`, so the
-    /// launch seed and the connect-time `upsertDefaultProfile` pin share one
-    /// instance and one sqlite file.
+    /// `PairingView` reads it via `@EnvironmentObject`, so the always-present
+    /// "Dev Mac" default and any user-saved profiles share one store instance
+    /// and one sqlite file.
     @StateObject private var profileStore = ConnectionProfileStore()
 
     var body: some Scene {
