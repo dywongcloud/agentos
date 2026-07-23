@@ -15,6 +15,9 @@ struct DiagnosticsView: View {
     @AppStorage("autoConnectEnabled") private var autoConnectEnabled = true
     @AppStorage("soundEnabled") private var soundEnabled = false
 
+    @State private var showTicketScanner = false
+    @State private var ticketRefreshMessage: String?
+
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -39,6 +42,31 @@ struct DiagnosticsView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .sheet(isPresented: $showTicketScanner) {
+                QRScannerSheet { scanned in
+                    handleRescannedTicket(scanned)
+                }
+            }
+        }
+    }
+
+    /// Applies a QR rescan to the saved default: extracts the ticket and, if it
+    /// parses and differs, replaces the "Dev Mac" default's ticket. The manual
+    /// fallback for when the daemon's identity fully rotated and neither the
+    /// stored nor the constant ticket can reach it (so no channel exists to send
+    /// a `current_ticket` over).
+    private func handleRescannedTicket(_ scanned: String) {
+        guard let ticket = PairingTicket.extract(from: scanned) else {
+            ticketRefreshMessage = "That QR didn't contain an iroh ticket."
+            return
+        }
+        if profileStore.refreshDefaultTicket(ticket) {
+            ConnectionDiagnostics.shared.note("default ticket replaced via manual QR rescan")
+            reachability.ticket = ticket
+            reachability.checkNow()
+            ticketRefreshMessage = "Dev Mac ticket updated from the scanned QR."
+        } else {
+            ticketRefreshMessage = "Scanned ticket matches the current default — no change."
         }
     }
 
@@ -99,6 +127,17 @@ struct DiagnosticsView: View {
                 reachability.checkNow()
             } label: {
                 Label("Check now", systemImage: "dot.radiowaves.left.and.right")
+            }
+            Button {
+                ticketRefreshMessage = nil
+                showTicketScanner = true
+            } label: {
+                Label("Rescan daemon QR (refresh ticket)", systemImage: "qrcode.viewfinder")
+            }
+            if let ticketRefreshMessage {
+                Text(ticketRefreshMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }

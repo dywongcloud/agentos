@@ -36,6 +36,10 @@ enum ServerMessage: Codable, Equatable {
     /// The daemon rejected this connection's auth (unknown device / wrong
     /// PIN) and is about to close it.
     case authRejected(text: String?)
+    /// The daemon's own current `iroh-live:` ticket, sent right after the
+    /// greeting. Lets the app refresh a stored default whose ticket went stale
+    /// on an identity rotation, over the already-authenticated channel.
+    case currentTicket(ticket: String)
     /// The P0-14 structured input request -- today produced by the daemon's
     /// sensitive-app consent gate. `kind` is the wire snake_case kind string
     /// (e.g. `"sensitive_access_consent"`); answer via
@@ -60,6 +64,7 @@ enum ServerMessage: Codable, Equatable {
         case expiresAt = "expires_at"
         case paused
         case queued
+        case ticket
     }
 
     private enum Kind: String, Codable {
@@ -70,6 +75,7 @@ enum ServerMessage: Codable, Equatable {
         case taskDone = "task_done"
         case taskActive = "task_active"
         case authRejected = "auth_rejected"
+        case currentTicket = "current_ticket"
         case inputRequest = "input_request"
     }
 
@@ -97,6 +103,8 @@ enum ServerMessage: Codable, Equatable {
             )
         case .authRejected:
             self = .authRejected(text: try container.decodeIfPresent(String.self, forKey: .text))
+        case .currentTicket:
+            self = .currentTicket(ticket: try container.decode(String.self, forKey: .ticket))
         case .inputRequest:
             self = .inputRequest(
                 requestId: try container.decode(String.self, forKey: .requestId),
@@ -134,6 +142,9 @@ enum ServerMessage: Codable, Equatable {
         case .authRejected(let text):
             try container.encode(Kind.authRejected, forKey: .type)
             try container.encodeIfPresent(text, forKey: .text)
+        case .currentTicket(let ticket):
+            try container.encode(Kind.currentTicket, forKey: .type)
+            try container.encode(ticket, forKey: .ticket)
         case .inputRequest(let requestId, let kind, let context, let responseOptions, let expiresAt):
             try container.encode(Kind.inputRequest, forKey: .type)
             try container.encode(requestId, forKey: .requestId)
@@ -160,6 +171,7 @@ enum ServerMessage: Codable, Equatable {
             let base = paused ? "task paused from before" : "task still running from before"
             return queued > 0 ? "\(base) (\(queued) queued)" : base
         case .authRejected(let text): return text ?? "authentication rejected"
+        case .currentTicket(let ticket): return "daemon ticket: \(ticket)"
         case .inputRequest(_, _, let context, _, _): return context
         }
     }
@@ -175,6 +187,7 @@ enum ServerMessage: Codable, Equatable {
         case .taskDone: return "DONE"
         case .taskActive: return "TASK"
         case .authRejected: return "AUTH"
+        case .currentTicket: return "TICKET"
         case .inputRequest: return "INPUT"
         }
     }

@@ -551,6 +551,12 @@ pub struct ControlChannel {
     /// `ControlChannel` is itself cheaply `Clone`d per accepted connection (see this struct's own
     /// existing `bridge`/`auth` fields) and every clone must append to the same underlying file.
     audit: Arc<AuditLogger>,
+    /// This daemon's own drift-proof (node-id-only) `iroh-live:` ticket, sent to
+    /// the peer as a [`ServerMessage::CurrentTicket`] right after the greeting so
+    /// a client can refresh a stored default whose ticket went stale on identity
+    /// rotation. `Arc<str>` for the same per-connection cheap-clone reason as the
+    /// fields above.
+    current_ticket: Arc<str>,
 }
 
 impl std::fmt::Debug for ControlChannel {
@@ -572,7 +578,7 @@ impl ControlChannel {
     /// **not** what a real deployment should call; see `PAIRING.md`'s
     /// "Exact remaining wiring step" for what `main.rs` would need to
     /// change to actually enable enforcement by default.
-    pub fn new(bridge: Arc<HoloBridge>, audit: Arc<AuditLogger>) -> Self {
+    pub fn new(bridge: Arc<HoloBridge>, audit: Arc<AuditLogger>, current_ticket: Arc<str>) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
         Self {
             bridge,
@@ -582,6 +588,7 @@ impl ControlChannel {
                 expected_pin: None,
             })),
             audit,
+            current_ticket,
         }
     }
 
@@ -594,7 +601,12 @@ impl ControlChannel {
     /// connection). This is the constructor `PAIRING.md` designs `main.rs`
     /// around, but `main.rs` does not call it yet -- see that file's
     /// "Exact remaining wiring step" section.
-    pub fn with_auth(bridge: Arc<HoloBridge>, expected_pin: String, audit: Arc<AuditLogger>) -> Self {
+    pub fn with_auth(
+        bridge: Arc<HoloBridge>,
+        expected_pin: String,
+        audit: Arc<AuditLogger>,
+        current_ticket: Arc<str>,
+    ) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
         Self {
             bridge,
@@ -604,6 +616,7 @@ impl ControlChannel {
                 expected_pin: Some(expected_pin),
             })),
             audit,
+            current_ticket,
         }
     }
 
@@ -835,6 +848,23 @@ impl ProtocolHandler for ControlChannel {
         .await
         {
             warn!(peer = %remote, error = %err, "control channel: failed to send greeting");
+        }
+
+        // Hand the peer this daemon's current node-id-only ticket right after the
+        // greeting, so a client whose stored default went stale on an identity
+        // rotation can refresh it over the already-authenticated channel instead
+        // of needing a QR re-scan. Best-effort: a send failure here never fails
+        // the connection (the greeting already succeeded above).
+        if let Err(err) = send_envelope(
+            &mut send,
+            &mut outbound_state,
+            &session_id,
+            None,
+            ServerMessage::current_ticket(&*self.current_ticket),
+        )
+        .await
+        {
+            warn!(peer = %remote, error = %err, "control channel: failed to send current ticket");
         }
 
         // Reconnect visibility: if a Holo task survived a previous connection's drop (still

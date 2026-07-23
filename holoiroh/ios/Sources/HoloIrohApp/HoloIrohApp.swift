@@ -24,8 +24,18 @@ struct HoloIrohApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(profileStore)
+            // The recent-prompts SwiftData container is injected only when it
+            // initialized successfully; if it's nil the app runs exactly as
+            // before (pairing/connection never touch SwiftData), and the
+            // recent-prompts strip stays hidden.
+            Group {
+                if let container = RecentPromptStore.container {
+                    ContentView().modelContainer(container)
+                } else {
+                    ContentView()
+                }
+            }
+            .environmentObject(profileStore)
         }
     }
 }

@@ -147,6 +147,29 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwA/holoiroh"
     private static let currentDevPin = "394299"
 
+    /// UserDefaults key holding a ticket the daemon reported over the
+    /// authenticated control channel (or a manual QR rescan) after its identity
+    /// rotated -- see `refreshDefaultTicket`. Absent until a real rotation, so a
+    /// fresh install always starts on the drift-proof `currentDevTicket`.
+    private static let refreshedTicketDefaultsKey = "refreshedDevTicket"
+
+    /// A stored refreshed ticket, but only if it still parses as an
+    /// `iroh-live:` ticket -- a malformed value is ignored so a bad write can
+    /// never leave the default pointing at garbage (the constant wins).
+    private static var storedRefreshedTicket: String? {
+        guard let t = UserDefaults.standard.string(forKey: refreshedTicketDefaultsKey),
+              t.hasPrefix("iroh-live:")
+        else { return nil }
+        return t
+    }
+
+    /// The ticket the synthesized default actually uses: a refreshed ticket if
+    /// the daemon's identity rotated, otherwise the drift-proof constant. Never
+    /// empty by construction, so the always-present-default invariant holds.
+    static var effectiveDefaultTicket: String {
+        storedRefreshedTicket ?? currentDevTicket
+    }
+
     // MARK: - CRUD
 
     /// Sentinel id for the in-memory synthesized default (never a real sqlite
@@ -199,13 +222,32 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
             ConnectionProfile(
                 id: Self.syntheticDefaultID,
                 name: "Dev Mac",
-                ticket: Self.currentDevTicket,
+                ticket: Self.effectiveDefaultTicket,
                 pin: Self.currentDevPin,
                 createdAt: Date(timeIntervalSince1970: 0)
             ),
             at: 0
         )
         profiles = result
+    }
+
+    /// Refreshes the "Dev Mac" default's ticket after the daemon's identity
+    /// rotated -- called with the ticket the daemon reported over the
+    /// authenticated control channel (`ServerMessage.currentTicket`) or from a
+    /// manual QR rescan. Persists the new ticket as the override the synthesized
+    /// default then uses, so future launches reach the rotated daemon without a
+    /// re-scan. No-op (returns false) unless the ticket parses AND differs from
+    /// the current default -- it never downgrades a working default to a bad or
+    /// identical ticket.
+    @discardableResult
+    func refreshDefaultTicket(_ ticket: String) -> Bool {
+        let trimmed = ticket.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("iroh-live:"),
+              trimmed != defaultProfile?.ticket
+        else { return false }
+        UserDefaults.standard.set(trimmed, forKey: Self.refreshedTicketDefaultsKey)
+        reload()
+        return true
     }
 
     /// Inserts (or, if a profile with the same ticket already exists,

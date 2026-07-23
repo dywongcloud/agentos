@@ -117,6 +117,8 @@ final class OrbEffectsState: ObservableObject {
         reactionID += 1
         orbitingApps = OrbitApp.matches(in: prompt)
         isReacting = true
+        // Optional high-tech cue (opt-in; best-effort; never blocks the visual).
+        OrbSound.playReaction()
         let id = reactionID
         clearTask?.cancel()
         clearTask = Task { [weak self] in

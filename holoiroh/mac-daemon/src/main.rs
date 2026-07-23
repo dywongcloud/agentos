@@ -52,6 +52,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use iroh::EndpointAddr;
 use iroh::protocol::Router;
 use iroh_live::{
     Live,
@@ -623,11 +624,27 @@ async fn main() -> anyhow::Result<()> {
     // connection-per-ALPN model. ---
     let router_builder = Router::builder(live.endpoint().clone());
     let router_builder = live.register_protocols(router_builder);
+    // The daemon's OWN drift-proof (node-id-only) ticket, handed to every
+    // accepted control connection as a CurrentTicket so a client can refresh a
+    // stored default that went stale on identity rotation. Node-id-only (not
+    // live.endpoint().addr()'s address-hinted form) so it matches the iOS app's
+    // stored constant format and only differs when the identity key actually
+    // changed -- not on every restart's address churn.
+    let daemon_control_ticket: Arc<str> = Arc::from(
+        LiveTicket::new(EndpointAddr::from(live.endpoint().id()), BROADCAST_NAME)
+            .to_string()
+            .as_str(),
+    );
     let router_builder = match bridge.clone() {
         Some(bridge) => {
             let control = match pin.clone() {
-                Some(pin) => ControlChannel::with_auth(bridge, pin, audit_logger.clone()),
-                None => ControlChannel::new(bridge, audit_logger.clone()),
+                Some(pin) => ControlChannel::with_auth(
+                    bridge,
+                    pin,
+                    audit_logger.clone(),
+                    daemon_control_ticket.clone(),
+                ),
+                None => ControlChannel::new(bridge, audit_logger.clone(), daemon_control_ticket.clone()),
             };
             control.register_protocols(router_builder)
         }

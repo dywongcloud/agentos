@@ -583,6 +583,17 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         text: Option<String>,
     },
+    /// Carries the daemon's own CURRENT `iroh-live:` ticket, sent right after
+    /// the greeting on a connected control channel so the app can refresh a
+    /// stored default whose ticket has gone stale (the daemon's identity key
+    /// rotated). The app treats this as authoritative for the machine it is
+    /// already authenticated to -- it arrives over the PIN-gated control
+    /// stream, so it is the live ticket of exactly the daemon in hand. Additive
+    /// per `PROTOCOL.md`'s extension policy: older clients that don't know this
+    /// type fall back to their generic "unrecognized control event" handling.
+    CurrentTicket {
+        ticket: String,
+    },
     /// Asks the user for structured input the agent cannot proceed without
     /// (Project Aro PRD, row P0-14). This variant is **metadata only**: it
     /// describes *what* is needed and *why*, plus (when applicable) a closed
@@ -662,6 +673,7 @@ impl ServerMessage {
             ServerMessage::TaskDone { .. } => "task_done",
             ServerMessage::TaskActive { .. } => "task_active",
             ServerMessage::AuthRejected { .. } => "auth_rejected",
+            ServerMessage::CurrentTicket { .. } => "current_ticket",
             ServerMessage::InputRequest { .. } => "input_request",
         }
     }
@@ -707,6 +719,14 @@ impl ServerMessage {
     pub fn auth_rejected(text: impl Into<String>) -> Self {
         ServerMessage::AuthRejected {
             text: Some(text.into()),
+        }
+    }
+
+    /// Convenience constructor for a `current_ticket` message carrying the
+    /// daemon's live `iroh-live:` ticket.
+    pub fn current_ticket(ticket: impl Into<String>) -> Self {
+        ServerMessage::CurrentTicket {
+            ticket: ticket.into(),
         }
     }
 

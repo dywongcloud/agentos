@@ -87,6 +87,7 @@ struct ContentView: View {
                             manualDisconnectThisSession = true
                             path.removeAll()
                         }
+                        .environmentObject(profileStore)
                     }
                 }
             }

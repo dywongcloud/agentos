@@ -62,6 +62,10 @@ struct MainView: View {
     /// Returns to `PairingView`.
     let onDisconnect: () -> Void
 
+    /// App-wide profile store, so a `current_ticket` from the daemon can refresh
+    /// the saved "Dev Mac" default when the daemon's identity has rotated.
+    @EnvironmentObject private var profileStore: ConnectionProfileStore
+
     // MARK: - Dashboard identity fields (PRD 6.1 dashboard row)
 
     /// The paired Mac's name, shown in Idle availability + Connecting/Working.
@@ -821,6 +825,8 @@ struct MainView: View {
             restoreTaskControls(paused: paused)
         case .authRejected(let text):
             failActiveTask(cause: text ?? "The daemon rejected this device's authentication.")
+        case .currentTicket(let ticket):
+            applyCurrentTicket(ticket)
         case .inputRequest(let requestId, let kind, let context, let responseOptions, _):
             presentInputRequest(
                 requestId: requestId,
@@ -851,6 +857,18 @@ struct MainView: View {
                 session = .idle
             }
         }
+    }
+
+    /// The daemon reported its current ticket over the authenticated channel.
+    /// If it differs from the saved default (the daemon's identity rotated),
+    /// refresh the "Dev Mac" default so future launches reach the rotated daemon
+    /// without a QR re-scan. Validated + no-op-on-same in the store, so a stale
+    /// or identical ticket never downgrades a working default.
+    private func applyCurrentTicket(_ ticket: String) {
+        let previous = profileStore.defaultProfile?.ticket ?? ""
+        guard profileStore.refreshDefaultTicket(ticket) else { return }
+        ConnectionDiagnostics.shared.recordTicketRefresh(from: previous, to: ticket)
+        log(.status(text: "saved Dev Mac ticket refreshed — daemon identity rotated"))
     }
 
     /// Projects a daemon `input_request` (today: the sensitive-app consent
@@ -1316,6 +1334,7 @@ struct MainView: View {
         case .taskDone(let status, _):
             return status == "failed" ? .red : .green
         case .inputRequest: return .yellow
+        case .currentTicket: return .blue
         }
     }
 
@@ -1413,7 +1432,14 @@ struct MainView: View {
 
     private func commandBar(fullscreen: Bool) -> some View {
         let hasPrompt = !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        return HStack(spacing: 10) {
+        return VStack(spacing: 8) {
+            if RecentPromptStore.container != nil, !isControllingRemotely {
+                RecentPromptsStrip { text in
+                    promptText = text
+                    isPromptFocused = true
+                }
+            }
+            HStack(spacing: 10) {
             Button {
                 showControls.toggle()
             } label: {
@@ -1520,6 +1546,7 @@ struct MainView: View {
         )
         .shadow(color: .black.opacity(0.5), radius: 20, y: 8)
         .shadow(color: Self.orbAccent.opacity(0.18), radius: 24, y: -2)
+        }
     }
 
     /// Debug-only unattended witness: fires exactly once per process
@@ -1640,6 +1667,8 @@ struct MainView: View {
         promptText = ""
         isPromptFocused = false
         lastSentTask = .prompt(text: trimmed)
+        // Best-effort recent-prompts history (SwiftData); never blocks the send.
+        RecentPromptsRepository().record(trimmed)
         // The orb visibly reacts to every send; apps named in the prompt
         // orbit it while it "thinks" (OrbEffects.swift).
         orbEffects.react(to: trimmed)

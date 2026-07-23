@@ -70,7 +70,12 @@ let package = Package(
                 // this copied directory. `.copy` keeps the directory
                 // structure so Bundle.module lookups can use
                 // subdirectory: "AppIcons".
-                .copy("Resources/AppIcons")
+                .copy("Resources/AppIcons"),
+                // Script-generated orb-reaction cue (gen_orb_sound.py) played
+                // behind the opt-in `soundEnabled` toggle when the orb reacts.
+                // `.copy` keeps the "Sounds" subdirectory for Bundle.module
+                // lookups.
+                .copy("Resources/Sounds")
             ]
         )
     ]
