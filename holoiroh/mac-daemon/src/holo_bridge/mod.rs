@@ -77,6 +77,7 @@ pub mod a2a_client;
 pub mod control;
 pub mod health;
 pub mod process;
+pub mod stall_watchdog;
 pub mod stop;
 
 use anyhow::{Context, Result};
@@ -419,6 +420,28 @@ impl HoloBridge {
             model = target_model,
             "intent router switching holo serve's model"
         );
+        self.switch_to(None, Some(target_model), false, Some(Some(target_model.to_string())))
+            .await
+    }
+
+    /// Explicitly force `holo serve` onto `tier`, bypassing [`router::should_switch`]'s
+    /// text-based classification entirely. Used by the stall watchdog
+    /// (`crate::holo_bridge::stall_watchdog`) right before redispatching a self-correction
+    /// nudge: the nudge's own short admonishment text ("check your last action...") is not
+    /// representative of the ORIGINAL task's real complexity, so scoring the nudge text alone
+    /// could accidentally downgrade the model right when a stuck agent most needs the
+    /// stronger tier. Same no-op guards as [`Self::route_model`] (local mode / on fallback),
+    /// same underlying [`Self::switch_to`] call -- this is a deliberate override of the
+    /// router's decision, not a parallel routing mechanism.
+    pub async fn force_tier(&self, tier: crate::router::Tier) -> Result<()> {
+        if self.primary.is_some() {
+            return Ok(());
+        }
+        if self.is_on_fallback() {
+            return Ok(());
+        }
+        let target_model = tier.model_id();
+        tracing::info!(to = ?tier, model = target_model, "stall watchdog forcing a stronger model tier");
         self.switch_to(None, Some(target_model), false, Some(Some(target_model.to_string())))
             .await
     }

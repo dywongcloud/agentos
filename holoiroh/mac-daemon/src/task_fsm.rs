@@ -110,6 +110,11 @@ pub struct TaskFsm {
     pub claimed_answer: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    /// When the stall watchdog (`crate::holo_bridge::stall_watchdog`) last nudged this task,
+    /// if ever -- see [`Self::should_nudge`]/[`Self::mark_nudged`]. `None` until the first
+    /// nudge; never touched by ordinary phase transitions (a nudge is not itself progress).
+    #[serde(default)]
+    pub last_nudge_ms: Option<u64>,
 }
 
 impl TaskFsm {
@@ -129,6 +134,7 @@ impl TaskFsm {
             claimed_answer: None,
             created_at_ms: now,
             updated_at_ms: now,
+            last_nudge_ms: None,
         }
     }
 
@@ -228,6 +234,33 @@ impl TaskFsm {
             Phase::Done => "done".to_string(),
             Phase::Failed => "failed".to_string(),
         }
+    }
+
+    /// Whether `crate::holo_bridge::stall_watchdog` should nudge this task at `now_ms`: not
+    /// terminal, no real phase advancement for at least `stall_window_ms`, and (if it was
+    /// nudged before) at least `nudge_cooldown_ms` since that last nudge -- a nudge is not
+    /// itself progress, so a task that's STILL stuck after one nudge is still eligible once
+    /// the cooldown passes, but never nudged twice in a tight loop while the agent is
+    /// genuinely working through the first nudge's correction.
+    pub fn should_nudge(&self, now_ms: u64, stall_window_ms: u64, nudge_cooldown_ms: u64) -> bool {
+        if self.phase.is_terminal() {
+            return false;
+        }
+        if now_ms.saturating_sub(self.updated_at_ms) < stall_window_ms {
+            return false;
+        }
+        match self.last_nudge_ms {
+            Some(last) => now_ms.saturating_sub(last) >= nudge_cooldown_ms,
+            None => true,
+        }
+    }
+
+    /// Records that a nudge was just sent. Deliberately does NOT touch `updated_at_ms`/`phase`
+    /// -- the nudge itself is not evidence of real progress, only a real `tool_result`/
+    /// `answer_event`/terminal signal (via `observe_working`/`observe_answer`/
+    /// `advance_terminal`) advances those.
+    pub fn mark_nudged(&mut self, now_ms: u64) {
+        self.last_nudge_ms = Some(now_ms);
     }
 
     // MARK: - Persistence (crash/restart survival, mirroring `.gm/turn-state.json`)

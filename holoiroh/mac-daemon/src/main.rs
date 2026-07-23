@@ -587,6 +587,15 @@ async fn main() -> anyhow::Result<()> {
                 bridge.clone(),
                 health_check_shutdown.clone(),
             ));
+            // Autonomous self-correction backstop: watches the running turn for a genuine
+            // stall and nudges it to fix its own mistake instead of sitting stuck. See
+            // `holo_bridge::stall_watchdog`'s module doc. Shares the health-check loop's own
+            // shutdown token -- both are daemon-lifetime background supervisors over the same
+            // bridge, so one cancellation stops both cleanly.
+            tokio::spawn(holo_bridge::stall_watchdog::run_stall_watchdog_loop(
+                bridge.clone(),
+                health_check_shutdown.clone(),
+            ));
             // Cooperative auto-yield: step the agent aside while the user is
             // actively using the Mac, resume when they go idle (see
             // `crate::auto_yield`). Starts its own physical-input CGEventTap;

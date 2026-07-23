@@ -286,6 +286,23 @@ const CONSENT_STOP_TASK: &str = "Stop task";
 /// standard safe-pause state (the task simply stays paused; `Resume` re-asks).
 const CONSENT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// See `crate::holo_bridge::stall_watchdog`'s module doc for the full design. How long a task
+/// may show zero real phase advancement (`TaskFsm::updated_at_ms` unchanged) while still
+/// `Working` before the watchdog nudges it. Conservative on purpose: a genuinely hard step
+/// (a slow page load, a long download) must never be mistaken for a stuck agent.
+const STALL_WATCHDOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
+/// Minimum gap between two nudges for the SAME task, so a still-stuck task after one nudge
+/// gets real time to act on it before a second nudge piles on.
+const STALL_WATCHDOG_NUDGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+/// The autonomous self-correction nudge sent (as a redirect on the SAME backend session) when
+/// the watchdog detects a stall. Deliberately echoes `agent_guidance::task_framing_block`'s
+/// self-correction rule so the reinforcement arrives exactly when it's needed.
+const STALL_WATCHDOG_NUDGE_TEXT: &str = "You have not made visible progress for a while. Before continuing: check whether your LAST action actually did what you intended (text in the wrong field, wrong element clicked, an unexpected dialog or state). If it did not, fix just that one step -- do not restart the whole task -- then continue toward the original goal.";
+/// Stable substring of the daemon-status line emitted right before a watchdog nudge, so a
+/// probe (and the iOS log panel) can distinguish a self-correction nudge from ordinary status
+/// text.
+const STALL_WATCHDOG_STATUS_MARKER: &str = "self-correction check:";
+
 /// Bridges control-channel messages to `holo serve`'s A2A endpoint and CLI-level stop
 /// handling. Holds no transport of its own -- the caller owns receiving `ControlMessage`s
 /// (from whatever the eventual `iroh` control stream deserializes into them) and sending
@@ -1707,6 +1724,69 @@ impl HoloControlBridge {
         // lands -- no race, no sleep.
         self.run_or_queue(request_id, trimmed, inherited_context)
             .await;
+    }
+
+    /// Called on every `stall_watchdog` tick (see that module's doc for the full design and
+    /// why this daemon-owned supervisory layer is the reachable "fan out agents" mechanism
+    /// given `holo serve`'s own reasoning loop is closed-source). Checks the CURRENTLY RUNNING
+    /// turn (if any) against its `TaskFsm`'s staleness, and on a genuine stall, cancels it and
+    /// redispatches a self-correction nudge on the SAME backend session -- reusing
+    /// [`Self::handle_redirect`] exactly, the same cancel-then-continue path `Redirect`
+    /// already uses, just triggered by the daemon instead of the user. A no-op turn (nothing
+    /// running, or the running turn isn't stalled, or it was already nudged within the
+    /// cooldown) costs one lock-and-check, no cancel, no emit.
+    pub async fn maybe_nudge_stalled_turn(&self) {
+        let Some(request_id) = self
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .as_ref()
+            .map(|t| t.request_id.clone())
+        else {
+            return;
+        };
+
+        let now = holoiroh_wire::epoch_millis_now();
+        let should_nudge = self
+            .tasks
+            .with_task(&request_id, |fsm| {
+                let should = fsm.should_nudge(
+                    now,
+                    STALL_WATCHDOG_WINDOW.as_millis() as u64,
+                    STALL_WATCHDOG_NUDGE_COOLDOWN.as_millis() as u64,
+                );
+                if should {
+                    fsm.mark_nudged(now);
+                }
+                should
+            })
+            .unwrap_or(false);
+        if !should_nudge {
+            return;
+        }
+
+        tracing::info!(request_id, "stall watchdog: nudging a stalled turn to self-correct");
+        self.emit_daemon_status(format!(
+            "{STALL_WATCHDOG_STATUS_MARKER} no progress detected -- asking the agent to verify and fix its last step"
+        ));
+        // Force the stronger model tier for the correction attempt, deterministically -- the
+        // nudge text's own (short, low-signal) wording must never accidentally leave the
+        // router on/downgrading to the simple tier right when the agent most needs the
+        // stronger one. Best-effort: a failed escalation still lets the nudge itself proceed.
+        if let Some(bridge) = self.bridge.get().and_then(std::sync::Weak::upgrade) {
+            if let Err(err) = bridge.force_tier(crate::router::Tier::Complex).await {
+                tracing::warn!(
+                    request_id,
+                    error = %format!("{err:#}"),
+                    "stall watchdog: forcing the complex model tier failed; nudging anyway"
+                );
+            }
+        }
+        self.handle_redirect(
+            format!("watchdog-nudge-{}", uuid::Uuid::new_v4()),
+            STALL_WATCHDOG_NUDGE_TEXT.to_string(),
+        )
+        .await;
     }
 
     /// Resolve a wire `InputResponse` against the outstanding sensitive-app consent request,

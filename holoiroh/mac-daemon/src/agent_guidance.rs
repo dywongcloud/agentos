@@ -17,6 +17,13 @@
 //! conclude the task was already done (or stall), instead of posting the new
 //! greeting. The rule below makes the intended behaviour explicit -- a request
 //! is an instruction to ACT, and pre-existing similar content is not completion.
+//!
+//! Second motivating bug: asked to email someone with the subject "hello", the
+//! agent typed "hello" into the recipients field by mistake, then froze instead
+//! of recognizing and fixing its own error. `holo serve`
+//! (`hcompai/holo-desktop-cli`, using the closed-source `hai-agent-runtime`) is
+//! not vendored source this daemon can edit -- the per-turn guidance block below
+//! is the reachable lever for this class of bug, same mechanism as the first.
 
 /// The task-execution framing block, prepended to every turn's prompt. A
 /// `&'static str` (not built per call) since it is constant and unconditional.
@@ -38,7 +45,17 @@ pub fn task_framing_block() -> &'static str {
      idle. If a turn tells you it is resuming after such an interruption, look at \
      the current on-screen state and CONTINUE from where you left off -- do not \
      restart the task or repeat steps you already completed. Avoid stealing the \
-     user's frontmost window when you don't need it."
+     user's frontmost window when you don't need it.\n\
+     - SELF-CORRECTION: after every action, check whether the on-screen result \
+     actually matches what you intended -- text landed in the wrong field, the \
+     wrong element got clicked, an unexpected dialog or state appeared. If it \
+     did not go as intended, do NOT freeze, do NOT restart the whole task, and \
+     do NOT ask the user for something you can just fix yourself. Undo or clear \
+     the specific wrong step (e.g. clear the wrong field, close the wrong \
+     dialog, click the correct target instead), then continue from there. A \
+     mistake in one step is a one-step fix, not a reason to stall or reset \
+     progress. Only ask the user if a genuine correction attempt fails or the \
+     situation is truly ambiguous."
 }
 
 /// A short, stable substring of [`task_framing_block`] that witnesses (in a
@@ -46,3 +63,9 @@ pub fn task_framing_block() -> &'static str {
 /// composed prompt -- kept here so the witness and the text share one source.
 #[allow(dead_code)] // used by examples/task_framing_probe.rs, not the bin target
 pub const TASK_FRAMING_MARKER: &str = "Pre-existing similar content is NOT completion";
+
+/// A short, stable substring witnessing the self-correction rule specifically
+/// (distinct from [`TASK_FRAMING_MARKER`] so a probe can assert on this rule in
+/// isolation, and so the two motivating bugs each have their own witness anchor).
+#[allow(dead_code)] // used by examples/self_correction_probe.rs, not the bin target
+pub const SELF_CORRECTION_MARKER: &str = "A mistake in one step is a one-step fix";
