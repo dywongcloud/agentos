@@ -48,9 +48,11 @@ final class ConnectionProfileStore: ObservableObject {
         }
         if db != nil {
             createTableIfNeeded()
-            reload()
-            ensureDefaultProfile()
         }
+        // reload() ALWAYS runs -- even when db == nil (both sqlite paths failed)
+        // -- so the in-memory default is synthesized and `profiles` is never left
+        // empty. This is the last line of defense behind the sqlite fallback.
+        reload()
         // Launch diagnostic: the macOS harness proves the seeding LOGIC; this
         // line proves the actual DEVICE state (pull it from the console). If a
         // real phone ever shows `opened=false` or `devMac=false`, the root
@@ -125,50 +127,6 @@ final class ConnectionProfileStore: ObservableObject {
         "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwA/holoiroh"
     private static let currentDevPin = "394299"
 
-    /// The iroh node-id portion of a ticket: the first 43 characters after
-    /// the `iroh-live:` scheme (a 32-byte node key, base64url unpadded).
-    /// Everything after it is address/relay hint data that drifts per daemon
-    /// restart; the node id IS the daemon's identity.
-    private static func nodeIdPrefix(of ticket: String) -> Substring? {
-        let scheme = "iroh-live:"
-        guard ticket.hasPrefix(scheme) else { return nil }
-        let body = ticket.dropFirst(scheme.count)
-        guard body.count >= 43 else { return nil }
-        return body.prefix(43)
-    }
-
-    /// Guarantees the "Dev Mac" default profile EXISTS on every launch --
-    /// deterministically, with no one-time flags. This replaced the old
-    /// seed-once-then-refresh-once design after it was live-witnessed
-    /// leaving a real phone with an EMPTY profiles table: the UserDefaults
-    /// seed flag survives app upgrades, the row had been deleted, and the
-    /// refresh path only updated an existing row -- an unreachable state no
-    /// flag-bump could repair. The requirement is that the current daemon's
-    /// ticket/PIN profile is ALWAYS present, so:
-    ///
-    /// - no "Dev Mac" row -> insert the built-in constants, every launch
-    ///   that finds it missing;
-    /// - row exists with the SAME iroh node id as the constants -> leave it
-    ///   (its address hints may be fresher; `upsertDefaultProfile` pins it
-    ///   to whatever actually connects);
-    /// - row exists pointing at a DIFFERENT node id -> repoint the default
-    ///   slot at the dev daemon's identity.
-    private func ensureDefaultProfile() {
-        guard db != nil else { return }
-        if let existing = profiles.first(where: { $0.name == "Dev Mac" }) {
-            let existingNode = Self.nodeIdPrefix(of: existing.ticket)
-            let builtinNode = Self.nodeIdPrefix(of: Self.currentDevTicket)
-            if existingNode != nil && existingNode == builtinNode {
-                return
-            }
-            NSLog("ConnectionProfileStore: 'Dev Mac' pointed at a different/invalid node id -- repointing at the built-in daemon identity")
-            upsertDefaultProfile(ticket: Self.currentDevTicket, pin: Self.currentDevPin)
-        } else {
-            NSLog("ConnectionProfileStore: default 'Dev Mac' profile missing -- inserting the built-in daemon identity")
-            save(name: "Dev Mac", ticket: Self.currentDevTicket, pin: Self.currentDevPin)
-        }
-    }
-
     /// Pins the "Dev Mac" default profile to the ticket/PIN a control-channel
     /// connection just SUCCEEDED with -- called from `MainView` on every
     /// `.connected`. This is what keeps the sqlite default profile pointed at
@@ -209,26 +167,55 @@ final class ConnectionProfileStore: ObservableObject {
 
     // MARK: - CRUD
 
-    func reload() {
-        guard let db else { return }
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT id, name, ticket, pin, created_at FROM profiles ORDER BY created_at DESC;", -1, &stmt, nil) == SQLITE_OK else {
-            logError("prepare select")
-            return
-        }
-        defer { sqlite3_finalize(stmt) }
+    /// Sentinel id for the in-memory synthesized default (never a real sqlite
+    /// row id, which start at 1). `delete()` on it is a harmless no-op DELETE,
+    /// and the next reload re-synthesizes it -- so the default can't be
+    /// permanently removed (only the daemon changing its identity replaces it).
+    static let syntheticDefaultID: Int64 = -1
 
+    func reload() {
+        // Load any USER-saved profiles from sqlite, best-effort. Crucially this
+        // NEVER early-returns before setting `profiles`: the old `guard let db
+        // else { return }` (and the prepare-fail early return) left `profiles`
+        // empty whenever sqlite couldn't open on device -> the "saved profiles
+        // are empty" bug. Everything below always runs.
         var loaded: [ConnectionProfile] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
-            loaded.append(ConnectionProfile(
-                id: sqlite3_column_int64(stmt, 0),
-                name: String(cString: sqlite3_column_text(stmt, 1)),
-                ticket: String(cString: sqlite3_column_text(stmt, 2)),
-                pin: String(cString: sqlite3_column_text(stmt, 3)),
-                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
-            ))
+        if let db {
+            var stmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT id, name, ticket, pin, created_at FROM profiles ORDER BY created_at DESC;", -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    loaded.append(ConnectionProfile(
+                        id: sqlite3_column_int64(stmt, 0),
+                        name: String(cString: sqlite3_column_text(stmt, 1)),
+                        ticket: String(cString: sqlite3_column_text(stmt, 2)),
+                        pin: String(cString: sqlite3_column_text(stmt, 3)),
+                        createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 4))
+                    ))
+                }
+            } else {
+                logError("prepare select")
+            }
+            sqlite3_finalize(stmt)
         }
-        profiles = loaded
+
+        // The "Dev Mac" default slot is ALWAYS the synthesized current-daemon
+        // CONSTANT (currentDevTicket/Pin) -- never a stored (possibly stale or
+        // duplicated) sqlite row. So it can't go missing because sqlite failed
+        // to open, or a view's @StateObject never initialized -- the real reasons
+        // it vanished on device -- and there is never more than one. Drop any
+        // persisted "Dev Mac" rows and prepend the constant.
+        var result = loaded.filter { $0.name != "Dev Mac" }
+        result.insert(
+            ConnectionProfile(
+                id: Self.syntheticDefaultID,
+                name: "Dev Mac",
+                ticket: Self.currentDevTicket,
+                pin: Self.currentDevPin,
+                createdAt: Date(timeIntervalSince1970: 0)
+            ),
+            at: 0
+        )
+        profiles = result
     }
 
     /// Inserts (or, if a profile with the same ticket already exists,
