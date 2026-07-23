@@ -151,6 +151,26 @@ struct MainView: View {
     /// Drives the command bar's full-height rise and the live-share box's
     /// clear-the-bar shift in `body` (see the `barShift`/`boxShift` derivation there).
     @State private var keyboardHeight: CGFloat = 0
+
+    /// Real, live-measured height of the risen bottom stack (task pill + recent-
+    /// prompts strip + clarify thinking-row/panel + the command bar itself),
+    /// read via `ViewHeightKey` -- replaces a hardcoded `barClearance` constant
+    /// that silently went stale every time new content (the clarify panel, the
+    /// recent-prompts strip) was added above the command bar, since a fixed
+    /// number can never reflect a VStack whose content varies. Falls back to a
+    /// single command-bar-row's rough height (96) before the first real
+    /// measurement lands, so `boxShift` is never computed against zero.
+    @State private var measuredBarStackHeight: CGFloat = 96
+
+    /// The real system keyboard-animation duration for the CURRENT show/hide,
+    /// captured from `keyboardWillShowNotification`'s own userInfo
+    /// (`UIResponder.keyboardAnimationDurationUserInfoKey`) instead of an
+    /// approximate spring -- eliminates the visible lag-during-rise class of
+    /// "the keyboard still overlaps the bar for a moment" bugs, since the bar's
+    /// motion is now driven by the SAME duration the keyboard itself animates
+    /// on. Falls back to a sane default (0.25s, iOS's typical keyboard
+    /// duration) if the notification ever omits the key.
+    @State private var keyboardAnimationDuration: Double = 0.25
     @StateObject private var voice = VoiceTranscriberModel()
     @State private var logEntries: [LogEntry] = [
         LogEntry(message: .status(text: "paired -- control channel not yet connected"))
@@ -163,12 +183,29 @@ struct MainView: View {
     /// stopped/restarted by going fullscreen.
     @State private var isVideoFullscreen = false
 
+    /// True once the user has manually collapsed fullscreen WHILE still
+    /// physically landscape -- suppresses the auto-landscape-fullscreen
+    /// re-trigger for the rest of that landscape session (never fight the
+    /// user, same pattern as the launch auto-connect suppression), and
+    /// resets the moment the device rotates back to portrait so the NEXT
+    /// landscape entry auto-expands again.
+    @State private var manuallyCollapsedWhileLandscape = false
+
     /// True while the user has escalated to hands-on control: a touch surface
     /// over the live view injects their taps/drags/scrolls as remote input, and
     /// the daemon has paused any active agent turn. Entering sends `takeControl`
     /// (and resets zoom so touches map 1:1 to the video); exiting sends
     /// `releaseControl`. See `RemoteControl.swift`.
     @State private var isControllingRemotely = false
+
+    /// Whether the lightweight floating typing overlay (task 4) is shown over
+    /// the live-share surface. Only ever visible while `isControllingRemotely`
+    /// -- cleared automatically on releaseControl (see `toggleRemoteControl`)
+    /// so it never persists floating over a non-controlled video.
+    @State private var showRemoteTypeOverlay = false
+    /// Focus for the floating typing overlay's text field, so opening it
+    /// auto-raises the keyboard without the user needing a second tap.
+    @FocusState private var isRemoteTypeFocused: Bool
 
     /// Whether the hidden controls sheet (the per-state SessionView panel,
     /// the status/log panel, and Disconnect) is presented. Toggled by the
@@ -270,6 +307,13 @@ struct MainView: View {
             // if the connection drops mid-fullscreen the normal layout comes
             // straight back instead of leaving a black screen.
             let isFullscreenActive = isVideoFullscreen && isConnected
+            // Auto-landscape-fullscreen (task 3): the SAME GeometryReader that
+            // already drives every other layout number in this view is the
+            // simplest, most robust orientation signal -- no separate
+            // UIDevice.orientation notification wiring needed, and it
+            // naturally re-fires on every real rotation since `body` itself
+            // re-renders when `geo.size` changes.
+            let isLandscape = geo.size.width > geo.size.height
 
             // Keyboard avoidance, DECOUPLED (live-witnessed bug in the joint
             // version: shifting bar and box together by `keyboardHeight -
@@ -289,8 +333,12 @@ struct MainView: View {
             let boxBottomY = boxCenterY + boxHeight / 2
             let spaceBelowBox = geo.size.height - boxBottomY
             let barShift = keyboardHeight
-            // Command bar height + its paddings + a visual gap above it.
-            let barClearance: CGFloat = 96
+            // The REAL measured height of the risen stack (see
+            // `measuredBarStackHeight`'s doc) plus a small visual gap, instead
+            // of a hardcoded guess -- correct regardless of whether the stack
+            // is just the command bar or also carries the clarify panel/
+            // recent-prompts strip/thinking row above it.
+            let barClearance: CGFloat = measuredBarStackHeight + 8
             let boxShift = keyboardHeight > 0
                 ? max(0, keyboardHeight + barClearance - spaceBelowBox)
                 : 0
@@ -339,6 +387,12 @@ struct MainView: View {
                             .padding(.horizontal, 16)
                             .padding(.bottom, 8)
                     }
+                    .background(
+                        GeometryReader { stackGeo in
+                            Color.clear.preference(key: ViewHeightKey.self, value: stackGeo.size.height)
+                        }
+                    )
+                    .onPreferenceChange(ViewHeightKey.self) { measuredBarStackHeight = $0 }
                     .offset(y: -barShift)
                     .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isTaskActive || isTaskPaused)
                 }
@@ -362,8 +416,14 @@ struct MainView: View {
             // by device/iOS version, matching this app's existing spring-first
             // animation style elsewhere (e.g. the zoom/pan gestures).
             // Keyed on `keyboardHeight` -- both barShift and boxShift derive
-            // from it, so one animation covers both surfaces.
-            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: keyboardHeight)
+            // from it, so one animation covers both surfaces. Duration matches
+            // the REAL system keyboard animation (captured per-notification
+            // into `keyboardAnimationDuration`), not an approximate spring --
+            // a mismatched duration is what makes the bar visibly lag behind
+            // the keyboard's own rise, the most likely real-world shape of
+            // "the keyboard overlaps the command bar" during the transition
+            // itself (the resting position was already correct).
+            .animation(.easeInOut(duration: keyboardAnimationDuration), value: keyboardHeight)
             // The box glides (not snaps) when the task pill appears/vanishes
             // and shifts its position via pillClearance.
             .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isTaskActive || isTaskPaused)
@@ -373,12 +433,32 @@ struct MainView: View {
             // manual `barShift` offset -- live-witnessed as the command bar
             // flying to the very top of the screen when the keyboard opened.
             .ignoresSafeArea(.keyboard)
+            // Auto-landscape-fullscreen: entering landscape expands to
+            // fullscreen (unless the user already manually collapsed it this
+            // landscape session); returning to portrait always restores the
+            // boxed layout and clears that suppression for next time. The
+            // manual tap-to-fullscreen toggle (in `videoOverlay`) still works
+            // independently in portrait.
+            .onChange(of: isLandscape) { _, nowLandscape in
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    if nowLandscape {
+                        if !manuallyCollapsedWhileLandscape {
+                            isVideoFullscreen = true
+                        }
+                    } else {
+                        isVideoFullscreen = false
+                        manuallyCollapsedWhileLandscape = false
+                    }
+                }
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
+            captureKeyboardAnimationDuration(from: note)
             guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
             keyboardHeight = frame.height
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+            captureKeyboardAnimationDuration(from: note)
             guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
             // A visible-but-resized keyboard (e.g. QuickType bar toggling,
             // switching to a different keyboard layout) fires this instead
@@ -386,7 +466,8 @@ struct MainView: View {
             // shift doesn't freeze at a stale value.
             keyboardHeight = max(0, UIScreen.main.bounds.height - frame.origin.y)
         }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { note in
+            captureKeyboardAnimationDuration(from: note)
             keyboardHeight = 0
         }
         .toolbar(.hidden, for: .navigationBar)
@@ -449,6 +530,21 @@ struct MainView: View {
                 break
             }
         }
+    }
+
+    // MARK: - Keyboard shelf helpers
+
+    /// Reads the REAL keyboard-animation duration out of a keyboard
+    /// show/hide/change-frame notification's userInfo, so the command-bar's
+    /// rise/fall animation (see `keyboardAnimationDuration`) matches the
+    /// system's own timing instead of an approximate spring. Falls back to
+    /// the existing value (never resets to a guess) if a notification is ever
+    /// missing the key -- degrade gracefully, never regress to a worse guess.
+    private func captureKeyboardAnimationDuration(from note: Notification) {
+        guard let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double,
+              duration > 0
+        else { return }
+        keyboardAnimationDuration = duration
     }
 
     // MARK: - Live-share zoom helpers
@@ -1105,6 +1201,13 @@ struct MainView: View {
                         // Expand / collapse control.
                         Button {
                             withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                // Collapsing WHILE physically landscape means the user is
+                                // explicitly overriding the auto-landscape-fullscreen trigger --
+                                // suppress it until the next rotation-to-portrait-and-back
+                                // (see `manuallyCollapsedWhileLandscape`'s doc).
+                                if isVideoFullscreen, size.width > size.height {
+                                    manuallyCollapsedWhileLandscape = true
+                                }
                                 isVideoFullscreen.toggle()
                             }
                         } label: {
@@ -1155,6 +1258,7 @@ struct MainView: View {
                         }
                     }
                     .overlay(alignment: .topLeading) { remoteControlToggle }
+                    .overlay(alignment: .topTrailing) { remoteTypeToggle }
                     .overlay(alignment: .top) {
                         if isControllingRemotely {
                             Text("You're in control \u{2014} the agent is paused")
@@ -1166,8 +1270,16 @@ struct MainView: View {
                                 .padding(.top, 10)
                         }
                     }
+                    .overlay(alignment: .bottom) {
+                        if isControllingRemotely, showRemoteTypeOverlay {
+                            remoteTypeBar
+                                .padding(.bottom, 14)
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                    }
                     .animation(.easeOut(duration: 0.18), value: liveScale > 1.01)
                     .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isControllingRemotely)
+                    .animation(.spring(response: 0.3, dampingFraction: 0.9), value: showRemoteTypeOverlay)
                     .contentShape(Rectangle())
                     // Pinch to zoom. `simultaneousGesture` so it composes
                     // with the pan drag below and never blocks the taps.
@@ -1271,6 +1383,13 @@ struct MainView: View {
             commandBar(fullscreen: true)
         }
         .padding(.horizontal, 12)
+        // Landscape safe-area awareness: in landscape the notch/Dynamic
+        // Island (and rounded corners) sit on the LEADING or TRAILING edge
+        // instead of the top -- `.safeAreaPadding` (iOS 17+) adds exactly
+        // enough extra padding to clear whichever edge actually needs it in
+        // the CURRENT orientation, so this overlay never sits under the
+        // sensor housing regardless of portrait vs. either landscape.
+        .safeAreaPadding(.horizontal)
         .padding(.bottom, 8)
         .background(
             LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom)
@@ -1676,11 +1795,103 @@ struct MainView: View {
                 .background(.ultraThinMaterial, in: Circle())
         }
         .padding(10)
+        // Landscape safe-area awareness: this toggle is pinned `.topLeading`
+        // on the video (see `videoOverlay`) -- in landscape the LEADING edge
+        // may be the notch/Dynamic Island side depending on which way the
+        // phone is rotated, so it needs the same safe-area-aware padding as
+        // `fullscreenChatOverlay`.
+        .safeAreaPadding(.leading)
         // Take-control haptic, gated by the diagnostics "Haptics" toggle.
         .sensoryFeedback(trigger: isControllingRemotely) { _, _ in
             Haptics.isEnabled ? .impact(weight: .medium) : nil
         }
         .accessibilityLabel(isControllingRemotely ? "Release control" : "Take control of the Mac")
+    }
+
+    /// Floating toggle (task 4) for the lightweight typing overlay -- only
+    /// ever shown while `isControllingRemotely`, paired top-trailing against
+    /// `remoteControlToggle`'s top-leading position.
+    @ViewBuilder
+    private var remoteTypeToggle: some View {
+        if isControllingRemotely {
+            Button {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                    showRemoteTypeOverlay.toggle()
+                }
+                if showRemoteTypeOverlay {
+                    isRemoteTypeFocused = true
+                }
+            } label: {
+                Image(systemName: showRemoteTypeOverlay ? "keyboard.chevron.compact.down" : "keyboard")
+                    .font(.footnote.weight(.bold))
+                    .foregroundStyle(showRemoteTypeOverlay ? Color.aroAccentBright : .white)
+                    .padding(10)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .padding(10)
+            .safeAreaPadding(.trailing)
+            .accessibilityLabel(showRemoteTypeOverlay ? "Hide typing keyboard" : "Type on the remote screen")
+        }
+    }
+
+    /// The lightweight, translucent, non-blocking floating text-entry bar
+    /// (task 4): shown while controlling remotely AND `showRemoteTypeOverlay`
+    /// is on. Bound to the SAME `promptText`/`sendLivePrompt()` path the
+    /// regular command bar uses -- `sendLivePrompt`'s existing
+    /// `isControllingRemotely` branch already routes typed text as
+    /// `.remoteControl(.text(...))`, so this overlay is purely an
+    /// alternative, more-discoverable UI surface over that one mechanism,
+    /// never a duplicate send path. Bounded height (a single-line field, not
+    /// the multi-line command-bar editor) so it only ever covers a small
+    /// strip of the live view.
+    private var remoteTypeBar: some View {
+        HStack(spacing: 10) {
+            TextField(
+                "",
+                text: $promptText,
+                prompt: Text("Type into the remote screen…").foregroundStyle(.white.opacity(0.4))
+            )
+            .textFieldStyle(.plain)
+            .foregroundStyle(.white)
+            .tint(Color.aroAccentBright)
+            .focused($isRemoteTypeFocused)
+            .submitLabel(.send)
+            .onSubmit { sendLivePrompt() }
+
+            Button {
+                sendLivePrompt()
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 22))
+                    .foregroundStyle(
+                        promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? .white.opacity(0.3) : Color.aroAccentBright
+                    )
+            }
+            .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            Button {
+                isRemoteTypeFocused = false
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.9)) {
+                    showRemoteTypeOverlay = false
+                }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+            .accessibilityLabel("Dismiss typing keyboard")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.14), lineWidth: 1)
+        )
+        .padding(.horizontal, 24)
+        .safeAreaPadding(.horizontal)
+        .shadow(color: .black.opacity(0.4), radius: 14, y: 4)
     }
 
     /// Enter/exit hands-on control: send `takeControl`/`releaseControl`, and on
@@ -1698,6 +1909,11 @@ struct MainView: View {
         } else {
             sendControlMessage(.remoteControl(.releaseControl))
             log(.status(text: "\u{2192} released control"))
+            // The typing overlay only ever makes sense while controlling --
+            // never leave it floating over a video the user is no longer
+            // driving directly.
+            isRemoteTypeFocused = false
+            showRemoteTypeOverlay = false
         }
     }
 
