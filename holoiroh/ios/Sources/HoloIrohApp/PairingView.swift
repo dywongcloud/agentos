@@ -165,6 +165,12 @@ struct PairingView: View {
             AroOrbMark(diameter: 58)
             VStack(spacing: 6) {
                 AroWordmark(size: 46)
+                    // Discreet fallback for opening the hidden diagnostics
+                    // screen (alongside the shake gesture) -- posts the same
+                    // notification ContentView's `.onShake` listens for.
+                    .onLongPressGesture(minimumDuration: 1.0) {
+                        NotificationCenter.default.post(name: UIDevice.deviceDidShakeNotification, object: nil)
+                    }
                 Text("Pair with the Mac running the Aro daemon")
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.55))

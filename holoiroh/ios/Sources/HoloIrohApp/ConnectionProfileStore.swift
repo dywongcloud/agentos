@@ -33,6 +33,15 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
 
     private var db: OpaquePointer?
 
+    /// The resolved on-disk path of the last-attempted sqlite database (for the
+    /// on-device diagnostics screen). Empty until `init` runs.
+    private(set) var databasePath: String = ""
+
+    /// Whether the backing sqlite database is currently open. When false, the
+    /// store is running purely on the in-memory synthesized default -- the exact
+    /// state the diagnostics screen exists to surface.
+    var isOpen: Bool { db != nil }
+
     /// SQLITE_TRANSIENT: tells sqlite to copy bound text immediately.
     /// Swift's temporary C strings from `withCString`/`-1` binds die before
     /// sqlite3_step without this; the classic silent-garbage bug.
@@ -69,6 +78,7 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
     /// concrete sqlite error on failure).
     @discardableResult
     private func openDatabase(_ url: URL) -> Bool {
+        databasePath = url.path
         var handle: OpaquePointer?
         if sqlite3_open(url.path, &handle) == SQLITE_OK {
             db = handle

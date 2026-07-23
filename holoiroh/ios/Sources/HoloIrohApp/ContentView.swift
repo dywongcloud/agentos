@@ -26,6 +26,14 @@ struct ContentView: View {
     /// each open is never a forced wait.
     @State private var showIntro = true
 
+    /// The app-wide profile store (injected by `HoloIrohApp`), re-injected into
+    /// the diagnostics sheet.
+    @EnvironmentObject private var profileStore: ConnectionProfileStore
+
+    /// The hidden diagnostics screen, opened by shaking the device (or the
+    /// long-press affordance on the pairing header).
+    @State private var showDiagnostics = false
+
     /// Debug-only auto-pair bypass: when both env vars are set (e.g. via
     /// `devicectl device process launch --environment-variables` for an
     /// unattended device witness, matching this project's own
@@ -71,6 +79,7 @@ struct ContentView: View {
             // orb the intro built up hands off into the pairing header glow.
             if showIntro {
                 IntroView {
+                    Haptics.fire(.introReveal)
                     withAnimation(.easeInOut(duration: 0.6)) {
                         showIntro = false
                     }
@@ -78,6 +87,12 @@ struct ContentView: View {
                 .transition(.opacity.combined(with: .scale(scale: 1.08, anchor: .top)))
                 .zIndex(1)
             }
+        }
+        // Shake (or long-press the "Aro" title) opens the hidden diagnostics
+        // screen -- see DiagnosticsView. Both post the same notification.
+        .onShake { showDiagnostics = true }
+        .sheet(isPresented: $showDiagnostics) {
+            DiagnosticsView().environmentObject(profileStore)
         }
     }
 }

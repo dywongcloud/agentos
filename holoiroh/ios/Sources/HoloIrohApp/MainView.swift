@@ -780,8 +780,11 @@ struct MainView: View {
                 frameSource.stop()
                 frameSource = live
             }
+            Haptics.fire(.connect)
+            ConnectionDiagnostics.shared.recordConnected(ticket: ticket)
             sendAutoPairPromptIfNeeded()
         case .failed(let reason):
+            ConnectionDiagnostics.shared.recordFailure(reason, ticket: ticket)
             // While the app is frontmost, a mid-session failure (daemon
             // restarted, network blipped, QUIC idle-out racing the
             // background transition) heals itself via the same bounded
@@ -1597,7 +1600,10 @@ struct MainView: View {
                 .background(.ultraThinMaterial, in: Circle())
         }
         .padding(10)
-        .sensoryFeedback(.impact(weight: .medium), trigger: isControllingRemotely)
+        // Take-control haptic, gated by the diagnostics "Haptics" toggle.
+        .sensoryFeedback(trigger: isControllingRemotely) { _, _ in
+            Haptics.isEnabled ? .impact(weight: .medium) : nil
+        }
         .accessibilityLabel(isControllingRemotely ? "Release control" : "Take control of the Mac")
     }
 
