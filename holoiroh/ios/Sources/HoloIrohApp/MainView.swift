@@ -111,6 +111,21 @@ struct MainView: View {
 
     @State private var promptText: String = ""
 
+    // MARK: - Clarify (ad-hoc clarifying questions)
+
+    /// Ask the daemon to generate clarifying questions before running a
+    /// possibly-ambiguous prompt. Opt-out via Diagnostics; default on.
+    @AppStorage("clarifyEnabled") private var clarifyEnabled = true
+    /// The prompt awaiting clarification -- set when a ClarifyRequest is sent,
+    /// cleared when the questions are answered, dismissed, come back empty, or
+    /// time out (fallback to a direct send).
+    @State private var pendingClarifyPrompt: String?
+    /// The daemon's clarifying questions; non-empty shows the ClarifyPanel above
+    /// the command bar.
+    @State private var clarifyQuestions: [ClarifyingQuestion] = []
+    /// True while the clarify inference is in flight (drives the thinking state).
+    @State private var isClarifying = false
+
     /// Guards `sendAutoPairPromptIfNeeded()` to at most once per process
     /// launch -- `.connected` can re-fire after a reconnect, and this must
     /// never re-send on that path.
@@ -827,6 +842,8 @@ struct MainView: View {
             failActiveTask(cause: text ?? "The daemon rejected this device's authentication.")
         case .currentTicket(let ticket):
             applyCurrentTicket(ticket)
+        case .clarifyQuestions(let questions):
+            applyClarifyQuestions(questions)
         case .inputRequest(let requestId, let kind, let context, let responseOptions, _):
             presentInputRequest(
                 requestId: requestId,
@@ -1335,6 +1352,7 @@ struct MainView: View {
             return status == "failed" ? .red : .green
         case .inputRequest: return .yellow
         case .currentTicket: return .blue
+        case .clarifyQuestions: return Self.orbAccent
         }
     }
 
@@ -1433,7 +1451,17 @@ struct MainView: View {
     private func commandBar(fullscreen: Bool) -> some View {
         let hasPrompt = !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return VStack(spacing: 8) {
-            if RecentPromptStore.container != nil, !isControllingRemotely {
+            if !clarifyQuestions.isEmpty {
+                ClarifyPanel(
+                    questions: clarifyQuestions,
+                    onCancel: { cancelClarification() },
+                    onContinue: { answers in submitClarification(answers) }
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            } else if isClarifying {
+                clarifyThinkingRow
+            }
+            if RecentPromptStore.container != nil, !isControllingRemotely, clarifyQuestions.isEmpty, !isClarifying {
                 RecentPromptsStrip { text in
                     promptText = text
                     isPromptFocused = true
@@ -1547,6 +1575,27 @@ struct MainView: View {
         .shadow(color: .black.opacity(0.5), radius: 20, y: 8)
         .shadow(color: Self.orbAccent.opacity(0.18), radius: 24, y: -2)
         }
+        .animation(.easeInOut(duration: 0.22), value: isClarifying)
+        .animation(.easeInOut(duration: 0.22), value: clarifyQuestions.count)
+    }
+
+    /// Compact "generating clarifying questions" indicator shown above the
+    /// command bar while the clarify inference is in flight.
+    private var clarifyThinkingRow: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(Color.aroAccentBright)
+            Text("Thinking of a few quick questions…")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.7))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
+        .transition(.opacity)
     }
 
     /// Debug-only unattended witness: fires exactly once per process
@@ -1666,6 +1715,19 @@ struct MainView: View {
         }
         promptText = ""
         isPromptFocused = false
+        // Clarify intercept: for a fresh task prompt, ask the daemon for
+        // clarifying questions first (opt-out). Redirects/active tasks, an
+        // in-flight clarify, or a disabled toggle fall straight through to a
+        // direct send -- the exact prior behavior.
+        if clarifyEnabled, !isTaskActive, !isTaskPaused, pendingClarifyPrompt == nil {
+            beginClarify(trimmed)
+            return
+        }
+        dispatchPrompt(trimmed)
+    }
+
+    /// Sends `trimmed` as the real prompt/redirect (the original send path).
+    private func dispatchPrompt(_ trimmed: String) {
         lastSentTask = .prompt(text: trimmed)
         // Best-effort recent-prompts history (SwiftData); never blocks the send.
         RecentPromptsRepository().record(trimmed)
@@ -1682,6 +1744,55 @@ struct MainView: View {
         isTaskPaused = false
         activeInputRequestID = nil
         session = .connecting
+    }
+
+    /// Kicks off clarification for `prompt`: sends a ClarifyRequest, shows the
+    /// thinking state, and starts a timeout that falls back to a direct send so
+    /// a prompt is never lost if the daemon never answers.
+    private func beginClarify(_ prompt: String) {
+        pendingClarifyPrompt = prompt
+        clarifyQuestions = []
+        isClarifying = true
+        orbEffects.react(to: prompt)
+        sendControlMessage(.clarifyRequest(prompt: prompt))
+        log(.status(text: "→ clarifying: \(prompt)"))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) {
+            guard isClarifying, pendingClarifyPrompt == prompt, clarifyQuestions.isEmpty else { return }
+            log(.status(text: "clarify timed out — sending directly"))
+            isClarifying = false
+            pendingClarifyPrompt = nil
+            dispatchPrompt(prompt)
+        }
+    }
+
+    /// The daemon answered a ClarifyRequest. Empty -> the prompt was clear, send
+    /// it directly. Non-empty -> present the panel for the user to answer.
+    private func applyClarifyQuestions(_ questions: [ClarifyingQuestion]) {
+        guard let prompt = pendingClarifyPrompt else { return }
+        isClarifying = false
+        if questions.isEmpty {
+            pendingClarifyPrompt = nil
+            dispatchPrompt(prompt)
+        } else {
+            clarifyQuestions = questions
+        }
+    }
+
+    /// Continue tapped in the panel: compose the clarified prompt + send it.
+    private func submitClarification(_ answers: [(question: String, answer: String)]) {
+        guard let prompt = pendingClarifyPrompt else { return }
+        let clarified = ClarifyComposer.compose(original: prompt, answers: answers)
+        pendingClarifyPrompt = nil
+        clarifyQuestions = []
+        dispatchPrompt(clarified)
+    }
+
+    /// Dismiss the panel without running anything (the original prompt is
+    /// dropped; the user can retype).
+    private func cancelClarification() {
+        pendingClarifyPrompt = nil
+        clarifyQuestions = []
+        isClarifying = false
     }
 
     private func toggleMicrophone() {

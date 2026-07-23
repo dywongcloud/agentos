@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
-use holoiroh_wire::{InputRequestKind, MouseButton, RemoteControlEvent};
+use holoiroh_wire::{ClarifyingQuestion, InputRequestKind, MouseButton, RemoteControlEvent};
 
 use crate::holo_bridge::a2a_client::{A2aClient, TaskUpdate, TerminalState};
 use crate::limits::ActionCounter;
@@ -200,6 +200,12 @@ pub enum ControlEvent {
         response_options: Vec<String>,
         expires_at: u64,
     },
+    /// Clarifying questions generated for a `ClientMessage::ClarifyRequest`
+    /// (empty when the instruction was already clear). Not tied to a task turn;
+    /// `control_channel::from_control_event` maps it to the wire
+    /// `ServerMessage::ClarifyQuestions`. Emitted by the control-channel read
+    /// loop's spawned clarify task, off the desktop-task pipeline.
+    ClarifyQuestions { questions: Vec<ClarifyingQuestion> },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

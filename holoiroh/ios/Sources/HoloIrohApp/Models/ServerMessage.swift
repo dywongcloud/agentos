@@ -1,5 +1,16 @@
 import Foundation
 
+/// One clarifying question the daemon generated for an ambiguous instruction
+/// (see `ServerMessage.clarifyQuestions`). `options` are concrete suggested
+/// answers; the UI renders them as single-select choices and appends its own
+/// "Something else…" free-text entry as the final option.
+struct ClarifyingQuestion: Codable, Equatable, Identifiable {
+    let question: String
+    let options: [String]
+
+    var id: String { question }
+}
+
 /// Swift mirror of `PROTOCOL.md`'s `ServerMessage` (Mac daemon -> iOS),
 /// a tagged, internally-tagged enum keyed on `type`.
 ///
@@ -40,6 +51,11 @@ enum ServerMessage: Codable, Equatable {
     /// greeting. Lets the app refresh a stored default whose ticket went stale
     /// on an identity rotation, over the already-authenticated channel.
     case currentTicket(ticket: String)
+    /// Clarifying questions the daemon generated for a `ClientMessage.clarifyRequest`
+    /// -- EMPTY when the instruction was already clear (the app then sends the
+    /// prompt directly). Each question carries concrete options; the UI appends
+    /// its own "Something else…" free-text option.
+    case clarifyQuestions(questions: [ClarifyingQuestion])
     /// The P0-14 structured input request -- today produced by the daemon's
     /// sensitive-app consent gate. `kind` is the wire snake_case kind string
     /// (e.g. `"sensitive_access_consent"`); answer via
@@ -65,6 +81,7 @@ enum ServerMessage: Codable, Equatable {
         case paused
         case queued
         case ticket
+        case questions
     }
 
     private enum Kind: String, Codable {
@@ -76,6 +93,7 @@ enum ServerMessage: Codable, Equatable {
         case taskActive = "task_active"
         case authRejected = "auth_rejected"
         case currentTicket = "current_ticket"
+        case clarifyQuestions = "clarify_questions"
         case inputRequest = "input_request"
     }
 
@@ -105,6 +123,10 @@ enum ServerMessage: Codable, Equatable {
             self = .authRejected(text: try container.decodeIfPresent(String.self, forKey: .text))
         case .currentTicket:
             self = .currentTicket(ticket: try container.decode(String.self, forKey: .ticket))
+        case .clarifyQuestions:
+            self = .clarifyQuestions(
+                questions: try container.decodeIfPresent([ClarifyingQuestion].self, forKey: .questions) ?? []
+            )
         case .inputRequest:
             self = .inputRequest(
                 requestId: try container.decode(String.self, forKey: .requestId),
@@ -145,6 +167,9 @@ enum ServerMessage: Codable, Equatable {
         case .currentTicket(let ticket):
             try container.encode(Kind.currentTicket, forKey: .type)
             try container.encode(ticket, forKey: .ticket)
+        case .clarifyQuestions(let questions):
+            try container.encode(Kind.clarifyQuestions, forKey: .type)
+            try container.encode(questions, forKey: .questions)
         case .inputRequest(let requestId, let kind, let context, let responseOptions, let expiresAt):
             try container.encode(Kind.inputRequest, forKey: .type)
             try container.encode(requestId, forKey: .requestId)
@@ -172,6 +197,8 @@ enum ServerMessage: Codable, Equatable {
             return queued > 0 ? "\(base) (\(queued) queued)" : base
         case .authRejected(let text): return text ?? "authentication rejected"
         case .currentTicket(let ticket): return "daemon ticket: \(ticket)"
+        case .clarifyQuestions(let questions):
+            return questions.isEmpty ? "no clarification needed" : "\(questions.count) clarifying question(s)"
         case .inputRequest(_, _, let context, _, _): return context
         }
     }
@@ -188,6 +215,7 @@ enum ServerMessage: Codable, Equatable {
         case .taskActive: return "TASK"
         case .authRejected: return "AUTH"
         case .currentTicket: return "TICKET"
+        case .clarifyQuestions: return "CLARIFY"
         case .inputRequest: return "INPUT"
         }
     }
@@ -214,6 +242,9 @@ enum ClientMessage: Codable, Equatable {
     /// The user escalated to hands-on control and is driving the Mac directly by
     /// touching the live-share view; `event` is one normalized touch action.
     case remoteControl(RemoteControlEvent)
+    /// Asks the daemon to generate clarifying questions for a possibly-ambiguous
+    /// instruction before it runs (answered by `ServerMessage.clarifyQuestions`).
+    case clarifyRequest(prompt: String)
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -221,6 +252,7 @@ enum ClientMessage: Codable, Equatable {
         case requestId = "request_id"
         case selectedOption = "selected_option"
         case event
+        case prompt
     }
 
     private enum Kind: String, Codable {
@@ -232,6 +264,7 @@ enum ClientMessage: Codable, Equatable {
         case redirect
         case inputResponse = "input_response"
         case remoteControl = "remote_control"
+        case clarifyRequest = "clarify_request"
     }
 
     init(from decoder: Decoder) throws {
@@ -257,6 +290,8 @@ enum ClientMessage: Codable, Equatable {
             )
         case .remoteControl:
             self = .remoteControl(try container.decode(RemoteControlEvent.self, forKey: .event))
+        case .clarifyRequest:
+            self = .clarifyRequest(prompt: try container.decode(String.self, forKey: .prompt))
         }
     }
 
@@ -285,6 +320,9 @@ enum ClientMessage: Codable, Equatable {
         case .remoteControl(let event):
             try container.encode(Kind.remoteControl, forKey: .type)
             try container.encode(event, forKey: .event)
+        case .clarifyRequest(let prompt):
+            try container.encode(Kind.clarifyRequest, forKey: .type)
+            try container.encode(prompt, forKey: .prompt)
         }
     }
 
@@ -301,6 +339,7 @@ enum ClientMessage: Codable, Equatable {
         case .redirect: return "redirect"
         case .inputResponse: return "input_response"
         case .remoteControl: return "remote_control"
+        case .clarifyRequest: return "clarify_request"
         }
     }
 }

@@ -14,6 +14,7 @@ struct DiagnosticsView: View {
     @AppStorage("hapticsEnabled") private var hapticsEnabled = true
     @AppStorage("autoConnectEnabled") private var autoConnectEnabled = true
     @AppStorage("soundEnabled") private var soundEnabled = false
+    @AppStorage("clarifyEnabled") private var clarifyEnabled = true
 
     @State private var showTicketScanner = false
     @State private var ticketRefreshMessage: String?
@@ -177,6 +178,7 @@ struct DiagnosticsView: View {
             Toggle("Haptics", isOn: $hapticsEnabled)
             Toggle("Auto-connect on launch", isOn: $autoConnectEnabled)
             Toggle("Orb sound", isOn: $soundEnabled)
+            Toggle("Ask clarifying questions", isOn: $clarifyEnabled)
         }
     }
 }

@@ -253,6 +253,9 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
             response_options,
             expires_at,
         },
+        ControlEvent::ClarifyQuestions { questions } => {
+            ServerMessage::clarify_questions(questions)
+        }
     }
 }
 
@@ -271,7 +274,9 @@ fn event_request_id(event: &ControlEvent) -> Option<String> {
         | ControlEvent::Error { request_id, .. }
         | ControlEvent::Queued { request_id, .. }
         | ControlEvent::InputRequested { request_id, .. } => request_id,
-        ControlEvent::DaemonStatus { .. } | ControlEvent::TaskActive { .. } => return None,
+        ControlEvent::DaemonStatus { .. }
+        | ControlEvent::TaskActive { .. }
+        | ControlEvent::ClarifyQuestions { .. } => return None,
     };
     if id.is_empty() { None } else { Some(id.clone()) }
 }
@@ -330,6 +335,9 @@ pub fn to_control_message(request_id: String, msg: ClientMessage) -> Option<Cont
         ClientMessage::RemoteControl { event } => Some(ControlMessage::RemoteControl { event }),
         ClientMessage::Pin { .. } => None,
         ClientMessage::InputResponse { .. } => None,
+        // Clarification runs off the desktop-task pipeline (handled inline in
+        // the control-channel read loop), so it never becomes a ControlMessage.
+        ClientMessage::ClarifyRequest { .. } => None,
     }
 }
 
@@ -557,6 +565,11 @@ pub struct ControlChannel {
     /// rotation. `Arc<str>` for the same per-connection cheap-clone reason as the
     /// fields above.
     current_ticket: Arc<str>,
+    /// Clarifying-questions inference backend (Tinfoil key + model), when a
+    /// `TINFOIL_API_KEY` is configured. `None` disables clarification entirely --
+    /// a `ClarifyRequest` then replies with an empty question set so the app
+    /// proceeds with a direct send.
+    clarify: Option<crate::clarify::ClarifyConfig>,
 }
 
 impl std::fmt::Debug for ControlChannel {
@@ -578,7 +591,12 @@ impl ControlChannel {
     /// **not** what a real deployment should call; see `PAIRING.md`'s
     /// "Exact remaining wiring step" for what `main.rs` would need to
     /// change to actually enable enforcement by default.
-    pub fn new(bridge: Arc<HoloBridge>, audit: Arc<AuditLogger>, current_ticket: Arc<str>) -> Self {
+    pub fn new(
+        bridge: Arc<HoloBridge>,
+        audit: Arc<AuditLogger>,
+        current_ticket: Arc<str>,
+        clarify: Option<crate::clarify::ClarifyConfig>,
+    ) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
         Self {
             bridge,
@@ -589,6 +607,7 @@ impl ControlChannel {
             })),
             audit,
             current_ticket,
+            clarify,
         }
     }
 
@@ -606,6 +625,7 @@ impl ControlChannel {
         expected_pin: String,
         audit: Arc<AuditLogger>,
         current_ticket: Arc<str>,
+        clarify: Option<crate::clarify::ClarifyConfig>,
     ) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
         Self {
@@ -617,6 +637,7 @@ impl ControlChannel {
             })),
             audit,
             current_ticket,
+            clarify,
         }
     }
 
@@ -1261,6 +1282,35 @@ impl ProtocolHandler for ControlChannel {
                         }
                     }
                 }
+                Ok(ClientMessage::ClarifyRequest { prompt }) => {
+                    // Clarification runs OFF the desktop-task pipeline: spawn the
+                    // (up to ~20s) inference so the read loop keeps draining, and
+                    // deliver the result as a ControlEvent the writer turns into
+                    // ServerMessage::ClarifyQuestions. No clarify config (no
+                    // TINFOIL_API_KEY) replies immediately with an empty set so the
+                    // app proceeds with a direct send.
+                    let clarify_tx = events_tx.clone();
+                    match self.clarify.clone() {
+                        Some(config) => {
+                            tokio::spawn(async move {
+                                let questions = crate::clarify::generate_clarifying_questions(
+                                    &prompt, &config,
+                                )
+                                .await;
+                                let _ = clarify_tx
+                                    .send(ControlEvent::ClarifyQuestions { questions });
+                            });
+                        }
+                        None => {
+                            if clarify_tx
+                                .send(ControlEvent::ClarifyQuestions { questions: Vec::new() })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
                 Ok(msg) => {
                     debug!(peer = %remote, ?msg, "control channel: received message");
                     // task_id threading: an inbound envelope that already
@@ -1310,7 +1360,10 @@ impl ProtocolHandler for ControlChannel {
                         | ClientMessage::InputResponse { .. }
                         // Remote-control input events are not agent turns; they
                         // inject direct user input and produce no audit entry.
-                        | ClientMessage::RemoteControl { .. } => None,
+                        | ClientMessage::RemoteControl { .. }
+                        // ClarifyRequest is handled by its own arm above (never
+                        // reaches here); listed only to keep the match exhaustive.
+                        | ClientMessage::ClarifyRequest { .. } => None,
                     } {
                         audit_starts.lock().expect("audit_starts lock poisoned").insert(
                             request_id.clone(),

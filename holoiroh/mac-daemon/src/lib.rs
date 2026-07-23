@@ -18,6 +18,7 @@ pub mod allowlist;
 pub mod audit_log;
 pub mod auth;
 pub mod auto_yield;
+pub mod clarify;
 pub mod remote_input;
 pub mod user_activity;
 pub mod capture;

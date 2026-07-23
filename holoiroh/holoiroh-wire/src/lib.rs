@@ -404,6 +404,25 @@ pub enum ClientMessage {
     /// normalized, touch-derived action; see [`RemoteControlEvent`]. Additive
     /// per `PROTOCOL.md`'s extension policy.
     RemoteControl { event: RemoteControlEvent },
+    /// Asks the daemon to generate clarifying questions for a possibly-ambiguous
+    /// instruction BEFORE it runs. The daemon calls its clarification model and
+    /// replies with [`ServerMessage::ClarifyQuestions`] (empty when the
+    /// instruction is already clear). Handled OFF the task pipeline -- this
+    /// variant never dispatches `prompt` to the desktop backend; the app sends a
+    /// separate [`ClientMessage::Prompt`] once the user has answered. Additive
+    /// per `PROTOCOL.md`'s extension policy.
+    ClarifyRequest { prompt: String },
+}
+
+/// One clarifying question the daemon asks before running an ambiguous
+/// instruction (see [`ServerMessage::ClarifyQuestions`]). `options` are concrete
+/// suggested answers the app renders as single-select choices; the app appends
+/// its own "Something else…" free-text entry as the final option, so an empty
+/// `options` list still yields a usable (free-text-only) question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClarifyingQuestion {
+    pub question: String,
+    pub options: Vec<String>,
 }
 
 /// Which mouse button a [`RemoteControlEvent`] refers to.
@@ -514,6 +533,7 @@ impl ClientMessage {
             ClientMessage::Pin { .. } => "pin",
             ClientMessage::InputResponse { .. } => "input_response",
             ClientMessage::RemoteControl { .. } => "remote_control",
+            ClientMessage::ClarifyRequest { .. } => "clarify_request",
         }
     }
 }
@@ -593,6 +613,16 @@ pub enum ServerMessage {
     /// type fall back to their generic "unrecognized control event" handling.
     CurrentTicket {
         ticket: String,
+    },
+    /// The clarifying questions the daemon generated for a
+    /// [`ClientMessage::ClarifyRequest`] -- EMPTY when the instruction was
+    /// already clear enough to run as-is (the app then just sends the prompt).
+    /// Each question carries a few concrete `options`; the app renders them and
+    /// appends its own "Something else…" free-text option. Additive per
+    /// `PROTOCOL.md`'s extension policy; older clients that don't know this type
+    /// fall back to their generic "unrecognized control event" handling.
+    ClarifyQuestions {
+        questions: Vec<ClarifyingQuestion>,
     },
     /// Asks the user for structured input the agent cannot proceed without
     /// (Project Aro PRD, row P0-14). This variant is **metadata only**: it
@@ -674,6 +704,7 @@ impl ServerMessage {
             ServerMessage::TaskActive { .. } => "task_active",
             ServerMessage::AuthRejected { .. } => "auth_rejected",
             ServerMessage::CurrentTicket { .. } => "current_ticket",
+            ServerMessage::ClarifyQuestions { .. } => "clarify_questions",
             ServerMessage::InputRequest { .. } => "input_request",
         }
     }
@@ -728,6 +759,12 @@ impl ServerMessage {
         ServerMessage::CurrentTicket {
             ticket: ticket.into(),
         }
+    }
+
+    /// Convenience constructor for a `clarify_questions` message. An empty
+    /// `questions` list means the instruction needed no clarification.
+    pub fn clarify_questions(questions: Vec<ClarifyingQuestion>) -> Self {
+        ServerMessage::ClarifyQuestions { questions }
     }
 
     /// Convenience constructor for an `input_request` message. `ttl` is how

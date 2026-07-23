@@ -18,6 +18,7 @@ mod agent_guidance;
 mod allowlist;
 mod audit_log;
 mod auto_yield;
+mod clarify;
 mod remote_input;
 mod user_activity;
 mod auth;
@@ -492,6 +493,16 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty());
+    // Clarifying-questions inference reuses the same Tinfoil key as a SEPARATE
+    // direct call (independent of the holo-serve rate-limit fallback proxy
+    // below -- so clarification works even in local-model mode). `None` when no
+    // key is set, which disables clarification (the control channel then replies
+    // to a ClarifyRequest with an empty question set).
+    let clarify_config = tinfoil_key.clone().map(clarify::ClarifyConfig::new);
+    match &clarify_config {
+        Some(cfg) => info!(model = %cfg.model(), "clarifying-questions inference enabled"),
+        None => info!("clarifying-questions inference disabled (no TINFOIL_API_KEY)"),
+    }
     // Underscore-named (not bare `_`): the binding must LIVE until main
     // returns -- dropping it aborts the proxy task and every fallback
     // inference call with it. A bare `_` pattern would drop it right here.
@@ -643,8 +654,14 @@ async fn main() -> anyhow::Result<()> {
                     pin,
                     audit_logger.clone(),
                     daemon_control_ticket.clone(),
+                    clarify_config.clone(),
                 ),
-                None => ControlChannel::new(bridge, audit_logger.clone(), daemon_control_ticket.clone()),
+                None => ControlChannel::new(
+                    bridge,
+                    audit_logger.clone(),
+                    daemon_control_ticket.clone(),
+                    clarify_config.clone(),
+                ),
             };
             control.register_protocols(router_builder)
         }

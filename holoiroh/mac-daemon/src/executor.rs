@@ -672,7 +672,8 @@ fn translate_control_event(event: ControlEvent) -> Option<ExecutorEvent> {
         // paused run is tracked separately by the bridge), so it is out-of-band here too.
         ControlEvent::DaemonStatus { .. }
         | ControlEvent::TaskActive { .. }
-        | ControlEvent::InputRequested { .. } => None,
+        | ControlEvent::InputRequested { .. }
+        | ControlEvent::ClarifyQuestions { .. } => None,
     }
 }
 
