@@ -23,8 +23,12 @@ struct ConnectionProfile: Identifiable, Equatable {
 /// All sqlite access happens on the main actor -- the table is tiny and
 /// every call site is UI-driven, so a serial background queue would add
 /// complexity without a measurable win.
+/// SQLite-backed, local-first implementation of `ConnectionProfileRepository`
+/// (see that protocol for how this maps to the article's local-first
+/// principles). The "Dev Mac" default is synthesized in-memory so it is always
+/// present with zero latency and no network -- offline-primary by construction.
 @MainActor
-final class ConnectionProfileStore: ObservableObject {
+final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepository {
     @Published private(set) var profiles: [ConnectionProfile] = []
 
     private var db: OpaquePointer?
