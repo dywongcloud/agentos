@@ -174,6 +174,19 @@ HoloirohBridge *holoiroh_ios_bridge_new(void);
 void holoiroh_ios_bridge_free(HoloirohBridge *bridge);
 
 /**
+ * ADDITIVE daemon-reachability probe -- fully self-contained, touches NO
+ * bridge/connection state (takes no HoloirohBridge). Binds a throwaway iroh
+ * endpoint (its own identity, so it never fights the daemon's pkarr record),
+ * dials the ticket's node on the control ALPN, and returns whether a control
+ * bi-stream opens within timeout_ms. `true` = the daemon is up and accepting
+ * control connections; `false` = null/invalid ticket, bind failure, dial
+ * timeout, or daemon down. Blocks up to ~timeout_ms; call off the main thread.
+ * Never disturbs holoiroh_ios_bridge_ticket_connect / _control_connect.
+ */
+bool holoiroh_ios_bridge_probe_reachable(const char *ticket_cstr,
+                                         uint64_t timeout_ms);
+
+/**
  * Parses an `iroh-live:` ticket C string and connects+subscribes the bridge's
  * Live session to the peer it describes. Blocks; call off the main thread.
  * Returns HOLOIROH_OK, or a negative HoloirohStatus. On failure, writes a

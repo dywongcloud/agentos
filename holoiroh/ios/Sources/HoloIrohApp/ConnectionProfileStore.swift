@@ -155,6 +155,14 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
     /// permanently removed (only the daemon changing its identity replaces it).
     static let syntheticDefaultID: Int64 = -1
 
+    /// The always-present synthesized "Dev Mac" default -- the current daemon's
+    /// ticket + PIN. Non-nil in every real state (reload() always prepends it),
+    /// so the reachability monitor and launch auto-connect can read the ticket
+    /// to probe/dial without reaching into the private constants.
+    var defaultProfile: ConnectionProfile? {
+        profiles.first { $0.id == Self.syntheticDefaultID }
+    }
+
     func reload() {
         // Load any USER-saved profiles from sqlite, best-effort. Crucially this
         // NEVER early-returns before setting `profiles`: the old `guard let db

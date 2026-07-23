@@ -8,6 +8,7 @@ import SwiftUI
 /// self-diagnose on device.
 struct DiagnosticsView: View {
     @EnvironmentObject private var profileStore: ConnectionProfileStore
+    @EnvironmentObject private var reachability: ReachabilityMonitor
     @ObservedObject private var diagnostics = ConnectionDiagnostics.shared
 
     @AppStorage("hapticsEnabled") private var hapticsEnabled = true
@@ -20,6 +21,7 @@ struct DiagnosticsView: View {
         NavigationStack {
             Form {
                 storeSection
+                reachabilitySection
                 connectionSection
                 settingsSection
                 Section {
@@ -83,6 +85,24 @@ struct DiagnosticsView: View {
         }
     }
 
+    // MARK: Daemon reachability
+
+    private var reachabilitySection: some View {
+        Section("Daemon reachability") {
+            LabeledContent("Dev Mac") {
+                ReachabilityPill(state: reachability.state)
+            }
+            if let at = reachability.lastCheckedAt {
+                LabeledContent("Last checked", value: at.formatted(date: .omitted, time: .standard))
+            }
+            Button {
+                reachability.checkNow()
+            } label: {
+                Label("Check now", systemImage: "dot.radiowaves.left.and.right")
+            }
+        }
+    }
+
     // MARK: Connection
 
     private var connectionSection: some View {
@@ -125,4 +145,5 @@ struct DiagnosticsView: View {
 #Preview {
     DiagnosticsView()
         .environmentObject(ConnectionProfileStore())
+        .environmentObject(ReachabilityMonitor(ticket: ""))
 }

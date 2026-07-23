@@ -461,6 +461,78 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_free(bridge: *mut HoloirohBridge) {
 }
 
 // ---------------------------------------------------------------------
+// Reachability probe
+// ---------------------------------------------------------------------
+
+/// ADDITIVE, fully self-contained daemon-reachability probe. Touches NONE of the
+/// existing bridge/connection state: it binds a THROWAWAY iroh endpoint (its own
+/// identity, so it never fights the daemon's pkarr record), dials the ticket's
+/// node on [`CONTROL_ALPN`], and reports whether a control bi-stream opens within
+/// `timeout_ms`.
+///
+/// A successful dial + `open_bi` means the daemon is up and accepting control
+/// connections -- exactly what the pairing screen's "reachable / unreachable"
+/// indicator and the launch auto-connect want to know BEFORE a real connect.
+/// (The PIN handshake happens later on a real connect; it is not needed just to
+/// learn that the daemon is reachable, and the daemon accepts the connection +
+/// stream before the PIN line anyway.)
+///
+/// Returns `true` if reachable, `false` otherwise (null/invalid ticket, no
+/// runtime, endpoint bind failure, dial timeout, or daemon down). Blocks the
+/// calling thread for at most ~`timeout_ms` plus a brief endpoint bind, so call
+/// it off the main thread. Never panics across the FFI boundary.
+///
+/// # Safety
+/// `ticket_cstr` must be a valid null-terminated C string, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn holoiroh_ios_bridge_probe_reachable(
+    ticket_cstr: *const c_char,
+    timeout_ms: u64,
+) -> bool {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if ticket_cstr.is_null() {
+            return false;
+        }
+        let ticket_str = match unsafe { CStr::from_ptr(ticket_cstr) }.to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let ticket = match LiveTicket::from_str(ticket_str) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        // A short-lived, single-thread runtime, isolated to this probe.
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        runtime.block_on(async move {
+            let endpoint = match Endpoint::builder(presets::N0).bind().await {
+                Ok(e) => e,
+                Err(_) => return false,
+            };
+            let peer = ticket.endpoint.clone();
+            let dial = async {
+                let connection = endpoint
+                    .connect(peer, CONTROL_ALPN)
+                    .await
+                    .map_err(|_| ())?;
+                connection.open_bi().await.map_err(|_| ())?;
+                Ok::<(), ()>(())
+            };
+            matches!(
+                tokio::time::timeout(Duration::from_millis(timeout_ms.max(500)), dial).await,
+                Ok(Ok(()))
+            )
+        })
+    }));
+    result.unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------
 // Ticket-connect
 // ---------------------------------------------------------------------
 

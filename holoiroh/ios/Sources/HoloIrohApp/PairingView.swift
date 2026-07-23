@@ -28,6 +28,12 @@ struct PairingView: View {
     /// the device is already allowlisted -- see PROTOCOL.md's PIN handshake).
     let onConnect: (_ ticket: String, _ pin: String) -> Void
 
+    /// Fired the first time the user actively engages this screen (focuses a
+    /// field, taps scan/save/connect, or manually refreshes reachability), so
+    /// the launch auto-connect can stand down and never yank a user who has
+    /// started pairing manually. Defaulted so existing call sites are unchanged.
+    var onInteract: () -> Void = {}
+
     @State private var ticketText: String = ""
     @State private var pinText: String = ""
     @State private var showScanner = false
@@ -55,6 +61,11 @@ struct PairingView: View {
     /// default profile is guaranteed present regardless of when/whether this
     /// view's own lifecycle would have created + seeded a store.
     @EnvironmentObject private var profileStore: ConnectionProfileStore
+
+    /// Live daemon-reachability for the default profile, owned by `ContentView`
+    /// and injected here so the "Dev Mac" card can show a real reachable/offline
+    /// status pill before the user taps to connect.
+    @EnvironmentObject private var reachability: ReachabilityMonitor
     @State private var showSaveNamePrompt = false
     @State private var newProfileName = ""
 
@@ -153,7 +164,15 @@ struct PairingView: View {
                 }
             )
         }
-        .onAppear(perform: autoFocusForWitnessIfNeeded)
+        .onAppear {
+            autoFocusForWitnessIfNeeded()
+            reachability.checkNow()
+        }
+        // Focusing either field means the user is pairing by hand -- stand the
+        // launch auto-connect down so it never yanks them mid-edit.
+        .onChange(of: focusedField) { _, newValue in
+            if newValue != nil { onInteract() }
+        }
     }
 
     // MARK: - Sections
@@ -256,6 +275,7 @@ struct PairingView: View {
     /// Secondary glass button that opens the live QR scanner.
     private var scanButton: some View {
         Button {
+            onInteract()
             scanError = nil
             showScanner = true
         } label: {
@@ -286,10 +306,26 @@ struct PairingView: View {
     /// immediately (it was phrase-verified when first saved).
     private var savedProfilesSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            AroFieldLabel(title: "Saved profiles", systemImage: "bookmark")
+            HStack {
+                AroFieldLabel(title: "Saved profiles", systemImage: "bookmark")
+                Spacer()
+                Button {
+                    onInteract()
+                    reachability.checkNow()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .rotationEffect(.degrees(reachability.state == .checking ? 360 : 0))
+                        .animation(reachability.state == .checking ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default, value: reachability.state)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Refresh daemon reachability")
+            }
             VStack(spacing: 10) {
                     ForEach(profileStore.profiles) { profile in
                         Button {
+                            onInteract()
                             onConnect(profile.ticket, profile.pin)
                         } label: {
                             HStack(spacing: 12) {
@@ -302,9 +338,14 @@ struct PairingView: View {
                                             .foregroundStyle(Color.aroAccentBright)
                                     )
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(profile.name)
-                                        .font(.subheadline.weight(.semibold))
-                                        .foregroundStyle(.white)
+                                    HStack(spacing: 8) {
+                                        Text(profile.name)
+                                            .font(.subheadline.weight(.semibold))
+                                            .foregroundStyle(.white)
+                                        if profile.id == ConnectionProfileStore.syntheticDefaultID {
+                                            ReachabilityPill(state: reachability.state)
+                                        }
+                                    }
                                     Text(profile.phrase)
                                         .font(.system(.caption2, design: .monospaced))
                                         .foregroundStyle(.white.opacity(0.5))
@@ -338,6 +379,7 @@ struct PairingView: View {
     private var actionBar: some View {
         HStack(spacing: 12) {
             Button {
+                onInteract()
                 // Prefill with the ticket's phrase as a recognizable default
                 // name; the alert lets the user replace it.
                 newProfileName = PairingPhrase.phrase(for: trimmedTicket)
@@ -350,6 +392,7 @@ struct PairingView: View {
             .opacity(canConnect ? 1 : 0.5)
 
             Button {
+                onInteract()
                 // Do NOT connect yet — require phrase verification first.
                 showVerification = true
             } label: {
@@ -379,9 +422,11 @@ struct PairingView: View {
 #Preview("Pairing - empty") {
     PairingView(onConnect: { _, _ in })
         .environmentObject(ConnectionProfileStore())
+        .environmentObject(ReachabilityMonitor(ticket: ""))
 }
 
 #Preview("Pairing - filled") {
     PairingView(onConnect: { _, _ in })
         .environmentObject(ConnectionProfileStore())
+        .environmentObject(ReachabilityMonitor(ticket: ""))
 }
