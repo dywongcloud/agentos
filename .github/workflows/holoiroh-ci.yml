@@ -89,7 +89,8 @@ jobs:
             task_active_wire_probe \
             task_framing_probe \
             auto_yield_probe \
-            remote_control_wire_probe
+            remote_control_wire_probe \
+            current_ticket_wire_probe
           do
             # duration parsing is witnessed by ticket_rotation_probe; skip the alias
             [ "$probe" = "duration_probe_via_ticket_rotation" ] && continue
