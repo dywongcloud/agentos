@@ -27,6 +27,7 @@ encrypted_secrets.json
 .gm/next-step.md
 .gm/instructions/
 .gm/residual-check-fired
+.gm/claim-audit-fired
 .gm/.instructions-shipped-manifest.json
 .claude/
 .turbo/
