@@ -30,6 +30,13 @@ import Foundation
 ///   regressing it. We apply the *principles* (local-first, repository, SSOT,
 ///   separation) without force-fitting the framework onto a handful-of-rows store
 ///   where it would add risk and migration surface with no user-visible benefit.
+/// - **No Keychain encryption of the ticket/PIN.** The article's "encryption
+///   for sensitive data" principle was considered and scoped out: the iOS app
+///   sandbox is already Data-Protection-encrypted at rest, the default profile's
+///   PIN is a public compile-time source constant (not a secret), and moving the
+///   store to the Keychain would touch the device-confirmed critical path for
+///   negligible gain. (We DID apply the article's schema/indexing principle: a
+///   UNIQUE index on `ticket` -- see `ConnectionProfileStore.createTableIfNeeded`.)
 @MainActor
 protocol ConnectionProfileRepository: ObservableObject {
     /// The current profiles, default-first. ALWAYS contains the current-daemon

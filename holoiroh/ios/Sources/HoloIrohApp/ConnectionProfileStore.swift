@@ -111,6 +111,13 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
             created_at REAL NOT NULL
         );
         """)
+        // Schema hardening (the article's indexing / uniqueness principle): a
+        // UNIQUE index on `ticket` enforces at the DB level what save() already
+        // enforces in code -- one row per daemon ticket -- as defense in depth.
+        // IF NOT EXISTS keeps it idempotent; on a legacy DB that somehow holds
+        // duplicate tickets the creation simply fails and is logged (the in-code
+        // dedup still protects), so adding it can never break an existing store.
+        exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_ticket ON profiles(ticket);")
     }
 
     /// The built-in ticket/PIN for the dev Mac's daemon -- the constant that
