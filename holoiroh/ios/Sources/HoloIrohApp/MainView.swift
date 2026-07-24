@@ -225,18 +225,23 @@ struct MainView: View {
 
     // MARK: Live-share zoom (pinch to zoom, drag to pan, double-tap resets)
 
-    /// Committed zoom factor for the live-share surface (1 = fit). The
-    /// in-flight pinch multiplies on top via `pinchScale`; both are clamped
-    /// to `Self.zoomRange` so the mirror can neither shrink below fit nor
-    /// blow up past readable magnification.
+    /// Committed zoom factor for the live-share surface (1 = fit), passed
+    /// into `PanZoomVideoSurface` as a `Binding` -- the in-flight pinch
+    /// (`pinchScale`) and its clamping now live entirely inside that struct
+    /// (see its doc for why: keeping the live gesture state off `MainView`
+    /// itself is the actual performance fix).
     @State private var zoomScale: CGFloat = 1
-    /// The pinch currently under the user's fingers (1 while none).
-    @GestureState private var pinchScale: CGFloat = 1
-    /// Committed pan offset of the zoomed content (points, post-scale).
+    /// Committed pan offset of the zoomed content (points, post-scale),
+    /// passed into `PanZoomVideoSurface` as a `Binding`.
     @State private var panOffset: CGSize = .zero
-    /// The drag currently under the user's finger (.zero while none).
-    @GestureState private var panDrag: CGSize = .zero
-    private static let zoomRange: ClosedRange<CGFloat> = 1...5
+
+    /// Holds the running frame-timing witness (see `FrameTimingProbe.swift`)
+    /// so it isn't deallocated mid-measurement -- debug-only, see
+    /// `runFrameTimingProbeIfNeeded`.
+    #if DEBUG
+    @State private var frameTimingProbe: FrameTimingProbe?
+    @State private var frameTimingDriveTimer: Timer?
+    #endif
 
     // MARK: Auto-reconnect (app-switch/backgrounding recovery)
 
@@ -582,22 +587,6 @@ struct MainView: View {
     }
 
     // MARK: - Live-share zoom helpers
-
-    private func clampZoom(_ value: CGFloat) -> CGFloat {
-        min(max(value, Self.zoomRange.lowerBound), Self.zoomRange.upperBound)
-    }
-
-    /// Clamp a pan offset so the scaled content always covers the whole
-    /// viewport (no revealed backdrop): with center-anchored scaling, the
-    /// content edge reaches the viewport edge at +/- viewport*(scale-1)/2.
-    private func clampedPan(_ proposed: CGSize, scale: CGFloat, viewport: CGSize) -> CGSize {
-        let maxX = max(0, viewport.width * (scale - 1) / 2)
-        let maxY = max(0, viewport.height * (scale - 1) / 2)
-        return CGSize(
-            width: min(max(proposed.width, -maxX), maxX),
-            height: min(max(proposed.height, -maxY), maxY)
-        )
-    }
 
     private func resetZoom() {
         zoomScale = 1
@@ -1211,15 +1200,6 @@ struct MainView: View {
                 width: isVideoFullscreen ? size.width : boxWidth,
                 height: isVideoFullscreen ? size.height : boxHeight
             )
-            let liveScale = clampZoom(zoomScale * pinchScale)
-            let liveOffset = clampedPan(
-                CGSize(
-                    width: panOffset.width + panDrag.width,
-                    height: panOffset.height + panDrag.height
-                ),
-                scale: liveScale,
-                viewport: viewport
-            )
 
             ZStack {
                 if isVideoFullscreen {
@@ -1228,17 +1208,19 @@ struct MainView: View {
                         .transition(.opacity)
                 }
 
-                VideoRenderView(source: frameSource)
-                    .id(ObjectIdentifier(frameSource as AnyObject))
-                    .scaleEffect(liveScale)
-                    .offset(liveOffset)
-                    .frame(width: viewport.width, height: viewport.height)
-                    .background(Color.black)
-                    .clipShape(RoundedRectangle(cornerRadius: isVideoFullscreen ? 0 : 28))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: isVideoFullscreen ? 0 : 28)
-                            .stroke(Color.white.opacity(isVideoFullscreen ? 0 : 0.35), lineWidth: 1)
-                    )
+                // The gesture-transform-affected content (video + pinch/pan +
+                // zoom badge) lives in its own View struct so a live pinch/pan
+                // only re-renders THAT small subtree, not this whole body --
+                // see `PanZoomVideoSurface`'s doc for the full performance
+                // rationale (the "panning and scrolling is choppy" fix).
+                PanZoomVideoSurface(
+                    frameSource: frameSource,
+                    viewport: viewport,
+                    isVideoFullscreen: isVideoFullscreen,
+                    isControllingRemotely: isControllingRemotely,
+                    zoomScale: $zoomScale,
+                    panOffset: $panOffset
+                )
                     .overlay(alignment: .topTrailing) {
                         // Expand / collapse control.
                         Button {
@@ -1264,26 +1246,6 @@ struct MainView: View {
                         .padding(10)
                         .sensoryFeedback(.impact(weight: .medium), trigger: isVideoFullscreen)
                         .accessibilityLabel(isVideoFullscreen ? "Exit fullscreen" : "Fullscreen live view")
-                    }
-                    .overlay(alignment: .bottomLeading) {
-                        // Zoom badge, only while zoomed: current factor +
-                        // an affordance hint that double-tap resets.
-                        if liveScale > 1.01 {
-                            HStack(spacing: 4) {
-                                Text(String(format: "%.1f\u{00D7}", liveScale))
-                                    .font(.caption.weight(.semibold).monospacedDigit())
-                                Image(systemName: "arrow.counterclockwise")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(.ultraThinMaterial, in: Capsule())
-                            .overlay(Capsule().stroke(.white.opacity(0.12), lineWidth: 1))
-                            .padding(10)
-                            .transition(.scale(scale: 0.8).combined(with: .opacity))
-                            .accessibilityLabel("Zoom \(String(format: "%.1f", liveScale))x, double tap to reset")
-                        }
                     }
                     // Hands-on control: a touch surface over the video that injects
                     // the user's taps/drags/scrolls as remote input, plus a toggle
@@ -1339,64 +1301,14 @@ struct MainView: View {
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
                     }
-                    .animation(.easeOut(duration: 0.18), value: liveScale > 1.01)
                     .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isControllingRemotely)
                     .animation(.easeInOut(duration: keyboardAnimationDuration), value: isRemoteTypeFocused)
                     .animation(.spring(response: 0.3, dampingFraction: 0.9), value: showRemoteTypeOverlay)
                     .contentShape(Rectangle())
-                    // Pinch to zoom -- stays active even while controlling remotely
-                    // (unlike the pan/tap gestures below): pinch has no meaning as a
-                    // remote-mouse action, so there's nothing for it to conflict with.
-                    // `RemoteControlSurface`'s own pan2 (2-finger drag -> remote scroll)
-                    // now backs off during a genuine pinch (see its `pinch.require`
-                    // wiring), so this can't misfire a stray remote scroll either.
-                    // `simultaneousGesture` so it composes with the pan drag below and
-                    // never blocks the taps.
-                    .simultaneousGesture(
-                        MagnificationGesture()
-                            .updating($pinchScale) { value, state, _ in
-                                state = value
-                            }
-                            .onEnded { value in
-                                zoomScale = clampZoom(zoomScale * value)
-                                panOffset = clampedPan(panOffset, scale: zoomScale, viewport: viewport)
-                            }
-                    )
-                    // Drag to pan -- only once zoomed (at fit, the drag is ignored so
-                    // it can never swallow scroll-ish intents). minimumDistance keeps
-                    // single/double taps working.
-                    //
-                    // GATED OFF (GestureMask.none) while isControllingRemotely: a
-                    // 1-finger drag on the video during control is UNAMBIGUOUSLY
-                    // "move the remote cursor" (RemoteControlSurface's own pan1) --
-                    // this local viewport-pan gesture is a DIFFERENT interpretation of
-                    // the identical touch shape, and being a `simultaneousGesture`
-                    // (deliberately non-exclusive) it does not lose the arbitration on
-                    // its own. Live-witnessed as the reported bug: panning/dragging
-                    // while in control also dragged the remote pointer, "accidentally
-                    // mov[ing] the cursor around or highlight[ing]/click[ing] things."
-                    // `.none` fully removes this recognizer from the touch pipeline
-                    // during control, rather than merely no-op'ing its callback (which
-                    // would still let it compete for/consume the touch).
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 12)
-                            .updating($panDrag) { value, state, _ in
-                                guard zoomScale > 1.01 else { return }
-                                state = value.translation
-                            }
-                            .onEnded { value in
-                                guard zoomScale > 1.01 else { return }
-                                panOffset = clampedPan(
-                                    CGSize(
-                                        width: panOffset.width + value.translation.width,
-                                        height: panOffset.height + value.translation.height
-                                    ),
-                                    scale: zoomScale,
-                                    viewport: viewport
-                                )
-                            },
-                        including: isControllingRemotely ? .none : .all
-                    )
+                    // Pinch-to-zoom and pan-to-drag are attached inside
+                    // `PanZoomVideoSurface` itself now (see its doc) -- only
+                    // the double-tap/single-tap gestures, which don't touch
+                    // the live gesture state, stay attached out here.
                     // Double-tap: reset zoom (attached BEFORE the single-tap so
                     // SwiftUI sequences them; the single-tap then only fires when a
                     // second tap doesn't follow). Also gated off during control -- a
@@ -1860,12 +1772,63 @@ struct MainView: View {
             }
             return
         }
+        if ProcessInfo.processInfo.environment["HOLOIROH_FRAME_TIMING_PROBE"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                runFrameTimingProbe()
+            }
+        }
         guard ProcessInfo.processInfo.environment["HOLOIROH_AUTOFOCUS_PROMPT"] == "1" else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             isPromptFocused = true
         }
         #endif
     }
+
+    #if DEBUG
+    /// Empirical witness for the video pan/zoom performance investigation
+    /// (see `FrameTimingProbe.swift`'s doc for why this is a legitimate
+    /// substitute for a real touch gesture). Drives `zoomScale`/`panOffset`
+    /// -- the SAME state `videoOverlay`'s `liveScale`/`liveOffset` read --
+    /// at roughly the rate a real pinch/pan gesture updates `@GestureState`,
+    /// for `HOLOIROH_FRAME_TIMING_PROBE_SECONDS` seconds (default 4), while a
+    /// `CADisplayLink` measures actual per-frame cost. Zoom/pan are restored
+    /// to identity afterward so the probe never leaves the view visibly
+    /// altered. Triggered once per launch by `HOLOIROH_FRAME_TIMING_PROBE=1`.
+    private func runFrameTimingProbe() {
+        let seconds = Double(ProcessInfo.processInfo.environment["HOLOIROH_FRAME_TIMING_PROBE_SECONDS"] ?? "") ?? 4.0
+        let probe = FrameTimingProbe(label: "video-pan-zoom") { _ in }
+        frameTimingProbe = probe
+        probe.start()
+
+        let start = Date()
+        // ~120Hz drive interval -- matches ProMotion touch-tracking rate, the
+        // upper end of what a real pinch/pan's @GestureState updates at.
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 120.0, repeats: true) { t in
+            let elapsed = Date().timeIntervalSince(start)
+            guard elapsed < seconds else {
+                t.invalidate()
+                frameTimingDriveTimer = nil
+                probe.stop()
+                frameTimingProbe = nil
+                withAnimation(nil) {
+                    zoomScale = 1
+                    panOffset = .zero
+                }
+                return
+            }
+            // A small continuous oscillation in both zoom and pan -- exercises
+            // the identical clampZoom/clampedPan + liveScale/liveOffset path a
+            // real pinch-then-drag gesture would, at a steady synthetic rate.
+            let t2 = elapsed * 2 * .pi
+            zoomScale = 1.5 + 0.3 * CGFloat(sin(t2 * 0.5))
+            panOffset = CGSize(
+                width: 40 * CGFloat(sin(t2)),
+                height: 40 * CGFloat(cos(t2))
+            )
+        }
+        frameTimingDriveTimer = timer
+    }
+    #endif
 
     /// Live send: straight to the daemon, straight into the feed -- no
     /// Reviewing stage. While a task is ACTIVE, a sent prompt REDIRECTS it
