@@ -68,6 +68,13 @@ enum ServerMessage: Codable, Equatable {
         responseOptions: [String],
         expiresAt: UInt64
     )
+    /// Whether the Mac's currently-focused field is a secure (password-class) input right
+    /// now -- true whenever the login window's authentication UI, a screen-lock password
+    /// prompt, or a `sudo`/Keychain dialog has focus. Sent whenever this state CHANGES, not
+    /// per-frame. The video's black rectangle over that field is macOS's own
+    /// ScreenCaptureKit security boundary (not a bug); this signal lets the app explain it
+    /// instead of leaving it unexplained. See `mac-daemon/src/holo_bridge/secure_input_watchdog.rs`.
+    case secureInputState(active: Bool)
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -82,6 +89,7 @@ enum ServerMessage: Codable, Equatable {
         case queued
         case ticket
         case questions
+        case active
     }
 
     private enum Kind: String, Codable {
@@ -95,6 +103,7 @@ enum ServerMessage: Codable, Equatable {
         case currentTicket = "current_ticket"
         case clarifyQuestions = "clarify_questions"
         case inputRequest = "input_request"
+        case secureInputState = "secure_input_state"
     }
 
     init(from decoder: Decoder) throws {
@@ -135,6 +144,8 @@ enum ServerMessage: Codable, Equatable {
                 responseOptions: try container.decode([String].self, forKey: .responseOptions),
                 expiresAt: try container.decode(UInt64.self, forKey: .expiresAt)
             )
+        case .secureInputState:
+            self = .secureInputState(active: try container.decode(Bool.self, forKey: .active))
         }
     }
 
@@ -177,6 +188,9 @@ enum ServerMessage: Codable, Equatable {
             try container.encode(context, forKey: .context)
             try container.encode(responseOptions, forKey: .responseOptions)
             try container.encode(expiresAt, forKey: .expiresAt)
+        case .secureInputState(let active):
+            try container.encode(Kind.secureInputState, forKey: .type)
+            try container.encode(active, forKey: .active)
         }
     }
 
@@ -200,6 +214,8 @@ enum ServerMessage: Codable, Equatable {
         case .clarifyQuestions(let questions):
             return questions.isEmpty ? "no clarification needed" : "\(questions.count) clarifying question(s)"
         case .inputRequest(_, _, let context, _, _): return context
+        case .secureInputState(let active):
+            return active ? "Mac is at a login/lock screen" : "Mac is signed in"
         }
     }
 
@@ -217,6 +233,7 @@ enum ServerMessage: Codable, Equatable {
         case .currentTicket: return "TICKET"
         case .clarifyQuestions: return "CLARIFY"
         case .inputRequest: return "INPUT"
+        case .secureInputState: return "LOCK"
         }
     }
 }

@@ -205,6 +205,15 @@ struct MainView: View {
     /// `releaseControl`. See `RemoteControl.swift`.
     @State private var isControllingRemotely = false
 
+    /// True while the Mac's focused field is secure (password-class) -- the login window's
+    /// authentication UI, a screen-lock password prompt, or a `sudo`/Keychain dialog has
+    /// focus. Driven by `ServerMessage.secureInputState`, itself sourced from the daemon's
+    /// `secure_input_watchdog` polling macOS's own `IsSecureEventInputEnabled()` signal. Used
+    /// to explain the video's black region (ScreenCaptureKit excludes secure UI from every
+    /// captured frame -- an OS security boundary, not a holoiroh bug) instead of leaving a
+    /// user staring at an unexplained black rectangle.
+    @State private var isMacAtLockScreen = false
+
     /// Whether the lightweight floating typing overlay (task 4) is shown over
     /// the live-share surface. Only ever visible while `isControllingRemotely`
     /// -- cleared automatically on releaseControl (see `toggleRemoteControl`)
@@ -978,6 +987,8 @@ struct MainView: View {
                 context: context,
                 responseOptions: responseOptions
             )
+        case .secureInputState(let active):
+            isMacAtLockScreen = active
         }
     }
 
@@ -1269,15 +1280,33 @@ struct MainView: View {
                     .overlay(alignment: .topLeading) { remoteControlToggle }
                     .overlay(alignment: .topTrailing) { remoteTypeToggle }
                     .overlay(alignment: .top) {
-                        if isControllingRemotely {
-                            Text("You're in control \u{2014} the agent is paused")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Color.orange.opacity(0.92), in: Capsule())
-                                .padding(.top, 10)
+                        // Stacked, not competing for the same slot: the lock banner explains
+                        // the black region whenever it's up, independent of whether the user
+                        // also happens to be in hands-on control at the same moment.
+                        VStack(spacing: 6) {
+                            if isMacAtLockScreen {
+                                Label(
+                                    isControllingRemotely
+                                        ? "Mac is locked \u{2014} tap the keyboard to type your password"
+                                        : "Mac is locked \u{2014} take control to sign in",
+                                    systemImage: "lock.fill"
+                                )
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.blue.opacity(0.92), in: Capsule())
+                            }
+                            if isControllingRemotely {
+                                Text("You're in control \u{2014} the agent is paused")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.orange.opacity(0.92), in: Capsule())
+                            }
                         }
+                        .padding(.top, 10)
                     }
                     .overlay(alignment: .bottom) {
                         if isControllingRemotely, showRemoteTypeOverlay {
@@ -1302,6 +1331,7 @@ struct MainView: View {
                         }
                     }
                     .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isControllingRemotely)
+                    .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isMacAtLockScreen)
                     .animation(.easeInOut(duration: keyboardAnimationDuration), value: isRemoteTypeFocused)
                     .animation(.spring(response: 0.3, dampingFraction: 0.9), value: showRemoteTypeOverlay)
                     .contentShape(Rectangle())
@@ -1475,6 +1505,7 @@ struct MainView: View {
         case .inputRequest: return .yellow
         case .currentTicket: return .blue
         case .clarifyQuestions: return Self.orbAccent
+        case .secureInputState: return .blue
         }
     }
 

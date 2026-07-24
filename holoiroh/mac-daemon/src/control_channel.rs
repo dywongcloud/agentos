@@ -256,6 +256,7 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
         ControlEvent::ClarifyQuestions { questions } => {
             ServerMessage::clarify_questions(questions)
         }
+        ControlEvent::SecureInputState { active } => ServerMessage::SecureInputState { active },
     }
 }
 
@@ -276,7 +277,8 @@ fn event_request_id(event: &ControlEvent) -> Option<String> {
         | ControlEvent::InputRequested { request_id, .. } => request_id,
         ControlEvent::DaemonStatus { .. }
         | ControlEvent::TaskActive { .. }
-        | ControlEvent::ClarifyQuestions { .. } => return None,
+        | ControlEvent::ClarifyQuestions { .. }
+        | ControlEvent::SecureInputState { .. } => return None,
     };
     if id.is_empty() { None } else { Some(id.clone()) }
 }

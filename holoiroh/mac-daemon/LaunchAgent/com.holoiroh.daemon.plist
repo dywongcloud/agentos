@@ -77,3 +77,31 @@
   <string>Interactive</string>
 </dict>
 </plist>
+
+<!--
+  Lock vs. logout: this is a per-user LaunchAgent (lives under
+  ~/Library/LaunchAgents, no LimitLoadToSessionType override above, so it
+  loads into the default Aqua session type). That means it starts with this
+  user's GUI login session and is torn down when that session ends. Locking
+  the screen (Ctrl+Cmd+Q, screen saver, closing the lid) keeps the same login
+  session alive underneath the lock overlay, so this daemon (and holo serve
+  under it) keeps running through a lock, exactly as reported live: the
+  video stream partially continues (wallpaper visible, secure UI excluded by
+  ScreenCaptureKit) rather than cutting out entirely. A genuine logout, or a
+  switch to a different user via Fast User Switching, ends the Aqua session
+  this LaunchAgent is scoped to and launchd kills it along with every other
+  per-user agent; nothing here can outlive that by itself.
+
+  Surviving a real logout needs a LaunchDaemon instead (system-level, under
+  /Library/LaunchDaemons, running as root at boot before any login exists).
+  That conversion is a materially bigger step than swapping a directory:
+  Screen Recording and Accessibility (both required, see permissions.rs) are
+  TCC grants normally made through an interactive System Settings prompt
+  tied to a logged-in GUI session, and there is no documented flow for
+  pre-granting either one to a daemon meant to run before any user is
+  logged in at all. Until that permission story has a real answer, staying
+  a per-user LaunchAgent and handling "no session yet" as an honest,
+  explained state (see holo_bridge::secure_input_watchdog) is the safer
+  trade than shipping a LaunchDaemon that silently can't capture or inject
+  anything the moment nobody is logged in.
+-->

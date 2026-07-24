@@ -206,6 +206,12 @@ pub enum ControlEvent {
     /// `ServerMessage::ClarifyQuestions`. Emitted by the control-channel read
     /// loop's spawned clarify task, off the desktop-task pipeline.
     ClarifyQuestions { questions: Vec<ClarifyingQuestion> },
+    /// Whether the Mac's currently-focused field is a secure (password-class)
+    /// input right now -- emitted only on CHANGE by
+    /// `holo_bridge::secure_input_watchdog`'s polling loop. Not tied to a
+    /// task turn; `control_channel::from_control_event` maps it straight to
+    /// the wire `ServerMessage::SecureInputState`.
+    SecureInputState { active: bool },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -683,6 +689,12 @@ impl HoloControlBridge {
     /// event already flows through.
     pub fn emit_daemon_status(&self, text: impl Into<String>) {
         self.emit(ControlEvent::DaemonStatus { text: text.into() });
+    }
+
+    /// Emit a [`ControlEvent::SecureInputState`] -- see
+    /// `holo_bridge::secure_input_watchdog`, the only caller.
+    pub fn emit_secure_input_state(&self, active: bool) {
+        self.emit(ControlEvent::SecureInputState { active });
     }
 
     fn emit(&self, event: ControlEvent) {

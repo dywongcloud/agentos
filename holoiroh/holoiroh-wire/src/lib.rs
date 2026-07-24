@@ -688,6 +688,22 @@ pub enum ServerMessage {
         /// `std::time::SystemTime`.
         expires_at: u64,
     },
+    /// Whether the Mac's currently-focused field is a secure (password-class)
+    /// input right now -- true whenever the login window's authentication
+    /// UI, a screen-lock password prompt, or a `sudo`/Keychain dialog has
+    /// focus. Sent whenever this state CHANGES (never per-frame): macOS's
+    /// own `IsSecureEventInputEnabled()` signal, the same condition that
+    /// makes ScreenCaptureKit exclude that field from every captured video
+    /// frame (a WindowServer-level security boundary no process can bypass,
+    /// not a bug in this daemon's capture pipeline). The app uses this to
+    /// show an honest "Mac is locked -- video is limited for security, type
+    /// your password below" message instead of an unexplained black
+    /// rectangle. Additive per `PROTOCOL.md`'s extension policy; older
+    /// clients that don't know this type fall back to their generic
+    /// "unrecognized control event" handling.
+    SecureInputState {
+        active: bool,
+    },
 }
 
 impl ServerMessage {
@@ -706,6 +722,7 @@ impl ServerMessage {
             ServerMessage::CurrentTicket { .. } => "current_ticket",
             ServerMessage::ClarifyQuestions { .. } => "clarify_questions",
             ServerMessage::InputRequest { .. } => "input_request",
+            ServerMessage::SecureInputState { .. } => "secure_input_state",
         }
     }
 

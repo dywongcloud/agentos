@@ -12,6 +12,25 @@
 //! doing nothing. All injected events are synthetic (a nonzero source pid), so
 //! `crate::user_activity`'s physical-input tap correctly ignores them -- these
 //! are the user's REMOTE inputs, not local hardware activity.
+//!
+//! ## Reaching the login/lock screen's password field
+//!
+//! [`text`] and [`key`] post through `CGEventTapLocation::HIDEventTap`, the
+//! lowest-level system-wide injection point (the same level real hardware
+//! keystrokes arrive at) -- the correct mechanism, and nothing in this file
+//! gates it to a particular session. Whether the OS actually *delivers* those
+//! synthetic events to a focused secure field is a separate question this
+//! file cannot answer by inspection alone: `crate::permissions::secure_input_active`
+//! reports when the login window, lock screen, or a `sudo`/Keychain prompt has
+//! focus, and Apple's own documented purpose for that state (`SecureEventInput`)
+//! is specifically to block synthetic keystroke delivery to such fields --
+//! the same protection that stops password-harvesting malware would, by
+//! design, equally block a legitimate remote-typing feature. This has not
+//! been live-tested against the user's own lock screen (deliberately -- a
+//! failed synthetic-unlock attempt risks tripping password-attempt lockout on
+//! their real account); confirming it one way or the other needs a disposable
+//! test machine, or the account owner's explicit, informed consent to try it
+//! on their own Mac.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -131,3 +131,45 @@ pub fn accessibility_granted() -> bool {
 pub fn accessibility_granted() -> bool {
     compile_error!("holoiroh-daemon is macOS-only; accessibility_granted() has no non-macOS implementation");
 }
+
+#[cfg(target_os = "macos")]
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    /// `Boolean IsSecureEventInputEnabled(void)` from `<Carbon/HIToolbox/Events.h>`.
+    /// Exported by `Carbon.framework` (the umbrella `HIToolbox` lives under),
+    /// NOT `ApplicationServices.framework` -- live-witnessed: linking against
+    /// `ApplicationServices` alone left `_IsSecureEventInputEnabled`
+    /// undefined at link time despite that framework being otherwise already
+    /// linked transitively via `objc2-application-services`. Public,
+    /// documented, long-stable Apple API; not bound by
+    /// `objc2-application-services` itself, hence the direct declaration
+    /// here rather than a generated binding. `Boolean` is a C
+    /// `unsigned char` (0/1), not the same ABI as Rust `bool`, so the raw
+    /// return type is `u8`.
+    fn IsSecureEventInputEnabled() -> u8;
+}
+
+/// Whether the CURRENTLY FOCUSED field anywhere on the system is a secure
+/// (password-class) input field -- true whenever the loginwindow's
+/// authentication UI, a screen-lock password prompt, a `sudo`/Keychain
+/// dialog, or any other app's explicit `EnableSecureEventInput()` call has
+/// focus. This is macOS's own signal for "a screen-capture/keystroke-
+/// synthesis-hostile field is active right now", the exact condition behind
+/// the live-reported black rectangle where the login window's password
+/// field should render: ScreenCaptureKit deliberately excludes secure UI
+/// from every captured frame while this is true, a WindowServer-level
+/// security boundary no process can bypass regardless of privilege.
+///
+/// Read-only query, no side effects, safe to poll on any thread/cadence.
+#[cfg(target_os = "macos")]
+pub fn secure_input_active() -> bool {
+    // Safety: IsSecureEventInputEnabled takes no arguments and returns a
+    // plain Boolean; it only queries current secure-input state and never
+    // prompts, blocks, or mutates anything.
+    unsafe { IsSecureEventInputEnabled() != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn secure_input_active() -> bool {
+    compile_error!("holoiroh-daemon is macOS-only; secure_input_active() has no non-macOS implementation");
+}

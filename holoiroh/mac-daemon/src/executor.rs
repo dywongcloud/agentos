@@ -673,7 +673,8 @@ fn translate_control_event(event: ControlEvent) -> Option<ExecutorEvent> {
         ControlEvent::DaemonStatus { .. }
         | ControlEvent::TaskActive { .. }
         | ControlEvent::InputRequested { .. }
-        | ControlEvent::ClarifyQuestions { .. } => None,
+        | ControlEvent::ClarifyQuestions { .. }
+        | ControlEvent::SecureInputState { .. } => None,
     }
 }
 

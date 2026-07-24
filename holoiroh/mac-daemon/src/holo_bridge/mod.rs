@@ -77,6 +77,7 @@ pub mod a2a_client;
 pub mod control;
 pub mod health;
 pub mod process;
+pub mod secure_input_watchdog;
 pub mod stall_watchdog;
 pub mod stop;
 

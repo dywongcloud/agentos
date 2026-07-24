@@ -596,6 +596,15 @@ async fn main() -> anyhow::Result<()> {
                 bridge.clone(),
                 health_check_shutdown.clone(),
             ));
+            // Lock/login-screen visibility: watches macOS's own secure-input signal and tells
+            // the phone when the black rectangle over the video is the login/lock password
+            // field (an OS security boundary, not a bug) rather than leaving it unexplained.
+            // See `holo_bridge::secure_input_watchdog`'s module doc. Same shared shutdown token
+            // as the other daemon-lifetime background supervisors above.
+            tokio::spawn(holo_bridge::secure_input_watchdog::run_secure_input_watchdog_loop(
+                bridge.clone(),
+                health_check_shutdown.clone(),
+            ));
             // Cooperative auto-yield: step the agent aside while the user is
             // actively using the Mac, resume when they go idle (see
             // `crate::auto_yield`). Starts its own physical-input CGEventTap;
