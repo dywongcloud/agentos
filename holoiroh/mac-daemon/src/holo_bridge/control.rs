@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
@@ -250,6 +250,12 @@ struct CurrentTurn {
     /// `tasks/cancel` actually requires (a context-id stand-in returns
     /// "Task not found" on the current holo serve; see `A2aClient::cancel`).
     a2a_task_id: Option<String>,
+    /// [`HoloControlBridge::client_epoch`]'s value at the moment this turn started. If the
+    /// live epoch has since moved on (a crash-restart or a backend switch replaced the
+    /// `holo serve` process this turn's `context_id`/`a2a_task_id` belong to), those ids are
+    /// pointing at a session that no longer exists anywhere -- see `client_epoch`'s doc for
+    /// why a redirect must never inherit them once stale.
+    started_epoch: u64,
 }
 
 /// A turn parked by `Pause` (or by the sensitive-app consent gate): everything `Resume`
@@ -313,6 +319,18 @@ pub struct HoloControlBridge {
     /// is only ever swapped wholesale (`replace_client`, on `holo_bridge::health` restart), a
     /// cheap `Clone` of a small struct, never held across an `.await`.
     client: RwLock<A2aClient>,
+    /// Bumped by [`Self::replace_client`] every time `client` is swapped onto a DIFFERENT
+    /// `holo serve` process -- both `HoloBridge::restart_process` (crash-detected auto-restart)
+    /// and `HoloBridge::switch_to` (rate-limit failover, primary-restore, intent-router tier
+    /// force) funnel through it, so this counts every process replacement uniformly regardless
+    /// of trigger. Each running-process "generation" gets a fresh `hai-agent-runtime` session
+    /// namespace with zero memory of any prior generation's `context_id`/`a2a_task_id` --
+    /// [`CurrentTurn::started_epoch`] lets a turn detect it survived past its own process's
+    /// death, so `handle_redirect`/`maybe_nudge_stalled_turn` can refuse to inherit a context
+    /// that no longer exists anywhere instead of silently misfiring into the new process. Never
+    /// reset; only ever compared for (in)equality, so wraparound is a non-issue at any
+    /// realistic restart rate.
+    client_epoch: AtomicU64,
     /// Wrapped in a `std::sync::RwLock` (not `tokio::sync::RwLock`) so the
     /// active event sink can be swapped per control-channel connection
     /// (see `crate::control_channel`, which calls
@@ -427,6 +445,18 @@ enum TurnOutcome {
 /// swallowed before it reaches A2A, so a broader retry-once-on-the-other-backend is the
 /// best available response). The 429/rate-limit forms cover transport-level errors that DO
 /// carry detail.
+/// Pure equality check backing [`HoloControlBridge::is_stale`]: a turn started against process
+/// generation `started_epoch` is stale once the live generation (`current_epoch`, i.e.
+/// [`HoloControlBridge::client_epoch`]) has moved past it -- a crash-restart or backend switch
+/// replaced the `holo serve` process the turn's `context_id`/`a2a_task_id` belong to, and no
+/// process generation ever revisits an earlier epoch, so simple inequality is the whole rule.
+/// Extracted as a standalone `pub fn` (rather than inlined into `is_stale`) so it is directly
+/// probe-testable without needing a live `HoloControlBridge`/`A2aClient` -- see
+/// `examples/epoch_mismatch_probe.rs`.
+pub fn turn_epoch_is_stale(started_epoch: u64, current_epoch: u64) -> bool {
+    started_epoch != current_epoch
+}
+
 fn is_backend_error_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("agent backend error")
@@ -444,6 +474,7 @@ impl HoloControlBridge {
     ) -> Self {
         Self {
             client: RwLock::new(client),
+            client_epoch: AtomicU64::new(0),
             events_tx: RwLock::new(events_tx),
             holo_bin: holo_bin.into(),
             busy: Mutex::new(false),
@@ -511,11 +542,29 @@ impl HoloControlBridge {
         let _ = self.bridge.set(bridge);
     }
 
-    /// Swap in a freshly-built `A2aClient` pointed at a respawned `holo serve` process. See
-    /// `HoloBridge::restart_process`, the only caller. Does not touch `busy`/`queue`/`events_tx`
-    /// -- only which process subsequent A2A calls go to.
+    /// Swap in a freshly-built `A2aClient` pointed at a respawned `holo serve` process. Called
+    /// by `HoloBridge::restart_process` (crash-restart) and `HoloBridge::switch_to` (failover /
+    /// primary-restore / tier force) -- every path that replaces the underlying process funnels
+    /// through here. Does not touch `busy`/`queue`/`events_tx` -- only which process subsequent
+    /// A2A calls go to, plus bumping `client_epoch` so any turn that started against the OLD
+    /// process can detect it and refuse to inherit a now-dead `context_id`/`a2a_task_id` (see
+    /// `client_epoch`'s doc).
     pub fn replace_client(&self, client: A2aClient) {
         *self.client.write().expect("client lock poisoned") = client;
+        self.client_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The live process generation -- see `client_epoch`'s doc.
+    fn current_client_epoch(&self) -> u64 {
+        self.client_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Whether `turn` started against a `holo serve` process that has since been replaced (its
+    /// `context_id`/`a2a_task_id`, if any, belong to a session no memory of which survives in
+    /// the currently-running process). Thin wrapper over [`turn_epoch_is_stale`] -- see that
+    /// function for the pure, probe-testable equality check itself.
+    fn is_stale(&self, turn: &CurrentTurn) -> bool {
+        turn_epoch_is_stale(turn.started_epoch, self.current_client_epoch())
     }
 
     /// Reports whether a turn is currently running and how many more are queued behind it.
@@ -885,6 +934,7 @@ impl HoloControlBridge {
             text: text.clone(),
             context_id: context_id.map(str::to_owned),
             a2a_task_id: None,
+            started_epoch: self.current_client_epoch(),
         });
         // NOTE: `turn_allowances` is deliberately NOT cleared here. A resumed/consent-allowed
         // turn re-enters through this same path, and clearing at run start would wipe the
@@ -1696,23 +1746,49 @@ impl HoloControlBridge {
             .expect("turn_allowances lock poisoned")
             .clear();
 
-        // Inherit the session: prefer the RUNNING turn's contextId, else a parked turn's --
-        // whichever task the user is steering, its history should carry into the new
-        // instruction.
-        let inherited_context = self
+        // Snapshot the active turn once: inheritance and the stale-session guard below both
+        // read from this SAME clone, so there is no window for the two checks to desync.
+        let active = self
             .current_turn
             .lock()
             .expect("current_turn lock poisoned")
+            .clone();
+        let active_is_stale = active.as_ref().is_some_and(|t| self.is_stale(t));
+
+        // Stale-context guard: if the active turn's backend session belongs to a `holo serve`
+        // process that has since been replaced (crash-restart or a backend switch -- see
+        // `client_epoch`'s doc), its context_id/a2a_task_id point at a session that no longer
+        // exists anywhere. There is nothing live to cancel (a scoped cancel against the current
+        // process would just be "task not found" and fall back to a global `holo stop`, which
+        // could interrupt an unrelated task on the new process) and no history left to inherit
+        // -- fail that turn cleanly and tell the user, instead of silently dropping its context
+        // or sending a cancel that can't land where it's aimed.
+        if let Some(stale) = active.as_ref().filter(|_| active_is_stale) {
+            tracing::warn!(
+                request_id = stale.request_id,
+                "redirect: active turn's backend session was replaced (crash-restart or backend switch) mid-task; failing it cleanly instead of inheriting a dead context"
+            );
+            self.tasks.with_task(&stale.request_id, |fsm| fsm.fail());
+            *self.current_turn.lock().expect("current_turn lock poisoned") = None;
+            self.emit(ControlEvent::Error {
+                request_id: stale.request_id.clone(),
+                message: "the agent backend restarted mid-task (it may have crashed) -- \
+                    that request may not have completed as intended."
+                    .to_owned(),
+            });
+        }
+
+        // Inherit the session: prefer the RUNNING turn's contextId (unless it's stale -- see
+        // above), else a parked turn's -- whichever task the user is steering, its history
+        // should carry into the new instruction.
+        let inherited_context = active
             .as_ref()
+            .filter(|_| !active_is_stale)
             .and_then(|t| t.context_id.clone())
             .or_else(|| parked.and_then(|p| p.context_id));
 
-        let had_active = self
-            .current_turn
-            .lock()
-            .expect("current_turn lock poisoned")
-            .is_some();
-        if had_active {
+        let had_active_live = active.is_some() && !active_is_stale;
+        if had_active_live {
             self.cancel_current_turn("redirect").await;
             self.emit_daemon_status(
                 "redirecting: canceling the current task, your new instruction runs next",
@@ -1736,15 +1812,15 @@ impl HoloControlBridge {
     /// running, or the running turn isn't stalled, or it was already nudged within the
     /// cooldown) costs one lock-and-check, no cancel, no emit.
     pub async fn maybe_nudge_stalled_turn(&self) {
-        let Some(request_id) = self
+        let Some(turn) = self
             .current_turn
             .lock()
             .expect("current_turn lock poisoned")
-            .as_ref()
-            .map(|t| t.request_id.clone())
+            .clone()
         else {
             return;
         };
+        let request_id = turn.request_id.clone();
 
         let now = holoiroh_wire::epoch_millis_now();
         let should_nudge = self
@@ -1762,6 +1838,31 @@ impl HoloControlBridge {
             })
             .unwrap_or(false);
         if !should_nudge {
+            return;
+        }
+
+        // The stall this tick detected may not be a genuinely stuck agent at all: `holo serve`
+        // itself may have crashed mid-turn (the user-reported "signal 15 (SIGTERM)" case) and
+        // been auto-restarted by the health-check loop -- an event this watchdog has no way to
+        // observe except the stream going quiet, identically to a real stall. A same-context
+        // redirect in that case is guaranteed to fail: the freshly-spawned process has zero
+        // memory of the mistake being "corrected" (`client_epoch` has moved on since this turn
+        // started -- see its doc). Fail the turn cleanly with an honest status instead of
+        // chasing a doomed retry that can only ever look like a second, unexplained failure.
+        if self.is_stale(&turn) {
+            tracing::warn!(
+                request_id,
+                "stall watchdog: turn's backend session was replaced (crash-restart or backend switch) mid-task; failing cleanly instead of nudging a dead context"
+            );
+            self.tasks.with_task(&request_id, |fsm| fsm.fail());
+            *self.current_turn.lock().expect("current_turn lock poisoned") = None;
+            self.emit(ControlEvent::Error {
+                request_id,
+                message: "the agent backend restarted mid-task (it may have crashed) -- \
+                    the request may not have completed as intended. Please review and \
+                    re-send if needed."
+                    .to_owned(),
+            });
             return;
         }
 
