@@ -704,9 +704,17 @@ struct MainView: View {
                     connection.shutdown()
                     onDisconnect()
                 } label: {
-                    Text("Disconnect")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
+                    VStack(spacing: 2) {
+                        Text("Disconnect")
+                            .font(.headline)
+                        // This button is also the only way back to the pairing screen's saved
+                        // profiles list -- without this line the profile-switching path was
+                        // undiscoverable (it looked like a one-way "end the session" action).
+                        Text("Switch Mac or manage saved connections")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.85))
+                    }
+                    .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)

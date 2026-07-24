@@ -47,6 +47,12 @@ final class ConnectionDiagnostics: ObservableObject {
         let stamp = ConnectionDiagnostics.formatter.string(from: Date())
         log.append("\(stamp)  \(message)")
         if log.count > 50 { log.removeFirst(log.count - 50) }
+        // Also mirror to the system log (matches ConnectionProfileStore's own NSLog
+        // diagnostics) -- the in-memory `log` above only surfaces once someone opens the
+        // hidden DiagnosticsView, but a device console pull (this project's standard
+        // screenshot-free iOS witnessing method -- screenshots are blocked on-device) needs
+        // these events visible without a human in the loop shaking the phone first.
+        NSLog("ConnectionDiagnostics: \(message)")
     }
 
     private static let formatter: DateFormatter = {

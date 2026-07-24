@@ -186,6 +186,34 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         profiles.first { $0.id == Self.syntheticDefaultID }
     }
 
+    /// UserDefaults key holding the ticket of whatever profile the user last successfully
+    /// connected to -- see `autoConnectProfile`/`markConnected`.
+    private static let lastConnectedTicketDefaultsKey = "lastConnectedTicket"
+
+    /// The profile launch auto-connect should use: whichever one the user actually last
+    /// connected to (by hand, or by tapping a saved-profile card), falling back to the
+    /// synthesized "Dev Mac" default only if nothing has ever been connected to, or if the
+    /// last-connected ticket no longer matches a saved profile (e.g. it was deleted). Without
+    /// this, auto-connect always dialed the hardcoded Dev Mac ticket regardless of what the
+    /// user actually paired with -- "ensure the active connection is saved as a default
+    /// connection profile" wasn't actually true.
+    var autoConnectProfile: ConnectionProfile? {
+        if let lastTicket = UserDefaults.standard.string(forKey: Self.lastConnectedTicketDefaultsKey),
+           let match = profiles.first(where: { $0.ticket == lastTicket }) {
+            return match
+        }
+        return defaultProfile
+    }
+
+    /// Records `ticket` as the most recently connected-to profile, so the NEXT launch's
+    /// auto-connect (see `autoConnectProfile`) reconnects to it instead of always falling back
+    /// to the synthesized Dev Mac default. Call this from wherever a connection is actually
+    /// established (manual pairing or tapping a saved profile) -- never from `reload()` or any
+    /// passive read path.
+    func markConnected(ticket: String) {
+        UserDefaults.standard.set(ticket, forKey: Self.lastConnectedTicketDefaultsKey)
+    }
+
     func reload() {
         // Load any USER-saved profiles from sqlite, best-effort. Crucially this
         // NEVER early-returns before setting `profiles`: the old `guard let db

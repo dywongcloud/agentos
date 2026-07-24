@@ -342,7 +342,7 @@ struct PairingView: View {
                                         Text(profile.name)
                                             .font(.subheadline.weight(.semibold))
                                             .foregroundStyle(.white)
-                                        if profile.id == ConnectionProfileStore.syntheticDefaultID {
+                                        if profile.ticket == profileStore.autoConnectProfile?.ticket {
                                             ReachabilityPill(state: reachability.state)
                                         }
                                     }

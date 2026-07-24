@@ -45,6 +45,21 @@ struct ContentView: View {
     @State private var userEngagedPairing = false
     @State private var manualDisconnectThisSession = false
 
+    /// Auto-connect used to fire in the SAME FRAME the intro finished fading (whenever the
+    /// daemon was already reachable, which is now virtually every launch since the default
+    /// profile is auto-ensured) -- `PairingView` is fully built (QR scan, ticket+PIN entry,
+    /// phrase verification, a complete sqlite-backed saved-profiles list) but was composited
+    /// for zero perceptible frames before `MainView` replaced it, so it read as "missing" even
+    /// though the code and data were correct. This flag gates BOTH `maybeAutoConnect()` call
+    /// sites and only flips true a beat after the intro reveals the pairing screen, so the user
+    /// genuinely sees it exists before any automatic navigation away from it.
+    @State private var autoConnectGraceElapsed = false
+    /// How long `PairingView` must be visibly on-screen after the intro reveals it before
+    /// auto-connect is allowed to navigate away -- long enough to register as a real screen,
+    /// short enough that a returning user reaching for a known-reachable Dev Mac still feels
+    /// instant.
+    private static let autoConnectGracePeriod: TimeInterval = 0.6
+
     /// The hidden diagnostics screen, opened by shaking the device (or the
     /// long-press affordance on the pairing header).
     @State private var showDiagnostics = false
@@ -73,6 +88,7 @@ struct ContentView: View {
         ZStack {
             NavigationStack(path: $path) {
                 PairingView(onConnect: { ticket, pin in
+                    profileStore.markConnected(ticket: ticket)
                     path.append(.main(ticket: ticket, pin: pin))
                 }, onInteract: {
                     userEngagedPairing = true
@@ -96,9 +112,11 @@ struct ContentView: View {
                 guard path.isEmpty, let auto = Self.autoPairFromEnvironment else { return }
                 path.append(.main(ticket: auto.ticket, pin: auto.pin))
             }
-            // The default profile's ticket can change at runtime (Group: ticket
-            // refresh) -- keep the monitor pointed at the current one.
-            .onChange(of: profileStore.defaultProfile?.ticket) { _, newTicket in
+            // The auto-connect target's ticket can change at runtime (Group: ticket refresh,
+            // or a fresh profile just became the last-connected one) -- keep the monitor
+            // pointed at whichever profile auto-connect would actually dial, not always the
+            // synthesized Dev Mac default, so the reachability gate matches the real target.
+            .onChange(of: profileStore.autoConnectProfile?.ticket) { _, newTicket in
                 reachability.ticket = newTicket ?? ""
                 reachability.checkNow()
             }
@@ -117,10 +135,13 @@ struct ContentView: View {
                     withAnimation(.easeInOut(duration: 0.6)) {
                         showIntro = false
                     }
-                    // Reveal hands off to the live session directly when the
-                    // daemon is already reachable -- otherwise the pairing
-                    // screen it fades to.
-                    maybeAutoConnect()
+                    // Reveal hands off to the live session once the pairing screen has had a
+                    // real moment on-screen -- not the instant the intro finishes fading (see
+                    // `autoConnectGraceElapsed`'s doc).
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.autoConnectGracePeriod) {
+                        autoConnectGraceElapsed = true
+                        maybeAutoConnect()
+                    }
                 }
                 .transition(.opacity.combined(with: .scale(scale: 1.08, anchor: .top)))
                 .zIndex(1)
@@ -136,10 +157,10 @@ struct ContentView: View {
         }
     }
 
-    /// Points the monitor at the current default ticket and begins periodic
+    /// Points the monitor at the current auto-connect target's ticket and begins periodic
     /// probing. Safe to call repeatedly (start() is an idempotent restart).
     private func startReachability() {
-        if let ticket = profileStore.defaultProfile?.ticket, reachability.ticket != ticket {
+        if let ticket = profileStore.autoConnectProfile?.ticket, reachability.ticket != ticket {
             reachability.ticket = ticket
         }
         reachability.start()
@@ -152,6 +173,7 @@ struct ContentView: View {
     /// the daemon is confirmed reachable.
     private func maybeAutoConnect() {
         guard autoConnectEnabled,
+              autoConnectGraceElapsed,
               !didAttemptAutoConnect,
               !userEngagedPairing,
               !manualDisconnectThisSession,
@@ -159,11 +181,12 @@ struct ContentView: View {
               path.isEmpty,
               Self.autoPairFromEnvironment == nil,
               reachability.state == .reachable,
-              let def = profileStore.defaultProfile
+              let def = profileStore.autoConnectProfile
         else { return }
         didAttemptAutoConnect = true
-        ConnectionDiagnostics.shared.note("auto-connect: Dev Mac reachable -> opening session")
+        ConnectionDiagnostics.shared.note("auto-connect: \(def.name) reachable -> opening session")
         Haptics.fire(.connect)
+        profileStore.markConnected(ticket: def.ticket)
         path.append(.main(ticket: def.ticket, pin: def.pin))
     }
 }
