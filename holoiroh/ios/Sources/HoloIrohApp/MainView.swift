@@ -162,6 +162,13 @@ struct MainView: View {
     /// measurement lands, so `boxShift` is never computed against zero.
     @State private var measuredBarStackHeight: CGFloat = 96
 
+    /// Real, live-measured height of `remoteTypeBar`, same `ViewHeightKey`
+    /// discipline as `measuredBarStackHeight` above -- used to compute exactly
+    /// how far the bar itself must rise to clear the keyboard, independent of
+    /// the (now-stationary-during-remote-typing) video box's own position. See
+    /// `remoteTypeBarShift(boxBottomY:screenHeight:)`.
+    @State private var measuredRemoteTypeBarHeight: CGFloat = 56
+
     /// The real system keyboard-animation duration for the CURRENT show/hide,
     /// captured from `keyboardWillShowNotification`'s own userInfo
     /// (`UIResponder.keyboardAnimationDurationUserInfoKey`) instead of an
@@ -339,7 +346,17 @@ struct MainView: View {
             // is just the command bar or also carries the clarify panel/
             // recent-prompts strip/thinking row above it.
             let barClearance: CGFloat = measuredBarStackHeight + 8
-            let boxShift = keyboardHeight > 0
+            // Gated on `isPromptFocused` (the MAIN command bar), NOT on
+            // `keyboardHeight` alone: `keyboardHeight` is a single global signal
+            // that rises identically whether the command bar's field OR the
+            // remote-type overlay's field is what's focused, and `remoteTypeBar`
+            // is an overlay riding along with the box's own position -- so
+            // without this gate, focusing the remote-type field ALSO shoved the
+            // whole live-share video out of view (live-reported: "it moves the
+            // screenshare up so i cant see it"), even though watching the video
+            // update live is the entire point of remote-typing. The command
+            // bar's own shelf behavior (this IS its rise) is unaffected.
+            let boxShift = (keyboardHeight > 0 && isPromptFocused)
                 ? max(0, keyboardHeight + barClearance - spaceBelowBox)
                 : 0
 
@@ -533,6 +550,23 @@ struct MainView: View {
     }
 
     // MARK: - Keyboard shelf helpers
+
+    /// How far `remoteTypeBar` must rise (independent of the video box, which
+    /// stays put -- see `boxShift`'s doc) to clear the keyboard, when the
+    /// remote-typing field is what's focused. Pure function of already-known
+    /// geometry so it's directly probe-testable without a live keyboard.
+    ///
+    /// `boxBottomY` is the box's bottom edge in screen coordinates (its natural
+    /// resting position, since the box no longer shifts for this case);
+    /// `remoteTypeBar` sits `14`pt below that (its own `.padding(.bottom, 14)`)
+    /// plus its own real measured height. If that natural bottom edge is
+    /// already above the keyboard's top edge, no rise is needed.
+    private func remoteTypeBarShift(boxBottomY: CGFloat, screenHeight: CGFloat) -> CGFloat {
+        guard isRemoteTypeFocused, keyboardHeight > 0 else { return 0 }
+        let naturalBottomY = boxBottomY + 14 + measuredRemoteTypeBarHeight
+        let keyboardTopY = screenHeight - keyboardHeight
+        return max(0, naturalBottomY - keyboardTopY + 8)
+    }
 
     /// Reads the REAL keyboard-animation duration out of a keyboard
     /// show/hide/change-frame notification's userInfo, so the command-bar's
@@ -1251,11 +1285,16 @@ struct MainView: View {
                             .accessibilityLabel("Zoom \(String(format: "%.1f", liveScale))x, double tap to reset")
                         }
                     }
-                    // Hands-on control: a touch surface over the video that
-                    // injects the user's taps/drags/scrolls as remote input,
-                    // plus a toggle and a banner. The surface (a UIView) consumes
-                    // all touches while active, so the zoom/pan/pinch gestures
-                    // below never fire during control.
+                    // Hands-on control: a touch surface over the video that injects
+                    // the user's taps/drags/scrolls as remote input, plus a toggle
+                    // and a banner. The pan/tap gestures below are explicitly
+                    // GestureMask.none'd while controlling (a plain `.overlay`
+                    // does NOT, by itself, stop a `simultaneousGesture` elsewhere in
+                    // the hierarchy from also recognizing the same touch -- that was
+                    // this section's own prior, incorrect assumption, and the
+                    // resulting double-interpretation was the live-reported "pan/zoom
+                    // accidentally moves the cursor" bug). Pinch stays active
+                    // unconditionally -- see its own doc below.
                     .overlay {
                         if isControllingRemotely {
                             RemoteControlSurface(frameSize: frameSource.lastFrameSize) { ev in
@@ -1281,16 +1320,38 @@ struct MainView: View {
                     .overlay(alignment: .bottom) {
                         if isControllingRemotely, showRemoteTypeOverlay {
                             remoteTypeBar
+                                .background(
+                                    GeometryReader { barGeo in
+                                        Color.clear.preference(key: ViewHeightKey.self, value: barGeo.size.height)
+                                    }
+                                )
+                                .onPreferenceChange(ViewHeightKey.self) { measuredRemoteTypeBarHeight = $0 }
                                 .padding(.bottom, 14)
+                                // Independent of `boxShift` (which stays 0 while
+                                // remote-typing -- see its own doc) so the video
+                                // never moves: only this bar rises, by exactly
+                                // enough to clear the keyboard from ITS OWN
+                                // natural (unshifted) position, using the same
+                                // real-measured-height discipline as the command
+                                // bar's `measuredBarStackHeight` rather than a
+                                // hardcoded guess.
+                                .offset(y: -remoteTypeBarShift(boxBottomY: boxCenterY + boxHeight / 2, screenHeight: size.height))
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
                         }
                     }
                     .animation(.easeOut(duration: 0.18), value: liveScale > 1.01)
                     .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isControllingRemotely)
+                    .animation(.easeInOut(duration: keyboardAnimationDuration), value: isRemoteTypeFocused)
                     .animation(.spring(response: 0.3, dampingFraction: 0.9), value: showRemoteTypeOverlay)
                     .contentShape(Rectangle())
-                    // Pinch to zoom. `simultaneousGesture` so it composes
-                    // with the pan drag below and never blocks the taps.
+                    // Pinch to zoom -- stays active even while controlling remotely
+                    // (unlike the pan/tap gestures below): pinch has no meaning as a
+                    // remote-mouse action, so there's nothing for it to conflict with.
+                    // `RemoteControlSurface`'s own pan2 (2-finger drag -> remote scroll)
+                    // now backs off during a genuine pinch (see its `pinch.require`
+                    // wiring), so this can't misfire a stray remote scroll either.
+                    // `simultaneousGesture` so it composes with the pan drag below and
+                    // never blocks the taps.
                     .simultaneousGesture(
                         MagnificationGesture()
                             .updating($pinchScale) { value, state, _ in
@@ -1301,9 +1362,22 @@ struct MainView: View {
                                 panOffset = clampedPan(panOffset, scale: zoomScale, viewport: viewport)
                             }
                     )
-                    // Drag to pan -- only once zoomed (at fit, the drag is
-                    // ignored so it can never swallow scroll-ish intents).
-                    // minimumDistance keeps single/double taps working.
+                    // Drag to pan -- only once zoomed (at fit, the drag is ignored so
+                    // it can never swallow scroll-ish intents). minimumDistance keeps
+                    // single/double taps working.
+                    //
+                    // GATED OFF (GestureMask.none) while isControllingRemotely: a
+                    // 1-finger drag on the video during control is UNAMBIGUOUSLY
+                    // "move the remote cursor" (RemoteControlSurface's own pan1) --
+                    // this local viewport-pan gesture is a DIFFERENT interpretation of
+                    // the identical touch shape, and being a `simultaneousGesture`
+                    // (deliberately non-exclusive) it does not lose the arbitration on
+                    // its own. Live-witnessed as the reported bug: panning/dragging
+                    // while in control also dragged the remote pointer, "accidentally
+                    // mov[ing] the cursor around or highlight[ing]/click[ing] things."
+                    // `.none` fully removes this recognizer from the touch pipeline
+                    // during control, rather than merely no-op'ing its callback (which
+                    // would still let it compete for/consume the touch).
                     .simultaneousGesture(
                         DragGesture(minimumDistance: 12)
                             .updating($panDrag) { value, state, _ in
@@ -1320,23 +1394,32 @@ struct MainView: View {
                                     scale: zoomScale,
                                     viewport: viewport
                                 )
-                            }
+                            },
+                        including: isControllingRemotely ? .none : .all
                     )
-                    // Double-tap: reset zoom (attached BEFORE the single-tap
-                    // so SwiftUI sequences them; the single-tap then only
-                    // fires when a second tap doesn't follow).
-                    .onTapGesture(count: 2) {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                            resetZoom()
-                        }
-                    }
-                    .onTapGesture {
-                        if !isVideoFullscreen {
-                            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                                isVideoFullscreen = true
+                    // Double-tap: reset zoom (attached BEFORE the single-tap so
+                    // SwiftUI sequences them; the single-tap then only fires when a
+                    // second tap doesn't follow). Also gated off during control -- a
+                    // tap on the video while controlling is a remote click
+                    // (RemoteControlSurface's own tap), not a local zoom-reset.
+                    .gesture(
+                        TapGesture(count: 2).onEnded {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                                resetZoom()
                             }
-                        }
-                    }
+                        },
+                        including: isControllingRemotely ? .none : .all
+                    )
+                    .gesture(
+                        TapGesture().onEnded {
+                            if !isVideoFullscreen {
+                                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                    isVideoFullscreen = true
+                                }
+                            }
+                        },
+                        including: isControllingRemotely ? .none : .all
+                    )
                     .accessibilityLabel("Live remote view of the Mac")
                     .position(
                         x: size.width / 2,
@@ -1852,8 +1935,22 @@ struct MainView: View {
     /// never a duplicate send path. Bounded height (a single-line field, not
     /// the multi-line command-bar editor) so it only ever covers a small
     /// strip of the live view.
+    ///
+    /// Deliberately styled in the SAME orange this app already uses for every
+    /// other "you are actively remote-controlling" signal (the toggle icon,
+    /// the "You're in control" banner) -- a leading cursor glyph plus an
+    /// orange-tinted border, instead of the command bar's neutral white/gray
+    /// chrome -- so a glance distinguishes "typing into the remote screen"
+    /// from "composing a new agent task" even before reading the placeholder
+    /// text. Its keyboard-rise is ALSO independently animated from the
+    /// command bar's (see `remoteTypeBarShift`'s doc) -- the two typing
+    /// interactions look and move differently on purpose.
     private var remoteTypeBar: some View {
         HStack(spacing: 10) {
+            Image(systemName: "cursorarrow.rays")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.orange)
+
             TextField(
                 "",
                 text: $promptText,
@@ -1895,7 +1992,7 @@ struct MainView: View {
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.14), lineWidth: 1)
+                .strokeBorder(Color.orange.opacity(0.55), lineWidth: 1.5)
         )
         .padding(.horizontal, 24)
         .safeAreaPadding(.horizontal)

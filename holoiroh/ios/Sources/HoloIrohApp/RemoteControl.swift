@@ -161,6 +161,21 @@ struct RemoteControlSurface: UIViewRepresentable {
         pan2.minimumNumberOfTouches = 2
         pan2.maximumNumberOfTouches = 2
         v.addGestureRecognizer(pan2)
+
+        // Silent pinch-detector: never sends anything itself (the LOCAL
+        // MagnificationGesture elsewhere in the hierarchy owns the actual visual
+        // zoom) -- it exists solely so `pan2.require(toFail:)` can make the
+        // 2-finger-drag-to-scroll recognizer back off while the touches are
+        // actually a pinch. Without this, a real pinch's small translational
+        // component (two fingers moving apart/together are rarely perfectly
+        // symmetric) was ALSO recognized by `pan2` as a pan, sending stray
+        // `.scroll` events to the remote Mac on every local zoom gesture --
+        // part of the live-reported "zoom in and out... accidentally... clicks
+        // things" bug (the other part was the pan1-vs-local-pan conflict, fixed
+        // in MainView's gesture gating).
+        let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.onPinchNoop(_:)))
+        v.addGestureRecognizer(pinch)
+        pan2.require(toFail: pinch)
         // Let a tap still register even though a pan is present.
         tap.require(toFail: pan1)
         return v
@@ -179,6 +194,12 @@ struct RemoteControlSurface: UIViewRepresentable {
             let frame = parent.frameSize ?? view.bounds.size
             return normalizedInVideo(touch: p, viewSize: view.bounds.size, frameSize: frame)
         }
+
+        // Intentionally does nothing -- see `pinch`'s doc in `makeUIView`. This
+        // recognizer exists only to make `pan2` back off during a real pinch;
+        // the visual zoom itself is owned entirely by the LOCAL
+        // MagnificationGesture elsewhere in the view hierarchy.
+        @objc func onPinchNoop(_ g: UIPinchGestureRecognizer) {}
 
         @objc func onTap(_ g: UITapGestureRecognizer) {
             guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
