@@ -5,15 +5,25 @@ import QuartzCore
 
 /// Debug-only empirical frame-timing witness for the video pan/zoom
 /// performance investigation (the reported "panning and scrolling is choppy"
-/// bug). Not automatable-by-touch: `@GestureState` can only be mutated by a
-/// real `UIGestureRecognizer` in flight, but the actual rendering/diffing
-/// cost a pinch or pan gesture triggers is identical to varying the plain
-/// `@State` `zoomScale`/`panOffset` at the same frequency (both feed the same
-/// `liveScale`/`liveOffset` computation `videoOverlay` renders from) -- so a
-/// synthetic high-frequency state-update loop exercises the SAME code path a
-/// human's fingers would, without requiring device touch-automation tooling
-/// this session doesn't have. `CADisplayLink` measures the real per-frame
-/// cost this drives, on real hardware.
+/// bug). `@GestureState` can only be mutated by a real `UIGestureRecognizer`
+/// in flight, so this drives the plain `@State` `zoomScale`/`panOffset`
+/// instead -- the only state a synthetic loop can reach without device
+/// touch-automation tooling this session doesn't have. `CADisplayLink`
+/// measures the real per-frame cost that drives, on real hardware.
+///
+/// IMPORTANT, live-witnessed caveat: `zoomScale`/`panOffset` are owned by
+/// `MainView` in BOTH the pre- and post-`PanZoomVideoSurface` code (passed to
+/// the child only as a `Binding`) -- `pinchScale`/`panDrag`, the
+/// `@GestureState` a REAL pinch/pan actually ticks, is what moved into the
+/// child. Driving `zoomScale`/`panOffset` therefore invalidates
+/// `MainView.body` in both versions equally and never exercises the
+/// per-View-struct `@GestureState` scoping the refactor optimizes -- a
+/// before/after comparison using this harness measures a different, less
+/// relevant code path (repeated `Binding` writes through an extra view
+/// layer), not the live-touch-gesture win. Treat its numbers as raw data
+/// about that path, not as confirmation either way of the real fix's effect;
+/// see the `measure-after-refactor` PRD resolution for the full comparison
+/// and why it came out the "wrong" direction for exactly this reason.
 ///
 /// Gated behind `HOLOIROH_FRAME_TIMING_PROBE=1` (same convention as this
 /// file's sibling `HOLOIROH_DEBUG_*` hooks in MainView.swift), `#if DEBUG`

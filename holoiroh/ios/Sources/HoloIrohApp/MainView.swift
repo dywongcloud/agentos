@@ -1816,15 +1816,18 @@ struct MainView: View {
     }
 
     #if DEBUG
-    /// Empirical witness for the video pan/zoom performance investigation
-    /// (see `FrameTimingProbe.swift`'s doc for why this is a legitimate
-    /// substitute for a real touch gesture). Drives `zoomScale`/`panOffset`
-    /// -- the SAME state `videoOverlay`'s `liveScale`/`liveOffset` read --
-    /// at roughly the rate a real pinch/pan gesture updates `@GestureState`,
-    /// for `HOLOIROH_FRAME_TIMING_PROBE_SECONDS` seconds (default 4), while a
-    /// `CADisplayLink` measures actual per-frame cost. Zoom/pan are restored
-    /// to identity afterward so the probe never leaves the view visibly
-    /// altered. Triggered once per launch by `HOLOIROH_FRAME_TIMING_PROBE=1`.
+    /// Empirical witness for the video pan/zoom performance investigation --
+    /// see `FrameTimingProbe.swift`'s doc for the full caveat: this drives
+    /// `zoomScale`/`panOffset` (the `MainView`-owned `@State` `PanZoomVideoSurface`
+    /// receives as a `Binding`), NOT `pinchScale`/`panDrag` (the `@GestureState`
+    /// that actually moved into that child and is what a real pinch/pan ticks),
+    /// so it does not isolate that specific optimization -- read its numbers
+    /// as raw data about a different code path, not as before/after proof.
+    /// Runs for `HOLOIROH_FRAME_TIMING_PROBE_SECONDS` seconds (default 4)
+    /// while a `CADisplayLink` measures actual per-frame cost. Zoom/pan are
+    /// restored to identity afterward so the probe never leaves the view
+    /// visibly altered. Triggered once per launch by
+    /// `HOLOIROH_FRAME_TIMING_PROBE=1`.
     private func runFrameTimingProbe() {
         let seconds = Double(ProcessInfo.processInfo.environment["HOLOIROH_FRAME_TIMING_PROBE_SECONDS"] ?? "") ?? 4.0
         let probe = FrameTimingProbe(label: "video-pan-zoom") { _ in }
