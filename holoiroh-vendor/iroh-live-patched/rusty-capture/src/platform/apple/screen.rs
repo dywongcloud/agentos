@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicU32, Ordering},
         mpsc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -216,6 +216,15 @@ impl SCStreamOutputTrait for FrameHandler {
     }
 }
 
+/// How this capturer's target was originally selected — retained so a dead
+/// capture stream can be torn down and rebuilt against the identical target
+/// once it becomes capturable again (see `MacScreenCapturer::rebuild_stream`).
+#[derive(Clone, Debug)]
+enum CaptureTarget {
+    Display(MonitorInfo),
+    Window(u32),
+}
+
 /// macOS screen capturer via ScreenCaptureKit.
 #[derive(derive_more::Debug)]
 pub struct MacScreenCapturer {
@@ -231,6 +240,12 @@ pub struct MacScreenCapturer {
     rx: mpsc::Receiver<VideoFrame>, // bounded via SyncSender
     #[debug(skip)]
     stream: SCStream,
+    target: CaptureTarget,
+    #[debug(skip)]
+    config: ScreenConfig,
+    /// Rate-limits `try_recover_if_target_gone`'s `SCShareableContent`
+    /// re-enumeration so a stalled poll loop doesn't hammer it.
+    last_recovery_check: Option<Instant>,
 }
 
 impl MacScreenCapturer {
@@ -266,7 +281,7 @@ impl MacScreenCapturer {
 
         let filter = SCContentFilter::create().with_window(&window).build();
 
-        Self::start_stream(width, height, filter, config)
+        Self::start_stream(width, height, filter, CaptureTarget::Window(window_id), config)
     }
 
     /// Creates a screen capturer for the given monitor.
@@ -303,15 +318,39 @@ impl MacScreenCapturer {
             .with_excluding_windows(&[])
             .build();
 
-        Self::start_stream(width, height, filter, config)
+        Self::start_stream(width, height, filter, CaptureTarget::Display(monitor.clone()), config)
     }
 
     fn start_stream(
         width: u32,
         height: u32,
         filter: SCContentFilter,
+        target: CaptureTarget,
         config: &ScreenConfig,
     ) -> Result<Self> {
+        let (stream, rx, actual_dims) = Self::build_stream(width, height, filter, config)?;
+
+        Ok(Self {
+            requested_width: width,
+            requested_height: height,
+            actual_dims,
+            rx,
+            stream,
+            target,
+            config: config.clone(),
+            last_recovery_check: None,
+        })
+    }
+
+    /// Constructs a fresh `SCStream` (+ its frame channel/dims) for the given
+    /// resolved filter. Pure construction, no `Self` bookkeeping — shared by
+    /// `start_stream` (initial construction) and `rebuild_stream` (recovery).
+    fn build_stream(
+        width: u32,
+        height: u32,
+        filter: SCContentFilter,
+        config: &ScreenConfig,
+    ) -> Result<(SCStream, mpsc::Receiver<VideoFrame>, Arc<ActualDimensions>)> {
         let mut stream_config = SCStreamConfiguration::new()
             .with_width(width)
             .with_height(height)
@@ -343,13 +382,159 @@ impl MacScreenCapturer {
 
         info!(width, height, "macOS screen capture started");
 
-        Ok(Self {
-            requested_width: width,
-            requested_height: height,
-            actual_dims,
-            rx: frame_rx,
-            stream,
-        })
+        Ok((stream, frame_rx, actual_dims))
+    }
+
+    /// How often a no-new-frame poll re-verifies the capture target is still
+    /// enumerable via `SCShareableContent`, the cheap check
+    /// `try_recover_if_target_gone` uses to decide whether to rebuild.
+    const RECOVERY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+    /// Live-witnessed root cause of a permanently frozen live-share view:
+    /// when the Mac reaches its login/lock screen, ScreenCaptureKit can stop
+    /// the running `SCStream` out from under this wrapper (`SCStream error
+    /// (System stopped the stream)`) or fail to find any capturable
+    /// display/window at all (`SCStream error (No capture source
+    /// provided)`) — both observed as raw diagnostic prints from the
+    /// `screencapturekit` crate/framework, NOT as a `Result` this Rust code
+    /// can catch. Frames simply stop arriving forever: the last frame stays
+    /// frozen on every viewer's screen, with zero errors surfaced anywhere,
+    /// since neither this struct nor `SharedVideoSource`'s poll loop
+    /// (`moq-media/src/publish.rs`) previously noticed.
+    ///
+    /// Deliberately NOT triggered by frame-arrival timing: ScreenCaptureKit
+    /// is dirty-region-driven, not a fixed-rate camera, so genuinely static
+    /// on-screen content can legitimately produce no new frames for long
+    /// stretches — treating that as failure would rebuild a perfectly
+    /// healthy stream. Instead, this periodically re-enumerates
+    /// `SCShareableContent` and checks whether THIS capturer's own target is
+    /// still present — the same unambiguous signal ScreenCaptureKit's own
+    /// uncatchable error already reported, checked directly. On absence (or
+    /// a transient enumeration error), tears down the dead stream and
+    /// rebuilds it from the retained target/config, self-healing the moment
+    /// the target becomes capturable again (e.g. the Mac is unlocked) with
+    /// no daemon restart required.
+    ///
+    /// Called from `pop_frame()` only when no new frame was ready this poll,
+    /// rate-limited to `RECOVERY_CHECK_INTERVAL` so the enumeration call
+    /// doesn't run on every tight-loop poll. Never returns `Err` — a failed
+    /// recovery attempt is retried on the next interval, since
+    /// `SharedVideoSource`'s poll loop treats any `Err` from `pop_frame()`
+    /// as fatal and permanently kills the capture thread.
+    fn try_recover_if_target_gone(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_recovery_check {
+            if now.duration_since(last) < Self::RECOVERY_CHECK_INTERVAL {
+                return;
+            }
+        }
+        self.last_recovery_check = Some(now);
+
+        let target_present = match SCShareableContent::get() {
+            Ok(content) => match &self.target {
+                CaptureTarget::Display(monitor) => {
+                    let display_id: Option<u32> = monitor
+                        .id
+                        .strip_prefix("macos-display-")
+                        .and_then(|s| s.parse().ok());
+                    match display_id {
+                        Some(did) => content.displays().into_iter().any(|d| d.display_id() == did),
+                        None => !content.displays().is_empty(),
+                    }
+                }
+                CaptureTarget::Window(window_id) => content
+                    .windows()
+                    .into_iter()
+                    .any(|w| w.window_id() == *window_id),
+            },
+            Err(_) => false,
+        };
+
+        if target_present {
+            return;
+        }
+
+        warn!(
+            "screen capture target no longer enumerable (Mac likely at a login/lock screen or \
+             fast-user-switch) -- rebuilding the capture stream so it self-heals once capturable \
+             again"
+        );
+        if let Err(e) = self.rebuild_stream() {
+            tracing::debug!("capture stream rebuild attempt failed, will retry: {e:?}");
+        } else {
+            info!("screen capture stream rebuilt successfully, resuming");
+        }
+    }
+
+    /// Tears down the current (dead) `SCStream` and constructs a fresh one
+    /// against the same retained target/config — the instance-method
+    /// equivalent of `new`/`new_window`, reused by `try_recover_if_target_gone`.
+    fn rebuild_stream(&mut self) -> Result<()> {
+        let content = SCShareableContent::get()
+            .map_err(|e| anyhow::anyhow!("ScreenCaptureKit: failed to get content: {e:?}"))?;
+
+        let (width, height, filter) = match &self.target {
+            CaptureTarget::Display(monitor) => {
+                let display_id: Option<u32> = monitor
+                    .id
+                    .strip_prefix("macos-display-")
+                    .and_then(|s| s.parse().ok());
+                let displays = content.displays();
+                let display = if let Some(did) = display_id {
+                    displays
+                        .into_iter()
+                        .find(|d| d.display_id() == did)
+                        .context("display not found")?
+                } else {
+                    displays.into_iter().next().context("no displays available")?
+                };
+                let width = display.width() as u32;
+                let height = display.height() as u32;
+                let filter = SCContentFilter::create()
+                    .with_display(&display)
+                    .with_excluding_windows(&[])
+                    .build();
+                (width, height, filter)
+            }
+            CaptureTarget::Window(window_id) => {
+                let window = content
+                    .windows()
+                    .into_iter()
+                    .find(|w| w.window_id() == *window_id)
+                    .context("window not found")?;
+                let frame = window.frame();
+                let displays = content.displays();
+                let cx = frame.x + frame.width / 2.0;
+                let cy = frame.y + frame.height / 2.0;
+                let scale = displays
+                    .iter()
+                    .find(|d| {
+                        let f = d.frame();
+                        cx >= f.x && cx < f.x + f.width && cy >= f.y && cy < f.y + f.height
+                    })
+                    .map(|d| display_scale_factor(d))
+                    .unwrap_or(2.0);
+                let width = (frame.width * scale) as u32;
+                let height = (frame.height * scale) as u32;
+                let filter = SCContentFilter::create().with_window(&window).build();
+                (width, height, filter)
+            }
+        };
+
+        let (stream, rx, actual_dims) = Self::build_stream(width, height, filter, &self.config)?;
+
+        // Best-effort: the old stream is almost certainly already dead, so a
+        // stop() failure here is expected and not actionable.
+        if let Err(e) = self.stream.stop_capture() {
+            tracing::debug!("stop_capture on the dead stream returned {e:?} (expected)");
+        }
+
+        self.stream = stream;
+        self.rx = rx;
+        self.actual_dims = actual_dims;
+        self.requested_width = width;
+        self.requested_height = height;
+        Ok(())
     }
 }
 
@@ -415,6 +600,9 @@ impl VideoSource for MacScreenCapturer {
         let mut latest = None;
         while let Ok(frame) = self.rx.try_recv() {
             latest = Some(frame);
+        }
+        if latest.is_none() {
+            self.try_recover_if_target_gone();
         }
         Ok(latest)
     }

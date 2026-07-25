@@ -1180,7 +1180,18 @@ impl SharedVideoSource {
                             }
                             let _ = tx.send(Some(frame));
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            // Live-witnessed: without a sleep here, a source with no
+                            // frame ready (e.g. ScreenCaptureKit gone quiet during a
+                            // login/lock-screen capture stall, or any dirty-region
+                            // source over static content) makes this loop spin as
+                            // fast as the CPU allows -- 100%+ sustained CPU on a
+                            // capture thread that has nothing to do. 2ms is far
+                            // below any real frame interval (33ms at 30fps), so it
+                            // adds no perceptible latency once a frame IS ready.
+                            const IDLE_POLL_SLEEP: Duration = Duration::from_millis(2);
+                            thread::sleep(IDLE_POLL_SLEEP);
+                        }
                         Err(_) => break,
                     }
                 }

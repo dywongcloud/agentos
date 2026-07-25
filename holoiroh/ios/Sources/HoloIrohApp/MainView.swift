@@ -1380,36 +1380,20 @@ struct MainView: View {
         }
     }
 
-    /// Twitch-style live overlay for fullscreen: the last few log entries as
-    /// a translucent feed, with the command bar below for sending prompts to
-    /// the agent without leaving the mirror. Fullscreen sends go DIRECTLY to
-    /// the daemon (no Reviewing detour): fullscreen is the live-driving mode.
+    /// Fullscreen bottom overlay: the task-control pill (when relevant) and
+    /// the command bar, for sending prompts to the agent without leaving the
+    /// mirror. Fullscreen sends go DIRECTLY to the daemon (no Reviewing
+    /// detour): fullscreen is the live-driving mode.
+    ///
+    /// Deliberately does NOT show a log feed here: an earlier "Twitch-style"
+    /// stack of the last 5 log entries covered a large fraction of the
+    /// screen once a burst of status messages arrived (reconnects, ticket
+    /// refreshes, lock-state changes) -- live-reported as the live share
+    /// becoming "unviewable" behind piled-up log entries. Full history is
+    /// still reachable via the sparkle button's controls sheet
+    /// (`logPanel`); fullscreen stays reserved for the video itself.
     private var fullscreenChatOverlay: some View {
         VStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(logEntries.suffix(5)) { entry in
-                    HStack(alignment: .top, spacing: 6) {
-                        Text(entry.message.kindLabel)
-                            .font(.system(.caption2, design: .monospaced).weight(.bold))
-                            .foregroundStyle(logColor(for: entry.message))
-                        Text(entry.message.displayText)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.92))
-                            .lineLimit(2)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(.ultraThinMaterial.opacity(0.9), in: RoundedRectangle(cornerRadius: 10))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 10)
-                            .stroke(.white.opacity(0.06), lineWidth: 1)
-                    )
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .animation(.spring(response: 0.3, dampingFraction: 0.9), value: logEntries.count)
-
             if isTaskActive || isTaskPaused {
                 taskControlBar
             }
@@ -1918,6 +1902,10 @@ struct MainView: View {
             }
             .padding(10)
             .safeAreaPadding(.trailing)
+            // Shifted below the fullscreen toggle (also `.topTrailing`, always visible) so the
+            // two buttons stack instead of overlapping while `isControllingRemotely` is true --
+            // live-reported: the keyboard button sat directly on top of the fullscreen button.
+            .offset(y: 54)
             .accessibilityLabel(showRemoteTypeOverlay ? "Hide typing keyboard" : "Type on the remote screen")
         }
     }

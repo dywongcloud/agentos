@@ -178,6 +178,22 @@ struct RemoteControlSurface: UIViewRepresentable {
         pan2.require(toFail: pinch)
         // Let a tap still register even though a pan is present.
         tap.require(toFail: pan1)
+
+        // Without an explicit delegate, UIKit's default arbitration treats
+        // every recognizer here as MUTUALLY EXCLUSIVE with recognizers on any
+        // OTHER view -- including the SwiftUI `MagnificationGesture` this
+        // surface floats directly on top of (`PanZoomVideoSurface`, a
+        // separate SwiftUI-hosted UIView). Live-reported: pinch-to-zoom
+        // simply stopped responding while in remote control -- `pinch` here
+        // (added only so `pan2.require(toFail:)` can defer to it, see its own
+        // doc) was silently WINNING that exclusivity race against the real
+        // zoom gesture underneath, since nothing told UIKit the two are
+        // allowed to recognize at once. `shouldRecognizeSimultaneouslyWith`
+        // is independent of `require(toFail:)` -- allowing simultaneous
+        // recognition here doesn't change pan2 still waiting on pinch to
+        // fail; it only stops these four recognizers from blocking whatever
+        // else is touching the screen underneath.
+        [tap, pan1, pan2, pinch].forEach { $0.delegate = context.coordinator }
         return v
     }
 
@@ -185,10 +201,22 @@ struct RemoteControlSurface: UIViewRepresentable {
         context.coordinator.parent = self
     }
 
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var parent: RemoteControlSurface
         private var oneFingerDown = false
         init(_ parent: RemoteControlSurface) { self.parent = parent }
+
+        /// Always allow simultaneous recognition -- see the doc on
+        /// `[tap, pan1, pan2, pinch].forEach { $0.delegate = ... }` in
+        /// `makeUIView` for why this surface's recognizers must never
+        /// exclude a gesture on a different view (e.g. the SwiftUI
+        /// `MagnificationGesture` this surface floats on top of).
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            true
+        }
 
         private func normalized(_ p: CGPoint, in view: UIView) -> CGPoint? {
             let frame = parent.frameSize ?? view.bounds.size
