@@ -204,6 +204,11 @@ struct RemoteControlSurface: UIViewRepresentable {
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var parent: RemoteControlSurface
         private var oneFingerDown = false
+        /// Last touch point that was actually over the video image, in
+        /// normalized coordinates. Used to release the mouse button when a drag
+        /// ends out in the letterbox, where there is no valid current point —
+        /// see `onPan1`.
+        private var lastInVideo: CGPoint?
         init(_ parent: RemoteControlSurface) { self.parent = parent }
 
         /// Always allow simultaneous recognition -- see the doc on
@@ -237,11 +242,32 @@ struct RemoteControlSurface: UIViewRepresentable {
         @objc func onPan1(_ g: UIPanGestureRecognizer) {
             guard let v = g.view else { return }
             let loc = g.location(in: v)
+
             guard let n = normalized(loc, in: v) else {
-                // Dragged into the letterbox: lift if we were holding.
-                if oneFingerDown, g.state == .changed { return }
+                // Touch is in the letterbox, outside the video image.
+                //
+                // This branch used to `return` unconditionally despite a comment
+                // promising to "lift if we were holding" — so ending a drag out
+                // in the letterbox never sent button-up and left the Mac's left
+                // mouse button PHYSICALLY HELD DOWN, with no touch left on screen
+                // to release it. The Mac would then select/drag everything the
+                // pointer crossed until the user happened to start and finish
+                // another drag inside the image.
+                //
+                // A terminal state must always release, using the last point that
+                // was actually over the video (the pointer never moved past it, so
+                // it is where the Mac's cursor really is).
+                if oneFingerDown, g.state == .ended || g.state == .cancelled || g.state == .failed {
+                    let p = lastInVideo ?? CGPoint(x: 0.5, y: 0.5)
+                    parent.onEvent(
+                        .button(x: Double(p.x), y: Double(p.y), button: .left, down: false)
+                    )
+                    oneFingerDown = false
+                }
                 return
             }
+
+            lastInVideo = n
             let x = Double(n.x), y = Double(n.y)
             switch g.state {
             case .began:

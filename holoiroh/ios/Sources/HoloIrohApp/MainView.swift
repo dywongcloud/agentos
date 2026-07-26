@@ -565,6 +565,16 @@ struct MainView: View {
         // same ticket + allowlisted device without a new PIN scan).
         .onChange(of: scenePhase) { _, newPhase in
             guard newPhase == .active else { return }
+            // Returning to the foreground replenishes the reconnect budget.
+            //
+            // It was otherwise only reset by a SUCCESSFUL connect, so a single
+            // window where the Mac was unreachable (asleep, off Wi-Fi, moved
+            // networks) burned all the attempts and left the session
+            // permanently unable to reconnect — for the rest of its life, even
+            // once the Mac came back — with the only escape being to force-quit
+            // the app. Coming back to the app is an explicit "try again" from
+            // the user and is exactly the right moment to grant a fresh budget.
+            reconnectAttempts = 0
             switch connection.phase {
             case .connected:
                 frameSource.stop()
@@ -703,6 +713,35 @@ struct MainView: View {
                                     .font(.caption)
                                     .foregroundStyle(.white.opacity(0.6))
                             }
+                        } else if case .failed = connection.phase {
+                            // A failed connection previously rendered the same
+                            // passive "Appears when your Mac connects" as idle,
+                            // so the one state the user needs to act on looked
+                            // identical to the one that needs no action, with no
+                            // visible way to retry. This is the only surface that
+                            // reports it — there is no banner or pill elsewhere.
+                            Text("Can't reach your Mac")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.white.opacity(0.75))
+                            Text("Make sure it's awake and on the same network.")
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.5))
+                                .multilineTextAlignment(.center)
+                            Button {
+                                // An explicit tap is a fresh intent, so it also
+                                // clears the bounded-retry budget.
+                                reconnectAttempts = 0
+                                attemptReconnect(reason: "manual retry")
+                            } label: {
+                                Text("Try again")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 7)
+                                    .background(Self.orbAccent.opacity(0.9), in: Capsule())
+                                    .foregroundStyle(.white)
+                            }
+                            .padding(.top, 2)
+                            .accessibilityLabel("Try connecting to your Mac again")
                         } else {
                             Text("Appears when your Mac connects")
                                 .font(.caption)
