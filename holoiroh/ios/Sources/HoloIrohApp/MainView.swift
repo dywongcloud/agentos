@@ -412,20 +412,32 @@ struct MainView: View {
                     // barShift/boxShift derivation above).
                     VStack(spacing: 8) {
                         Spacer()
-                        if isTaskActive || isTaskPaused {
-                            taskControlBar
+                        // The height probe is attached to THIS inner stack, not the
+                        // outer one. The outer VStack contains a `Spacer()`, so it
+                        // always fills the whole screen -- measuring it reported
+                        // ~844pt (the full height) as `measuredBarStackHeight`
+                        // instead of the ~100pt the bars actually occupy. That value
+                        // feeds `barClearance`, which feeds `boxShift`, so focusing
+                        // the prompt field shifted the live video up by roughly the
+                        // height of the screen and pushed it out of view entirely --
+                        // on a product where watching the screen while you type is
+                        // the point.
+                        VStack(spacing: 8) {
+                            if isTaskActive || isTaskPaused {
+                                taskControlBar
+                                    .padding(.horizontal, 16)
+                                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                            }
+                            commandBar
                                 .padding(.horizontal, 16)
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
+                                .padding(.bottom, 8)
                         }
-                        commandBar
-                            .padding(.horizontal, 16)
-                            .padding(.bottom, 8)
+                        .background(
+                            GeometryReader { stackGeo in
+                                Color.clear.preference(key: ViewHeightKey.self, value: stackGeo.size.height)
+                            }
+                        )
                     }
-                    .background(
-                        GeometryReader { stackGeo in
-                            Color.clear.preference(key: ViewHeightKey.self, value: stackGeo.size.height)
-                        }
-                    )
                     .onPreferenceChange(ViewHeightKey.self) { measuredBarStackHeight = $0 }
                     .offset(y: -barShift)
                     .animation(.spring(response: 0.3, dampingFraction: 0.9), value: isTaskActive || isTaskPaused)
