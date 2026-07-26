@@ -8,7 +8,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -182,6 +182,12 @@ struct FrameHandler {
     tx: mpsc::SyncSender<VideoFrame>,
     capture_start: Instant,
     actual_dims: Arc<ActualDimensions>,
+    /// Milliseconds-since-`capture_start` at which the most recent frame was
+    /// delivered. This is the capture stream's liveness heartbeat: ScreenCaptureKit
+    /// delivers continuously (~27fps, max observed inter-frame gap 226ms) even on a
+    /// completely static screen — measured by `examples/frame_arrival_pattern.rs` —
+    /// so a long gap unambiguously means the stream is dead, not that nothing moved.
+    last_frame_ms: Arc<AtomicU64>,
 }
 
 impl SCStreamOutputTrait for FrameHandler {
@@ -205,10 +211,10 @@ impl SCStreamOutputTrait for FrameHandler {
         let raw = pixel_buffer.as_ptr();
         let gpu_frame =
             unsafe { AppleGpuFrame::from_raw(raw, width, height, GpuPixelFormat::Bgra) };
-        let frame = VideoFrame::new_gpu(
-            GpuFrame::new(Arc::new(gpu_frame)),
-            self.capture_start.elapsed(),
-        );
+        let elapsed = self.capture_start.elapsed();
+        self.last_frame_ms
+            .store(elapsed.as_millis() as u64, Ordering::Relaxed);
+        let frame = VideoFrame::new_gpu(GpuFrame::new(Arc::new(gpu_frame)), elapsed);
 
         // Drop frame if channel is full — backpressure from the callback
         // thread. The consumer drains to latest anyway.
@@ -243,97 +249,92 @@ pub struct MacScreenCapturer {
     target: CaptureTarget,
     #[debug(skip)]
     config: ScreenConfig,
-    /// Raised by the background watchdog thread when the capture target stops
-    /// being enumerable. `pop_frame` only ever does a cheap atomic load of this
-    /// — the expensive enumeration that sets it happens off the frame-delivery
-    /// thread. See `spawn_target_watchdog`.
+    /// Raised by `spawn_liveness_watchdog` when frames stop arriving.
+    /// `pop_frame` only ever does a cheap atomic load of this.
     #[debug(skip)]
-    target_gone: Arc<AtomicBool>,
+    needs_rebuild: Arc<AtomicBool>,
     /// Signals the watchdog thread to exit when this capturer is dropped.
     #[debug(skip)]
     watchdog_shutdown: Arc<AtomicBool>,
-    /// Rate-limits *rebuild attempts* (not the detection, which the watchdog
-    /// owns) so a target that is enumerable-but-unopenable can't spin
-    /// `pop_frame` into a tight rebuild loop.
+    /// Shared timebase for frame timestamps AND the liveness heartbeat.
+    /// Deliberately preserved across `rebuild_stream` so frame timestamps do not
+    /// jump backwards to ~0 after a recovery — a backwards jump would re-anchor
+    /// the downstream pacing clock and stall playout.
+    #[debug(skip)]
+    epoch: Instant,
+    /// Millis-since-`epoch` of the last delivered frame; written by `FrameHandler`,
+    /// read by the watchdog.
+    #[debug(skip)]
+    last_frame_ms: Arc<AtomicU64>,
+    /// Rate-limits *rebuild attempts* (not detection) so a target that stays
+    /// unopenable can't spin `pop_frame` into a tight rebuild loop.
     last_rebuild_attempt: Option<Instant>,
 }
 
-/// Interval between background checks of whether the capture target still exists.
-const TARGET_WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
-/// Granularity of the watchdog's sleep, so `Drop` doesn't wait a full interval.
-const TARGET_WATCHDOG_TICK: Duration = Duration::from_millis(250);
-/// Minimum spacing between rebuild attempts once the target is reported gone.
-const REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Returns whether `target` is currently present in ScreenCaptureKit's
-/// enumeration. **Measured cost: 37–54ms** (live-witnessed via
-/// `examples/sck_enumeration_cost.rs`, 217 windows) — i.e. LONGER than one
-/// frame at 30fps. This must never be called on the frame-delivery thread;
-/// that is the entire reason the watchdog below exists.
-#[cfg(target_os = "macos")]
-fn target_is_present(target: &CaptureTarget) -> bool {
-    let Ok(content) = SCShareableContent::get() else {
-        // A transient enumeration failure is not proof the target is gone;
-        // treating it as "present" avoids a spurious stream rebuild.
-        return true;
-    };
-    match target {
-        CaptureTarget::Display(monitor) => {
-            let display_id: Option<u32> = monitor
-                .id
-                .strip_prefix("macos-display-")
-                .and_then(|s| s.parse().ok());
-            match display_id {
-                Some(did) => content.displays().into_iter().any(|d| d.display_id() == did),
-                None => !content.displays().is_empty(),
-            }
-        }
-        CaptureTarget::Window(window_id) => content
-            .windows()
-            .into_iter()
-            .any(|w| w.window_id() == *window_id),
-    }
-}
-
-/// Polls `target_is_present` on its own OS thread and publishes the answer as
-/// an atomic flag.
+/// How long the capture stream may deliver no frames before it is presumed dead.
 ///
-/// The whole point is that the ~40ms `SCShareableContent::get()` call happens
-/// HERE and not in `pop_frame`. An earlier version of this recovery logic called
-/// it inline on the poll thread every 10s; because that exceeds a 30fps frame
-/// budget, it produced a visible video hitch every 10 seconds — a self-inflicted
-/// regression on the exact smoothness this recovery exists to protect.
+/// ScreenCaptureKit delivers continuously even on a completely static screen —
+/// measured at ~27fps with a maximum inter-frame gap of 226ms over 20s of an
+/// untouched desktop (`examples/frame_arrival_pattern.rs`). 3s is >13x that
+/// worst observed gap, so this cannot fire on a merely idle screen.
+const FRAME_GAP_DEATH: Duration = Duration::from_secs(3);
+/// Granularity of the watchdog's sleep, so `Drop` doesn't wait a full interval.
+const WATCHDOG_TICK: Duration = Duration::from_millis(250);
+/// Minimum spacing between rebuild attempts while the stream stays dead.
+const REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Watches the capture stream's frame heartbeat and raises `needs_rebuild` when
+/// frames stop arriving.
+///
+/// Frame arrival — not target enumeration — is the death signal, for two reasons:
+///
+/// 1. **It catches strictly more failures.** The live-reported freeze was
+///    `SCStream error (System stopped the stream)`, where ScreenCaptureKit tears
+///    down the stream but the display *remains perfectly enumerable*. An
+///    enumeration-based check is blind to exactly that case, which is the one the
+///    user actually hit at the login/lock screen. Frames stopping covers it, and
+///    also covers the display genuinely disappearing (frames stop then too).
+/// 2. **It is free.** `SCShareableContent::get()` costs 37–54ms
+///    (`examples/sck_enumeration_cost.rs`) — longer than a frame at 30fps. Reading
+///    an atomic costs nothing, so the healthy path now pays *zero* overhead; the
+///    expensive enumeration happens only inside `rebuild_stream`, i.e. only once
+///    capture is already known dead and its cost cannot hurt anyone.
+///
+/// The earlier version of this logic had it backwards on both counts: it polled
+/// enumeration every 10s, on the frame-delivery thread, and still missed the
+/// actual failure mode.
 #[cfg(target_os = "macos")]
-fn spawn_target_watchdog(
-    target: CaptureTarget,
-    target_gone: Arc<AtomicBool>,
+fn spawn_liveness_watchdog(
+    epoch: Instant,
+    last_frame_ms: Arc<AtomicU64>,
+    needs_rebuild: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
-        .name("sck-target-watchdog".into())
+        .name("sck-liveness-watchdog".into())
         .spawn(move || {
-            let mut since_check = Duration::ZERO;
             loop {
                 if shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                std::thread::sleep(TARGET_WATCHDOG_TICK);
-                since_check += TARGET_WATCHDOG_TICK;
-                if since_check < TARGET_WATCHDOG_INTERVAL {
-                    continue;
-                }
-                since_check = Duration::ZERO;
+                std::thread::sleep(WATCHDOG_TICK);
                 if shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                let gone = !target_is_present(&target);
-                if gone && !target_gone.load(Ordering::Acquire) {
+                let now_ms = epoch.elapsed().as_millis() as u64;
+                let last_ms = last_frame_ms.load(Ordering::Relaxed);
+                let gap = Duration::from_millis(now_ms.saturating_sub(last_ms));
+                if gap < FRAME_GAP_DEATH {
+                    continue;
+                }
+                if !needs_rebuild.swap(true, Ordering::AcqRel) {
                     warn!(
-                        "screen capture target no longer enumerable (Mac likely at a login/lock \
-                         screen or fast-user-switch) -- flagging for stream rebuild"
+                        gap_ms = gap.as_millis() as u64,
+                        "screen capture delivered no frames for longer than the liveness threshold \
+                         (ScreenCaptureKit streams even a static screen, so this means the stream \
+                         is dead, not idle) -- flagging for rebuild"
                     );
                 }
-                target_gone.store(gone, Ordering::Release);
             }
         })
         .ok();
@@ -419,13 +420,17 @@ impl MacScreenCapturer {
         target: CaptureTarget,
         config: &ScreenConfig,
     ) -> Result<Self> {
-        let (stream, rx, actual_dims) = Self::build_stream(width, height, filter, config)?;
+        let epoch = Instant::now();
+        let last_frame_ms = Arc::new(AtomicU64::new(0));
+        let (stream, rx, actual_dims) =
+            Self::build_stream(width, height, filter, config, epoch, Arc::clone(&last_frame_ms))?;
 
-        let target_gone = Arc::new(AtomicBool::new(false));
+        let needs_rebuild = Arc::new(AtomicBool::new(false));
         let watchdog_shutdown = Arc::new(AtomicBool::new(false));
-        spawn_target_watchdog(
-            target.clone(),
-            Arc::clone(&target_gone),
+        spawn_liveness_watchdog(
+            epoch,
+            Arc::clone(&last_frame_ms),
+            Arc::clone(&needs_rebuild),
             Arc::clone(&watchdog_shutdown),
         );
 
@@ -437,8 +442,10 @@ impl MacScreenCapturer {
             stream,
             target,
             config: config.clone(),
-            target_gone,
+            needs_rebuild,
             watchdog_shutdown,
+            epoch,
+            last_frame_ms,
             last_rebuild_attempt: None,
         })
     }
@@ -451,6 +458,8 @@ impl MacScreenCapturer {
         height: u32,
         filter: SCContentFilter,
         config: &ScreenConfig,
+        epoch: Instant,
+        last_frame_ms: Arc<AtomicU64>,
     ) -> Result<(SCStream, mpsc::Receiver<VideoFrame>, Arc<ActualDimensions>)> {
         let mut stream_config = SCStreamConfiguration::new()
             .with_width(width)
@@ -471,8 +480,9 @@ impl MacScreenCapturer {
         let (frame_tx, frame_rx) = mpsc::sync_channel(2);
         let handler = FrameHandler {
             tx: frame_tx,
-            capture_start: Instant::now(),
+            capture_start: epoch,
             actual_dims: Arc::clone(&actual_dims),
+            last_frame_ms,
         };
 
         let mut stream = SCStream::new(&filter, &stream_config);
@@ -514,8 +524,8 @@ impl MacScreenCapturer {
     /// Never returns `Err`: `SharedVideoSource`'s poll loop treats any `Err`
     /// from `pop_frame` as fatal and permanently kills the capture thread, so a
     /// failed rebuild must only be logged and retried.
-    fn try_recover_if_target_gone(&mut self) {
-        if !self.target_gone.load(Ordering::Acquire) {
+    fn try_recover_if_stream_dead(&mut self) {
+        if !self.needs_rebuild.load(Ordering::Acquire) {
             return;
         }
 
@@ -530,12 +540,16 @@ impl MacScreenCapturer {
         match self.rebuild_stream() {
             Ok(()) => {
                 info!("screen capture stream rebuilt successfully, resuming");
-                // Let the watchdog re-confirm on its own cadence rather than
-                // assuming success sticks; clearing it here just stops this
-                // method from rebuilding again on the very next poll.
-                self.target_gone.store(false, Ordering::Release);
+                // Credit the heartbeat now so the watchdog gives the fresh stream
+                // a full FRAME_GAP_DEATH window to produce its first frame instead
+                // of immediately re-flagging it as dead.
+                self.last_frame_ms
+                    .store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                self.needs_rebuild.store(false, Ordering::Release);
             }
             Err(e) => {
+                // Expected while the Mac is genuinely locked: the target is not
+                // openable yet. Retried every REBUILD_RETRY_INTERVAL until it is.
                 tracing::debug!("capture stream rebuild attempt failed, will retry: {e:?}");
             }
         }
@@ -543,7 +557,7 @@ impl MacScreenCapturer {
 
     /// Tears down the current (dead) `SCStream` and constructs a fresh one
     /// against the same retained target/config — the instance-method
-    /// equivalent of `new`/`new_window`, reused by `try_recover_if_target_gone`.
+    /// equivalent of `new`/`new_window`, reused by `try_recover_if_stream_dead`.
     fn rebuild_stream(&mut self) -> Result<()> {
         let content = SCShareableContent::get()
             .map_err(|e| anyhow::anyhow!("ScreenCaptureKit: failed to get content: {e:?}"))?;
@@ -596,13 +610,23 @@ impl MacScreenCapturer {
             }
         };
 
-        let (stream, rx, actual_dims) = Self::build_stream(width, height, filter, &self.config)?;
-
-        // Best-effort: the old stream is almost certainly already dead, so a
-        // stop() failure here is expected and not actionable.
+        // Stop the old stream BEFORE starting the replacement. Building first
+        // would briefly run two SCStreams against the same display, doubling
+        // capture cost and letting the doomed stream race frames into the new
+        // handler. Best-effort: the old stream is almost certainly already dead,
+        // so a stop() failure here is expected and not actionable.
         if let Err(e) = self.stream.stop_capture() {
             tracing::debug!("stop_capture on the dead stream returned {e:?} (expected)");
         }
+
+        let (stream, rx, actual_dims) = Self::build_stream(
+            width,
+            height,
+            filter,
+            &self.config,
+            self.epoch,
+            Arc::clone(&self.last_frame_ms),
+        )?;
 
         self.stream = stream;
         self.rx = rx;
@@ -610,6 +634,19 @@ impl MacScreenCapturer {
         self.requested_width = width;
         self.requested_height = height;
         Ok(())
+    }
+
+    /// Test seam: stops the underlying `SCStream` while leaving this wrapper
+    /// otherwise untouched, reproducing exactly the live-reported failure
+    /// (`SCStream error (System stopped the stream)`) in which ScreenCaptureKit
+    /// tears the stream down but the display stays fully enumerable.
+    ///
+    /// That failure is otherwise only reachable by physically locking the Mac,
+    /// which makes the recovery path untestable in an automated way. Exposed so
+    /// `examples/recovery_after_stream_death.rs` can prove recovery works.
+    #[doc(hidden)]
+    pub fn __test_kill_stream(&mut self) {
+        let _ = self.stream.stop_capture();
     }
 }
 
@@ -687,7 +724,7 @@ impl VideoSource for MacScreenCapturer {
             latest = Some(frame);
         }
         if latest.is_none() {
-            self.try_recover_if_target_gone();
+            self.try_recover_if_stream_dead();
         }
         Ok(latest)
     }
