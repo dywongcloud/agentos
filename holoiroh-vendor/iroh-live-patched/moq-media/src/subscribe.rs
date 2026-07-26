@@ -381,9 +381,26 @@ impl RemoteBroadcast {
             });
             (watchable, task)
         };
-        // Always create the Sync (100 ms jitter default). It is only
-        // passed to pipelines when SyncMode::Synced is active.
-        let sync = crate::sync::Sync::new();
+        // 20ms, not the 100ms default.
+        //
+        // The default exists to align audio with video. This product publishes
+        // NO audio track, and the decoded-frame channel downstream is a
+        // single-slot latest-wins slot, so a large buffer buys no continuity —
+        // it lands entirely on glass-to-glass latency and on the touch-to-cursor
+        // feedback loop of hands-on remote control, where 100ms is very visible.
+        //
+        // Deliberately NOT `SyncMode::Unmanaged`: the `sleep_ms <= 0 => render
+        // immediately` path inside the synced clock is the decode loop's ONLY
+        // skip-to-live mechanism, and the FramePacer fallback never drops or
+        // skips, so going unmanaged would let post-congestion lag accumulate
+        // permanently instead of catching up.
+        //
+        // Paired with propagating the real capture PTS in VtbEncoder: that
+        // encoder previously stamped a synthetic frame counter, which pinned
+        // this clock's reference open and left the buffer inert. Fixing the PTS
+        // alone would have ACTIVATED the full 100ms and made latency worse, so
+        // the two must land together.
+        let sync = crate::sync::Sync::with_jitter(std::time::Duration::from_millis(20));
 
         Ok(Self {
             broadcast_name,

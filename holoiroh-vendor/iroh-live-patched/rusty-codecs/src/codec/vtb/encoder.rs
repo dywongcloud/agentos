@@ -68,6 +68,9 @@ pub struct VtbEncoder {
     /// Force the next encoded frame to be a keyframe. Set after priming so
     /// the first real frame is an IDR instead of waiting MaxKeyFrameInterval.
     force_next_keyframe: bool,
+    /// Microseconds of the last PTS actually submitted to VideoToolbox, used to
+    /// enforce strict monotonicity when propagating real capture timestamps.
+    last_pts_us: Option<i64>,
 }
 
 // Safety: VTCompressionSession is thread-safe per Apple documentation.
@@ -185,6 +188,7 @@ impl VtbEncoder {
             scale_mode: config.scale_mode,
             scaler: Scaler::new(Some((width, height))),
             force_next_keyframe: false,
+            last_pts_us: None,
         })
     }
 }
@@ -241,6 +245,10 @@ impl VideoEncoder for VtbEncoder {
     }
 
     fn push_frame(&mut self, frame: VideoFrame) -> Result<()> {
+        // Captured before the branch below consumes/borrows `frame`.
+        // `Duration` is `Copy`, so this is free.
+        let input_timestamp = frame.timestamp;
+
         // Zero-copy fast path: if the frame is a GPU frame backed by a
         // CVPixelBuffer (e.g. from ScreenCaptureKit or AVFoundation),
         // pass it directly to VTCompressionSession. VTB handles color
@@ -277,7 +285,47 @@ impl VideoEncoder for VtbEncoder {
             let state = self.callback_state.lock().unwrap();
             state.frame_count
         };
-        let pts = unsafe { CMTime::new(frame_count as i64, self.framerate as i32) };
+
+        // Propagate the REAL capture timestamp when we can trust it.
+        //
+        // This was previously always `CMTime::new(frame_count, framerate)` — a
+        // synthetic counter, making VtbEncoder the only encoder in the tree that
+        // discards the input PTS (h264/av1/vaapi all propagate it). Because the
+        // screen source is dirty-region driven, encoded-frame count drifts
+        // monotonically behind wall clock, which pins the receiver's playout
+        // clock reference open and makes the shipped jitter buffer inert.
+        //
+        // Guarded rather than propagated blindly. `Duration::ZERO` is the
+        // documented default for capture frames that carry no timestamp, and a
+        // non-monotonic PTS anchor has already caused a live permanent-black-
+        // screen incident on the publish side (see publish.rs's own comment). So
+        // the real timestamp is used only when it is non-zero AND strictly ahead
+        // of the last one submitted; anything else falls back to the counter,
+        // which is always monotonic.
+        // Everything is expressed on ONE microsecond timeline, so the output is
+        // monotonic by construction.
+        //
+        // An earlier version of this fell back to the raw frame counter whenever
+        // the input timestamp looked untrustworthy — which was itself
+        // non-monotonic, because the counter timeline and the capture timeline
+        // are unrelated. Measured (examples/vtb_pts_propagation.rs): a repeated
+        // input timestamp after 350ms emitted 100ms, jumping the PTS backwards —
+        // the exact anomalous-anchor hazard this guard exists to prevent. Mixing
+        // two clocks is the bug; there is only one clock here now.
+        let _ = frame_count;
+        let frame_interval_us = 1_000_000i64 / self.framerate.max(1) as i64;
+        let input_us = input_timestamp.as_micros() as i64;
+        let next_us = match self.last_pts_us {
+            // Real capture clock, when it genuinely advanced.
+            Some(last) if input_us > last => input_us,
+            // Untrustworthy (zero, repeated, or backwards): advance by exactly
+            // one frame so the timeline keeps moving forward regardless.
+            Some(last) => last + frame_interval_us,
+            None if input_us > 0 => input_us,
+            None => 0,
+        };
+        self.last_pts_us = Some(next_us);
+        let pts = unsafe { CMTime::new(next_us, 1_000_000) };
         let duration = unsafe { CMTime::new(1, self.framerate as i32) };
 
         let frame_props = if self.force_next_keyframe {
@@ -337,6 +385,23 @@ impl VideoEncoder for VtbEncoder {
         }
         self.bitrate = bitrate;
         Ok(())
+    }
+}
+
+impl VtbEncoder {
+    /// Test seam: forces VideoToolbox to emit every buffered frame now.
+    ///
+    /// VTB holds frames internally for pipelining, so a short push sequence
+    /// otherwise drains only the first packet — which makes PTS behaviour
+    /// unobservable from outside the crate. The in-crate tests already use
+    /// `complete_frames` for exactly this reason; this exposes it so
+    /// `examples/vtb_pts_propagation.rs` can verify the real encoder rather
+    /// than a stand-in.
+    #[doc(hidden)]
+    pub fn __test_flush(&mut self) {
+        unsafe {
+            let _ = self.session.complete_frames(kCMTimeInvalid);
+        }
     }
 }
 
