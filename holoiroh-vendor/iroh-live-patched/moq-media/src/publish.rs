@@ -1012,15 +1012,49 @@ impl VideoRenditions {
     }
 
     /// Adds a rendition using a statically-typed encoder factory.
+    ///
+    /// The preset selects the *quality tier* (its height and bitrate); the
+    /// encoder's WIDTH is derived from the source's own aspect ratio rather than
+    /// taken from the preset. Every `VideoPreset` is a fixed 16:9 box
+    /// (320x180 / 640x360 / 1280x720 / 1920x1080), so encoding a non-16:9 source
+    /// at preset dimensions geometrically distorts it. That is not hypothetical:
+    /// a 1512x982 Mac display (3:2) encoded into 1280x720 is stretched
+    /// horizontally by 15.5% — circles become ellipses and text is visibly wrong
+    /// for the entire session, on a product whose whole purpose is looking at
+    /// your computer.
+    ///
+    /// Anchoring on the preset's height keeps the intended bitrate/quality tier
+    /// and the vertical resolution, and costs nothing: a 3:2 source at the 720
+    /// tier becomes 1108x720 instead of a distorted 1280x720.
     pub fn add_with_generic<E: VideoEncoderFactory>(&mut self, preset: VideoPreset) {
         let name = format!("video/{}-{}", E::ID, preset);
-        let enc_config = VideoEncoderConfig::from_preset(preset);
+        let mut enc_config = VideoEncoderConfig::from_preset(preset);
+
+        let [src_w, src_h] = self.source.format().dimensions;
+        if src_w > 0 && src_h > 0 {
+            let (_, tier_h) = preset.dimensions();
+            let derived_w = (src_w as f64 / src_h as f64 * tier_h as f64).round() as u32;
+            // H.264 requires even dimensions; round down to the nearest even
+            // pixel and never degenerate to zero.
+            enc_config.width = derived_w.max(2) & !1;
+            enc_config.height = tier_h;
+            if enc_config.width != src_w || enc_config.height != src_h {
+                tracing::debug!(
+                    src_w,
+                    src_h,
+                    out_w = enc_config.width,
+                    out_h = enc_config.height,
+                    "encoding at source aspect ratio rather than the preset's 16:9 box"
+                );
+            }
+        }
+
         let config = E::config_for(&enc_config);
         self.renditions.insert(
             name,
             VideoRenditionEntry {
                 config: config.into(),
-                factory: Box::new(move || Ok(Box::new(E::with_preset(preset)?))),
+                factory: Box::new(move || Ok(Box::new(E::with_config(enc_config.clone())?))),
             },
         );
     }
