@@ -646,6 +646,24 @@ impl HoloControlBridge {
         self.remote_control_active.load(Ordering::SeqCst)
     }
 
+    /// Clears the hands-on-control latch without the usual `ReleaseControl`
+    /// round trip, for when the client vanishes instead of releasing.
+    ///
+    /// `remote_control_active` was set by `TakeControl` and cleared ONLY by
+    /// `ReleaseControl`. `auto_yield` skips sampling entirely while it is set,
+    /// so a phone that dropped, backgrounded, or was swiped away mid-control
+    /// left it stuck true for the rest of the daemon's process lifetime --
+    /// silently disabling "the agent steps aside while you use your Mac" for
+    /// every later task, with nothing logging that it had happened.
+    pub fn clear_remote_control_active(&self) {
+        if self.remote_control_active.swap(false, Ordering::SeqCst) {
+            tracing::info!(
+                "control connection ended while hands-on control was active -- clearing the \
+                 latch so auto-yield keeps working"
+            );
+        }
+    }
+
     /// Auto-yield: step the running turn aside because the user is actively
     /// using the Mac. Like [`handle_pause`](Self::handle_pause) but tagged
     /// `auto` (so only [`auto_yield_resume`](Self::auto_yield_resume) brings it
@@ -825,6 +843,12 @@ impl HoloControlBridge {
             }
             RemoteControlEvent::ReleaseControl => {
                 self.remote_control_active.store(false, Ordering::SeqCst);
+                // Never hand the Mac back mid-drag. If the last thing the user
+                // did was lift a finger over the letterbox (where the client
+                // cannot map a coordinate), a button can still be latched down;
+                // resuming the agent under a held button would make it drag
+                // everything its cursor crosses.
+                crate::remote_input::release_all();
                 let parked = self.paused.lock().expect("paused lock poisoned").take();
                 if let Some(parked) = parked {
                     let queued = self.queue.lock().expect("queue lock poisoned").len();

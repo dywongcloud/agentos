@@ -50,6 +50,40 @@ pub fn is_permitted() -> bool {
     crate::permissions::accessibility_granted()
 }
 
+/// Releases any mouse button this module still believes is held, at wherever
+/// the cursor currently is.
+///
+/// `LEFT_DOWN`/`RIGHT_DOWN` were only ever cleared as a side effect of
+/// [`button`] receiving a matching up, or of [`click`]. Nothing cleared them
+/// when the *client* went away mid-drag — a phone that loses its connection,
+/// gets swiped away, or lifts a finger over the letterbox. The Mac was then left
+/// inside a live drag/selection session, unattended, with no touch anywhere to
+/// end it: the pointer keeps dragging whatever it crosses until someone
+/// physically uses the machine.
+///
+/// Safe to call unconditionally and repeatedly — a synthetic button-up with
+/// nothing held is a no-op as far as AppKit is concerned, and this only posts
+/// for flags it actually observes set.
+pub fn release_all() {
+    let p = cursor_location().unwrap_or(CGPoint { x: 0.0, y: 0.0 });
+    if LEFT_DOWN.swap(false, Ordering::Relaxed) {
+        tracing::info!("releasing a left mouse button still held by remote control");
+        if let Some(ev) =
+            CGEvent::new_mouse_event(None, CGEventType::LeftMouseUp, p, CGMouseButton::Left)
+        {
+            post(&ev);
+        }
+    }
+    if RIGHT_DOWN.swap(false, Ordering::Relaxed) {
+        tracing::info!("releasing a right mouse button still held by remote control");
+        if let Some(ev) =
+            CGEvent::new_mouse_event(None, CGEventType::RightMouseUp, p, CGMouseButton::Right)
+        {
+            post(&ev);
+        }
+    }
+}
+
 /// Map a normalized point (`0..=1` within the captured display) to a global CG
 /// point. Uses the PRIMARY display (the daemon captures primary by default -- a
 /// captured non-primary display is a documented refinement, not wired here).
@@ -68,7 +102,6 @@ fn post(event: &CGEvent) {
 }
 
 /// Current cursor location in global CG points (for witnesses / diagnostics).
-#[allow(dead_code)] // used by examples/remote_input_probe.rs, not the bin target
 pub fn cursor_location() -> Option<CGPoint> {
     let ev = CGEvent::new(None)?;
     Some(CGEvent::location(Some(&ev)))

@@ -532,6 +532,11 @@ impl HoloBridge {
         self.control.replace_event_sink(events_tx);
     }
 
+    /// See [`HoloControlBridge::clear_remote_control_active`].
+    pub fn clear_remote_control_active(&self) {
+        self.control.clear_remote_control_active();
+    }
+
     /// `(turn currently in flight, prompts queued behind it)`. See
     /// [`HoloControlBridge::busy_state`] -- surfaced through the control channel's
     /// on-connect greeting so a reconnecting peer immediately learns whether a stale

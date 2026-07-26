@@ -1436,6 +1436,14 @@ impl ProtocolHandler for ControlChannel {
             }
         }
 
+        // The client is gone. If it disappeared mid-drag -- connection dropped,
+        // app swiped away, phone locked -- a mouse button can still be latched
+        // down on the Mac with no touch anywhere able to release it, leaving the
+        // machine in a live drag/selection session unattended. Clearing
+        // remote-control state here is the only place that can notice.
+        crate::remote_input::release_all();
+        self.bridge.clear_remote_control_active();
+
         drop(events_tx);
         let _ = send_task.await;
         connection.closed().await;
