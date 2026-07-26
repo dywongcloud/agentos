@@ -246,6 +246,17 @@ final class HoloConnection: ObservableObject {
             report: { [weak self] message, wire in
                 // Runs on main (the sender hops there): surface the confirmed
                 // wire send in the same log stream as daemon events.
+                //
+                // Remote-control events are deliberately NOT logged. They are
+                // emitted at touch-tracking frequency (~60Hz for the whole
+                // duration of a drag), and every log entry appends to MainView's
+                // @State log array -- which re-evaluates that entire ~2200-line
+                // body. Logging them turned the product's most latency-sensitive
+                // interaction, dragging to control the Mac, into the moment the
+                // UI does the most work per second, and grew an unbounded array
+                // of envelopes nobody reads. Their effect is already visible to
+                // the user directly: the Mac's cursor moves.
+                if case .remoteControl = message { return }
                 let trimmed = wire.trimmingCharacters(in: .whitespacesAndNewlines)
                 self?.onServerMessage?(.status(text: "→ sent \(message.wireKindLabel): \(trimmed)"))
             },
@@ -298,6 +309,15 @@ final class HoloConnection: ObservableObject {
                     self.eventPump?.cancel()
                     self.eventPump = nil
                     self.onServerMessage?(.error(text: detail))
+                    // The pump is the ONLY thing reading the control channel, so
+                    // cancelling it means this connection can never again receive
+                    // anything from the daemon. Previously the failure stopped
+                    // here: `phase` stayed `.connected`, so MainView's
+                    // reconnect-on-failure never fired and the app sat claiming
+                    // it was connected, with a permanently dead control channel,
+                    // until the user force-quit. Publishing `.failed` is what
+                    // actually hands the problem to the reconnect path.
+                    self.phase = .failed(detail)
                 }
                 return
             }

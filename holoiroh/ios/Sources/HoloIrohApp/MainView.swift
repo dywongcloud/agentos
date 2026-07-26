@@ -296,7 +296,10 @@ struct MainView: View {
             // event flows through. The trailing newline is trimmed for display
             // (it is real on the wire, noise in the UI).
             let trimmed = wire.trimmingCharacters(in: .whitespacesAndNewlines)
-            logEntries.append(LogEntry(message: .status(text: "→ sent (not connected) \(message.wireKindLabel): \(trimmed)")))
+            // Routed through `log` (not a direct append) so it is subject to the
+            // same ring cap; a disconnected remote-control drag would otherwise
+            // append at touch frequency with nothing trimming it.
+            log(.status(text: "→ sent (not connected) \(message.wireKindLabel): \(trimmed)"))
         }
     }
 
@@ -516,7 +519,7 @@ struct MainView: View {
         }
         .onChange(of: voice.lastError) { _, error in
             guard let error else { return }
-            logEntries.append(LogEntry(message: .error(text: error)))
+            log(.error(text: error))
         }
         // Real transport lifecycle: connect the shared bridge on appear,
         // reflect its phase changes, and tear it down when the screen goes.
@@ -780,7 +783,7 @@ struct MainView: View {
 
     private func jump(to newState: SessionState) {
         session = newState
-        logEntries.append(LogEntry(message: .status(text: "demo → \(newState.displayName)")))
+        log(.status(text: "demo → \(newState.displayName)"))
     }
 
     // MARK: - Session action wiring
@@ -2110,9 +2113,7 @@ struct MainView: View {
         Task {
             await voice.toggle()
         }
-        logEntries.append(
-            LogEntry(message: .status(text: wasRecording ? "stopped listening" : "listening…"))
-        )
+        log(.status(text: wasRecording ? "stopped listening" : "listening…"))
     }
 
     // MARK: - Control-channel send helpers
@@ -2138,8 +2139,22 @@ struct MainView: View {
 
     // MARK: - Log helper
 
+    /// Newest-N ring cap for the status log.
+    ///
+    /// `logEntries` had five append sites and no removals, so it grew for the
+    /// entire life of a session — which on this product is the steady state, not
+    /// an edge case: people leave the mirror open. Every append also re-evaluates
+    /// this view's body, so an ever-longer array made that steadily more
+    /// expensive. 200 is far more history than the UI ever shows (the controls
+    /// sheet scrolls, the removed fullscreen feed showed 5) while making the cost
+    /// constant instead of unbounded.
+    private static let maxLogEntries = 200
+
     private func log(_ message: ServerMessage) {
         logEntries.append(LogEntry(message: message))
+        if logEntries.count > Self.maxLogEntries {
+            logEntries.removeFirst(logEntries.count - Self.maxLogEntries)
+        }
     }
 }
 

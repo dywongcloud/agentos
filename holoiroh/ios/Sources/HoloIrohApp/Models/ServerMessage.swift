@@ -377,8 +377,16 @@ struct LogEntry: Identifiable, Equatable {
 
     /// Formatted `HH:mm:ss` timestamp for compact display in the log row.
     var formattedTime: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter.string(from: timestamp)
+        Self.timeFormatter.string(from: timestamp)
     }
+
+    /// Shared formatter. `DateFormatter()` construction is genuinely expensive
+    /// (it builds ICU state), and this is called once per visible log row on
+    /// every re-render of the status list, so allocating a fresh one per row
+    /// was pure waste in a hot path.
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
 }
