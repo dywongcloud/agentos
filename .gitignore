@@ -47,3 +47,13 @@ holoiroh/.agentplug/
 # cargo workspace (see holoiroh/Cargo.toml) and from version control alike.
 holoiroh/rust_db_project/
 holoiroh/hello_world/
+
+# gm runtime state can appear under ANY directory a watcher was booted from,
+# not just the repo root -- the rules above are root-anchored, so a stray boot
+# from a subdirectory (e.g. holoiroh/mac-daemon/) left a live heartbeat file
+# tracked and churning in commits. These patterns match at any depth.
+**/.gm/exec-spool/
+**/.gm/witness/
+**/.gm/browser-state/
+**/.gm/rs-learn.db
+**/.gm/gm.db
