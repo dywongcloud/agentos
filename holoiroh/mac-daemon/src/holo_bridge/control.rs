@@ -233,6 +233,40 @@ impl From<TerminalState> for DoneStatus {
 }
 
 /// One `Prompt`/`VoiceTranscript` turn waiting for the in-flight turn ahead of it to finish.
+/// Releases the single-active-turn `busy` flag on ANY exit from a turn.
+///
+/// `busy` was previously cleared in exactly one place: `drain_queue`'s normal
+/// return. So a panic anywhere inside a turn -- or cancellation of the task
+/// owning that future -- left `busy == true` forever, and the daemon silently
+/// became "queue every future prompt, run none": the phone shows
+/// `queued, 0 ahead` for every task the user sends, indefinitely, while the
+/// daemon otherwise looks perfectly healthy (video streams, the control channel
+/// answers, nothing logs an error).
+///
+/// Resetting unconditionally on drop is correct because `drain_queue` only
+/// returns once the queue is empty, and it sets `busy = false` in that case --
+/// so on the normal path this guard is a no-op, and the only time it changes
+/// anything is the abnormal exit it exists for.
+///
+/// Deliberately recovers a poisoned lock instead of unwrapping: this can run
+/// during unwind, where a second panic would abort the process.
+struct BusyGuard<'a> {
+    busy: &'a std::sync::Mutex<bool>,
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        if *busy {
+            tracing::warn!(
+                "turn ended without clearing the busy flag (panic or cancellation) -- releasing \
+                 it so the daemon does not queue every future prompt forever"
+            );
+            *busy = false;
+        }
+    }
+}
+
 /// Both `ControlMessage` variants that carry free-form text collapse to this one shape once
 /// queued -- the queue only needs to replay `send_and_stream`'s inputs, not the original
 /// wire-level distinction (which was already informational-only, see `ControlMessage` doc).
@@ -885,6 +919,11 @@ impl HoloControlBridge {
             );
             *busy = true;
         }
+
+        // Releases `busy` on EVERY exit path, including a panic inside
+        // `run_prompt`/`drain_queue` or cancellation of the task that owns this
+        // future. See `BusyGuard` for why an unconditional reset is correct.
+        let _busy_guard = BusyGuard { busy: &self.busy };
 
         self.run_prompt(request_id, text, context_id.as_deref())
             .await;
