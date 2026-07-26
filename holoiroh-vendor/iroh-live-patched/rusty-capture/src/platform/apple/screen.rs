@@ -8,7 +8,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -243,9 +243,100 @@ pub struct MacScreenCapturer {
     target: CaptureTarget,
     #[debug(skip)]
     config: ScreenConfig,
-    /// Rate-limits `try_recover_if_target_gone`'s `SCShareableContent`
-    /// re-enumeration so a stalled poll loop doesn't hammer it.
-    last_recovery_check: Option<Instant>,
+    /// Raised by the background watchdog thread when the capture target stops
+    /// being enumerable. `pop_frame` only ever does a cheap atomic load of this
+    /// — the expensive enumeration that sets it happens off the frame-delivery
+    /// thread. See `spawn_target_watchdog`.
+    #[debug(skip)]
+    target_gone: Arc<AtomicBool>,
+    /// Signals the watchdog thread to exit when this capturer is dropped.
+    #[debug(skip)]
+    watchdog_shutdown: Arc<AtomicBool>,
+    /// Rate-limits *rebuild attempts* (not the detection, which the watchdog
+    /// owns) so a target that is enumerable-but-unopenable can't spin
+    /// `pop_frame` into a tight rebuild loop.
+    last_rebuild_attempt: Option<Instant>,
+}
+
+/// Interval between background checks of whether the capture target still exists.
+const TARGET_WATCHDOG_INTERVAL: Duration = Duration::from_secs(10);
+/// Granularity of the watchdog's sleep, so `Drop` doesn't wait a full interval.
+const TARGET_WATCHDOG_TICK: Duration = Duration::from_millis(250);
+/// Minimum spacing between rebuild attempts once the target is reported gone.
+const REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Returns whether `target` is currently present in ScreenCaptureKit's
+/// enumeration. **Measured cost: 37–54ms** (live-witnessed via
+/// `examples/sck_enumeration_cost.rs`, 217 windows) — i.e. LONGER than one
+/// frame at 30fps. This must never be called on the frame-delivery thread;
+/// that is the entire reason the watchdog below exists.
+#[cfg(target_os = "macos")]
+fn target_is_present(target: &CaptureTarget) -> bool {
+    let Ok(content) = SCShareableContent::get() else {
+        // A transient enumeration failure is not proof the target is gone;
+        // treating it as "present" avoids a spurious stream rebuild.
+        return true;
+    };
+    match target {
+        CaptureTarget::Display(monitor) => {
+            let display_id: Option<u32> = monitor
+                .id
+                .strip_prefix("macos-display-")
+                .and_then(|s| s.parse().ok());
+            match display_id {
+                Some(did) => content.displays().into_iter().any(|d| d.display_id() == did),
+                None => !content.displays().is_empty(),
+            }
+        }
+        CaptureTarget::Window(window_id) => content
+            .windows()
+            .into_iter()
+            .any(|w| w.window_id() == *window_id),
+    }
+}
+
+/// Polls `target_is_present` on its own OS thread and publishes the answer as
+/// an atomic flag.
+///
+/// The whole point is that the ~40ms `SCShareableContent::get()` call happens
+/// HERE and not in `pop_frame`. An earlier version of this recovery logic called
+/// it inline on the poll thread every 10s; because that exceeds a 30fps frame
+/// budget, it produced a visible video hitch every 10 seconds — a self-inflicted
+/// regression on the exact smoothness this recovery exists to protect.
+#[cfg(target_os = "macos")]
+fn spawn_target_watchdog(
+    target: CaptureTarget,
+    target_gone: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+) {
+    std::thread::Builder::new()
+        .name("sck-target-watchdog".into())
+        .spawn(move || {
+            let mut since_check = Duration::ZERO;
+            loop {
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(TARGET_WATCHDOG_TICK);
+                since_check += TARGET_WATCHDOG_TICK;
+                if since_check < TARGET_WATCHDOG_INTERVAL {
+                    continue;
+                }
+                since_check = Duration::ZERO;
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                let gone = !target_is_present(&target);
+                if gone && !target_gone.load(Ordering::Acquire) {
+                    warn!(
+                        "screen capture target no longer enumerable (Mac likely at a login/lock \
+                         screen or fast-user-switch) -- flagging for stream rebuild"
+                    );
+                }
+                target_gone.store(gone, Ordering::Release);
+            }
+        })
+        .ok();
 }
 
 impl MacScreenCapturer {
@@ -330,6 +421,14 @@ impl MacScreenCapturer {
     ) -> Result<Self> {
         let (stream, rx, actual_dims) = Self::build_stream(width, height, filter, config)?;
 
+        let target_gone = Arc::new(AtomicBool::new(false));
+        let watchdog_shutdown = Arc::new(AtomicBool::new(false));
+        spawn_target_watchdog(
+            target.clone(),
+            Arc::clone(&target_gone),
+            Arc::clone(&watchdog_shutdown),
+        );
+
         Ok(Self {
             requested_width: width,
             requested_height: height,
@@ -338,7 +437,9 @@ impl MacScreenCapturer {
             stream,
             target,
             config: config.clone(),
-            last_recovery_check: None,
+            target_gone,
+            watchdog_shutdown,
+            last_rebuild_attempt: None,
         })
     }
 
@@ -385,11 +486,6 @@ impl MacScreenCapturer {
         Ok((stream, frame_rx, actual_dims))
     }
 
-    /// How often a no-new-frame poll re-verifies the capture target is still
-    /// enumerable via `SCShareableContent`, the cheap check
-    /// `try_recover_if_target_gone` uses to decide whether to rebuild.
-    const RECOVERY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
-
     /// Live-witnessed root cause of a permanently frozen live-share view:
     /// when the Mac reaches its login/lock screen, ScreenCaptureKit can stop
     /// the running `SCStream` out from under this wrapper (`SCStream error
@@ -402,67 +498,46 @@ impl MacScreenCapturer {
     /// since neither this struct nor `SharedVideoSource`'s poll loop
     /// (`moq-media/src/publish.rs`) previously noticed.
     ///
-    /// Deliberately NOT triggered by frame-arrival timing: ScreenCaptureKit
-    /// is dirty-region-driven, not a fixed-rate camera, so genuinely static
-    /// on-screen content can legitimately produce no new frames for long
-    /// stretches — treating that as failure would rebuild a perfectly
-    /// healthy stream. Instead, this periodically re-enumerates
-    /// `SCShareableContent` and checks whether THIS capturer's own target is
-    /// still present — the same unambiguous signal ScreenCaptureKit's own
-    /// uncatchable error already reported, checked directly. On absence (or
-    /// a transient enumeration error), tears down the dead stream and
-    /// rebuilds it from the retained target/config, self-healing the moment
-    /// the target becomes capturable again (e.g. the Mac is unlocked) with
-    /// no daemon restart required.
+    /// Detection is deliberately NOT frame-arrival timing: ScreenCaptureKit is
+    /// dirty-region-driven, not a fixed-rate camera, so genuinely static screen
+    /// content legitimately produces no frames for long stretches — treating
+    /// that as failure would rebuild a perfectly healthy stream. It is instead
+    /// the presence of this capturer's own target in `SCShareableContent`, the
+    /// same unambiguous signal ScreenCaptureKit's uncatchable error reports.
     ///
-    /// Called from `pop_frame()` only when no new frame was ready this poll,
-    /// rate-limited to `RECOVERY_CHECK_INTERVAL` so the enumeration call
-    /// doesn't run on every tight-loop poll. Never returns `Err` — a failed
-    /// recovery attempt is retried on the next interval, since
-    /// `SharedVideoSource`'s poll loop treats any `Err` from `pop_frame()`
-    /// as fatal and permanently kills the capture thread.
+    /// That enumeration costs 37–54ms (measured: `examples/sck_enumeration_cost.rs`),
+    /// which is longer than a 30fps frame, so it runs on `spawn_target_watchdog`'s
+    /// own thread and this method only does a cheap atomic load of the result.
+    /// Rebuilding itself is done here because it needs `&mut self`; its own
+    /// enumeration cost is irrelevant since by definition capture is already dead.
+    ///
+    /// Never returns `Err`: `SharedVideoSource`'s poll loop treats any `Err`
+    /// from `pop_frame` as fatal and permanently kills the capture thread, so a
+    /// failed rebuild must only be logged and retried.
     fn try_recover_if_target_gone(&mut self) {
-        let now = Instant::now();
-        if let Some(last) = self.last_recovery_check {
-            if now.duration_since(last) < Self::RECOVERY_CHECK_INTERVAL {
-                return;
-            }
-        }
-        self.last_recovery_check = Some(now);
-
-        let target_present = match SCShareableContent::get() {
-            Ok(content) => match &self.target {
-                CaptureTarget::Display(monitor) => {
-                    let display_id: Option<u32> = monitor
-                        .id
-                        .strip_prefix("macos-display-")
-                        .and_then(|s| s.parse().ok());
-                    match display_id {
-                        Some(did) => content.displays().into_iter().any(|d| d.display_id() == did),
-                        None => !content.displays().is_empty(),
-                    }
-                }
-                CaptureTarget::Window(window_id) => content
-                    .windows()
-                    .into_iter()
-                    .any(|w| w.window_id() == *window_id),
-            },
-            Err(_) => false,
-        };
-
-        if target_present {
+        if !self.target_gone.load(Ordering::Acquire) {
             return;
         }
 
-        warn!(
-            "screen capture target no longer enumerable (Mac likely at a login/lock screen or \
-             fast-user-switch) -- rebuilding the capture stream so it self-heals once capturable \
-             again"
-        );
-        if let Err(e) = self.rebuild_stream() {
-            tracing::debug!("capture stream rebuild attempt failed, will retry: {e:?}");
-        } else {
-            info!("screen capture stream rebuilt successfully, resuming");
+        let now = Instant::now();
+        if let Some(last) = self.last_rebuild_attempt {
+            if now.duration_since(last) < REBUILD_RETRY_INTERVAL {
+                return;
+            }
+        }
+        self.last_rebuild_attempt = Some(now);
+
+        match self.rebuild_stream() {
+            Ok(()) => {
+                info!("screen capture stream rebuilt successfully, resuming");
+                // Let the watchdog re-confirm on its own cadence rather than
+                // assuming success sticks; clearing it here just stops this
+                // method from rebuilding again on the very next poll.
+                self.target_gone.store(false, Ordering::Release);
+            }
+            Err(e) => {
+                tracing::debug!("capture stream rebuild attempt failed, will retry: {e:?}");
+            }
         }
     }
 
@@ -535,6 +610,16 @@ impl MacScreenCapturer {
         self.requested_width = width;
         self.requested_height = height;
         Ok(())
+    }
+}
+
+impl Drop for MacScreenCapturer {
+    /// Stops the target watchdog. Without this the thread outlives every
+    /// capturer that ever existed, each one waking to make a ~40ms
+    /// `SCShareableContent` call forever — a real leak on any code path that
+    /// constructs capturers repeatedly (display switching, re-broadcast).
+    fn drop(&mut self) {
+        self.watchdog_shutdown.store(true, Ordering::Release);
     }
 }
 
