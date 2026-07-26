@@ -175,7 +175,23 @@ struct RemoteControlSurface: UIViewRepresentable {
         // in MainView's gesture gating).
         let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.onPinchNoop(_:)))
         v.addGestureRecognizer(pinch)
-        pan2.require(toFail: pinch)
+        // Deliberately NOT `pan2.require(toFail: pinch)`.
+        //
+        // That dependency made two-finger scroll -- the only `.scroll` producer
+        // in the app, and the most-used remote-desktop interaction after
+        // clicking -- impossible to ever fire. `require(toFail:)` holds the
+        // dependent in `.possible` and fails it outright once the prerequisite
+        // reaches `.began`, and a two-touch UIPinchGestureRecognizer has no
+        // meaningful scale deadband, so it begins almost immediately on any
+        // two-finger gesture. Under either branch of the UIKit state machine
+        // pan2 never delivered a usable scroll, and there is no fallback: the
+        // app never constructs a `.key` event, so there is no Page Down either.
+        //
+        // The stray-scroll-during-pinch problem the dependency was meant to
+        // solve is instead handled in `onPan2` by consulting this recognizer's
+        // live state, which suppresses emission without suppressing the
+        // recognizer itself.
+        context.coordinator.pinch = pinch
         // Let a tap still register even though a pan is present.
         tap.require(toFail: pan1)
 
@@ -209,6 +225,10 @@ struct RemoteControlSurface: UIViewRepresentable {
         /// ends out in the letterbox, where there is no valid current point —
         /// see `onPan1`.
         private var lastInVideo: CGPoint?
+        /// The silent pinch detector, consulted by `onPan2` to suppress scroll
+        /// while a pinch is in flight. Held weakly: the recognizer is owned by
+        /// the view, which owns the coordinator.
+        weak var pinch: UIPinchGestureRecognizer?
         init(_ parent: RemoteControlSurface) { self.parent = parent }
 
         /// Always allow simultaneous recognition -- see the doc on
@@ -287,6 +307,22 @@ struct RemoteControlSurface: UIViewRepresentable {
 
         @objc func onPan2(_ g: UIPanGestureRecognizer) {
             guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
+
+            // Suppress scroll while the touches are actually a pinch. Two fingers
+            // moving apart are rarely perfectly symmetric, so a real pinch carries
+            // a translational component that would otherwise be sent to the Mac as
+            // stray scrolling.
+            //
+            // The translation MUST still be zeroed on the suppressed path. Only
+            // the emit branch below used to reset it, so letting it accumulate
+            // during a pinch would flush as one large stale scroll the instant
+            // suppression lifted -- reintroducing the exact bug this suppression
+            // exists to prevent.
+            if let pinch, pinch.state == .began || pinch.state == .changed {
+                g.setTranslation(.zero, in: v)
+                return
+            }
+
             let t = g.translation(in: v)
             // Scroll deltas in wheel "line" units; a small divisor keeps it from
             // being hypersensitive. Reset so each callback is an incremental delta.

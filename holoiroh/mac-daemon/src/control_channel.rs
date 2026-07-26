@@ -964,6 +964,27 @@ impl ProtocolHandler for ControlChannel {
         // iroh peer.
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ControlEvent>();
 
+        // Point the bridge at THIS connection now, on accept -- not later, on the
+        // first dispatchable message.
+        //
+        // The only other `replace_event_sink` call lives inside the read loop's
+        // payload-dispatch arm, and `Pin`/`InputResponse`/`ClarifyRequest` all
+        // `continue` before reaching it. A reconnecting phone sends a bare PIN
+        // first, so it was greeted with "a Holo task is still running from
+        // before" and a TaskActive pill, and then every subsequent `emit` went to
+        // the PREVIOUS connection's dead channel: progress lines, the terminal
+        // `task_done`, the sensitive-app consent `InputRequest`, and
+        // `SecureInputState`. The pill hung in Working forever and a consent gate
+        // could expire without ever being shown. `emit` deliberately swallows the
+        // send error, so nothing logged it either.
+        //
+        // Doing it here also closes the cold-start window in which `main.rs`'s
+        // long-lived `_bridge_events_rx` binding silently absorbed every event
+        // emitted before the first phone connected. Auth has already passed at
+        // this point, and the call at the dispatch site below stays as an
+        // idempotent re-assert.
+        self.bridge.replace_event_sink(events_tx.clone());
+
         // The task_id of the turn currently being driven through
         // `self.bridge.handle_message` (set by the read loop just before
         // each call, per the one-concurrent-turn-per-connection model this

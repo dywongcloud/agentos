@@ -289,7 +289,22 @@ fn has_ipv6_default_route() -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    // An explicit fallback filter, because `fmt::init()` alone defaults to
+    // ERROR when RUST_LOG is unset. Developers set RUST_LOG by habit and so
+    // never see that — but the shipped LaunchAgent sets no environment at all,
+    // so an installed user's support log could contain nothing except benign
+    // `noq_proto` PTO spam (which that crate emits at error! level), while every
+    // diagnostic the daemon already knows how to print stayed invisible. That is
+    // exactly backwards for the logs you only ever read after something broke.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(
+                    "info,holoiroh_daemon=debug,iroh_moq=info,noq_proto=warn",
+                )
+            }),
+        )
+        .init();
     tracing::info!("holoiroh-daemon starting");
 
     // --- single-instance guard, before ANY other startup work (including

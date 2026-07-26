@@ -258,6 +258,13 @@ struct MainView: View {
     /// `.connected`. Bounded (`Self.maxReconnectAttempts`) so a genuinely
     /// dead daemon surfaces a real failure instead of silent retry forever.
     @State private var reconnectAttempts = 0
+    /// When the app last left the foreground, used to tell a real absence from a
+    /// Control Center / notification-banner blip when deciding whether to
+    /// replenish the reconnect budget.
+    @State private var lastBackgroundedAt: Date?
+    /// How long the app must have been away before returning to it grants a
+    /// fresh reconnect budget.
+    private static let reconnectBudgetRefreshAfter: TimeInterval = 30
     /// True while a reconnect is scheduled/in flight, so overlapping
     /// triggers (failure event + foreground return) collapse into one.
     @State private var isReconnecting = false
@@ -564,17 +571,31 @@ struct MainView: View {
         // `attemptReconnect`, which the daemon supports (it re-accepts the
         // same ticket + allowlisted device without a new PIN scan).
         .onChange(of: scenePhase) { _, newPhase in
-            guard newPhase == .active else { return }
-            // Returning to the foreground replenishes the reconnect budget.
+            if newPhase != .active {
+                // Stamp the first non-active transition only, so a quick
+                // Control Center peek does not look like a long absence.
+                if lastBackgroundedAt == nil { lastBackgroundedAt = Date() }
+                return
+            }
+            // Replenish the reconnect budget, but only after a real absence.
             //
-            // It was otherwise only reset by a SUCCESSFUL connect, so a single
-            // window where the Mac was unreachable (asleep, off Wi-Fi, moved
-            // networks) burned all the attempts and left the session
-            // permanently unable to reconnect — for the rest of its life, even
-            // once the Mac came back — with the only escape being to force-quit
-            // the app. Coming back to the app is an explicit "try again" from
-            // the user and is exactly the right moment to grant a fresh budget.
-            reconnectAttempts = 0
+            // The budget was otherwise reset ONLY by a successful connect, so a
+            // single window where the Mac was unreachable (asleep, off Wi-Fi)
+            // burned every attempt and left the session permanently unable to
+            // reconnect for the rest of its life — force-quitting the app being
+            // the only escape.
+            //
+            // Deliberately NOT reset on every activation: `.active` also fires
+            // when a notification banner or Control Center is dismissed, and
+            // resetting there would erase the bound the retry budget exists to
+            // provide, letting the app hammer a Mac that is genuinely gone. A
+            // minimum gap means only an actual return-to-the-app grants a fresh
+            // budget. Explicit user intent (the Try again button) bypasses this.
+            let now = Date()
+            if let left = lastBackgroundedAt, now.timeIntervalSince(left) >= Self.reconnectBudgetRefreshAfter {
+                reconnectAttempts = 0
+            }
+            lastBackgroundedAt = nil
             switch connection.phase {
             case .connected:
                 frameSource.stop()
@@ -2070,7 +2091,12 @@ struct MainView: View {
         if isControllingRemotely {
             promptText = ""
             sendControlMessage(.remoteControl(.text(trimmed)))
-            log(.status(text: "\u{2192} typed to Mac: \(trimmed)"))
+            // Length only, never the text. While controlling remotely the
+            // command bar types straight into the Mac -- and the lock-screen
+            // banner explicitly tells the user to type their Mac PASSWORD here.
+            // Logging it verbatim put that password in plaintext into the
+            // in-app status log.
+            log(.status(text: "\u{2192} typed \(trimmed.count) characters to Mac"))
             return
         }
         promptText = ""
