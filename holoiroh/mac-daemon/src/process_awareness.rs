@@ -52,6 +52,7 @@ const PROTECTED_COMMS: &[(&str, &str)] = &[
     ("ghostty", "the Ghostty terminal (this user's default) -- may host a Claude Code session; do not close or disturb"),
     ("terminal", "a Terminal window -- may host a CLI/Claude Code session; do not close or disturb"),
     ("holoiroh-daemon", "the Aro daemon itself -- never touch"),
+    ("tmux", "the tmux server hosting the shared `aro` work session -- killing it destroys in-flight terminal work and the user's view of it"),
 ];
 
 /// Enumerate running processes via `ps`, flagging protected ones. Best-effort: any failure
@@ -150,6 +151,9 @@ pub fn format_guard_block(procs: &[ProcessInfo]) -> String {
          - Do not close, kill, or disrupt the Aro daemon or any process listed as protected \
          below.\n",
     );
+    if let Some(tmux_line) = crate::tmux::guidance_line() {
+        block.push_str(&tmux_line);
+    }
     let protected = protected_summary(procs);
     if !protected.is_empty() {
         block.push_str(

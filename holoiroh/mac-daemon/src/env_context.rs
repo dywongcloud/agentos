@@ -526,6 +526,16 @@ pub const DEFAULT_ENV_FACTS: &[(&str, &str)] = &[
          running, open a separate terminal window instead of reusing that one.",
     ),
     (
+        "terminal-work-in-tmux-session-aro",
+        "Terminal and CLI work belongs in the tmux session named `aro`, which the Aro daemon \
+         keeps running in its own terminal window. Bring that window to the front before working \
+         in it so the user watching the live screen share can see the work happen -- a fullscreen \
+         app on another macOS Space hides it entirely, and a session nobody can see defeats the \
+         point of sharing the screen. Attach with `tmux attach -t aro` only when no window is \
+         already showing it. Never kill the tmux server or session, never detach it, and never \
+         start terminal work in a window that already has a Claude Code session in it.",
+    ),
+    (
         "project-aro-holoiroh",
         "This computer-use daemon's own source project is called Aro (internal codename \
          holoiroh, directory ~/Documents/agentOS/holoiroh); it is a git repository the user edits \

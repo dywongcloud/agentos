@@ -41,6 +41,7 @@ mod router;
 mod env_context;
 mod task_fsm;
 mod tinfoil_proxy;
+mod tmux;
 mod pairing_phrase;
 mod permissions;
 mod policy;
@@ -517,6 +518,15 @@ async fn main() -> anyhow::Result<()> {
     match &clarify_config {
         Some(cfg) => info!(model = %cfg.model(), "clarifying-questions inference enabled"),
         None => info!("clarifying-questions inference disabled (no TINFOIL_API_KEY)"),
+    }
+
+    match tokio::task::spawn_blocking(tmux::ensure_session).await {
+        Ok(state) => info!(
+            session = tmux::SESSION_NAME,
+            ?state,
+            "shared terminal session ready for agent CLI work"
+        ),
+        Err(err) => warn!(error = %err, "ensuring the shared tmux session panicked; terminal guidance falls back to plain-terminal wording"),
     }
     // Underscore-named (not bare `_`): the binding must LIVE until main
     // returns -- dropping it aborts the proxy task and every fallback
