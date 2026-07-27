@@ -523,6 +523,7 @@ async fn main() -> anyhow::Result<()> {
     match tokio::task::spawn_blocking(tmux::ensure_session).await {
         Ok(state) => info!(
             session = tmux::SESSION_NAME,
+            usable_by_agent = state.agent_can_use_it(),
             ?state,
             "shared terminal session ready for agent CLI work"
         ),
