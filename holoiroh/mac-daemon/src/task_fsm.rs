@@ -255,6 +255,13 @@ impl TaskFsm {
         }
     }
 
+    pub fn mark_awaiting_user_decision(&mut self, now_ms: u64) {
+        if self.phase.is_terminal() {
+            return;
+        }
+        self.updated_at_ms = now_ms;
+    }
+
     /// Records that a nudge was just sent. Deliberately does NOT touch `updated_at_ms`/`phase`
     /// -- the nudge itself is not evidence of real progress, only a real `tool_result`/
     /// `answer_event`/terminal signal (via `observe_working`/`observe_answer`/

@@ -454,6 +454,26 @@ pub struct HoloControlBridge {
     turn_allowances: Mutex<HashSet<String>>,
     /// The outstanding sensitive-app consent request, if any.
     pending_consent: Mutex<Option<PendingConsent>>,
+    turns_this_daemon_canceled_itself: TurnsCanceledByUs,
+}
+
+#[derive(Default)]
+pub struct TurnsCanceledByUs(Mutex<HashSet<String>>);
+
+impl TurnsCanceledByUs {
+    pub fn record(&self, request_id: &str) {
+        self.0
+            .lock()
+            .expect("self-canceled turns lock poisoned")
+            .insert(request_id.to_owned());
+    }
+
+    pub fn stream_error_here_was_expected(&self, request_id: &str) -> bool {
+        self.0
+            .lock()
+            .expect("self-canceled turns lock poisoned")
+            .remove(request_id)
+    }
 }
 
 /// What one streaming attempt of a turn produced -- see [`HoloControlBridge::run_prompt`]'s
@@ -572,6 +592,7 @@ impl HoloControlBridge {
             ),
             turn_allowances: Mutex::new(HashSet::new()),
             pending_consent: Mutex::new(None),
+            turns_this_daemon_canceled_itself: TurnsCanceledByUs::default(),
         }
     }
 
@@ -1432,6 +1453,17 @@ impl HoloControlBridge {
             }
             Err(err) => {
                 let message = err.to_string();
+                if self
+                    .turns_this_daemon_canceled_itself
+                    .stream_error_here_was_expected(&request_id)
+                {
+                    tracing::info!(
+                        request_id,
+                        error = %format!("{err:#}"),
+                        "stream ended because this daemon cancelled the turn; not surfacing it as a failure"
+                    );
+                    return TurnOutcome::Completed;
+                }
                 if failover_armed && is_backend_error_message(&message) {
                     // Transport-level rate-limit shape (these DO carry the HTTP detail,
                     // unlike serve.py's swallowed terminal): same failover treatment.
@@ -1442,7 +1474,11 @@ impl HoloControlBridge {
                         }],
                     };
                 }
-                tracing::warn!(request_id, error = %err, "prompt turn failed before a terminal A2A state");
+                tracing::warn!(
+                    request_id,
+                    error = %format!("{err:#}"),
+                    "prompt turn failed before a terminal A2A state"
+                );
                 self.tasks.with_task(&request_id, |fsm| fsm.fail());
                 self.emit(ControlEvent::Error {
                     request_id,
@@ -1681,6 +1717,8 @@ impl HoloControlBridge {
             .expect("current_turn lock poisoned")
             .clone();
         let Some(turn) = current else { return };
+        self.turns_this_daemon_canceled_itself
+            .record(&turn.request_id);
         match turn.context_id.as_deref() {
             Some(ctx) => {
                 let client = self.client.read().expect("client lock poisoned").clone();
@@ -1898,6 +1936,12 @@ impl HoloControlBridge {
         let request_id = turn.request_id.clone();
 
         let now = holoiroh_wire::epoch_millis_now();
+        if self.is_awaiting_user_decision() {
+            self.tasks
+                .with_task(&request_id, |fsm| fsm.mark_awaiting_user_decision(now));
+            return;
+        }
+
         let should_nudge = self
             .tasks
             .with_task(&request_id, |fsm| {
@@ -1963,6 +2007,14 @@ impl HoloControlBridge {
             STALL_WATCHDOG_NUDGE_TEXT.to_string(),
         )
         .await;
+    }
+
+    fn is_awaiting_user_decision(&self) -> bool {
+        self.pending_consent
+            .lock()
+            .expect("pending_consent lock poisoned")
+            .is_some()
+            || self.paused.lock().expect("paused lock poisoned").is_some()
     }
 
     /// Resolve a wire `InputResponse` against the outstanding sensitive-app consent request,
