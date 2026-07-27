@@ -1867,6 +1867,12 @@ struct MainView: View {
                 runFrameTimingProbe()
             }
         }
+        if ProcessInfo.processInfo.environment["HOLOIROH_WITNESS_DISCONNECT"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
+                NSLog("MainView: witness invoking disconnect")
+                onDisconnect()
+            }
+        }
         guard ProcessInfo.processInfo.environment["HOLOIROH_AUTOFOCUS_PROMPT"] == "1" else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             isPromptFocused = true

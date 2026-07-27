@@ -1,18 +1,13 @@
 import SwiftUI
 
-/// The hidden on-device diagnostics screen (opened by shaking the device, or a
-/// long-press on the "Aro" title). It surfaces the exact state that recent
-/// support reports needed console logs to see: the ConnectionProfileStore's real
-/// contents + sqlite health, the last connection error, a rolling event log, and
-/// the user-facing feature toggles -- so "saved profiles are empty" type reports
-/// self-diagnose on device.
 struct DiagnosticsView: View {
     @EnvironmentObject private var profileStore: ConnectionProfileStore
     @EnvironmentObject private var reachability: ReachabilityMonitor
     @ObservedObject private var diagnostics = ConnectionDiagnostics.shared
 
     @AppStorage("hapticsEnabled") private var hapticsEnabled = true
-    @AppStorage("autoConnectEnabled") private var autoConnectEnabled = true
+    @AppStorage(AppSettings.AutoConnect.storageKey)
+    private var autoConnectEnabled = AppSettings.AutoConnect.enabledByDefault
     @AppStorage("soundEnabled") private var soundEnabled = false
     @AppStorage("clarifyEnabled") private var clarifyEnabled = true
 
@@ -51,11 +46,6 @@ struct DiagnosticsView: View {
         }
     }
 
-    /// Applies a QR rescan to the saved default: extracts the ticket and, if it
-    /// parses and differs, replaces the "Dev Mac" default's ticket. The manual
-    /// fallback for when the daemon's identity fully rotated and neither the
-    /// stored nor the constant ticket can reach it (so no channel exists to send
-    /// a `current_ticket` over).
     private func handleRescannedTicket(_ scanned: String) {
         guard let ticket = PairingTicket.extract(from: scanned) else {
             ticketRefreshMessage = "That QR didn't contain an iroh ticket."

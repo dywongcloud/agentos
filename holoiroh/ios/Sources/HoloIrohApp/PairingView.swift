@@ -1,37 +1,8 @@
 import SwiftUI
 
-/// Pairing screen: the user scans (or pastes) the iroh ticket printed by
-/// `mac-daemon` on startup, confirms the short verification phrase matches
-/// what the Mac shows, then connects.
-///
-/// ## Flow (Project Aro PRD P0-2)
-/// 1. **Scan or paste the ticket.** "Scan QR" opens a live camera scanner
-///    (`QRScannerSheet` → `QRScannerView`, AVFoundation) whose decoded
-///    string is run through `PairingTicket.extract` and auto-filled into the
-///    ticket field. Pasting the ticket text is the equivalent manual path.
-/// 2. **Verify the short phrase.** Tapping Connect does *not* connect
-///    immediately: it opens `PairingVerificationView`, which shows a short
-///    phrase deterministically derived from the ticket (`PairingPhrase`).
-///    The user confirms it matches the phrase the Mac is displaying next to
-///    its QR. Only that explicit confirmation calls `onConnect`. A
-///    substituted QR/ticket yields a different phrase, so a
-///    man-in-the-middle is caught here.
-///
-/// `onConnect` is still handed the raw ticket string and it's the caller's
-/// (`ContentView`'s) responsibility to decide what "connect" means — that
-/// contract is unchanged; the verification gate is entirely local to this
-/// screen, so `ContentView`'s navigation wiring did not have to change.
 struct PairingView: View {
-    /// Called only after the user has confirmed the verification phrase
-    /// matches the Mac's, with the trimmed ticket and the pairing PIN the
-    /// daemon displayed (empty if the daemon runs with `--no-pin-auth` or
-    /// the device is already allowlisted -- see PROTOCOL.md's PIN handshake).
     let onConnect: (_ ticket: String, _ pin: String) -> Void
 
-    /// Fired the first time the user actively engages this screen (focuses a
-    /// field, taps scan/save/connect, or manually refreshes reachability), so
-    /// the launch auto-connect can stand down and never yank a user who has
-    /// started pairing manually. Defaulted so existing call sites are unchanged.
     var onInteract: () -> Void = {}
 
     @State private var ticketText: String = ""
@@ -40,34 +11,20 @@ struct PairingView: View {
     @State private var showVerification = false
     @State private var scanError: String?
 
-    /// Which pairing field owns the keyboard. Neither field can dismiss the
-    /// keyboard on its own -- the ticket editor is a multi-line `TextEditor`
-    /// (return inserts a newline, never submits) and the PIN field uses the
-    /// `.numberPad` keyboard (which has no return key at all) -- so a
-    /// keyboard-toolbar Done button plus tap-outside-to-dismiss, both driven
-    /// by clearing this focus, are the ONLY ways off the keyboard here.
     private enum Field: Hashable {
         case ticket
         case pin
     }
     @FocusState private var focusedField: Field?
 
-    /// Saved connection profiles (sqlite-backed). Selecting one connects
-    /// immediately -- its ticket already went through phrase verification
-    /// when it was first saved, so re-verifying every reconnect would only
-    /// add friction without adding trust.
-    /// The app-wide store, injected by `HoloIrohApp` (seeded at launch). Read
-    /// via `@EnvironmentObject` -- NOT a per-view `@StateObject` -- so the
-    /// default profile is guaranteed present regardless of when/whether this
-    /// view's own lifecycle would have created + seeded a store.
     @EnvironmentObject private var profileStore: ConnectionProfileStore
 
-    /// Live daemon-reachability for the default profile, owned by `ContentView`
-    /// and injected here so the "Dev Mac" card can show a real reachable/offline
-    /// status pill before the user taps to connect.
     @EnvironmentObject private var reachability: ReachabilityMonitor
     @State private var showSaveNamePrompt = false
     @State private var newProfileName = ""
+
+    @AppStorage(AppSettings.AutoConnect.storageKey)
+    private var autoConnectEnabled = AppSettings.AutoConnect.enabledByDefault
 
     private var trimmedTicket: String {
         ticketText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -78,20 +35,11 @@ struct PairingView: View {
     }
 
     var body: some View {
-        // A ScrollView, not a fixed VStack: the header + saved profiles + two
-        // glass input cards + scan + actions exceed a phone's usable height, and
-        // in a fixed VStack that overflow pushed the saved-profiles section off
-        // the bottom -- the "I open the app and don't see the saved profile"
-        // symptom. Scrolling guarantees every section, especially the seeded
-        // "Dev Mac" reconnect, is always reachable.
         ScrollView {
             VStack(spacing: 18) {
                 header
                     .padding(.top, 36)
 
-                // Saved profiles FIRST when present: opening the app surfaces
-                // the current-daemon "Dev Mac" one-tap reconnect immediately,
-                // above the manual scan/paste inputs.
                 if !profileStore.profiles.isEmpty {
                     savedProfilesSection
                         .padding(.horizontal, 20)
@@ -118,18 +66,11 @@ struct PairingView: View {
         }
         .scrollDismissesKeyboard(.interactively)
         .preferredColorScheme(.dark)
-        // Backdrop doubles as tap-outside-to-dismiss for the keyboard: the
-        // tap only ever clears field focus, and buttons/fields hit-test
-        // first, so nothing else on the screen changes behavior.
         .background(
             PairingBackdrop()
                 .contentShape(Rectangle())
                 .onTapGesture { focusedField = nil }
         )
-        // The standard iOS affordance for keyboards with no dismiss key
-        // (multi-line editor + number pad): the shared Done bar riding above
-        // the keyboard, clearing focus for whichever field owns it. One
-        // merged keyboard toolbar is shown for both fields.
         .keyboardDoneToolbar { focusedField = nil }
         .alert("Save profile", isPresented: $showSaveNamePrompt) {
             TextField("Profile name", text: $newProfileName)
@@ -140,7 +81,6 @@ struct PairingView: View {
         } message: {
             Text("Saves this ticket and PIN so you can reconnect with one tap.")
         }
-        // Scanner: decode -> extract the ticket -> auto-fill the field.
         .sheet(isPresented: $showScanner) {
             QRScannerSheet { scanned in
                 if let ticket = PairingTicket.extract(from: scanned) {
@@ -151,7 +91,6 @@ struct PairingView: View {
                 }
             }
         }
-        // Verification gate: confirm the short phrase, then connect.
         .sheet(isPresented: $showVerification) {
             PairingVerificationView(
                 ticket: trimmedTicket,
@@ -165,11 +104,9 @@ struct PairingView: View {
             )
         }
         .onAppear {
-            autoFocusForWitnessIfNeeded()
+            runUnattendedWitnessHooksIfNeeded()
             reachability.checkNow()
         }
-        // Focusing either field means the user is pairing by hand -- stand the
-        // launch auto-connect down so it never yanks them mid-edit.
         .onChange(of: focusedField) { _, newValue in
             if newValue != nil { onInteract() }
         }
@@ -177,16 +114,11 @@ struct PairingView: View {
 
     // MARK: - Sections
 
-    /// Brand header: the glowing orb mark, the wordmark, and a concise line
-    /// that names what you're pairing with.
     private var header: some View {
         VStack(spacing: 14) {
             AroOrbMark(diameter: 58)
             VStack(spacing: 6) {
                 AroWordmark(size: 46)
-                    // Discreet fallback for opening the hidden diagnostics
-                    // screen (alongside the shake gesture) -- posts the same
-                    // notification ContentView's `.onShake` listens for.
                     .onLongPressGesture(minimumDuration: 1.0) {
                         NotificationCenter.default.post(name: UIDevice.deviceDidShakeNotification, object: nil)
                     }
@@ -198,7 +130,6 @@ struct PairingView: View {
         }
     }
 
-    /// The two frosted input cards: the iroh ticket editor and the pairing PIN.
     private var inputCard: some View {
         VStack(spacing: 14) {
             AroCard {
@@ -216,10 +147,6 @@ struct PairingView: View {
         }
     }
 
-    /// A ticket is a long opaque token, not a single short word, so a
-    /// multi-line editor (rather than a single-line TextField) avoids the
-    /// pasted value scrolling off-screen horizontally. Capped height + internal
-    /// scrolling keeps very long tickets from pushing the actions off-screen.
     private var ticketEditor: some View {
         TextEditor(text: $ticketText)
             .font(.system(.footnote, design: .monospaced))
@@ -250,9 +177,6 @@ struct PairingView: View {
             .accessibilityLabel("Iroh ticket text field")
     }
 
-    /// The short PIN the daemon prints beside its QR (PROTOCOL.md's pre-session
-    /// PIN handshake). Optional: an already-allowlisted device (or a daemon run
-    /// with `--no-pin-auth`) needs none.
     private var pinField: some View {
         TextField("PIN shown by the Mac (optional)", text: $pinText)
             .font(.system(.body, design: .monospaced))
@@ -272,7 +196,6 @@ struct PairingView: View {
             .accessibilityLabel("Pairing PIN field")
     }
 
-    /// Secondary glass button that opens the live QR scanner.
     private var scanButton: some View {
         Button {
             onInteract()
@@ -285,7 +208,6 @@ struct PairingView: View {
         .buttonStyle(AroSecondaryButtonStyle())
     }
 
-    /// The inline scan-failure banner.
     private func scanErrorBanner(_ message: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
@@ -302,8 +224,6 @@ struct PairingView: View {
         )
     }
 
-    /// The one-tap reconnect list -- sleek glass cards. Selecting one connects
-    /// immediately (it was phrase-verified when first saved).
     private var savedProfilesSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -372,16 +292,37 @@ struct PairingView: View {
                         }
                     }
                 }
+            autoConnectToggle
         }
     }
 
-    /// The bottom action bar: compact Save + prominent Connect.
+    private var autoConnectToggle: some View {
+        Toggle(isOn: $autoConnectEnabled) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Connect automatically on launch")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+                Text("Skips this screen and opens your last profile")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.45))
+            }
+        }
+        .tint(Color.aroAccent)
+        .onChange(of: autoConnectEnabled) { _, _ in onInteract() }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
+        )
+        .accessibilityIdentifier("autoConnectToggle")
+    }
+
     private var actionBar: some View {
         HStack(spacing: 12) {
             Button {
                 onInteract()
-                // Prefill with the ticket's phrase as a recognizable default
-                // name; the alert lets the user replace it.
                 newProfileName = PairingPhrase.phrase(for: trimmedTicket)
                 showSaveNamePrompt = true
             } label: {
@@ -393,7 +334,6 @@ struct PairingView: View {
 
             Button {
                 onInteract()
-                // Do NOT connect yet — require phrase verification first.
                 showVerification = true
             } label: {
                 Label("Connect", systemImage: "link")
@@ -403,17 +343,27 @@ struct PairingView: View {
         }
     }
 
-    /// Debug-only unattended witness (same pattern as `MainView`'s
-    /// `HOLOIROH_AUTOFOCUS_PROMPT`): `simctl`/`devicectl` cannot tap the
-    /// ticket editor, so `HOLOIROH_AUTOFOCUS_TICKET=1` focuses it
-    /// programmatically -- the exact `focusedField = .ticket` a real tap
-    /// performs -- driving the real keyboard and therefore the real
-    /// keyboard-toolbar Done bar for a screenshot witness.
-    private func autoFocusForWitnessIfNeeded() {
+    private func runUnattendedWitnessHooksIfNeeded() {
         #if DEBUG
-        guard ProcessInfo.processInfo.environment["HOLOIROH_AUTOFOCUS_TICKET"] == "1" else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            focusedField = .ticket
+        let env = ProcessInfo.processInfo.environment
+        if env["HOLOIROH_AUTOFOCUS_TICKET"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                focusedField = .ticket
+            }
+        }
+        if env["HOLOIROH_WITNESS_OPEN_SCANNER"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                scanError = nil
+                showScanner = true
+            }
+        }
+        if env["HOLOIROH_WITNESS_TAP_SAVED_PROFILE"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                guard let profile = profileStore.profiles.first else { return }
+                NSLog("PairingView: witness tapping saved profile \(profile.name)")
+                onInteract()
+                onConnect(profile.ticket, profile.pin)
+            }
         }
         #endif
     }
