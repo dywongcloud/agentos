@@ -74,7 +74,7 @@ struct ContentView: View {
                     withAnimation(.easeInOut(duration: 0.6)) {
                         isIntroPlaying = false
                     }
-                    autoConnectIfAllowed()
+                    DispatchQueue.main.async { autoConnectIfAllowed() }
                 }
                 .transition(.opacity.combined(with: .scale(scale: 1.08, anchor: .top)))
                 .zIndex(1)
