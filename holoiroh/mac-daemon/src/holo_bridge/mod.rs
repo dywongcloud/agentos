@@ -441,6 +441,14 @@ impl HoloBridge {
         if self.is_on_fallback() {
             return Ok(());
         }
+        if self.control.has_a_turn_streaming() {
+            tracing::info!(
+                requested = ?tier,
+                "skipping the model-tier escalation: switching tiers restarts holo serve, which \
+                 would tear down the turn's in-flight stream"
+            );
+            return Ok(());
+        }
         let target_model = tier.model_id();
         tracing::info!(to = ?tier, model = target_model, "stall watchdog forcing a stronger model tier");
         self.switch_to(None, Some(target_model), false, Some(Some(target_model.to_string())))

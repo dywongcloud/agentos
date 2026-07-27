@@ -198,6 +198,17 @@ pub const HOLO_SERVE_DEFAULT_PORT: u16 = 18794;
 /// itself may need to download on first run (`runtime_install.py`), so this is generous --
 /// longer than the ~45s `SPAWN_TIMEOUT_S` the CLI's own inner spawn uses for the runtime binary,
 /// to leave room for the outer `holo serve` process startup on top of that.
+pub const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(2000);
+
+pub const LONGEST_OBSERVED_PORT_HOLD_AFTER_KILL: Duration = Duration::from_secs(30);
+
+pub const MAX_SPAWN_ATTEMPTS: u32 = 2
+    * (LONGEST_OBSERVED_PORT_HOLD_AFTER_KILL.as_millis() / SPAWN_RETRY_BACKOFF.as_millis()) as u32;
+
+pub const fn total_spawn_retry_budget() -> Duration {
+    Duration::from_millis(SPAWN_RETRY_BACKOFF.as_millis() as u64 * MAX_SPAWN_ATTEMPTS as u64)
+}
+
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -330,8 +341,6 @@ impl HoloServeProcess {
         // the only retry shape that actually closes this race. A port genuinely held by an
         // unrelated long-lived process still fails after the retry budget, with the real
         // holo-serve-reported reason surfaced.
-        const MAX_SPAWN_ATTEMPTS: u32 = 8;
-        const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(1200);
         let mut last_spawn_err = None;
         for attempt in 1..=MAX_SPAWN_ATTEMPTS {
             match Self::spawn_attempt(holo_bin, port, local_base_url, model_override, &auth_token, &base_url).await
@@ -351,7 +360,13 @@ impl HoloServeProcess {
                 }
             }
         }
-        Err(last_spawn_err.expect("loop runs at least once, so an error is always recorded on exhaustion"))
+        let exhausted = last_spawn_err
+            .expect("loop runs at least once, so an error is always recorded on exhaustion");
+        Err(exhausted.context(format!(
+            "holo serve did not come up within {}s of retries ({} attempts)",
+            total_spawn_retry_budget().as_secs(),
+            MAX_SPAWN_ATTEMPTS
+        )))
     }
 
     /// One attempt to spawn `holo serve` and wait for it to report healthy. Split out of

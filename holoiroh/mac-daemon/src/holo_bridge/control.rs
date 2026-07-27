@@ -2009,6 +2009,13 @@ impl HoloControlBridge {
         .await;
     }
 
+    pub fn has_a_turn_streaming(&self) -> bool {
+        self.current_turn
+            .lock()
+            .expect("current_turn lock poisoned")
+            .is_some()
+    }
+
     fn is_awaiting_user_decision(&self) -> bool {
         self.pending_consent
             .lock()
