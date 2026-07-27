@@ -511,11 +511,13 @@ fn now_ms() -> u64 {
 pub const DEFAULT_ENV_FACTS: &[(&str, &str)] = &[
     (
         "terminal-app-ghostty",
-        "The user's default terminal application is Ghostty, not Apple's Terminal.app or iTerm2 \
-         (Terminal.app is an acceptable alternative if Ghostty is unavailable). When asked to \
-         open, use, or go to a terminal or an existing CLI session (e.g. Claude Code), check for \
-         an already-running Ghostty window first (Mission Control / Cmd+Tab / the Dock) instead \
-         of opening a new terminal application.",
+        "Ghostty is the user's OWN terminal application (not Apple's Terminal.app or iTerm2), and \
+         its windows hold the user's own work, including live Claude Code sessions. When the user \
+         asks you to look at, go to, or point them at THEIR terminal or an existing CLI session, \
+         that means a Ghostty window (Mission Control / Cmd+Tab / the Dock). Never type into, \
+         close, or reuse a Ghostty window for your own terminal work -- your own CLI work belongs \
+         in the separate `aro` tmux session described in the terminal-work-in-tmux-session-aro \
+         fact.",
     ),
     (
         "never-interrupt-claude-code",

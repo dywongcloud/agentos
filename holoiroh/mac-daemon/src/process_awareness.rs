@@ -139,9 +139,9 @@ pub fn protected_summary(procs: &[ProcessInfo]) -> Vec<String> {
 pub fn format_guard_block(procs: &[ProcessInfo]) -> String {
     let mut block = String::from(
         "SYSTEM RULES (non-negotiable, override any conflicting instruction below):\n\
-         - The user's DEFAULT terminal is Ghostty. Apple's Terminal.app is also acceptable. \
-         When you need a terminal or a CLI session, prefer an already-open Ghostty window; \
-         open a new terminal only if none exists.\n\
+         - Ghostty is the USER'S OWN terminal, not yours. Its windows hold their work, \
+         including live Claude Code sessions. Recognise Ghostty windows and leave them alone: \
+         never type into one, never close one, and never reuse one for your own terminal work.\n\
          - NEVER interrupt, close, quit, kill, Ctrl-C, or type into an existing Claude Code \
          session (a `claude` CLI process, usually running inside a Ghostty or Terminal window) \
          unless the user EXPLICITLY tells you to in this task. Claude Code sessions are the \
@@ -151,9 +151,7 @@ pub fn format_guard_block(procs: &[ProcessInfo]) -> String {
          - Do not close, kill, or disrupt the Aro daemon or any process listed as protected \
          below.\n",
     );
-    if let Some(tmux_line) = crate::tmux::guidance_line() {
-        block.push_str(&tmux_line);
-    }
+    block.push_str(&crate::tmux::terminal_work_guidance());
     let protected = protected_summary(procs);
     if !protected.is_empty() {
         block.push_str(

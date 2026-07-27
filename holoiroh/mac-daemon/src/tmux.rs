@@ -132,31 +132,33 @@ pub fn ensure_session() -> SessionState {
     session_state()
 }
 
-pub fn guidance_line() -> Option<String> {
-    guidance_for(&session_state())
+pub fn terminal_work_guidance() -> String {
+    terminal_work_guidance_for(&session_state())
 }
 
-pub fn guidance_for(state: &SessionState) -> Option<String> {
-    let shared_rules = format!(
-        "Bring the {HOST_TERMINAL_APP} window to the front before you work in it (click \
+pub fn terminal_work_guidance_for(state: &SessionState) -> String {
+    let visibility_rules = format!(
+        "Bring that {HOST_TERMINAL_APP} window to the front before you work in it (click \
          {HOST_TERMINAL_APP} in the Dock, or Cmd+Tab to it) so the user watching the live screen \
          share can see the work happen -- a fullscreen app on another macOS Space hides it \
-         completely, and work nobody can see defeats the point of sharing the screen. Do this \
-         terminal work in {HOST_TERMINAL_APP}, never in Ghostty: Ghostty is the user's own \
-         terminal and its windows host live Claude Code sessions you must never disturb. Never \
-         `tmux kill-server`, `tmux kill-session`, or detach the session.\n"
+         completely, and work nobody can see defeats the point of sharing the screen."
     );
     match state {
-        SessionState::TmuxNotInstalled => None,
-        SessionState::RunningWithAttachedWindow { .. } => Some(format!(
-            "- For terminal/CLI work, use the tmux session named `{SESSION_NAME}`, already \
-             running in a {HOST_TERMINAL_APP} window. {shared_rules}"
-        )),
-        SessionState::RunningWithNoWindowAttached => Some(format!(
-            "- For terminal/CLI work, use the tmux session named `{SESSION_NAME}`. No window is \
-             showing it right now, so open {HOST_TERMINAL_APP} and run \
+        SessionState::RunningWithAttachedWindow { .. } => format!(
+            "- Do your OWN terminal/CLI work in the tmux session named `{SESSION_NAME}`, already \
+             running in a {HOST_TERMINAL_APP} window. {visibility_rules} Never \
+             `tmux kill-server`, `tmux kill-session`, or detach that session.\n"
+        ),
+        SessionState::RunningWithNoWindowAttached => format!(
+            "- Do your OWN terminal/CLI work in the tmux session named `{SESSION_NAME}`. No \
+             window is showing it right now, so open {HOST_TERMINAL_APP} and run \
              `tmux attach -t {SESSION_NAME}` (create it with `tmux new-session -s {SESSION_NAME}` \
-             if it is gone). {shared_rules}"
-        )),
+             if it is gone). {visibility_rules} Never `tmux kill-server`, `tmux kill-session`, or \
+             detach that session.\n"
+        ),
+        SessionState::TmuxNotInstalled => format!(
+            "- Do your OWN terminal/CLI work in a {HOST_TERMINAL_APP} window that you open for \
+             yourself. {visibility_rules}\n"
+        ),
     }
 }

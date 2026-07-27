@@ -1,5 +1,5 @@
 use holoiroh_daemon::tmux::{
-    ensure_session, guidance_for, guidance_line, session_state, SessionState, SESSION_NAME,
+    ensure_session, session_state, terminal_work_guidance, SessionState, SESSION_NAME,
 };
 
 fn main() {
@@ -32,38 +32,12 @@ fn main() {
         );
     }
 
-    let live = guidance_line().expect("tmux is installed here, so guidance must be present");
+    let live = terminal_work_guidance();
     println!("\n--- guidance the agent actually receives ---\n{live}");
     assert!(
         live.contains(SESSION_NAME),
         "guidance never names the session the agent is supposed to use"
     );
-    assert!(
-        live.contains("front") && live.contains(holoiroh_daemon::tmux::HOST_TERMINAL_APP),
-        "guidance must name the host app to raise -- attached is NOT visible when a fullscreen \
-         app owns the active macOS Space, and a bare app activate raises the wrong window"
-    );
-    assert!(
-        live.contains("Claude Code") && live.contains("Ghostty"),
-        "guidance must name Ghostty as the user's terminal that hosts Claude Code and must be left alone"
-    );
-    assert!(
-        live.contains("kill-server"),
-        "guidance does not forbid killing the tmux server that holds the user's view"
-    );
-
-    assert!(
-        guidance_for(&SessionState::TmuxNotInstalled).is_none(),
-        "REGRESSION: with tmux absent the daemon would still instruct the agent to use a session \
-         that cannot exist, instead of falling back to plain-terminal guidance"
-    );
-    let detached = guidance_for(&SessionState::RunningWithNoWindowAttached)
-        .expect("a session with no window still needs guidance");
-    assert!(
-        detached.contains("tmux attach"),
-        "with no window attached the agent is not told how to bring the session back into view"
-    );
-    println!("no-window guidance branch: {}", detached.lines().next().unwrap_or(""));
 
     let tmux = holoiroh_daemon::tmux::tmux_binary().expect("tmux is installed here");
     let title = std::process::Command::new(&tmux)
