@@ -1,7 +1,8 @@
 //! Native running-process awareness + the hard "do not touch" guidance the desktop agent
 //! must obey. Issue-2's requirement: the agent must never interrupt an existing Claude Code
-//! session, must know the user's default terminal is Ghostty (regular Terminal is also fine),
-//! and must be aware of what is actually running so it knows what not to touch.
+//! session, must be able to recognise the user's own terminal windows (Ghostty) so it leaves
+//! them alone, and must be aware of what is actually running so it knows what not to touch.
+//! Where the agent's OWN terminal work goes is a separate question, owned by [`crate::tmux`].
 //!
 //! Two layers, deliberately separate:
 //!
@@ -13,8 +14,8 @@
 //! - **[`format_guard_block`]**: the HARD, non-negotiable instruction block prepended to every
 //!   turn (see `crate::holo_bridge::control`'s `run_prompt`). Unlike the soft, semantically
 //!   retrieved `env_context` facts (top-k, may not surface), this block is injected
-//!   UNCONDITIONALLY so the "never interrupt Claude Code / default terminal is Ghostty" rule
-//!   is present on literally every turn.
+//!   UNCONDITIONALLY, so the never-interrupt-Claude-Code rule and the agent's own terminal
+//!   destination are both present on literally every turn.
 //!
 //! This is guidance-injection, not enforcement: this daemon forwards whole prompts to
 //! `holo serve` and has no per-action interception hook for terminal input specifically (the
@@ -45,8 +46,8 @@ pub struct ProcessInfo {
 
 /// Executable-name fragments that mark a protected process. Matched case-insensitively against
 /// `comm`. Claude Code runs as `claude` (witnessed: `claude --teleport ...`); Ghostty is this
-/// user's terminal; Terminal.app is the acceptable alternative; both host CLI sessions that
-/// must be left alone.
+/// user's own terminal; Terminal.app hosts the agent's shared `aro` session (see
+/// [`crate::tmux`]). Both host CLI sessions that must be left alone.
 const PROTECTED_COMMS: &[(&str, &str)] = &[
     ("claude", "an active Claude Code CLI session -- NEVER interrupt, close, or type into it"),
     ("ghostty", "the Ghostty terminal (this user's default) -- may host a Claude Code session; do not close or disturb"),
@@ -132,7 +133,8 @@ pub fn protected_summary(procs: &[ProcessInfo]) -> Vec<String> {
 }
 
 /// The HARD guidance block prepended to every turn. Combines the non-negotiable
-/// never-interrupt-Claude-Code / default-terminal-is-Ghostty rules with a live snapshot of the
+/// never-interrupt-Claude-Code and leave-the-user's-Ghostty-windows-alone rules, the agent's own
+/// terminal destination from [`crate::tmux::terminal_work_guidance`], and a live snapshot of the
 /// protected processes actually running right now, so the agent can recognize them on screen.
 /// Always returns a block (the rules are unconditional); the live-process section is included
 /// only when a snapshot is available.

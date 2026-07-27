@@ -11,11 +11,21 @@ const STATES: &[(&str, SessionState)] = &[
     ("tmux-absent", SessionState::TmuxNotInstalled),
 ];
 
+const GUIDANCE_MODULE_SOURCES: &[(&str, &str)] = &[
+    ("env_context.rs", include_str!("../src/env_context.rs")),
+    (
+        "process_awareness.rs",
+        include_str!("../src/process_awareness.rs"),
+    ),
+    ("tmux.rs", include_str!("../src/tmux.rs")),
+];
+
 const ROUTES_AGENT_INTO_GHOSTTY: &[&str] = &[
     "prefer an already-open Ghostty",
     "already-open Ghostty window",
     "already-running Ghostty window first",
     "check for an already-running Ghostty",
+    "rather than needing a fresh one opened",
 ];
 
 fn main() {
@@ -90,12 +100,16 @@ fn main() {
         .find(|(k, _)| *k == "terminal-work-in-tmux-session-aro")
         .expect("the tmux destination fact is missing");
 
-    for phrase in ROUTES_AGENT_INTO_GHOSTTY {
-        assert!(
-            !ghostty.1.contains(phrase),
-            "the seeded terminal-app-ghostty fact still contains {phrase:?}; semantic retrieval \
-             can surface it ALONE, steering the agent into Ghostty with the tmux fact never shown"
-        );
+    for (key, text) in facts {
+        for phrase in ROUTES_AGENT_INTO_GHOSTTY {
+            assert!(
+                !text.contains(phrase),
+                "the seeded fact {key:?} contains {phrase:?}; EVERY fact is retrieved \
+                 semantically and can surface ALONE, so any one of them steering the agent into \
+                 a Ghostty window re-opens the hazard -- checking only the Ghostty fact is how \
+                 the project-aro-holoiroh fact slipped through"
+            );
+        }
     }
     assert!(
         ghostty.1.contains("Claude Code") && ghostty.1.contains("Never type into"),
@@ -117,5 +131,18 @@ fn main() {
         "the window title does not identify which session it hosts"
     );
 
-    println!("\nVERDICT: OK -- one destination for the agent's terminal work, in every state, and Ghostty is protected rather than nominated");
+    for (module, source) in GUIDANCE_MODULE_SOURCES {
+        for phrase in ROUTES_AGENT_INTO_GHOSTTY {
+            assert!(
+                !source.contains(phrase),
+                "{module} still contains {phrase:?} somewhere in its SOURCE -- including in a \
+                 comment, where none of the live-text assertions above can see it. A stale copy \
+                 there is what a maintainer reads and reintroduces; that is exactly how this \
+                 phrase survived the first fix"
+            );
+        }
+        println!("{module}: no stale routing copy in source");
+    }
+
+    println!("\nVERDICT: OK -- one destination for the agent's terminal work, in every state, Ghostty is protected rather than nominated, and no stale copy survives in source");
 }

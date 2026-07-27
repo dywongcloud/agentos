@@ -5,13 +5,15 @@
 //!
 //! ## The concrete failure this exists to fix
 //!
-//! Live-witnessed: asked to "go to Claude Code" to modify this very project, the agent opened
-//! a NEW terminal window instead of finding the existing Claude Code session already running
-//! in Ghostty (this user's actual terminal app, not Terminal.app -- a fact the model has zero
-//! way to know from a screenshot alone if the target window isn't currently visible/focused).
-//! There was no mechanism anywhere in this daemon to inject a fact like "the user's terminal is
-//! Ghostty" into a turn; `A2aClient::send_and_stream` sends the raw prompt text and nothing
-//! else (see its own doc). This module is that mechanism.
+//! Live-witnessed: asked to "go to Claude Code" to modify this very project, the agent could not
+//! tell which window the user meant -- Ghostty is this user's terminal app, not Terminal.app, and
+//! the model has zero way to know that from a screenshot alone if the target window isn't
+//! currently visible/focused. There was no mechanism anywhere in this daemon to inject a fact
+//! like "the user's terminal is Ghostty" into a turn; `A2aClient::send_and_stream` sends the raw
+//! prompt text and nothing else (see its own doc). This module is that mechanism.
+//!
+//! Knowing which windows are the user's is what lets the agent leave them alone; where the
+//! agent's OWN terminal work goes is a separate question, answered by [`crate::tmux`].
 //!
 //! ## Architecture: pattern-ported from `AnEntrypoint/gm`'s `rs-plugkit`, not vendored
 //!
@@ -94,10 +96,10 @@ pub struct ContextFact {
     pub key: String,
     /// Always `"default"` today -- see this module's doc on why no category schema exists.
     pub ns: String,
-    /// The fact itself, present-tense, e.g. "The user's terminal application is Ghostty, not
-    /// Apple's Terminal.app or iTerm2. When asked to open/use/go to a terminal or an existing
-    /// CLI session (e.g. Claude Code), check for an already-running Ghostty window first
-    /// instead of opening a new terminal application."
+    /// The fact itself, present-tense, e.g. "The user's screenshots directory is
+    /// ~/Pictures/Screenshots, not the Desktop." Kept policy-free on purpose: the real terminal
+    /// facts live in [`DEFAULT_ENV_FACTS`], and an example that restates one of them is a second
+    /// copy that goes stale the moment the real fact changes.
     pub text: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -541,8 +543,9 @@ pub const DEFAULT_ENV_FACTS: &[(&str, &str)] = &[
         "project-aro-holoiroh",
         "This computer-use daemon's own source project is called Aro (internal codename \
          holoiroh, directory ~/Documents/agentOS/holoiroh); it is a git repository the user edits \
-         via Claude Code, typically already running in an existing Ghostty terminal window \
-         rather than needing a fresh one opened.",
+         via Claude Code, usually in one of their own Ghostty windows. That window is the user's \
+         work -- recognise it so you leave it alone, and do your own terminal work in the `aro` \
+         session instead.",
     ),
 ];
 
