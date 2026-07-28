@@ -25,6 +25,10 @@ encrypted_secrets.json
 # worktree on every chain and blocks the COMPLETE gate for no reason. Same class as the runtime
 # state already listed above.
 .gm/memories/.flat-export-done
+# gm-continue's own recursion counter. Its docs say it is "reset by a fresh user prompt", so it is
+# rewritten on essentially every session and every re-invocation -- tracked, that dirties the
+# worktree and blocks the COMPLETE gate for a file no human edits. Same class as the marker above.
+.gm/.gm-continue-count
 .gm/turn-state.json
 .gm/mutables.yml
 .gm/prd.yml

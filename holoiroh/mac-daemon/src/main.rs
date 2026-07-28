@@ -122,6 +122,17 @@ struct Cli {
 
 /// Reports whether this machine can run the daemon, without becoming one.
 async fn run_preflight(live: &Live, display_index: Option<usize>) -> anyhow::Result<()> {
+    // Run the checks, THEN close, whatever the outcome. Closing only on the success path meant
+    // every early return dropped the endpoint instead, and iroh logs "Endpoint dropped without
+    // calling Endpoint::close. Aborting ungracefully." at ERROR -- so the one run where something
+    // is genuinely wrong printed a scary unrelated-looking line right next to the real reason.
+    // Witnessed with `--preflight --display 99`.
+    let outcome = preflight_checks(live, display_index).await;
+    live.endpoint().close().await;
+    outcome
+}
+
+async fn preflight_checks(live: &Live, display_index: Option<usize>) -> anyhow::Result<()> {
     use iroh_live::media::capture::ScreenCapturer;
     use iroh_live::media::traits::VideoSource;
 
@@ -174,10 +185,6 @@ async fn run_preflight(live: &Live, display_index: Option<usize>) -> anyhow::Res
         accessibility,
         "Accessibility is not granted, so hands-on control would silently do nothing"
     );
-    // Close rather than drop: an endpoint dropped without this logs "Aborting ungracefully" at
-    // ERROR, which in a diagnostic whose whole job is telling the operator whether things are
-    // healthy reads as a failure right after it reported success.
-    live.endpoint().close().await;
     println!("\npreflight OK -- this machine can publish its screen and accept remote control.");
     Ok(())
 }
