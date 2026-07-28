@@ -120,6 +120,71 @@ impl VideoSource for PacedProbeSource {
     }
 }
 
+/// Times the two CPU pixel passes the iOS bridge performs on every decoded frame.
+async fn measure_pixel_passes() -> anyhow::Result<Option<(Duration, Duration, usize)>> {
+    let publisher = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind()
+        .await?;
+    let subscriber = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind()
+        .await?;
+    let publisher_addr = iroh::EndpointAddr::from_parts(
+        publisher.id(),
+        publisher.bound_sockets().into_iter().map(|mut s| {
+            if s.ip().is_unspecified() {
+                s.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+            }
+            iroh::TransportAddr::Ip(s)
+        }),
+    );
+    let publisher_live = Live::builder(publisher).with_router().spawn();
+    let subscriber_live = Live::builder(subscriber).with_router().spawn();
+
+    let broadcast = LocalBroadcast::new();
+    let codec = VideoCodec::best_available().unwrap_or(VideoCodec::H264);
+    let mut source = PacedProbeSource::new(60.0);
+    source.start()?;
+    broadcast
+        .video()
+        .set_source(source, codec, vec![VideoPreset::P720])?;
+    publisher_live.publish(BROADCAST_NAME, &broadcast).await?;
+
+    let subscription = subscriber_live
+        .subscribe(publisher_addr, BROADCAST_NAME)
+        .await?;
+    let mut track = subscription.broadcast().video_ready().await?;
+    tokio::time::sleep(SETTLE).await;
+
+    let mut to_rgba = Duration::ZERO;
+    let mut swizzle = Duration::ZERO;
+    let mut frames = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(500), track.next_frame()).await
+        else {
+            continue;
+        };
+        let started = Instant::now();
+        let rgba = frame.rgba_image();
+        to_rgba += started.elapsed();
+
+        // The exact shape of the bridge's own swizzle: swap R and B in place.
+        let mut pixels = rgba.as_raw().clone();
+        let started = Instant::now();
+        for px in pixels.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        swizzle += started.elapsed();
+        std::hint::black_box(&pixels);
+        frames += 1;
+    }
+
+    if frames == 0 {
+        return Ok(None);
+    }
+    Ok(Some((to_rgba / frames as u32, swizzle / frames as u32, frames)))
+}
+
 /// Time from subscribing to the first decoded frame arriving.
 async fn measure_join() -> anyhow::Result<Duration> {
     let publisher = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
@@ -365,6 +430,31 @@ async fn main() -> anyhow::Result<()> {
             "  skipped: no display available ({err:#}). On macOS this is a missing Screen \
              Recording grant, which CI does not have."
         ),
+    }
+
+    // What the phone pays per frame AFTER decoding. The VideoToolbox decoder already produces an
+    // NV12 CVPixelBuffer, which AVSampleBufferDisplayLayer accepts directly, but the bridge asks
+    // for `rgba_image()` (a CPU readback plus NV12->RGBA) and then swizzles RGBA->BGRA in a
+    // scalar loop, before Swift memcpys a third time into a pooled buffer. This times the two
+    // passes that happen in Rust, on real decoded frames, so the row is quantified rather than
+    // estimated. A phone is slower than this Mac, so treat these as a floor.
+    println!("\nper-frame CPU pixel work the phone does after decoding");
+    let pixel_costs = measure_pixel_passes().await?;
+    match pixel_costs {
+        Some((to_rgba, swizzle, frames)) => {
+            println!(
+                "  over {frames} decoded frames: NV12->RGBA {to_rgba:.2?}/frame, \
+                 RGBA->BGRA swizzle {swizzle:.2?}/frame, total {:.2?}/frame",
+                to_rgba + swizzle
+            );
+            let budget = Duration::from_secs_f64(1.0 / 28.0);
+            println!(
+                "  that is {:.1}% of the {:.2?} frame interval the pipeline actually delivers at",
+                (to_rgba + swizzle).as_secs_f64() / budget.as_secs_f64() * 100.0,
+                budget
+            );
+        }
+        None => println!("  skipped: no frames decoded"),
     }
 
     println!("\nthe app actually asks for these settings");
