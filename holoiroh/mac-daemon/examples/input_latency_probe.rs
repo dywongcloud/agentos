@@ -50,6 +50,32 @@ fn envelope(sequence: u64, payload: ClientMessage) -> TaskEnvelope<ClientMessage
     }
 }
 
+/// `HOLOIROH_PROBE_INITIAL_RTT_MS` exists because the opening moves of a fresh connection cost
+/// tens of milliseconds, and stock QUIC assumes a 333ms RTT until it takes its first sample --
+/// an obvious-looking culprit.
+///
+/// It is not the culprit. Measured three runs each at stock, 10ms and 50ms: the first move cost
+/// 25-33ms in every configuration, and steady-state p50 stayed at 135-208us throughout. The
+/// opening cost is connection and stream establishment itself, and the probe's second drag
+/// already shows it does not recur after an idle period. The hook is kept precisely so this
+/// stays measured rather than being re-proposed from first principles.
+fn probe_transport_config() -> iroh::endpoint::QuicTransportConfig {
+    let builder = iroh::endpoint::QuicTransportConfig::builder();
+    match std::env::var("HOLOIROH_PROBE_INITIAL_RTT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(ms) => {
+            println!("initial_rtt overridden to {ms}ms");
+            builder.initial_rtt(Duration::from_millis(ms)).build()
+        }
+        None => {
+            println!("initial_rtt left at the stock default");
+            builder.build()
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     assert_eq!(
@@ -63,8 +89,10 @@ async fn main() -> anyhow::Result<()> {
     // handed over directly as a loopback socket. That is deliberately the BEST case -- two
     // endpoints already on a direct path -- because the point is to floor the daemon's own cost,
     // not to measure how long iroh takes to find a peer.
+    let transport = probe_transport_config();
     let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .alpns(vec![CONTROL_ALPN.to_vec()])
+        .transport_config(transport.clone())
         .bind()
         .await?;
     let sockets = server.bound_sockets();
@@ -80,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
     );
     println!("dialing: {server_addr:?}");
     let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .transport_config(transport)
         .bind()
         .await?;
 

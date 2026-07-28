@@ -145,6 +145,14 @@ imageproc = "0.25"
 ab_glyph = "0.2"
 regex = "1"
 base64 = "0.22"
+# Local-network (mDNS) address lookup, added to the N0 preset in main.rs rather than replacing
+# it. Without it a phone and a Mac in the same room start every session relayed through a
+# datacentre, because N0 resolves a node id via pkarr/DNS and the publisher advertises relay
+# addresses only. Measured by mac-daemon/examples/lan_discovery_probe.rs: time to a direct path
+# 1.36s -> 198ms on this machine. iroh 1.0.2 moved mDNS out of the main crate into this one
+# (see iroh's address_lookup module doc), so this is the maintained implementation, not a bespoke
+# one. Resolves against the `=1.0.2` iroh pin above.
+iroh-mdns-address-lookup = "0.4.0"
 
 [target.'cfg(unix)'.dependencies]
 # Used only to send SIGTERM (graceful shutdown) to the `holo serve` child before falling back

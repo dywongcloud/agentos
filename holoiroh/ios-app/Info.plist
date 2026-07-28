@@ -22,6 +22,10 @@
 	<string>1</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Aro uses the camera to scan the pairing QR code your Mac displays.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_irohv1._udp</string>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Aro connects directly to your paired Mac over your local network for the lowest-latency screen mirroring and control, falling back to a relay when a direct connection isn't possible.</string>
 	<key>NSMicrophoneUsageDescription</key>

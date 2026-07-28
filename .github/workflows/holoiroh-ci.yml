@@ -126,6 +126,12 @@ jobs:
           # dispatch, injection) and proves order survives a real connection. Asserts on the
           # median, not a tail percentile, so a busy runner cannot make it flaky.
           cargo run --release --example input_latency_probe -p holoiroh-daemon --locked
+          # Guards-only mode (no HOLOIROH_LAN_PROBE_NETWORK): asserts the daemon, the iOS bridge,
+          # Info.plist and project.yml all still opt into local-network discovery. The timing
+          # measurement it also carries needs multicast plus macOS local-network permission and is
+          # deliberately not run here -- but without these guards nothing would notice the product
+          # silently going back to starting every same-room session on the relay.
+          cargo run --example lan_discovery_probe -p holoiroh-daemon --locked
 
       - name: Witness iOS ConnectionProfileRepository conformance (macOS Swift)
         run: |

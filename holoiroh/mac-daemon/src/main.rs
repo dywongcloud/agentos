@@ -392,8 +392,22 @@ async fn main() -> anyhow::Result<()> {
     // this machine has no v6 route -- skipping the dead path outright
     // instead of waiting out iroh's own path-probing/migration timeout. ---
     let secret_key = persistent_secret_key()?;
-    let mut endpoint_builder =
-        iroh::Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key);
+    // mDNS address lookup, ADDED to the N0 preset rather than replacing it, so a phone on
+    // cellular still reaches this Mac through the relay exactly as before.
+    //
+    // What it fixes: `presets::N0` gives pkarr publish + n0 DNS resolve + relay and nothing else,
+    // and the publisher defaults to advertising RELAY addresses only. Resolving the daemon's node
+    // id therefore hands the phone a relay URL, so a phone and a Mac in the same room begin every
+    // session with their packets crossing a datacentre, and only fall back to a local path once
+    // in-band NAT-traversal candidate exchange discovers one. `lan_discovery_probe` measures the
+    // difference on this machine: stock reaches a direct path 1.36s after connecting, with mDNS
+    // 198ms, and the connect itself drops from 842ms to 96ms.
+    //
+    // Safe in a way that publishing the same addresses via pkarr would not be: mDNS records are
+    // link-local and never leave the network the two devices are already sharing.
+    let mut endpoint_builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(secret_key)
+        .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder());
     if has_ipv6_default_route() {
         info!("IPv6 default route present -- binding both IPv4 and IPv6 transports");
     } else {

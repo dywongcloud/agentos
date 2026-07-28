@@ -40,6 +40,12 @@ iroh-live = { git = "https://github.com/n0-computer/iroh-live", rev = "5f95758fc
 # Pinned to the same iroh version iroh-live's own dependency graph resolves
 # to, same rationale as mac-daemon/Cargo.toml.
 iroh = "=1.0.2"
+# Local-network (mDNS) address lookup, added to the N0 preset in lib.rs rather than replacing it,
+# so a phone away from the Mac's network still connects through the relay unchanged. On the same
+# network it is what stops the session starting relayed through a datacentre; see the daemon's
+# matching dependency comment. Needs `NSBonjourServices` in the app's Info.plist or iOS refuses
+# the multicast queries. Same version the daemon pins, resolving against the `=1.0.2` iroh pin.
+iroh-mdns-address-lookup = "0.4.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 # NDJSON control-channel framing: builds the bare `{"type":"pin","pin":...}`
 # handshake line (with correct JSON string escaping for arbitrary PIN input)

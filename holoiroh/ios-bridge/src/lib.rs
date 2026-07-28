@@ -389,8 +389,18 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_new() -> *mut HoloirohBridge {
         // sessions -- the publisher's catalog/tracks -- are accepted). This is
         // exactly the pattern iroh-live's own subscribe_test.rs / frame_dump.rs
         // examples use.
+        // mDNS address lookup is ADDED to the preset, not substituted for it: away from the Mac's
+        // network the phone still reaches it through the relay exactly as before. On the same
+        // network it stops the session beginning with every packet routed through a datacentre --
+        // see main.rs's matching comment and mac-daemon/examples/lan_discovery_probe.rs for the
+        // measurement. Requires `NSBonjourServices` in the app's Info.plist; without that entry
+        // iOS silently refuses the multicast queries and this quietly degrades to relay-first.
         let live = runtime.block_on(async {
-            let endpoint = Endpoint::builder(presets::N0).bind().await.ok()?;
+            let endpoint = Endpoint::builder(presets::N0)
+                .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
+                .bind()
+                .await
+                .ok()?;
             Some(Live::builder(endpoint).with_router().spawn())
         })?;
 
