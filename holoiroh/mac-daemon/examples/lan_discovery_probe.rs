@@ -36,6 +36,26 @@ const WIRING_SOURCES: &[(&str, &str)] = &[
         include_str!("../../ios-bridge/src/lib.rs"),
     ),
 ];
+/// Both `Endpoint::builder` calls in the bridge -- the real connection and the reachability
+/// probe that predicts it -- must register the lookup, so counting them is the check.
+const BRIDGE_REACHABILITY_USES_LOOKUP: bool = {
+    let source = include_str!("../../ios-bridge/src/lib.rs").as_bytes();
+    let needle = b"MdnsAddressLookup::builder()";
+    let mut found = 0;
+    let mut i = 0;
+    while i + needle.len() <= source.len() {
+        let mut j = 0;
+        while j < needle.len() && source[i + j] == needle[j] {
+            j += 1;
+        }
+        if j == needle.len() {
+            found += 1;
+        }
+        i += 1;
+    }
+    found >= 2
+};
+
 const INFO_PLIST: &str = include_str!("../../ios-app/Info.plist");
 const PROJECT_YML: &str = include_str!("../../ios-app/project.yml");
 const CONNECT_BUDGET: Duration = Duration::from_secs(20);
@@ -235,6 +255,12 @@ fn check_the_product_opts_in() -> anyhow::Result<()> {
         );
         println!("  ok   {path} registers the mDNS address lookup");
     }
+    anyhow::ensure!(
+        BRIDGE_REACHABILITY_USES_LOOKUP,
+        "the reachability probe discovers less than the connect path it predicts, so it can \
+         report a Mac as unreachable that the app would have reached over the local network"
+    );
+    println!("  ok   the reachability probe uses the same lookup as the connect path");
     anyhow::ensure!(
         INFO_PLIST.contains("NSBonjourServices") && INFO_PLIST.contains("_irohv1._udp"),
         "ios-app/Info.plist does not declare the Bonjour service type; iOS refuses the multicast \

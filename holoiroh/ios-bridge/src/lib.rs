@@ -541,7 +541,16 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_probe_reachable(
             Err(_) => return false,
         };
         runtime.block_on(async move {
-            let endpoint = match Endpoint::builder(presets::N0).bind().await {
+            // Same address lookup as the real connect path above. This probe exists to PREDICT
+            // whether that path will work, so discovering strictly less than it does means
+            // reporting a Mac as unreachable that the app would in fact have reached -- a
+            // node-id-only ticket resolves through pkarr/DNS to a relay, and a peer reachable
+            // only on the local network would be invisible here while being fine there.
+            let endpoint = match Endpoint::builder(presets::N0)
+                .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
+                .bind()
+                .await
+            {
                 Ok(e) => e,
                 Err(_) => return false,
             };
