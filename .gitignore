@@ -21,6 +21,10 @@ encrypted_secrets.json
 .gm/last-instruction-ts
 .gm/last-prompt.txt
 .gm/long-gap-retry-state
+# gm rewrites this digest/count marker as it exports memories, so a tracked copy dirties the
+# worktree on every chain and blocks the COMPLETE gate for no reason. Same class as the runtime
+# state already listed above.
+.gm/memories/.flat-export-done
 .gm/turn-state.json
 .gm/mutables.yml
 .gm/prd.yml
