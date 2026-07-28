@@ -132,6 +132,11 @@ jobs:
           # deliberately not run here -- but without these guards nothing would notice the product
           # silently going back to starting every same-room session on the relay.
           cargo run --example lan_discovery_probe -p holoiroh-daemon --locked
+          # Publishes and subscribes over a real loopback iroh connection through the real
+          # encode/transport/decode pipeline, so the video-latency numbers the capture rate and
+          # playout budget were derived from stay live rather than becoming folklore. Its final
+          # section wants a real display and skips cleanly without one, which is the CI case.
+          cargo run --release --example video_latency_probe -p holoiroh-daemon --locked
 
       - name: Witness iOS ConnectionProfileRepository conformance (macOS Swift)
         run: |

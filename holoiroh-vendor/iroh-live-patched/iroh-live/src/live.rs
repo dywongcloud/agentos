@@ -231,12 +231,33 @@ impl Live {
         remote: impl Into<EndpointAddr>,
         broadcast_name: &str,
     ) -> Result<crate::Subscription> {
+        self.subscribe_with_playback_policy(
+            remote,
+            broadcast_name,
+            moq_media::playout::PlaybackPolicy::default(),
+        )
+        .await
+    }
+
+    /// Connects and subscribes with an explicit [`PlaybackPolicy`].
+    ///
+    /// [`Self::subscribe`] uses the default policy, whose `max_latency` of 150ms is a
+    /// head-of-line TOLERANCE: playout waits that long for an incomplete group before skipping it.
+    /// That default suits recorded media, where a stall is preferable to a gap. An interactive
+    /// screen share wants the opposite trade, and had no way to say so.
+    pub async fn subscribe_with_playback_policy(
+        &self,
+        remote: impl Into<EndpointAddr>,
+        broadcast_name: &str,
+        policy: moq_media::playout::PlaybackPolicy,
+    ) -> Result<crate::Subscription> {
         let remote = remote.into();
         tracing::Span::current().record("remote", tracing::field::display(remote.id.fmt_short()));
         let mut session = self.moq.connect(remote).await?;
         info!(id=%session.conn().remote_id(), "connected");
         let consumer = session.subscribe(broadcast_name).await?;
-        let broadcast = RemoteBroadcast::new(broadcast_name, consumer).await?;
+        let broadcast =
+            RemoteBroadcast::with_playback_policy(broadcast_name, consumer, policy).await?;
         Ok(crate::Subscription::new(session, broadcast))
     }
 

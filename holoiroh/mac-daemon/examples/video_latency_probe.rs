@@ -31,6 +31,10 @@ const HEIGHT: u32 = 720;
 const MEASURE_FOR: Duration = Duration::from_secs(6);
 const SETTLE: Duration = Duration::from_secs(2);
 
+/// The probe builds its own pipeline, so it would keep passing even if the shipping app stopped
+/// asking for the settings measured here.
+const BRIDGE_SOURCE: &str = include_str!("../../ios-bridge/src/lib.rs");
+
 /// Emits frames on a real schedule, stamped with real elapsed time.
 struct PacedProbeSource {
     format: VideoFormat,
@@ -113,6 +117,50 @@ impl VideoSource for PacedProbeSource {
             HEIGHT,
             elapsed,
         )))
+    }
+}
+
+/// Time from subscribing to the first decoded frame arriving.
+async fn measure_join() -> anyhow::Result<Duration> {
+    let publisher = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind()
+        .await?;
+    let subscriber = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .bind()
+        .await?;
+    let publisher_addr = iroh::EndpointAddr::from_parts(
+        publisher.id(),
+        publisher.bound_sockets().into_iter().map(|mut s| {
+            if s.ip().is_unspecified() {
+                s.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+            }
+            iroh::TransportAddr::Ip(s)
+        }),
+    );
+    let publisher_live = Live::builder(publisher).with_router().spawn();
+    let subscriber_live = Live::builder(subscriber).with_router().spawn();
+
+    let broadcast = LocalBroadcast::new();
+    let codec = VideoCodec::best_available().unwrap_or(VideoCodec::H264);
+    let mut source = PacedProbeSource::new(60.0);
+    source.start()?;
+    broadcast
+        .video()
+        .set_source(source, codec, vec![VideoPreset::P720])?;
+    publisher_live.publish(BROADCAST_NAME, &broadcast).await?;
+
+    // Let the publisher get well past its first keyframe, so the join lands mid-GOP the way a
+    // phone opening the app on an already-running daemon does.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let started = Instant::now();
+    let subscription = subscriber_live
+        .subscribe(publisher_addr, BROADCAST_NAME)
+        .await?;
+    let mut track = subscription.broadcast().video_ready().await?;
+    match tokio::time::timeout(Duration::from_secs(10), track.next_frame()).await {
+        Ok(Some(_)) => Ok(started.elapsed()),
+        _ => anyhow::bail!("no first frame within 10s"),
     }
 }
 
@@ -253,6 +301,26 @@ async fn main() -> anyhow::Result<()> {
         percentile(&thirty.latencies, 0.50),
         percentile(&sixty.latencies, 0.50)
     );
+    // How long a subscriber waits for its FIRST decoded frame. This is not a curiosity: the
+    // decoder cannot start on anything but a keyframe, so this number is bounded by the GOP, and
+    // the same wait is paid again after any decode error or skipped group
+    // (`video_decode.rs` sets waiting_for_keyframe and discards until the next IDR). It is
+    // therefore the real cost of the encoder's 1-second keyframe interval, and the reason
+    // lowering playout max_latency against that GOP could make freezes longer rather than shorter.
+    println!("\nhow long until a subscriber sees its FIRST frame? (bounded by the keyframe interval)");
+    let mut joins = Vec::new();
+    for _ in 0..5 {
+        joins.push(measure_join().await?);
+    }
+    joins.sort();
+    println!(
+        "  join latency over {} runs: min {:.2?}  median {:.2?}  max {:.2?}",
+        joins.len(),
+        joins.first().copied().unwrap_or_default(),
+        percentile(&joins, 0.50),
+        joins.last().copied().unwrap_or_default(),
+    );
+
     // Everything above runs against PacedProbeSource, which proves the PRINCIPLE but says
     // nothing about what the daemon actually captures at. This measures the real ScreenCaptureKit
     // capturer through the daemon's own config, so a regression to the default 30fps is caught.
@@ -298,6 +366,25 @@ async fn main() -> anyhow::Result<()> {
              Recording grant, which CI does not have."
         ),
     }
+
+    println!("\nthe app actually asks for these settings");
+    anyhow::ensure!(
+        BRIDGE_SOURCE.contains("subscribe_with_playback_policy"),
+        "ios-bridge is back on the default playback policy, whose 150ms max_latency lets the \
+         picture stall for longer than skipping the group would have cost"
+    );
+    anyhow::ensure!(
+        BRIDGE_SOURCE.contains("PLAYOUT_MAX_LATENCY"),
+        "ios-bridge no longer defines its own playout budget"
+    );
+    let median_join = percentile(&joins, 0.50);
+    anyhow::ensure!(
+        Duration::from_millis(60) < median_join,
+        "the playout budget (60ms) is no longer below the measured cost of skipping a group \
+         ({median_join:.2?}); above it, waiting is strictly worse than skipping and the budget \
+         needs re-deriving from this run rather than kept out of habit"
+    );
+    println!("  ok   playout budget 60ms stays under the {median_join:.2?} it costs to skip a group");
 
     println!(
         "\nVERDICT: measured. These are the numbers any change to capture rate, encoder pacing, \

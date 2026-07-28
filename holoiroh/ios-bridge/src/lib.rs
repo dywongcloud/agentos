@@ -236,6 +236,27 @@ pub const HOLOIROH_PIXFMT_BGRA8: u32 = 1;
 /// `CONTROL_ALPN` name (no module qualifier) keep resolving unchanged.
 pub use holoiroh_wire::CONTROL_ALPN;
 
+/// How long playout waits for an incomplete group before skipping it.
+///
+/// This is a head-of-line TOLERANCE, not a fixed delay: zero cost on a clean link, but on every
+/// loss or reordering event it is how long the picture is allowed to stall before playout gives
+/// up and moves on. The library default is 150ms, chosen for recorded media where a stall beats a
+/// gap. This product wants the opposite trade, and the codebase had already said so once -- the
+/// `Sync` jitter buffer beside it was deliberately set to 20ms with a comment naming "the
+/// touch-to-cursor feedback loop of hands-on remote control" -- while this was left 7.5x larger
+/// at the library default.
+///
+/// The number is derived rather than guessed. Skipping a group costs whatever it takes to resume
+/// at the next group boundary, which `video_latency_probe` measures at 66-172ms with an 80ms
+/// median. Tolerating a stall LONGER than that is strictly worse than skipping, so the budget
+/// belongs below it. 60ms sits under the 80ms median while still covering roughly two frames at
+/// the ~28fps the pipeline delivers, so ordinary reordering does not trigger a skip.
+///
+/// This also settles the concern that lowering it against the encoder's 1-second GOP could
+/// produce LONGER freezes: that assumed a skip costs a full wait for the next IDR, and the
+/// measurement says it does not, because a group begins with its own keyframe.
+const PLAYOUT_MAX_LATENCY: std::time::Duration = std::time::Duration::from_millis(60);
+
 /// How long [`holoiroh_ios_bridge_control_connect`] waits for the daemon's
 /// first reply line (a bare `auth_rejected`, or the envelope-wrapped ready
 /// greeting) after writing the PIN line. Generous enough for a relay-path
@@ -621,7 +642,12 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_ticket_connect(
         let subscribe_result = inner.runtime.block_on(async {
             inner
                 .live
-                .subscribe(ticket.endpoint.clone(), &ticket.broadcast_name)
+                .subscribe_with_playback_policy(
+                    ticket.endpoint.clone(),
+                    &ticket.broadcast_name,
+                    iroh_live::media::playout::PlaybackPolicy::default()
+                        .with_max_latency(PLAYOUT_MAX_LATENCY),
+                )
                 .await
         });
 
