@@ -19,9 +19,14 @@ import SwiftUI
 ///
 /// `MainView.videoOverlay` still owns and chains on every OTHER overlay
 /// (fullscreen toggle, RemoteControlSurface, remote-control toggle/banner,
-/// remote-type bar) -- none of those depend on the live gesture scale/offset,
-/// so they were never part of the problem and stay exactly where they were,
-/// applied as modifiers on this struct's rendered output.
+/// remote-type bar), applied as modifiers on this struct's rendered output.
+///
+/// Those overlays sit OUTSIDE the scaled subtree, which is why
+/// `RemoteControlSurface` is handed the committed zoom/pan and undoes them via
+/// the shared `VideoViewportTransform`: UIKit delivers it untransformed
+/// viewport coordinates while the video beneath it is scaled and offset. This
+/// doc previously claimed no other overlay depended on the transform; that
+/// claim is what left zoomed aiming sending the cursor to the wrong place.
 struct PanZoomVideoSurface: View {
     let frameSource: VideoFrameSource
     let viewport: CGSize
@@ -35,35 +40,27 @@ struct PanZoomVideoSurface: View {
     /// The drag currently under the user's finger (.zero while none).
     @GestureState private var panDrag: CGSize = .zero
 
-    private static let zoomRange: ClosedRange<CGFloat> = 1...5
-
     private func clampZoom(_ value: CGFloat) -> CGFloat {
-        min(max(value, Self.zoomRange.lowerBound), Self.zoomRange.upperBound)
+        VideoViewportTransform.clampZoom(value)
     }
 
-    /// Clamp a pan offset so the scaled content always covers the whole
-    /// viewport (no revealed backdrop): with center-anchored scaling, the
-    /// content edge reaches the viewport edge at +/- viewport*(scale-1)/2.
     private func clampedPan(_ proposed: CGSize, scale: CGFloat, viewport: CGSize) -> CGSize {
-        let maxX = max(0, viewport.width * (scale - 1) / 2)
-        let maxY = max(0, viewport.height * (scale - 1) / 2)
-        return CGSize(
-            width: min(max(proposed.width, -maxX), maxX),
-            height: min(max(proposed.height, -maxY), maxY)
-        )
+        VideoViewportTransform.clampedPan(proposed, scale: scale, viewport: viewport)
     }
 
-    private var liveScale: CGFloat {
-        clampZoom(zoomScale * pinchScale)
-    }
-
-    private var liveOffset: CGSize {
-        clampedPan(
-            CGSize(width: panOffset.width + panDrag.width, height: panOffset.height + panDrag.height),
-            scale: liveScale,
+    /// The rendered transform, and -- through the same type -- the one
+    /// `RemoteControlSurface` inverts to map touches back onto the desktop.
+    private var liveTransform: VideoViewportTransform {
+        VideoViewportTransform(
+            zoom: zoomScale * pinchScale,
+            pan: CGSize(width: panOffset.width + panDrag.width, height: panOffset.height + panDrag.height),
             viewport: viewport
         )
     }
+
+    private var liveScale: CGFloat { liveTransform.scale }
+
+    private var liveOffset: CGSize { liveTransform.offset }
 
     var body: some View {
         VideoRenderView(source: frameSource)

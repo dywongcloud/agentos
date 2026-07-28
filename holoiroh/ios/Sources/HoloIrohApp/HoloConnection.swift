@@ -460,8 +460,31 @@ final class FFIControlChannelSender: ControlChannelSending {
         self.reportError = reportError
     }
 
+    /// The newest cursor move not yet handed to the bridge, staged from the touch thread so a
+    /// move arriving while `queue` is blocked in a write can overwrite its predecessor.
+    private let moves = MoveCoalescer<ClientMessage>()
+
     func send(_ message: ClientMessage) {
-        sendWithRetry(message, retriesLeft: 20)
+        guard case .remoteControl(.move(_, _)) = message else {
+            sendWithRetry(message, retriesLeft: 20)
+            return
+        }
+        coalesceMove(message)
+    }
+
+    /// Sends the newest move rather than every move -- see `MoveCoalescer` for why that is
+    /// lossless. One flush is enqueued per move, so this self-clocks: on a nearby LAN each flush
+    /// finds its own move and nothing is dropped at all, and only a link too slow to keep up with
+    /// the finger sees any collapsing.
+    ///
+    /// Retries are deliberately not used here: a move held back waiting for a session greeting is
+    /// stale by the time it would fire, and a newer one is already on its way.
+    private func coalesceMove(_ message: ClientMessage) {
+        moves.stage(message)
+        queue.async {
+            guard let move = self.moves.takeLatest() else { return }
+            self.writeToBridge(move, reportSuccess: false)
+        }
     }
 
     /// The greeting that carries the daemon-minted `session_id` races any
@@ -473,9 +496,6 @@ final class FFIControlChannelSender: ControlChannelSending {
     /// 20 = up to 2s) instead of dropping; a genuinely missing greeting
     /// still surfaces the error after the window.
     private func sendWithRetry(_ message: ClientMessage, retriesLeft: Int) {
-        let bridge = bridge
-        let sessionState = sessionState
-        let report = report
         let reportError = reportError
         // Encoding happens on `queue` too (not the caller's thread): the
         // greeting's `session_id` is written from this same serial queue in
@@ -483,33 +503,50 @@ final class FFIControlChannelSender: ControlChannelSending {
         // the "has the greeting arrived yet" check and the encode itself on
         // one queue instead of racing a caller thread against it.
         queue.async {
-            guard let wire = self.encoded(message, sessionState: sessionState) else {
-                if retriesLeft > 0 {
-                    self.queue.asyncAfter(deadline: .now() + 0.1) {
-                        self.sendWithRetry(message, retriesLeft: retriesLeft - 1)
-                    }
-                } else {
-                    DispatchQueue.main.async {
-                        reportError("control send \(message.wireKindLabel) failed: no session_id yet (daemon greeting not received)")
-                    }
+            guard self.writeToBridge(message, reportSuccess: true) == .noSessionYet else { return }
+            if retriesLeft > 0 {
+                self.queue.asyncAfter(deadline: .now() + 0.1) {
+                    self.sendWithRetry(message, retriesLeft: retriesLeft - 1)
                 }
-                return
-            }
-            var err: UnsafeMutablePointer<CChar>?
-            let status = wire.withCString { cstr in
-                holoiroh_ios_bridge_control_send(bridge, cstr, &err)
-            }
-            if status == HOLOIROH_OK {
-                DispatchQueue.main.async { report(message, wire) }
             } else {
-                var detail = "control send \(message.wireKindLabel) failed (\(status))"
-                if let e = err {
-                    detail += ": " + String(cString: e)
-                    holoiroh_ios_bridge_free_error_string(e)
+                DispatchQueue.main.async {
+                    reportError("control send \(message.wireKindLabel) failed: no session_id yet (daemon greeting not received)")
                 }
-                DispatchQueue.main.async { reportError(detail) }
             }
         }
+    }
+
+    enum BridgeWriteOutcome {
+        case sent
+        case refused
+        /// The daemon greeting carrying `session_id` has not arrived yet -- the one outcome a
+        /// caller can usefully wait out.
+        case noSessionYet
+    }
+
+    /// Encodes `message` and hands it to the bridge. Must run on `queue`.
+    @discardableResult
+    private func writeToBridge(_ message: ClientMessage, reportSuccess: Bool) -> BridgeWriteOutcome {
+        guard let wire = encoded(message, sessionState: sessionState) else { return .noSessionYet }
+        var err: UnsafeMutablePointer<CChar>?
+        let status = wire.withCString { cstr in
+            holoiroh_ios_bridge_control_send(bridge, cstr, &err)
+        }
+        if status == HOLOIROH_OK {
+            if reportSuccess {
+                let report = report
+                DispatchQueue.main.async { report(message, wire) }
+            }
+            return .sent
+        }
+        var detail = "control send \(message.wireKindLabel) failed (\(status))"
+        if let e = err {
+            detail += ": " + String(cString: e)
+            holoiroh_ios_bridge_free_error_string(e)
+        }
+        let reportError = reportError
+        DispatchQueue.main.async { reportError(detail) }
+        return .refused
     }
 }
 

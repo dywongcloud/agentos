@@ -97,7 +97,35 @@ pub fn map_normalized(nx: f64, ny: f64) -> CGPoint {
     }
 }
 
+static APPLIED_MOVES: std::sync::Mutex<Vec<(f64, f64)>> = std::sync::Mutex::new(Vec::new());
+
+fn injection_is_dry_run() -> bool {
+    static DRY_RUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DRY_RUN.get_or_init(|| std::env::var("HOLOIROH_INPUT_DRY_RUN").as_deref() == Ok("1"))
+}
+
+pub fn take_applied_moves() -> Vec<(f64, f64)> {
+    std::mem::take(
+        &mut *APPLIED_MOVES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
+fn record_applied_move(nx: f64, ny: f64) {
+    if !injection_is_dry_run() {
+        return;
+    }
+    APPLIED_MOVES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((nx, ny));
+}
+
 fn post(event: &CGEvent) {
+    if injection_is_dry_run() {
+        return;
+    }
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
 }
 
@@ -109,6 +137,7 @@ pub fn cursor_location() -> Option<CGPoint> {
 
 /// Move the cursor to the normalized point (a drag if a button is held).
 pub fn move_cursor(nx: f64, ny: f64) {
+    record_applied_move(nx, ny);
     let p = map_normalized(nx, ny);
     let (ty, btn) = if LEFT_DOWN.load(Ordering::Relaxed) {
         (CGEventType::LeftMouseDragged, CGMouseButton::Left)

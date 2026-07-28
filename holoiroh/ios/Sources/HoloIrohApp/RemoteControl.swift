@@ -94,12 +94,39 @@ enum RemoteControlEvent: Codable, Equatable {
 /// Pure and self-contained so it is exercised directly by the app's own
 /// build-time sanity checks -- no view or device needed.
 func normalizedInVideo(touch: CGPoint, viewSize: CGSize, frameSize: CGSize) -> CGPoint? {
+    guard let n = videoRelativePoint(touch: touch, viewSize: viewSize, frameSize: frameSize) else {
+        return nil
+    }
+    if n.x < 0 || n.x > 1 || n.y < 0 || n.y > 1 {
+        return nil
+    }
+    return n
+}
+
+/// The same mapping, except a touch that strays into the letterbox slides along the nearest
+/// video edge instead of vanishing.
+///
+/// Dropping those touches froze the cursor mid-drag: the aspect-fit bars sit exactly where a
+/// thumb travels on a phone, and a wide desktop letterboxed into a short viewport puts them
+/// within easy reach of any vertical drag. Sliding along the edge is also what a real trackpad
+/// does when the pointer reaches the side of the screen, so it reads as continuous rather than
+/// stuck. Returns `nil` only for degenerate sizes, where there is no video rect at all.
+func normalizedInVideoClampedToEdges(touch: CGPoint, viewSize: CGSize, frameSize: CGSize) -> CGPoint? {
+    guard let n = videoRelativePoint(touch: touch, viewSize: viewSize, frameSize: frameSize) else {
+        return nil
+    }
+    return CGPoint(x: min(max(n.x, 0), 1), y: min(max(n.y, 0), 1))
+}
+
+/// The touch's position relative to the aspect-fit video rect, in `0..1` units of that rect --
+/// outside `0..1` when the touch is in a letterbox bar. The one place the aspect-fit geometry
+/// is computed, so the strict and clamped mappings can never disagree about where the image is.
+func videoRelativePoint(touch: CGPoint, viewSize: CGSize, frameSize: CGSize) -> CGPoint? {
     guard viewSize.width > 0, viewSize.height > 0, frameSize.width > 0, frameSize.height > 0 else {
         return nil
     }
     let viewAspect = viewSize.width / viewSize.height
     let frameAspect = frameSize.width / frameSize.height
-    // The displayed video rect within the view (aspect-fit).
     var vw = viewSize.width
     var vh = viewSize.height
     var ox: CGFloat = 0
@@ -113,12 +140,7 @@ func normalizedInVideo(touch: CGPoint, viewSize: CGSize, frameSize: CGSize) -> C
         vw = viewSize.height * frameAspect
         ox = (viewSize.width - vw) / 2
     }
-    let nx = (touch.x - ox) / vw
-    let ny = (touch.y - oy) / vh
-    if nx < 0 || nx > 1 || ny < 0 || ny > 1 {
-        return nil
-    }
-    return CGPoint(x: nx, y: ny)
+    return CGPoint(x: (touch.x - ox) / vw, y: (touch.y - oy) / vh)
 }
 
 #if canImport(UIKit)
@@ -139,6 +161,10 @@ struct RemoteControlSurface: UIViewRepresentable {
     /// The most recent video frame's pixel size, for the aspect-fit mapping.
     /// `nil` falls back to filling the view (no letterbox correction).
     var frameSize: CGSize?
+    /// The live pinch-zoom the video underneath is rendered at.
+    var zoom: CGFloat = 1
+    /// The live pan the video underneath is rendered at.
+    var pan: CGSize = .zero
     /// Sends one remote-control action over the control channel.
     var onEvent: (RemoteControlEvent) -> Void
 
@@ -243,9 +269,29 @@ struct RemoteControlSurface: UIViewRepresentable {
             true
         }
 
+        /// This surface is laid over the pan/zoom view but is NOT inside its scaled subtree, so
+        /// UIKit hands us raw viewport coordinates while the video underneath is scaled and
+        /// offset. Undoing that transform first is what makes aiming while zoomed land where the
+        /// user is looking -- and what turns a zoomed view into finer cursor control.
         private func normalized(_ p: CGPoint, in view: UIView) -> CGPoint? {
-            let frame = parent.frameSize ?? view.bounds.size
-            return normalizedInVideo(touch: p, viewSize: view.bounds.size, frameSize: frame)
+            mapped(p, in: view, clampingToEdges: false)
+        }
+
+        /// The mapping used by the drag gestures, where a touch straying into the letterbox
+        /// should slide the cursor along the video edge rather than freeze it.
+        private func normalizedClamped(_ p: CGPoint, in view: UIView) -> CGPoint? {
+            mapped(p, in: view, clampingToEdges: true)
+        }
+
+        private func mapped(_ p: CGPoint, in view: UIView, clampingToEdges: Bool) -> CGPoint? {
+            let viewport = view.bounds.size
+            let frame = parent.frameSize ?? viewport
+            let transform = VideoViewportTransform(zoom: parent.zoom, pan: parent.pan, viewport: viewport)
+            let inContent = transform.viewportPointToContent(p, viewport: viewport)
+            if clampingToEdges {
+                return normalizedInVideoClampedToEdges(touch: inContent, viewSize: viewport, frameSize: frame)
+            }
+            return normalizedInVideo(touch: inContent, viewSize: viewport, frameSize: frame)
         }
 
         // Intentionally does nothing -- see `pinch`'s doc in `makeUIView`. This
@@ -263,20 +309,12 @@ struct RemoteControlSurface: UIViewRepresentable {
             guard let v = g.view else { return }
             let loc = g.location(in: v)
 
-            guard let n = normalized(loc, in: v) else {
-                // Touch is in the letterbox, outside the video image.
-                //
-                // This branch used to `return` unconditionally despite a comment
-                // promising to "lift if we were holding" — so ending a drag out
-                // in the letterbox never sent button-up and left the Mac's left
-                // mouse button PHYSICALLY HELD DOWN, with no touch left on screen
-                // to release it. The Mac would then select/drag everything the
-                // pointer crossed until the user happened to start and finish
-                // another drag inside the image.
-                //
-                // A terminal state must always release, using the last point that
-                // was actually over the video (the pointer never moved past it, so
-                // it is where the Mac's cursor really is).
+            // A letterbox touch now maps to the nearest video edge rather than to nothing, so
+            // this only fires for a degenerate view/frame size. A terminal state must STILL
+            // release: ending a drag with no released button leaves the Mac's left mouse button
+            // physically held down, with no touch left on screen to lift it, selecting and
+            // dragging everything the pointer crosses until someone uses the machine directly.
+            guard let n = normalizedClamped(loc, in: v) else {
                 if oneFingerDown, g.state == .ended || g.state == .cancelled || g.state == .failed {
                     let p = lastInVideo ?? CGPoint(x: 0.5, y: 0.5)
                     parent.onEvent(
@@ -306,7 +344,7 @@ struct RemoteControlSurface: UIViewRepresentable {
         }
 
         @objc func onPan2(_ g: UIPanGestureRecognizer) {
-            guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
+            guard let v = g.view, let n = normalizedClamped(g.location(in: v), in: v) else { return }
 
             // Suppress scroll while the touches are actually a pinch. Two fingers
             // moving apart are rarely perfectly symmetric, so a real pinch carries

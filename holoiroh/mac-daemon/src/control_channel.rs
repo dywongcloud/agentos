@@ -313,6 +313,24 @@ fn event_request_id(event: &ControlEvent) -> Option<String> {
 /// a live `iroh` connection to reach it through [`ProtocolHandler::accept`].
 /// Still called internally by that accept loop, so it is not dead code from
 /// the bin target's perspective.
+/// Injection carries ABSOLUTE cursor positions, so an out-of-order apply teleports the pointer
+/// backwards rather than merely arriving late. These variants are synchronous CGEvent posts and
+/// must be awaited in stream order; `TakeControl`/`ReleaseControl` take the pause path and are
+/// deliberately excluded so they keep the spawn.
+pub fn must_preserve_arrival_order(message: &ControlMessage) -> bool {
+    matches!(
+        message,
+        ControlMessage::RemoteControl {
+            event: RemoteControlEvent::Move { .. }
+                | RemoteControlEvent::Button { .. }
+                | RemoteControlEvent::Click { .. }
+                | RemoteControlEvent::Scroll { .. }
+                | RemoteControlEvent::Text { .. }
+                | RemoteControlEvent::Key { .. }
+        }
+    )
+}
+
 pub fn to_control_message(request_id: String, msg: ClientMessage) -> Option<ControlMessage> {
     match msg {
         ClientMessage::Prompt { text } => Some(ControlMessage::Prompt {
@@ -1413,6 +1431,10 @@ impl ProtocolHandler for ControlChannel {
                     // discipline (built for exactly this concurrency) serializes the
                     // actual A2A turns; control verbs now process immediately.
                     self.bridge.replace_event_sink(events_tx.clone());
+                    if must_preserve_arrival_order(&control_message) {
+                        self.bridge.handle_message(control_message).await;
+                        continue;
+                    }
                     let bridge = self.bridge.clone();
                     tokio::spawn(async move {
                         bridge.handle_message(control_message).await;

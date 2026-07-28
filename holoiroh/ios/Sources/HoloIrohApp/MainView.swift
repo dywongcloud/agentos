@@ -1345,7 +1345,11 @@ struct MainView: View {
                     // unconditionally -- see its own doc below.
                     .overlay {
                         if isControllingRemotely {
-                            RemoteControlSurface(frameSize: frameSource.lastFrameSize) { ev in
+                            RemoteControlSurface(
+                                frameSize: frameSource.lastFrameSize,
+                                zoom: zoomScale,
+                                pan: panOffset
+                            ) { ev in
                                 sendControlMessage(.remoteControl(ev))
                             }
                             .frame(width: viewport.width, height: viewport.height)

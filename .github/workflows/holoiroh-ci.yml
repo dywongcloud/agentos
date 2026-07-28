@@ -109,6 +109,14 @@ jobs:
           done
           echo "All pure-logic holoiroh probes passed as real-execution witnesses."
 
+      - name: Witness remote-control input ordering (needs the dry-run injection seam)
+        env:
+          # Records injected moves instead of posting real CGEvents, so this exercises the true
+          # `remote_input` path without driving the runner's cursor. The probe asserts the var is
+          # set rather than silently degrading.
+          HOLOIROH_INPUT_DRY_RUN: "1"
+        run: cargo run --example remote_input_ordering_probe -p holoiroh-daemon --locked
+
       - name: Witness iOS ConnectionProfileRepository conformance (macOS Swift)
         run: |
           set -euo pipefail
@@ -117,3 +125,24 @@ jobs:
           # delete-reseed / stale-filter / broken-sqlite). Exits non-zero on any
           # regression -- a permanent guard on the hard-won device-confirmed fix.
           bash ios/Tools/RepositoryConformanceCheck/run.sh
+
+      - name: Witness remote-control touch mapping at every zoom level (macOS Swift)
+        run: |
+          set -euo pipefail
+          # Compiles the REAL VideoViewportTransform + normalizedInVideo and asserts a touch
+          # drives the Mac cursor to the pixel under the finger at every zoom the pinch can
+          # reach. Before this, the mapping ignored the live zoom/pan entirely: at 2x it landed
+          # the cursor ~557 desktop px away, which is what made aiming on a phone feel broken.
+          # Also scans the production call sites, which live behind `#if canImport(UIKit)` and
+          # so are not compiled by this check.
+          bash ios/Tools/CursorMappingCheck/run.sh
+
+      - name: Witness cursor-move send policy under a slow link (macOS Swift)
+        run: |
+          set -euo pipefail
+          # Drives the REAL MoveCoalescer through the stage-then-flush pattern the iOS sender
+          # uses, at display-refresh staging rate, against fast and slow stand-in writes.
+          # Asserts a nearby LAN loses nothing while a slow link collapses superseded moves
+          # instead of queueing a backlog the cursor spends seconds replaying -- and that the
+          # finger's final position is delivered either way.
+          bash ios/Tools/MoveCoalescingCheck/run.sh
