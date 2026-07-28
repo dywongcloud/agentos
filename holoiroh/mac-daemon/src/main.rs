@@ -106,6 +106,80 @@ struct Cli {
     /// protection regardless.
     #[arg(long, value_parser = duration::parse_rotate_duration)]
     rotate_every: Option<std::time::Duration>,
+
+    /// Check that this machine can actually run the daemon, print what it found, and exit.
+    ///
+    /// Everything a pairing failure usually turns out to be is checked here against the real
+    /// APIs rather than described: Accessibility and Screen Recording grants, which display
+    /// would be captured and at what rate, and whether the iroh endpoint binds with local-network
+    /// discovery registered. Deliberately stops short of publishing a broadcast, spawning
+    /// `holo serve`, or opening the control channel, so it is safe to run while another daemon
+    /// is already serving a phone -- it cannot steal that daemon's single client slot or fight
+    /// it for a port.
+    #[arg(long)]
+    preflight: bool,
+}
+
+/// Reports whether this machine can run the daemon, without becoming one.
+async fn run_preflight(live: &Live, display_index: Option<usize>) -> anyhow::Result<()> {
+    use iroh_live::media::capture::ScreenCapturer;
+    use iroh_live::media::traits::VideoSource;
+
+    println!("holoiroh preflight");
+    println!("  endpoint id      {}", live.endpoint().id());
+    println!("  bound sockets    {:?}", live.endpoint().bound_sockets());
+    println!(
+        "  local discovery  registered (mDNS), so a phone on this network can find this Mac \
+         without going through a relay"
+    );
+
+    let accessibility = remote_input::is_permitted();
+    println!(
+        "  accessibility    {}",
+        if accessibility {
+            "granted -- remote clicks and typing will work"
+        } else {
+            "DENIED -- the phone can watch this Mac but not drive it. Grant it in System \
+             Settings > Privacy & Security > Accessibility."
+        }
+    );
+
+    let monitor = capture::resolve_display(display_index)?;
+    println!("  display          {}", monitor.summary());
+
+    let mut capturer = ScreenCapturer::with_monitor_config(&monitor, &capture::screen_config())?;
+    capturer.start()?;
+    let window = std::time::Duration::from_secs(2);
+    let started = std::time::Instant::now();
+    let mut frames = 0u32;
+    while started.elapsed() < window {
+        if matches!(capturer.pop_frame(), Ok(Some(_))) {
+            frames += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    capturer.stop()?;
+    let observed = f64::from(frames) / window.as_secs_f64();
+    println!(
+        "  capture          {observed:.1} fps observed against {:.0} configured",
+        capture::CAPTURE_FPS
+    );
+
+    anyhow::ensure!(
+        frames > 0,
+        "captured no frames at all. Screen Recording is almost certainly not granted to this \
+         binary -- System Settings > Privacy & Security > Screen Recording."
+    );
+    anyhow::ensure!(
+        accessibility,
+        "Accessibility is not granted, so hands-on control would silently do nothing"
+    );
+    // Close rather than drop: an endpoint dropped without this logs "Aborting ungracefully" at
+    // ERROR, which in a diagnostic whose whole job is telling the operator whether things are
+    // healthy reads as a failure right after it reported success.
+    live.endpoint().close().await;
+    println!("\npreflight OK -- this machine can publish its screen and accept remote control.");
+    Ok(())
 }
 
 /// `holo` CLI executable used to spawn `holo serve` (see
@@ -308,14 +382,33 @@ async fn main() -> anyhow::Result<()> {
         .init();
     tracing::info!("holoiroh-daemon starting");
 
+    // Parsed before the single-instance guard below, which needs to know whether this is a
+    // `--preflight` run. Parsing is pure and cannot fail destructively, and doing it first also
+    // means `--help` and argument errors are reported instead of "another instance is running".
+    let cli = Cli::parse();
+
     // --- single-instance guard, before ANY other startup work (including
     // .env/auth/permission checks below, which are all cheap to redo but
     // pointless if a second instance is about to fail this exact check).
     // See `instance_guard`'s module doc for the live-witnessed failure mode
     // this closes: two daemons racing for `holo serve`'s port, with the
     // loser silently publishing a QR code with no control channel mounted. ---
+    //
+    // `--preflight` is exempt, and deliberately so: it exists to diagnose a Mac that will not
+    // pair, which is exactly when another daemon is likely already running, and refusing to run
+    // then would make the diagnostic useless precisely when it is needed. It is safe because it
+    // takes nothing contended -- no `holo serve` port, no control channel, no published
+    // broadcast; it binds an ephemeral endpoint and opens a second ScreenCaptureKit stream,
+    // which macOS supports alongside the first.
     let _instance_guard = match instance_guard::InstanceGuard::acquire() {
-        Ok(guard) => guard,
+        Ok(guard) => Some(guard),
+        Err(_) if cli.preflight => {
+            eprintln!(
+                "[holoiroh-daemon] note: another daemon is already running. Preflight does not \
+                 interfere with it -- continuing."
+            );
+            None
+        }
         Err(err) => {
             eprintln!("[holoiroh-daemon] {err}");
             anyhow::bail!("{err}");
@@ -334,8 +427,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(err) => warn!(error = %err, "failed to parse .env; continuing without it"),
     }
-
-    let cli = Cli::parse();
 
     // --- Holo auth token check, before any other startup work. `holo
     // serve` (mounted below via `HoloBridge::start`) depends on
@@ -422,6 +513,10 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = endpoint_builder.bind().await?;
     let live = Live::builder(endpoint).spawn();
     info!(id = %live.endpoint().id(), "endpoint ready");
+
+    if cli.preflight {
+        return run_preflight(&live, cli.display).await;
+    }
 
     // --- metadata-only local audit log (Project Aro PRD row P0-12; see `audit_log`'s module
     // doc). Best-effort, matching `holo_bridge`'s own degrade-don't-crash posture: a disk/
