@@ -138,6 +138,17 @@ jobs:
           # section wants a real display and skips cleanly without one, which is the CI case.
           cargo run --release --example video_latency_probe -p holoiroh-daemon --locked
 
+      - name: Witness what the playout stall budget buys on an incomplete group
+        run: |
+          set -euo pipefail
+          # Builds the incomplete group directly rather than simulating packet loss: an in-process
+          # moq-lite track with one group deliberately left open and blocking, newer groups
+          # arriving in real time past it, driven through the same moq-mux ordered Consumer the
+          # subscribe path uses. Needs no display, network or permissions. This is the one thing
+          # the 60ms budget's derivation could not show -- the benefit only exists when a group is
+          # incomplete, which a lossless loopback never produces.
+          cargo run --example playout_stall_probe -p holoiroh-daemon --locked
+
       - name: Witness iOS ConnectionProfileRepository conformance (macOS Swift)
         run: |
           set -euo pipefail

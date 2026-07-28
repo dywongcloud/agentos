@@ -3045,6 +3045,8 @@ dependencies = [
  "iroh-mdns-address-lookup",
  "libc",
  "libsql",
+ "moq-mux",
+ "moq-net",
  "objc2-application-services",
  "objc2-core-foundation",
  "objc2-core-graphics",
