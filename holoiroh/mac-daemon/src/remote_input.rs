@@ -130,6 +130,12 @@ fn injection_is_dry_run() -> bool {
     *DRY_RUN.get_or_init(|| std::env::var("HOLOIROH_INPUT_DRY_RUN").as_deref() == Ok("1"))
 }
 
+/// Drains the moves recorded under `HOLOIROH_INPUT_DRY_RUN`.
+///
+/// `allow(dead_code)`: the daemon binary compiles this module directly and never calls this, but
+/// `remote_input_ordering_probe` and `input_latency_probe` do, through the lib target. Without
+/// the allow, every binary build warns about a function that is genuinely used.
+#[allow(dead_code)]
 pub fn take_applied_moves() -> Vec<(f64, f64)> {
     std::mem::take(
         &mut *APPLIED_MOVES
@@ -140,6 +146,9 @@ pub fn take_applied_moves() -> Vec<(f64, f64)> {
 
 static APPLIED_CLICK_STATES: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 
+/// Drains the click states recorded under `HOLOIROH_INPUT_DRY_RUN`. Same lib-vs-bin situation as
+/// [`take_applied_moves`]; consumed by `click_state_probe`.
+#[allow(dead_code)]
 pub fn take_applied_click_states() -> Vec<i64> {
     std::mem::take(
         &mut *APPLIED_CLICK_STATES
