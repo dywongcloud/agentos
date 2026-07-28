@@ -12,6 +12,10 @@
 
 use holoiroh_daemon::remote_input;
 
+/// Mirrors `remote_input`'s own slop, used here only to decide whether this machine has enough
+/// display geometry for the distance rule to be testable at all.
+const DOUBLE_CLICK_SLOP_PX: f64 = 6.0;
+
 /// Waits past the double-click window so a scenario starts from a clean sequence. The tracking
 /// state is deliberately global and persistent -- four taps in a row really should read 1,2,3,3
 /// -- so scenarios have to separate themselves the same way a user would.
@@ -38,6 +42,18 @@ fn main() {
 
     let spot = (0.5, 0.5);
 
+    // The distance rule below compares MAPPED points, so it needs a display with real geometry.
+    // A headless machine (CI, a Mac with no attached display) has CGMainDisplayID() return 0 and
+    // CGDisplayBounds collapse to a zero rect, which maps every normalized point to the same
+    // place -- two taps at opposite corners would then look like a double-click and this would
+    // fail for a reason that has nothing to do with the code under test.
+    let far_apart = (
+        remote_input::map_normalized(0.2, 0.2),
+        remote_input::map_normalized(0.8, 0.8),
+    );
+    let geometry_is_real = (far_apart.0.x - far_apart.1.x).abs() > DOUBLE_CLICK_SLOP_PX
+        || (far_apart.0.y - far_apart.1.y).abs() > DOUBLE_CLICK_SLOP_PX;
+
     let two = click_states(&[spot, spot]);
     assert_eq!(
         two,
@@ -55,13 +71,21 @@ fn main() {
     );
     println!("four fast taps in one place -> {four:?}");
 
-    let apart = click_states(&[(0.2, 0.2), (0.8, 0.8)]);
-    assert_eq!(
-        apart,
-        vec![1, 1],
-        "two taps in different places are two separate clicks, however fast; got {apart:?}"
-    );
-    println!("two fast taps far apart -> {apart:?}");
+    if geometry_is_real {
+        let apart = click_states(&[(0.2, 0.2), (0.8, 0.8)]);
+        assert_eq!(
+            apart,
+            vec![1, 1],
+            "two taps in different places are two separate clicks, however fast; got {apart:?}"
+        );
+        println!("two fast taps far apart -> {apart:?}");
+    } else {
+        println!(
+            "two fast taps far apart -> skipped: this machine reports no display geometry, so \
+             every normalized point maps to the same place and the distance rule cannot be \
+             exercised. The timing rules below still run."
+        );
+    }
 
     begin_fresh_sequence();
     let _ = remote_input::take_applied_click_states();
