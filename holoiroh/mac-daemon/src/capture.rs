@@ -20,7 +20,7 @@
 //! `rusty-capture/screen-apple`).
 
 use iroh_live::media::{
-    capture::{MonitorInfo, ScreenCapturer},
+    capture::{MonitorInfo, ScreenCapturer, ScreenConfig},
     codec::VideoCodec,
     format::VideoPreset,
     publish::LocalBroadcast,
@@ -79,14 +79,22 @@ pub fn resolve_display(index: Option<usize>) -> anyhow::Result<MonitorInfo> {
     }
 }
 
-/// Opens the resolved display via [`ScreenCapturer::with_monitor`] and wires
+/// The capture configuration the daemon actually uses, exposed so `video_latency_probe` can
+/// measure the real capturer at the real rate rather than a copy of it that could drift.
+pub fn screen_config() -> ScreenConfig {
+    ScreenConfig {
+        target_fps: Some(CAPTURE_FPS),
+        ..ScreenConfig::default()
+    }
+}
+
+/// Opens the resolved display via [`ScreenCapturer::with_monitor_config`] and wires
 /// it into `broadcast` as the video source with the given codec/presets.
 ///
-/// Mirrors `iroh-live-cli`'s `setup_screen_source` non-Linux branch exactly:
-/// `ScreenCapturer::with_monitor(&monitor)` then
-/// `broadcast.video().set_source(screen, codec, presets)`. There is no
-/// PipeWire-restore-token branch here since that path is Linux-only and this
-/// daemon is macOS-only (see holoiroh/README.md).
+/// Follows `iroh-live-cli`'s `setup_screen_source` non-Linux branch, except that it passes an
+/// explicit [`ScreenConfig`] instead of taking the default one -- see [`CAPTURE_FPS`] for why the
+/// default rate is the wrong one here. There is no PipeWire-restore-token branch since that path
+/// is Linux-only and this daemon is macOS-only (see holoiroh/README.md).
 pub fn setup_screen_video(
     broadcast: &LocalBroadcast,
     display_index: Option<usize>,
@@ -99,10 +107,26 @@ pub fn setup_screen_video(
         "opening ScreenCaptureKit capturer for selected display"
     );
 
-    let screen = ScreenCapturer::with_monitor(&monitor)?;
+    let screen = ScreenCapturer::with_monitor_config(&monitor, &screen_config())?;
     broadcast
         .video()
         .set_source(screen, codec, presets.to_vec())?;
 
     Ok(())
 }
+
+/// Capture rate, deliberately ABOVE the encoder's own poll rate rather than equal to it.
+///
+/// The encoder pipeline wakes once per 33.3ms and takes whatever the latest captured frame is
+/// (`moq-media/src/pipeline/video_encode.rs`). Capturing at that same 30Hz means two independent
+/// clocks beating against each other: the poll repeatedly lands just before the next frame and
+/// picks up one a full period old, and the phase between them drifts.
+///
+/// `video_latency_probe` measures the cost on this machine. Holding everything else fixed and
+/// varying only the source rate, capture-to-decoded-frame p50 was 187ms at 30fps, 71ms at 45,
+/// 68ms at 60, 67ms at 90 and 65ms at 120 -- while the DELIVERED rate stayed at 28fps in every
+/// case, because the encoder loop is the throughput limit either way. So this buys about 119ms of
+/// video-feedback latency, which is what makes a remote cursor feel late, and it buys it without
+/// encoding a single extra frame. Nearly all of the gain is in clearing 30; past 60 it is noise,
+/// so this does not go higher and pay for capture work that buys nothing.
+pub const CAPTURE_FPS: f32 = 60.0;

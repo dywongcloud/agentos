@@ -637,6 +637,19 @@ impl ScreenCapturer {
         Ok(Self { inner })
     }
 
+    /// Opens a specific monitor with an explicit [`ScreenConfig`].
+    ///
+    /// [`Self::with_monitor`] hardcodes the default config, so a caller that wants a different
+    /// capture rate had no way to ask for one -- `with_backend` takes a config but picks the
+    /// monitor itself, which is not the same thing when a specific display was requested.
+    pub fn with_monitor_config(
+        monitor: &MonitorInfo,
+        config: &ScreenConfig,
+    ) -> anyhow::Result<Self> {
+        let inner = create_screen_backend(Some(monitor), config)?;
+        Ok(Self { inner })
+    }
+
     /// Lists available windows for capture (macOS only currently).
     pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
         #[allow(unused_mut, reason = "empty for some platforms")]
