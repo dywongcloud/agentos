@@ -258,6 +258,26 @@ check(
     !panZoomSource.contains("none of those depend on the live gesture scale/offset"),
     "the stale doc claiming the overlays ignore the transform is gone"
 )
+// Structural, not a UIKit arbitration witness: real arbitration needs a running UIApplication,
+// which this macOS check cannot host. What it can catch is the delegate going back to allowing
+// everything, which is what let a two-finger tap fire a scroll and a right click at once.
+// The CALL SITE, not just the identifier. Checking only that the helper exists somewhere passed
+// even with the delegate body replaced by a bare `true` -- caught by reverting it and watching
+// this stay green, the same presence-guard weakness that once hid a real bug here.
+check(
+    remoteControlSource.contains("!isTwoFingerTapVersusScroll(gestureRecognizer, otherGestureRecognizer)"),
+    "the delegate actually consults the exclusion instead of returning a bare true"
+)
+check(
+    remoteControlSource.contains("coordinator.rightTap = rightTap")
+        && remoteControlSource.contains("coordinator.pan2 = pan2"),
+    "the coordinator holds both recognizers, so the exclusion can actually fire"
+)
+check(
+    !remoteControlSource.contains("so neither can steal"),
+    "the wrong justification (\"neither can steal the other\") is not back in the source"
+)
+
 check(
     remoteControlSource.contains("guard let n = normalizedClamped(loc, in: v)"),
     "the one-finger drag maps through the edge-clamping variant"

@@ -182,9 +182,15 @@ struct RemoteControlSurface: UIViewRepresentable {
         //
         // A long press would be the other obvious choice, but it fights the one-finger drag:
         // a user holding still before starting to drag would get a context menu they never
-        // asked for. A two-finger TAP costs nothing, because the only other two-finger gesture
-        // here is scroll, which requires translation -- a tap has none, so neither can steal
-        // the other. It also needs no `require(toFail:)`, so it adds no latency to anything.
+        // asked for. A two-finger tap needs no `require(toFail:)`, so it adds no latency to
+        // anything.
+        //
+        // It does need one exclusion, and the first version of this comment got the reason
+        // wrong: it argued that scroll requires translation and a tap has none, so "neither can
+        // steal the other". Stealing was never the risk. This surface's delegate allows
+        // simultaneous recognition, so a two-finger tap that drifts past the pan threshold
+        // satisfies both and BOTH fire -- one gesture sending a scroll and a right click. See
+        // `shouldRecognizeSimultaneouslyWith`, which excludes exactly this pair.
         let rightTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.onTwoFingerTap(_:)))
         rightTap.numberOfTouchesRequired = 2
         v.addGestureRecognizer(rightTap)
@@ -246,6 +252,8 @@ struct RemoteControlSurface: UIViewRepresentable {
         // recognition here doesn't change pan2 still waiting on pinch to
         // fail; it only stops these four recognizers from blocking whatever
         // else is touching the screen underneath.
+        context.coordinator.rightTap = rightTap
+        context.coordinator.pan2 = pan2
         [tap, rightTap, pan1, pan2, pinch].forEach { $0.delegate = context.coordinator }
         context.coordinator.prepareHaptics()
         return v
@@ -267,18 +275,40 @@ struct RemoteControlSurface: UIViewRepresentable {
         /// while a pinch is in flight. Held weakly: the recognizer is owned by
         /// the view, which owns the coordinator.
         weak var pinch: UIPinchGestureRecognizer?
+        /// The one pair that must NOT recognize together -- see
+        /// `shouldRecognizeSimultaneouslyWith`. Weak for the same reason as `pinch`.
+        weak var rightTap: UITapGestureRecognizer?
+        weak var pan2: UIPanGestureRecognizer?
         init(_ parent: RemoteControlSurface) { self.parent = parent }
 
-        /// Always allow simultaneous recognition -- see the doc on
-        /// `[tap, pan1, pan2, pinch].forEach { $0.delegate = ... }` in
-        /// `makeUIView` for why this surface's recognizers must never
-        /// exclude a gesture on a different view (e.g. the SwiftUI
-        /// `MagnificationGesture` this surface floats on top of).
+        /// Simultaneous recognition is allowed for every pair EXCEPT two-finger-tap against
+        /// two-finger-scroll.
+        ///
+        /// The permissive default exists for a real reason -- see the doc on
+        /// `[tap, rightTap, pan1, pan2, pinch].forEach { $0.delegate = ... }` in `makeUIView`:
+        /// without it, UIKit treats these as mutually exclusive with recognizers on OTHER views
+        /// and silently kills the SwiftUI `MagnificationGesture` this surface floats over. It is
+        /// also what lets `onPan2` consult a live `pinch` state to suppress stray scroll, which
+        /// only works because both recognize at once.
+        ///
+        /// But "allow everything" was too broad for the pair added with right-click. A two-finger
+        /// tap that drifts past the pan threshold satisfies BOTH recognizers, and with simultaneous
+        /// recognition enabled that is not an arbitration UIKit resolves -- both fire, sending a
+        /// `.scroll` and a right `.click` for one gesture. Excluding exactly this pair leaves every
+        /// other pairing, and the cross-view case, untouched.
         func gestureRecognizer(
             _ gestureRecognizer: UIGestureRecognizer,
             shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
         ) -> Bool {
-            true
+            !isTwoFingerTapVersusScroll(gestureRecognizer, otherGestureRecognizer)
+        }
+
+        private func isTwoFingerTapVersusScroll(
+            _ a: UIGestureRecognizer,
+            _ b: UIGestureRecognizer
+        ) -> Bool {
+            guard let rightTap, let pan2 else { return false }
+            return (a === rightTap && b === pan2) || (a === pan2 && b === rightTap)
         }
 
         /// This surface is laid over the pan/zoom view but is NOT inside its scaled subtree, so
