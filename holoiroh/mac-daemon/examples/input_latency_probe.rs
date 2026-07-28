@@ -101,7 +101,14 @@ async fn main() -> anyhow::Result<()> {
         server.id(),
         sockets.into_iter().map(|mut s| {
             if s.ip().is_unspecified() {
-                s.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+                // Keep the family: bound_sockets() returns both 0.0.0.0 and [::], and rewriting
+                // the v6 entry to 127.0.0.1 would pair an IPv4 address with the port the IPv6
+                // socket is listening on.
+                s.set_ip(if s.is_ipv6() {
+                    std::net::Ipv6Addr::LOCALHOST.into()
+                } else {
+                    std::net::Ipv4Addr::LOCALHOST.into()
+                });
             }
             iroh::TransportAddr::Ip(s)
         }),
