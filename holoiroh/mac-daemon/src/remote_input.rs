@@ -34,7 +34,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use objc2_core_foundation::CGPoint;
+use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_core_graphics::{
     CGDisplayBounds, CGEvent, CGEventField, CGEventTapLocation, CGEventType, CGMainDisplayID,
     CGMouseButton, CGScrollEventUnit,
@@ -88,13 +88,39 @@ pub fn release_all() {
 /// point. Uses the PRIMARY display (the daemon captures primary by default -- a
 /// captured non-primary display is a documented refinement, not wired here).
 pub fn map_normalized(nx: f64, ny: f64) -> CGPoint {
-    let bounds = CGDisplayBounds(CGMainDisplayID());
+    let bounds = cached_display_bounds();
     let cx = nx.clamp(0.0, 1.0);
     let cy = ny.clamp(0.0, 1.0);
     CGPoint {
         x: bounds.origin.x + cx * bounds.size.width,
         y: bounds.origin.y + cy * bounds.size.height,
     }
+}
+
+/// How long a cached display geometry is trusted. Long enough that a drag never pays for the
+/// lookup twice, short enough that a resolution or display change corrects itself before the
+/// user could act on a misplaced cursor.
+const DISPLAY_BOUNDS_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
+static DISPLAY_BOUNDS: std::sync::Mutex<Option<(std::time::Instant, CGRect)>> =
+    std::sync::Mutex::new(None);
+
+/// `CGDisplayBounds(CGMainDisplayID())` is a system call, and a drag makes it 120 times a second
+/// on the read loop's inline path, where every microsecond delays reading the next control
+/// message. Measured at p50 20us but with 5ms outliers -- a third of a display frame of jitter
+/// landing directly in the cursor path -- against 167ns for a key event, which is the same code
+/// without the lookup. The geometry it returns changes only when the user changes displays.
+fn cached_display_bounds() -> CGRect {
+    let now = std::time::Instant::now();
+    let mut cached = DISPLAY_BOUNDS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((fetched_at, bounds)) = *cached {
+        if now.duration_since(fetched_at) < DISPLAY_BOUNDS_TTL {
+            return bounds;
+        }
+    }
+    let bounds = CGDisplayBounds(CGMainDisplayID());
+    *cached = Some((now, bounds));
+    bounds
 }
 
 static APPLIED_MOVES: std::sync::Mutex<Vec<(f64, f64)>> = std::sync::Mutex::new(Vec::new());
@@ -110,6 +136,26 @@ pub fn take_applied_moves() -> Vec<(f64, f64)> {
             .lock()
             .unwrap_or_else(|e| e.into_inner()),
     )
+}
+
+static APPLIED_CLICK_STATES: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+pub fn take_applied_click_states() -> Vec<i64> {
+    std::mem::take(
+        &mut *APPLIED_CLICK_STATES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
+fn record_applied_click(states: &[i64]) {
+    if !injection_is_dry_run() {
+        return;
+    }
+    APPLIED_CLICK_STATES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend_from_slice(states);
 }
 
 fn record_applied_move(nx: f64, ny: f64) {
@@ -170,7 +216,47 @@ pub fn button(nx: f64, ny: f64, right: bool, down: bool) {
     }
 }
 
-/// A full click (down+up) at the point; `count == 2` is a double-click.
+/// How close together in time two clicks must be to form a double-click. macOS's own default
+/// for `com.apple.mouse.doubleClickThreshold`; deliberately not read from the user's prefs,
+/// since doing that from the injection path means spawning a process mid-click.
+const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How far the pointer may drift between two clicks and still count as the same spot. Generous
+/// because the phone maps a whole desktop onto a few hundred points, so one touch-point of
+/// wobble is several desktop pixels.
+const DOUBLE_CLICK_SLOP: f64 = 6.0;
+
+static LAST_CLICK: std::sync::Mutex<Option<(std::time::Instant, CGPoint, bool, i64)>> =
+    std::sync::Mutex::new(None);
+
+/// The click state (1 = single, 2 = double, 3 = triple) this click should carry, derived the
+/// way the window server derives it for real hardware: from how soon and how near the previous
+/// click was.
+///
+/// The phone cannot send this itself without waiting out the double-click window on EVERY tap
+/// before it knows whether a second one is coming -- half a second of dead time on the most
+/// common interaction, in a feature whose whole point is feeling immediate. Deriving it here
+/// costs nothing and makes a fast double-tap open a folder, as it would with a real mouse.
+fn next_click_state(p: CGPoint, right: bool) -> i64 {
+    let now = std::time::Instant::now();
+    let mut last = LAST_CLICK.lock().unwrap_or_else(|e| e.into_inner());
+    let state = match *last {
+        Some((when, where_, was_right, previous))
+            if was_right == right
+                && now.duration_since(when) <= DOUBLE_CLICK_WINDOW
+                && (where_.x - p.x).abs() <= DOUBLE_CLICK_SLOP
+                && (where_.y - p.y).abs() <= DOUBLE_CLICK_SLOP =>
+        {
+            (previous + 1).min(3)
+        }
+        _ => 1,
+    };
+    *last = Some((now, p, right, state));
+    state
+}
+
+/// A full click (down+up) at the point. `count > 1` forces a multi-click; `count == 1` lets
+/// [`next_click_state`] decide, so consecutive taps become a real double-click.
 pub fn click(nx: f64, ny: f64, right: bool, count: u32) {
     let count = count.max(1);
     let p = map_normalized(nx, ny);
@@ -180,21 +266,19 @@ pub fn click(nx: f64, ny: f64, right: bool, count: u32) {
     } else {
         (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp)
     };
-    for i in 1..=count {
+    let states: Vec<i64> = if count > 1 {
+        (1..=count as i64).collect()
+    } else {
+        vec![next_click_state(p, right)]
+    };
+    record_applied_click(&states);
+    for state in states {
         if let Some(down) = CGEvent::new_mouse_event(None, dty, p, cgbtn) {
-            CGEvent::set_integer_value_field(
-                Some(&down),
-                CGEventField::MouseEventClickState,
-                i as i64,
-            );
+            CGEvent::set_integer_value_field(Some(&down), CGEventField::MouseEventClickState, state);
             post(&down);
         }
         if let Some(up) = CGEvent::new_mouse_event(None, uty, p, cgbtn) {
-            CGEvent::set_integer_value_field(
-                Some(&up),
-                CGEventField::MouseEventClickState,
-                i as i64,
-            );
+            CGEvent::set_integer_value_field(Some(&up), CGEventField::MouseEventClickState, state);
             post(&up);
         }
     }

@@ -115,7 +115,12 @@ jobs:
           # `remote_input` path without driving the runner's cursor. The probe asserts the var is
           # set rather than silently degrading.
           HOLOIROH_INPUT_DRY_RUN: "1"
-        run: cargo run --example remote_input_ordering_probe -p holoiroh-daemon --locked
+        run: |
+          set -euo pipefail
+          cargo run --example remote_input_ordering_probe -p holoiroh-daemon --locked
+          # Derives double/triple-click from timing+distance the way the window server does, so
+          # the phone never has to stall a tap for half a second to find out which it was.
+          cargo run --example click_state_probe -p holoiroh-daemon --locked
 
       - name: Witness iOS ConnectionProfileRepository conformance (macOS Swift)
         run: |

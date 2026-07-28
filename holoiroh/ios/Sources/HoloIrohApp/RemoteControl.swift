@@ -178,6 +178,17 @@ struct RemoteControlSurface: UIViewRepresentable {
         let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.onTap(_:)))
         v.addGestureRecognizer(tap)
 
+        // Two-finger tap -> right click.
+        //
+        // A long press would be the other obvious choice, but it fights the one-finger drag:
+        // a user holding still before starting to drag would get a context menu they never
+        // asked for. A two-finger TAP costs nothing, because the only other two-finger gesture
+        // here is scroll, which requires translation -- a tap has none, so neither can steal
+        // the other. It also needs no `require(toFail:)`, so it adds no latency to anything.
+        let rightTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.onTwoFingerTap(_:)))
+        rightTap.numberOfTouchesRequired = 2
+        v.addGestureRecognizer(rightTap)
+
         let pan1 = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.onPan1(_:)))
         pan1.minimumNumberOfTouches = 1
         pan1.maximumNumberOfTouches = 1
@@ -235,7 +246,8 @@ struct RemoteControlSurface: UIViewRepresentable {
         // recognition here doesn't change pan2 still waiting on pinch to
         // fail; it only stops these four recognizers from blocking whatever
         // else is touching the screen underneath.
-        [tap, pan1, pan2, pinch].forEach { $0.delegate = context.coordinator }
+        [tap, rightTap, pan1, pan2, pinch].forEach { $0.delegate = context.coordinator }
+        context.coordinator.prepareHaptics()
         return v
     }
 
@@ -300,9 +312,35 @@ struct RemoteControlSurface: UIViewRepresentable {
         // MagnificationGesture elsewhere in the view hierarchy.
         @objc func onPinchNoop(_ g: UIPinchGestureRecognizer) {}
 
+        /// The remote cursor is the only signal that a tap registered, and it is a few hundred
+        /// milliseconds of network and video encoding away. A tap that seems to do nothing gets
+        /// tapped again, which is how a laggy link turns into accidental double-clicks. The
+        /// haptic confirms locally and immediately that the tap was accepted and sent.
+        private let clickHaptics = UIImpactFeedbackGenerator(style: .light)
+
+        func prepareHaptics() {
+            clickHaptics.prepare()
+        }
+
+        private func confirmSent() {
+            clickHaptics.impactOccurred()
+            clickHaptics.prepare()
+        }
+
         @objc func onTap(_ g: UITapGestureRecognizer) {
             guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
             parent.onEvent(.click(x: Double(n.x), y: Double(n.y), button: .left, count: 1))
+            confirmSent()
+        }
+
+        /// Sends `count: 1`; the daemon derives the real click state from how soon and how near
+        /// the previous click was, exactly as the window server does for a real mouse. Waiting
+        /// out the double-click window here instead would put half a second of dead time on
+        /// every single tap.
+        @objc func onTwoFingerTap(_ g: UITapGestureRecognizer) {
+            guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
+            parent.onEvent(.click(x: Double(n.x), y: Double(n.y), button: .right, count: 1))
+            confirmSent()
         }
 
         @objc func onPan1(_ g: UIPanGestureRecognizer) {
