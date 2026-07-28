@@ -674,7 +674,20 @@ fn translate_control_event(event: ControlEvent) -> Option<ExecutorEvent> {
         | ControlEvent::TaskActive { .. }
         | ControlEvent::InputRequested { .. }
         | ControlEvent::ClarifyQuestions { .. }
-        | ControlEvent::SecureInputState { .. } => None,
+        | ControlEvent::SecureInputState { .. }
+        // Tinfoil document/image/audio/planner results: off the desktop-task pipeline, same
+        // as ClarifyQuestions -- not scoped to a ComputerUseExecutor run, so no place in a
+        // per-run observe stream.
+        | ControlEvent::DocumentProcessed { .. }
+        | ControlEvent::DocumentProcessFailed { .. }
+        | ControlEvent::ImageAnalyzed { .. }
+        | ControlEvent::ImageAnalysisFailed { .. }
+        | ControlEvent::AudioTranscribed { .. }
+        | ControlEvent::AudioTranscriptionFailed { .. }
+        | ControlEvent::SpeechReady { .. }
+        | ControlEvent::SpeechFailed { .. }
+        | ControlEvent::PlanReady { .. }
+        | ControlEvent::PlanFailed { .. } => None,
     }
 }
 

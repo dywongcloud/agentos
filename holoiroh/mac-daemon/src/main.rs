@@ -41,6 +41,12 @@ mod router;
 mod env_context;
 mod task_fsm;
 mod tinfoil_proxy;
+mod privacy;
+mod tinfoil_models;
+mod tinfoil_documents;
+mod tinfoil_vision;
+mod tinfoil_audio;
+mod tinfoil_planner;
 mod tmux;
 mod pairing_phrase;
 mod permissions;
@@ -631,6 +637,12 @@ async fn main() -> anyhow::Result<()> {
     // key is set, which disables clarification (the control channel then replies
     // to a ClarifyRequest with an empty question set).
     let clarify_config = tinfoil_key.clone().map(clarify::ClarifyConfig::new);
+    // Shared by the document/image/audio/planner control-channel handlers (tinfoil_documents,
+    // tinfoil_vision, tinfoil_audio, tinfoil_planner) -- cloned here, before `tinfoil_key` is
+    // moved into the tinfoil_proxy fallback branch below, so it survives to the ControlChannel
+    // construction further down regardless of which branch that `if`/`else` takes.
+    let tinfoil_key_for_control_channel: Option<Arc<str>> =
+        tinfoil_key.clone().map(|k| Arc::from(k.as_str()));
     match &clarify_config {
         Some(cfg) => info!(model = %cfg.model(), "clarifying-questions inference enabled"),
         None => info!("clarifying-questions inference disabled (no TINFOIL_API_KEY)"),
@@ -815,12 +827,14 @@ async fn main() -> anyhow::Result<()> {
                     audit_logger.clone(),
                     daemon_control_ticket.clone(),
                     clarify_config.clone(),
+                    tinfoil_key_for_control_channel.clone(),
                 ),
                 None => ControlChannel::new(
                     bridge,
                     audit_logger.clone(),
                     daemon_control_ticket.clone(),
                     clarify_config.clone(),
+                    tinfoil_key_for_control_channel.clone(),
                 ),
             };
             control.register_protocols(router_builder)

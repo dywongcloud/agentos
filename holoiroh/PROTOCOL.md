@@ -318,6 +318,46 @@ entire bare message body):
   daemon emits a one-time `status` asking the user to grant it and no-ops the
   input. Additive per this document's extension policy.
 
+### Tinfoil-backed messages: `process_document` / `analyze_image` / `transcribe_audio` / `request_speech` / `plan_task`
+
+Five additive message types added for the Tinfoil confidential-computing
+integration (see README's "Aro Confidential Cloud (Tinfoil)" section). All
+five are handled **off** the desktop-task pipeline, the same way
+`clarify_request` is (see below) — none of them ever dispatches to
+`holo-desktop-cli`, and each is independently disabled (replying with its
+`*_failed` counterpart, `error: "no TINFOIL_API_KEY configured"`) when no
+key is configured.
+
+```json
+{ "type": "process_document", "request_id": "...", "filename": "notes.pdf", "data_base64": "...", "mode": "text" }
+{ "type": "analyze_image", "request_id": "...", "image_data_base64": "...", "prompt": "what is in this screenshot?" }
+{ "type": "transcribe_audio", "request_id": "...", "audio_data_base64": "...", "format": "wav" }
+{ "type": "request_speech", "request_id": "...", "text": "hi", "voice": "serena" }
+{ "type": "plan_task", "request_id": "...", "goal": "reply to the last email from Sam and archive it" }
+```
+
+- `process_document`: converts an attached document to markdown
+  (`tinfoil_documents.rs`, `/v1/convert/file`). `mode` is one of
+  `"text"`/`"vision"`/`"images"`/`"raw"`/`"vlm"`; unrecognized values default
+  to `"text"`.
+- `analyze_image`: answers `prompt` about an attached image
+  (`tinfoil_vision.rs`). The image is redacted on-device
+  (`privacy.rs`'s OCR + PII redaction) before it ever leaves the daemon.
+- `transcribe_audio`: transcribes audio (`tinfoil_audio.rs`,
+  `voxtral-small-24b`). **Must only ever carry audio captured from the
+  client's own microphone** — never system/speaker output, which could
+  contain other call participants' voices. This is an explicit opt-in
+  alternative to the default on-device `voice_transcript` path
+  (`VoiceTranscriber.swift`'s on-device Speech framework); sending this
+  message means audio leaves the device. `format` is advisory only —
+  Tinfoil infers the real format from content.
+- `request_speech`: synthesizes `text` as speech (`tinfoil_audio.rs`,
+  `qwen3-tts`), returning WAV bytes.
+- `plan_task`: asks Tinfoil's `glm-5.2` (tool-calling) to break `goal` into
+  an ordered step list for the user to review — this **plans, it does not
+  execute**; turning a step into action is still a separate
+  `prompt`/`remote_control` message, exactly as it already is today.
+
 ## `ServerMessage` (Mac daemon → iOS)
 
 The `payload` field of every outbound `TaskEnvelope` (or, for
@@ -391,6 +431,27 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
   proceed without (Project Aro PRD row P0-14). See the dedicated section
   below — this is the most involved variant on the wire and has security
   properties the others don't.
+
+### Tinfoil-backed replies: `document_processed`/`document_process_failed`, `image_analyzed`/`image_analysis_failed`, `audio_transcribed`/`audio_transcription_failed`, `speech_ready`/`speech_failed`, `plan_ready`/`plan_failed`
+
+The success/failure reply pairs for the five `ClientMessage` types above
+(see that section for the request shapes). Each carries the `request_id`
+it answers so the client can correlate against multiple in-flight requests
+(unlike `clarify_questions`, these are not assumed to be at most one at a
+time).
+
+```json
+{ "type": "document_processed", "request_id": "...", "markdown": "# Notes\n..." }
+{ "type": "document_process_failed", "request_id": "...", "error": "file too large" }
+{ "type": "image_analyzed", "request_id": "...", "text": "A login form." }
+{ "type": "image_analysis_failed", "request_id": "...", "error": "..." }
+{ "type": "audio_transcribed", "request_id": "...", "text": "hello there" }
+{ "type": "audio_transcription_failed", "request_id": "...", "error": "..." }
+{ "type": "speech_ready", "request_id": "...", "audio_data_base64": "..." }
+{ "type": "speech_failed", "request_id": "...", "error": "..." }
+{ "type": "plan_ready", "request_id": "...", "steps": ["Desktop action: open Mail and find the last email from Sam", "Desktop action: reply and archive"] }
+{ "type": "plan_failed", "request_id": "...", "error": "..." }
+```
 
 ### `input_request` / `input_response`
 

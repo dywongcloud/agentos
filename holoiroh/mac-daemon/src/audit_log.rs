@@ -229,6 +229,45 @@ pub struct AuditEntry {
     pub action_count: u32,
 }
 
+/// Which Tinfoil cloud-egress capability a [`CloudEgressEntry`] describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudEgressCapability {
+    Document,
+    Image,
+    AudioTranscribe,
+    AudioSpeech,
+    Planner,
+}
+
+/// One record of data leaving the device to Tinfoil's confidential-computing cloud
+/// (`tinfoil_documents`/`tinfoil_vision`/`tinfoil_audio`/`tinfoil_planner`).
+///
+/// A **sibling** to [`AuditEntry`], not a repurposing of it: `AuditEntry` is a closed 10-field
+/// schema purpose-built for `holo-desktop-cli` task lifecycle (see this module's doc on why it
+/// has no catch-all field), and none of its fields (`app_category`, `inference_mode`,
+/// `remote_view_state`, `action_count`, ...) have a meaningful value for "a document was
+/// uploaded" -- forcing this event shape into that one would mean inventing fake values for
+/// fields that don't apply, which is the exact "no fabricated per-app breakdown" failure mode
+/// this module's own doc already rejects for `AppCategory`. This type follows the identical
+/// design discipline instead: exactly the fields that describe *what left the device and
+/// whether it succeeded*, deliberately no `details`/`text`/`Value` catch-all, so it is
+/// structurally impossible for a call site to log a document's content, an image, a transcript,
+/// or a plan's text here.
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudEgressEntry {
+    /// Opaque correlation id -- the wire `request_id` the client supplied, never user-supplied
+    /// free text (client-generated ids only correlate; they carry no semantic content).
+    pub request_id: String,
+    pub capability: CloudEgressCapability,
+    /// Unix epoch milliseconds when the request completed (success or failure).
+    pub occurred_at_ms: u64,
+    pub success: bool,
+    /// Size of the data sent off-device (file bytes / image bytes / audio bytes / goal text
+    /// length), never the data itself.
+    pub byte_count: u64,
+}
+
 /// Metadata-only, append-only audit logger.
 ///
 /// Writes one [`AuditEntry`] per line as JSON (JSON Lines / NDJSON, matching
@@ -314,7 +353,12 @@ impl AuditLogger {
     /// `control_channel.rs` for how a write failure is handled without tearing down the in-flight
     /// control-channel turn that produced it (logged as a warning, not propagated -- matching
     /// `holo_bridge`'s own best-effort/degrade-don't-crash posture).
-    pub fn append(&self, entry: &AuditEntry) -> Result<()> {
+    /// Generic over `T: Serialize` so both [`AuditEntry`] (task lifecycle) and
+    /// [`CloudEgressEntry`] (Tinfoil cloud-egress) share this one write path -- the body below
+    /// was never actually specific to `AuditEntry`'s shape (it only serializes+appends+flushes),
+    /// so widening the bound is a pure generalization, not a behavior change for existing
+    /// `AuditEntry` call sites.
+    pub fn append<T: Serialize>(&self, entry: &T) -> Result<()> {
         let mut line = serde_json::to_string(entry).context("serializing audit log entry")?;
         line.push('\n');
         let mut file = OpenOptions::new()

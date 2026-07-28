@@ -212,6 +212,27 @@ pub enum ControlEvent {
     /// task turn; `control_channel::from_control_event` maps it straight to
     /// the wire `ServerMessage::SecureInputState`.
     SecureInputState { active: bool },
+    /// Successful `ClientMessage::ProcessDocument` result. Off the desktop-task pipeline, same
+    /// posture as `ClarifyQuestions` -- emitted by a spawned `tinfoil_documents` call.
+    DocumentProcessed { request_id: String, markdown: String },
+    /// Failure of a `ClientMessage::ProcessDocument` request.
+    DocumentProcessFailed { request_id: String, error: String },
+    /// Successful `ClientMessage::AnalyzeImage` result.
+    ImageAnalyzed { request_id: String, text: String },
+    /// Failure of an `ClientMessage::AnalyzeImage` request.
+    ImageAnalysisFailed { request_id: String, error: String },
+    /// Successful `ClientMessage::TranscribeAudio` result.
+    AudioTranscribed { request_id: String, text: String },
+    /// Failure of a `ClientMessage::TranscribeAudio` request.
+    AudioTranscriptionFailed { request_id: String, error: String },
+    /// Successful `ClientMessage::RequestSpeech` result; `audio_data_base64` is WAV bytes.
+    SpeechReady { request_id: String, audio_data_base64: String },
+    /// Failure of a `ClientMessage::RequestSpeech` request.
+    SpeechFailed { request_id: String, error: String },
+    /// Successful `ClientMessage::PlanTask` result: an ordered human-readable step list.
+    PlanReady { request_id: String, steps: Vec<String> },
+    /// Failure of a `ClientMessage::PlanTask` request.
+    PlanFailed { request_id: String, error: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

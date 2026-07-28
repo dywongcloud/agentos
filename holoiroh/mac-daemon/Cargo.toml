@@ -51,7 +51,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # holo_bridge: talks to `holo serve`'s local A2A (JSON-RPC over HTTP + SSE) endpoint and manages
 # the `holo serve` subprocess. See holo_bridge/mod.rs doc comment for the source-grounded protocol
 # details (verified against hcompai/holo-desktop-cli source, not invented).
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+# "multipart" added for tinfoil_documents.rs (POST /v1/convert/file) and tinfoil_audio.rs
+# (POST /v1/audio/transcriptions), both of which upload raw file bytes as multipart/form-data
+# per docs.tinfoil.sh's documented request shape for those two endpoints.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Config-file format for sensitive_categories.rs (~/.holoiroh/sensitive_categories.toml),
@@ -202,9 +205,20 @@ objc2-application-services = { version = "0.3", default-features = false, featur
 # VNImageRequestHandler/VNRecognizeTextRequest/VNObservation/VNTypes (each symbol's doc page
 # states its exact required feature(s) verbatim, e.g. VNRecognizeTextRequest's struct itself is
 # gated on `VNRequest`, its `results()` accessor separately on `VNObservation`).
+# "objc2-core-foundation" added alongside the original five: VNDetectedObjectObservation's
+# boundingBox() (inherited by VNRecognizedTextObservation, which privacy.rs calls) is itself
+# gated behind this feature since CGRect lives in that crate -- confirmed directly against
+# objc2-vision's own generated bindings, not guessed.
 objc2-vision = { version = "0.3", default-features = false, features = [
     "VNRequestHandler", "VNRequest", "VNRecognizeTextRequest", "VNObservation", "VNTypes",
+    "objc2-core-foundation",
 ] }
+# src/privacy.rs: `objc2::rc::Retained` is named directly (privacy.rs holds Retained<NSData>,
+# Retained<VNImageRequestHandler>, etc.), so the base crate needs to be a real, nameable direct
+# dependency here too, not just transitively pulled in by objc2-vision/objc2-foundation. Pinned
+# to "0.6" to match the version those crates already resolve to in this workspace's Cargo.lock
+# (0.6.4), so this promotes rather than adds a second objc2 major version to the build.
+objc2 = { version = "0.6", default-features = false }
 # NSData (wrapping raw image bytes for Vision), NSArray (request lists, observation lists),
 # NSString (recognized text). objc2-vision's own features pull most Foundation types in
 # transitively, but NSData/NSArray/NSString are named directly in privacy.rs so they need to be

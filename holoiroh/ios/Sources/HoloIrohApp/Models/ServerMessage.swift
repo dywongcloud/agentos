@@ -75,6 +75,27 @@ enum ServerMessage: Codable, Equatable {
     /// ScreenCaptureKit security boundary (not a bug); this signal lets the app explain it
     /// instead of leaving it unexplained. See `mac-daemon/src/holo_bridge/secure_input_watchdog.rs`.
     case secureInputState(active: Bool)
+    /// Successful reply to `ClientMessage.processDocument`.
+    case documentProcessed(requestId: String, markdown: String)
+    /// Failure reply to `ClientMessage.processDocument`.
+    case documentProcessFailed(requestId: String, error: String)
+    /// Successful reply to `ClientMessage.analyzeImage`.
+    case imageAnalyzed(requestId: String, text: String)
+    /// Failure reply to `ClientMessage.analyzeImage`.
+    case imageAnalysisFailed(requestId: String, error: String)
+    /// Successful reply to `ClientMessage.transcribeAudio`.
+    case audioTranscribed(requestId: String, text: String)
+    /// Failure reply to `ClientMessage.transcribeAudio`.
+    case audioTranscriptionFailed(requestId: String, error: String)
+    /// Successful reply to `ClientMessage.requestSpeech`: `audioDataBase64` is WAV bytes.
+    case speechReady(requestId: String, audioDataBase64: String)
+    /// Failure reply to `ClientMessage.requestSpeech`.
+    case speechFailed(requestId: String, error: String)
+    /// Successful reply to `ClientMessage.planTask`: an ordered, human-readable step list to
+    /// show the user before anything runs -- this is a plan, not an execution.
+    case planReady(requestId: String, steps: [String])
+    /// Failure reply to `ClientMessage.planTask`.
+    case planFailed(requestId: String, error: String)
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -90,6 +111,10 @@ enum ServerMessage: Codable, Equatable {
         case ticket
         case questions
         case active
+        case markdown
+        case error
+        case audioDataBase64 = "audio_data_base64"
+        case steps
     }
 
     private enum Kind: String, Codable {
@@ -104,6 +129,16 @@ enum ServerMessage: Codable, Equatable {
         case clarifyQuestions = "clarify_questions"
         case inputRequest = "input_request"
         case secureInputState = "secure_input_state"
+        case documentProcessed = "document_processed"
+        case documentProcessFailed = "document_process_failed"
+        case imageAnalyzed = "image_analyzed"
+        case imageAnalysisFailed = "image_analysis_failed"
+        case audioTranscribed = "audio_transcribed"
+        case audioTranscriptionFailed = "audio_transcription_failed"
+        case speechReady = "speech_ready"
+        case speechFailed = "speech_failed"
+        case planReady = "plan_ready"
+        case planFailed = "plan_failed"
     }
 
     init(from decoder: Decoder) throws {
@@ -146,6 +181,56 @@ enum ServerMessage: Codable, Equatable {
             )
         case .secureInputState:
             self = .secureInputState(active: try container.decode(Bool.self, forKey: .active))
+        case .documentProcessed:
+            self = .documentProcessed(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                markdown: try container.decode(String.self, forKey: .markdown)
+            )
+        case .documentProcessFailed:
+            self = .documentProcessFailed(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                error: try container.decode(String.self, forKey: .error)
+            )
+        case .imageAnalyzed:
+            self = .imageAnalyzed(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                text: try container.decode(String.self, forKey: .text)
+            )
+        case .imageAnalysisFailed:
+            self = .imageAnalysisFailed(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                error: try container.decode(String.self, forKey: .error)
+            )
+        case .audioTranscribed:
+            self = .audioTranscribed(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                text: try container.decode(String.self, forKey: .text)
+            )
+        case .audioTranscriptionFailed:
+            self = .audioTranscriptionFailed(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                error: try container.decode(String.self, forKey: .error)
+            )
+        case .speechReady:
+            self = .speechReady(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                audioDataBase64: try container.decode(String.self, forKey: .audioDataBase64)
+            )
+        case .speechFailed:
+            self = .speechFailed(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                error: try container.decode(String.self, forKey: .error)
+            )
+        case .planReady:
+            self = .planReady(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                steps: try container.decode([String].self, forKey: .steps)
+            )
+        case .planFailed:
+            self = .planFailed(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                error: try container.decode(String.self, forKey: .error)
+            )
         }
     }
 
@@ -191,6 +276,46 @@ enum ServerMessage: Codable, Equatable {
         case .secureInputState(let active):
             try container.encode(Kind.secureInputState, forKey: .type)
             try container.encode(active, forKey: .active)
+        case .documentProcessed(let requestId, let markdown):
+            try container.encode(Kind.documentProcessed, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(markdown, forKey: .markdown)
+        case .documentProcessFailed(let requestId, let error):
+            try container.encode(Kind.documentProcessFailed, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(error, forKey: .error)
+        case .imageAnalyzed(let requestId, let text):
+            try container.encode(Kind.imageAnalyzed, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(text, forKey: .text)
+        case .imageAnalysisFailed(let requestId, let error):
+            try container.encode(Kind.imageAnalysisFailed, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(error, forKey: .error)
+        case .audioTranscribed(let requestId, let text):
+            try container.encode(Kind.audioTranscribed, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(text, forKey: .text)
+        case .audioTranscriptionFailed(let requestId, let error):
+            try container.encode(Kind.audioTranscriptionFailed, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(error, forKey: .error)
+        case .speechReady(let requestId, let audioDataBase64):
+            try container.encode(Kind.speechReady, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(audioDataBase64, forKey: .audioDataBase64)
+        case .speechFailed(let requestId, let error):
+            try container.encode(Kind.speechFailed, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(error, forKey: .error)
+        case .planReady(let requestId, let steps):
+            try container.encode(Kind.planReady, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(steps, forKey: .steps)
+        case .planFailed(let requestId, let error):
+            try container.encode(Kind.planFailed, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(error, forKey: .error)
         }
     }
 
@@ -216,6 +341,16 @@ enum ServerMessage: Codable, Equatable {
         case .inputRequest(_, _, let context, _, _): return context
         case .secureInputState(let active):
             return active ? "Mac is at a login/lock screen" : "Mac is signed in"
+        case .documentProcessed: return "document processed"
+        case .documentProcessFailed(_, let error): return error
+        case .imageAnalyzed(_, let text): return text
+        case .imageAnalysisFailed(_, let error): return error
+        case .audioTranscribed(_, let text): return text
+        case .audioTranscriptionFailed(_, let error): return error
+        case .speechReady: return "speech ready"
+        case .speechFailed(_, let error): return error
+        case .planReady(_, let steps): return "\(steps.count) step plan ready"
+        case .planFailed(_, let error): return error
         }
     }
 
@@ -234,6 +369,11 @@ enum ServerMessage: Codable, Equatable {
         case .clarifyQuestions: return "CLARIFY"
         case .inputRequest: return "INPUT"
         case .secureInputState: return "LOCK"
+        case .documentProcessed, .documentProcessFailed: return "DOCUMENT"
+        case .imageAnalyzed, .imageAnalysisFailed: return "IMAGE"
+        case .audioTranscribed, .audioTranscriptionFailed: return "TRANSCRIBE"
+        case .speechReady, .speechFailed: return "SPEECH"
+        case .planReady, .planFailed: return "PLAN"
         }
     }
 }
@@ -262,6 +402,24 @@ enum ClientMessage: Codable, Equatable {
     /// Asks the daemon to generate clarifying questions for a possibly-ambiguous
     /// instruction before it runs (answered by `ServerMessage.clarifyQuestions`).
     case clarifyRequest(prompt: String)
+    /// Asks the daemon to convert an attached document to markdown via Tinfoil
+    /// (answered by `ServerMessage.documentProcessed`/`documentProcessFailed`).
+    case processDocument(requestId: String, filename: String, dataBase64: String, mode: String)
+    /// Asks the daemon to analyze an attached image via Tinfoil (redacted on-device before
+    /// upload). Answered by `ServerMessage.imageAnalyzed`/`imageAnalysisFailed`.
+    case analyzeImage(requestId: String, imageDataBase64: String, prompt: String)
+    /// Asks the daemon to transcribe audio via Tinfoil. **Only ever send audio captured from
+    /// this device's own microphone** -- never system/speaker output. Opt-in alternative to
+    /// the default on-device `voiceTranscript` path. Answered by
+    /// `ServerMessage.audioTranscribed`/`audioTranscriptionFailed`.
+    case transcribeAudio(requestId: String, audioDataBase64: String, format: String)
+    /// Asks the daemon to synthesize `text` as speech via Tinfoil. Answered by
+    /// `ServerMessage.speechReady`/`speechFailed`.
+    case requestSpeech(requestId: String, text: String, voice: String)
+    /// Asks the daemon to plan `goal` into an ordered step list via Tinfoil's tool-calling --
+    /// this proposes steps for review, it does not execute them. Answered by
+    /// `ServerMessage.planReady`/`planFailed`.
+    case planTask(requestId: String, goal: String)
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -270,6 +428,14 @@ enum ClientMessage: Codable, Equatable {
         case selectedOption = "selected_option"
         case event
         case prompt
+        case filename
+        case dataBase64 = "data_base64"
+        case mode
+        case imageDataBase64 = "image_data_base64"
+        case audioDataBase64 = "audio_data_base64"
+        case format
+        case voice
+        case goal
     }
 
     private enum Kind: String, Codable {
@@ -282,6 +448,11 @@ enum ClientMessage: Codable, Equatable {
         case inputResponse = "input_response"
         case remoteControl = "remote_control"
         case clarifyRequest = "clarify_request"
+        case processDocument = "process_document"
+        case analyzeImage = "analyze_image"
+        case transcribeAudio = "transcribe_audio"
+        case requestSpeech = "request_speech"
+        case planTask = "plan_task"
     }
 
     init(from decoder: Decoder) throws {
@@ -309,6 +480,36 @@ enum ClientMessage: Codable, Equatable {
             self = .remoteControl(try container.decode(RemoteControlEvent.self, forKey: .event))
         case .clarifyRequest:
             self = .clarifyRequest(prompt: try container.decode(String.self, forKey: .prompt))
+        case .processDocument:
+            self = .processDocument(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                filename: try container.decode(String.self, forKey: .filename),
+                dataBase64: try container.decode(String.self, forKey: .dataBase64),
+                mode: try container.decode(String.self, forKey: .mode)
+            )
+        case .analyzeImage:
+            self = .analyzeImage(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                imageDataBase64: try container.decode(String.self, forKey: .imageDataBase64),
+                prompt: try container.decode(String.self, forKey: .prompt)
+            )
+        case .transcribeAudio:
+            self = .transcribeAudio(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                audioDataBase64: try container.decode(String.self, forKey: .audioDataBase64),
+                format: try container.decode(String.self, forKey: .format)
+            )
+        case .requestSpeech:
+            self = .requestSpeech(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                text: try container.decode(String.self, forKey: .text),
+                voice: try container.decode(String.self, forKey: .voice)
+            )
+        case .planTask:
+            self = .planTask(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                goal: try container.decode(String.self, forKey: .goal)
+            )
         }
     }
 
@@ -340,6 +541,31 @@ enum ClientMessage: Codable, Equatable {
         case .clarifyRequest(let prompt):
             try container.encode(Kind.clarifyRequest, forKey: .type)
             try container.encode(prompt, forKey: .prompt)
+        case .processDocument(let requestId, let filename, let dataBase64, let mode):
+            try container.encode(Kind.processDocument, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(filename, forKey: .filename)
+            try container.encode(dataBase64, forKey: .dataBase64)
+            try container.encode(mode, forKey: .mode)
+        case .analyzeImage(let requestId, let imageDataBase64, let prompt):
+            try container.encode(Kind.analyzeImage, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(imageDataBase64, forKey: .imageDataBase64)
+            try container.encode(prompt, forKey: .prompt)
+        case .transcribeAudio(let requestId, let audioDataBase64, let format):
+            try container.encode(Kind.transcribeAudio, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(audioDataBase64, forKey: .audioDataBase64)
+            try container.encode(format, forKey: .format)
+        case .requestSpeech(let requestId, let text, let voice):
+            try container.encode(Kind.requestSpeech, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(text, forKey: .text)
+            try container.encode(voice, forKey: .voice)
+        case .planTask(let requestId, let goal):
+            try container.encode(Kind.planTask, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(goal, forKey: .goal)
         }
     }
 
@@ -357,6 +583,11 @@ enum ClientMessage: Codable, Equatable {
         case .inputResponse: return "input_response"
         case .remoteControl: return "remote_control"
         case .clarifyRequest: return "clarify_request"
+        case .processDocument: return "process_document"
+        case .analyzeImage: return "analyze_image"
+        case .transcribeAudio: return "transcribe_audio"
+        case .requestSpeech: return "request_speech"
+        case .planTask: return "plan_task"
         }
     }
 }

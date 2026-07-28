@@ -10,9 +10,12 @@ struct DiagnosticsView: View {
     private var autoConnectEnabled = AppSettings.AutoConnect.enabledByDefault
     @AppStorage("soundEnabled") private var soundEnabled = false
     @AppStorage("clarifyEnabled") private var clarifyEnabled = true
+    @AppStorage(AppSettings.TinfoilAudio.storageKey)
+    private var tinfoilAudioEnabled = AppSettings.TinfoilAudio.enabledByDefault
 
     @State private var showTicketScanner = false
     @State private var ticketRefreshMessage: String?
+    @State private var showVerificationCenter = false
 
     @Environment(\.dismiss) private var dismiss
 
@@ -42,6 +45,9 @@ struct DiagnosticsView: View {
                 QRScannerSheet { scanned in
                     handleRescannedTicket(scanned)
                 }
+            }
+            .sheet(isPresented: $showVerificationCenter) {
+                VerificationCenterView()
             }
         }
     }
@@ -164,11 +170,29 @@ struct DiagnosticsView: View {
     // MARK: Settings
 
     private var settingsSection: some View {
-        Section("Settings") {
-            Toggle("Haptics", isOn: $hapticsEnabled)
-            Toggle("Auto-connect on launch", isOn: $autoConnectEnabled)
-            Toggle("Orb sound", isOn: $soundEnabled)
-            Toggle("Ask clarifying questions", isOn: $clarifyEnabled)
+        Group {
+            Section("Settings") {
+                Toggle("Haptics", isOn: $hapticsEnabled)
+                Toggle("Auto-connect on launch", isOn: $autoConnectEnabled)
+                Toggle("Orb sound", isOn: $soundEnabled)
+                Toggle("Ask clarifying questions", isOn: $clarifyEnabled)
+            }
+            Section {
+                Toggle("Tinfoil audio transcription", isOn: $tinfoilAudioEnabled)
+                if tinfoilAudioEnabled {
+                    Text("Your own microphone audio (never system/call audio) is sent to Tinfoil's confidential-computing cloud for transcription, as an alternative to on-device transcription.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Button("Verification Center") {
+                    showVerificationCenter = true
+                }
+            } header: {
+                Text("Aro Confidential Cloud (Tinfoil)")
+            } footer: {
+                Text("Documents, images, audio (when enabled above), and task planning sent to Tinfoil are processed in an attested confidential-computing enclave. Verification Center shows the live cryptographic proof.")
+                    .font(.caption)
+            }
         }
     }
 }

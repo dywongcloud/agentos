@@ -1121,22 +1121,59 @@ wasteful. The real end-to-end latency of actually serving it locally
 discussed honestly in [`BENCHMARKS.md`](./BENCHMARKS.md), not re-derived by
 the build/probe path.
 
-## Deferred to beta: Aro Confidential Cloud (Tinfoil)
+## Aro Confidential Cloud (Tinfoil) — live in alpha, diverging from PRD row P0-11
 
-The Project Aro PRD (section 7.4, P1-3, Launch Gates 7-8) scopes the
-Tinfoil-based Confidential Cloud inference mode to **beta (Phase 2)**, not
-alpha. Per PRD row P0-11, the alpha binary must contain **no cloud inference
-code path at all** (verified by egress audit), and Aro Private mode (local
-Holo3.1 via llama.cpp) is the only alpha inference mode. A Tinfoil API key
-was supplied during development but, by explicit decision, is **not wired
-into any code path** — it lives only in the gitignored
-`holoiroh/mac-daemon/.env` and no `.rs`/`.swift`/`.toml`/`.md` tracked source
-references `TINFOIL_API_KEY` (confirmed by grep). When beta work begins, this
-becomes a real build item: Tinfoil Containers deployment (Aro-controlled
-immutable image in an NVIDIA GPU TEE enclave), client-side attestation before
-any content leaves the Mac, request minimization, and a strict no-silent-
-fallback-to-non-confidential-endpoint guarantee, per the PRD's deployment
-requirements table.
+This section previously said Tinfoil was deferred entirely to beta and not
+wired into any code path. That was already stale by the time it was
+corrected here: commits `5c4c91f`/`54af62a` wired a Tinfoil rate-limit
+fallback and clarifying-questions inference into the alpha build before this
+update, and this build now wires Tinfoil into six code paths total, all
+gated on `TINFOIL_API_KEY` being set in the gitignored
+`holoiroh/mac-daemon/.env` (each independently optional — absence disables
+that one feature, logged, never a startup failure):
+
+- **`tinfoil_proxy.rs`** — rate-limit fallback to `kimi-k2-6` when the H
+  Company hosted backend 429s (loopback auth-injecting proxy; see that
+  module's doc for why a proxy is the only workable auth path).
+- **`clarify.rs`** — clarifying-questions inference before an ambiguous
+  instruction runs.
+- **`tinfoil_documents.rs`** — document-to-markdown conversion
+  (`/v1/convert/file`) for attached PDFs/DOCX/PPTX/XLSX/HTML/CSV.
+- **`tinfoil_vision.rs`** — image analysis (`qwen3-vl-30b`/`gemma-4-31b`),
+  routed through `privacy.rs`'s on-device OCR+redaction before upload.
+- **`tinfoil_audio.rs`** — audio transcription (`voxtral-small-24b`) and
+  text-to-speech (`qwen3-tts`). Transcription is opt-in and scoped to the
+  client's own microphone capture only, never system/speaker audio — see
+  `tinfoil_audio.rs`'s module doc.
+- **`tinfoil_planner.rs`** — agentic task planning via tool-calling
+  (`glm-5.2`), proposing a step list for the user to review before anything
+  executes; it composes over the `ComputerUseExecutor` seam rather than
+  reaching into it.
+
+**This directly conflicts with PRD row P0-11** ("the alpha binary must
+contain no cloud inference code path at all, verified by egress audit") and
+with section 7.4/P1-3/Launch Gates 7-8's scoping of Confidential Cloud to
+beta. That conflict already existed (silently) before this update; it is
+now large enough (six modules, not one fallback path) that it needs an
+explicit product decision rather than another silent README correction:
+either P0-11 is being deliberately superseded for this build (in which case
+the PRD itself should be updated to say so, and the beta-only deployment
+requirements below — attestation, request minimization, no-silent-fallback
+— should move up to apply now), or this work should be gated behind a
+build flag that reproduces alpha's original no-cloud posture. Flagging this
+here rather than resolving it unilaterally, since it's a scope/compliance
+call, not an implementation one.
+
+None of the above is TEE-attested today — every Tinfoil call is a plain
+HTTPS request with a bearer key, no client-side enclave attestation
+verification (see `verification-center-bridge`/`verification-center-webview`
+in this repo's PRD history for the in-progress Verification Center UI work,
+which is the first step toward the attestation guarantee the beta deployment
+requirements table calls for). When beta work formally begins, the
+deployment requirements table's other items remain real build items: Tinfoil
+Containers deployment (Aro-controlled immutable image in an NVIDIA GPU TEE
+enclave) and a strict no-silent-fallback-to-non-confidential-endpoint
+guarantee.
 
 ## Naming: `holoiroh` (technical) vs "Aro" (product)
 

@@ -412,6 +412,64 @@ pub enum ClientMessage {
     /// separate [`ClientMessage::Prompt`] once the user has answered. Additive
     /// per `PROTOCOL.md`'s extension policy.
     ClarifyRequest { prompt: String },
+    /// Asks the daemon to convert an attached document to markdown via Tinfoil's document
+    /// processing (`mac-daemon`'s `tinfoil_documents` module). The daemon replies with
+    /// [`ServerMessage::DocumentProcessed`] or [`ServerMessage::DocumentProcessFailed`].
+    /// Additive per `PROTOCOL.md`'s extension policy.
+    ProcessDocument {
+        /// Correlates this request with the eventual `DocumentProcessed`/`DocumentProcessFailed`.
+        request_id: String,
+        /// Original filename, used for server-side format detection by extension.
+        filename: String,
+        /// Raw file bytes, base64-encoded for JSON transport.
+        data_base64: String,
+        /// Tinfoil extraction mode (`"text"`/`"vision"`/`"images"`/`"raw"`/`"vlm"`), passed
+        /// through verbatim -- the daemon validates/defaults it, not this wire type.
+        mode: String,
+    },
+    /// Asks the daemon to analyze an attached image via Tinfoil's image-input-capable models
+    /// (`mac-daemon`'s `tinfoil_vision` module, which redacts on-device PII before upload).
+    /// Additive per `PROTOCOL.md`'s extension policy.
+    AnalyzeImage {
+        request_id: String,
+        /// Raw image bytes, base64-encoded for JSON transport.
+        image_data_base64: String,
+        /// What to ask the model about the image.
+        prompt: String,
+    },
+    /// Asks the daemon to transcribe audio via Tinfoil (`mac-daemon`'s `tinfoil_audio` module).
+    /// **Only ever send audio captured from this client's own microphone input** -- never
+    /// system/speaker output, which could contain other call participants' voices without
+    /// their consent (see `tinfoil_audio`'s module doc). This is an explicit OPT-IN
+    /// alternative to the default on-device `VoiceTranscript` path (`VoiceTranscriber.swift`'s
+    /// on-device Speech framework) -- sending this variant means audio leaves the device.
+    /// Additive per `PROTOCOL.md`'s extension policy.
+    TranscribeAudio {
+        request_id: String,
+        /// Raw audio bytes, base64-encoded for JSON transport.
+        audio_data_base64: String,
+        /// Container/codec hint (e.g. `"wav"`, `"m4a"`) -- Tinfoil infers format from content,
+        /// so this is advisory only.
+        format: String,
+    },
+    /// Asks the daemon to synthesize `text` as speech via Tinfoil (`mac-daemon`'s
+    /// `tinfoil_audio::speech`). Additive per `PROTOCOL.md`'s extension policy.
+    RequestSpeech {
+        request_id: String,
+        text: String,
+        /// Tinfoil voice id (e.g. `"serena"`), passed through verbatim.
+        voice: String,
+    },
+    /// Asks the daemon to plan `goal` into an ordered step list via Tinfoil's tool-calling
+    /// (`mac-daemon`'s `tinfoil_planner` module, glm-5.2). Handled OFF the task pipeline, the
+    /// same way [`ClientMessage::ClarifyRequest`] is: this never itself dispatches anything to
+    /// the desktop backend, it only proposes steps for the user to review -- turning a step
+    /// into action is still a separate [`ClientMessage::Prompt`]/[`ClientMessage::RemoteControl`]
+    /// as it already is today. Additive per `PROTOCOL.md`'s extension policy.
+    PlanTask {
+        request_id: String,
+        goal: String,
+    },
 }
 
 /// One clarifying question the daemon asks before running an ambiguous
@@ -534,6 +592,11 @@ impl ClientMessage {
             ClientMessage::InputResponse { .. } => "input_response",
             ClientMessage::RemoteControl { .. } => "remote_control",
             ClientMessage::ClarifyRequest { .. } => "clarify_request",
+            ClientMessage::ProcessDocument { .. } => "process_document",
+            ClientMessage::AnalyzeImage { .. } => "analyze_image",
+            ClientMessage::TranscribeAudio { .. } => "transcribe_audio",
+            ClientMessage::RequestSpeech { .. } => "request_speech",
+            ClientMessage::PlanTask { .. } => "plan_task",
         }
     }
 }
@@ -704,6 +767,63 @@ pub enum ServerMessage {
     SecureInputState {
         active: bool,
     },
+    /// Successful reply to [`ClientMessage::ProcessDocument`].
+    DocumentProcessed {
+        request_id: String,
+        /// The converted markdown content.
+        markdown: String,
+    },
+    /// Failure reply to [`ClientMessage::ProcessDocument`]. A separate variant from
+    /// [`ServerMessage::Error`] (matching [`ServerMessage::AuthRejected`]'s precedent) so the
+    /// client can key UI state off it -- e.g. clearing a specific attachment's "processing"
+    /// spinner -- rather than pattern-matching on generic error text.
+    DocumentProcessFailed {
+        request_id: String,
+        error: String,
+    },
+    /// Successful reply to [`ClientMessage::AnalyzeImage`].
+    ImageAnalyzed {
+        request_id: String,
+        text: String,
+    },
+    /// Failure reply to [`ClientMessage::AnalyzeImage`].
+    ImageAnalysisFailed {
+        request_id: String,
+        error: String,
+    },
+    /// Successful reply to [`ClientMessage::TranscribeAudio`].
+    AudioTranscribed {
+        request_id: String,
+        text: String,
+    },
+    /// Failure reply to [`ClientMessage::TranscribeAudio`].
+    AudioTranscriptionFailed {
+        request_id: String,
+        error: String,
+    },
+    /// Successful reply to [`ClientMessage::RequestSpeech`]: `audio_data_base64` is the WAV
+    /// bytes Tinfoil returned, base64-encoded for JSON transport.
+    SpeechReady {
+        request_id: String,
+        audio_data_base64: String,
+    },
+    /// Failure reply to [`ClientMessage::RequestSpeech`].
+    SpeechFailed {
+        request_id: String,
+        error: String,
+    },
+    /// Successful reply to [`ClientMessage::PlanTask`]: an ordered list of human-readable step
+    /// descriptions for the client to show the user before anything runs. See
+    /// `mac-daemon`'s `tinfoil_planner` module doc for why this is a plan, not an execution.
+    PlanReady {
+        request_id: String,
+        steps: Vec<String>,
+    },
+    /// Failure reply to [`ClientMessage::PlanTask`].
+    PlanFailed {
+        request_id: String,
+        error: String,
+    },
 }
 
 impl ServerMessage {
@@ -723,6 +843,16 @@ impl ServerMessage {
             ServerMessage::ClarifyQuestions { .. } => "clarify_questions",
             ServerMessage::InputRequest { .. } => "input_request",
             ServerMessage::SecureInputState { .. } => "secure_input_state",
+            ServerMessage::DocumentProcessed { .. } => "document_processed",
+            ServerMessage::DocumentProcessFailed { .. } => "document_process_failed",
+            ServerMessage::ImageAnalyzed { .. } => "image_analyzed",
+            ServerMessage::ImageAnalysisFailed { .. } => "image_analysis_failed",
+            ServerMessage::AudioTranscribed { .. } => "audio_transcribed",
+            ServerMessage::AudioTranscriptionFailed { .. } => "audio_transcription_failed",
+            ServerMessage::SpeechReady { .. } => "speech_ready",
+            ServerMessage::SpeechFailed { .. } => "speech_failed",
+            ServerMessage::PlanReady { .. } => "plan_ready",
+            ServerMessage::PlanFailed { .. } => "plan_failed",
         }
     }
 

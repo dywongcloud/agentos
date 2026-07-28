@@ -126,6 +126,28 @@ struct MainView: View {
     /// True while the clarify inference is in flight (drives the thinking state).
     @State private var isClarifying = false
 
+    // MARK: - Tinfoil-backed features (document/image/audio/planner)
+
+    @AppStorage(AppSettings.TinfoilAudio.storageKey)
+    private var tinfoilAudioEnabled = AppSettings.TinfoilAudio.enabledByDefault
+    @StateObject private var tinfoilAudioRecorder = TinfoilAudioRecorder()
+    @StateObject private var speechPlayback = SpeechPlaybackController()
+
+    @State private var showDocumentAttachSheet = false
+    @State private var showImageAttachSheet = false
+    @State private var showPlanSheet = false
+    @State private var showTinfoilRecordSheet = false
+
+    @State private var tinfoilRequestID = UUID().uuidString
+    @State private var documentResult: String?
+    @State private var documentError: String?
+    @State private var imageResult: String?
+    @State private var imageError: String?
+    @State private var transcriptionResult: String?
+    @State private var transcriptionError: String?
+    @State private var planSteps: [String]?
+    @State private var planError: String?
+
     /// Guards `sendAutoPairPromptIfNeeded()` to at most once per process
     /// launch -- `.connected` can re-fire after a reconnect, and this must
     /// never re-send on that path.
@@ -530,6 +552,49 @@ struct MainView: View {
         .sheet(isPresented: $showControls) {
             controlsSheet
         }
+        .sheet(isPresented: $showDocumentAttachSheet) {
+            TinfoilAttachSheet(
+                mode: .document,
+                onSend: { sendTinfoilMessage($0) },
+                resultText: $documentResult,
+                resultError: $documentError,
+                requestId: tinfoilRequestID
+            )
+        }
+        .sheet(isPresented: $showImageAttachSheet) {
+            TinfoilAttachSheet(
+                mode: .image,
+                onSend: { sendTinfoilMessage($0) },
+                resultText: $imageResult,
+                resultError: $imageError,
+                requestId: tinfoilRequestID
+            )
+        }
+        .sheet(isPresented: $showPlanSheet) {
+            PlanStepsSheet(
+                onSend: { sendTinfoilMessage($0) },
+                onRunStep: { dispatchPrompt($0) },
+                steps: $planSteps,
+                planError: $planError,
+                requestId: tinfoilRequestID
+            )
+        }
+        .sheet(isPresented: $showTinfoilRecordSheet) {
+            TinfoilRecordSheet(
+                recorder: tinfoilAudioRecorder,
+                onSend: { audioData in
+                    transcriptionResult = nil
+                    transcriptionError = nil
+                    sendTinfoilMessage(.transcribeAudio(
+                        requestId: tinfoilRequestID,
+                        audioDataBase64: audioData.base64EncodedString(),
+                        format: "wav"
+                    ))
+                },
+                resultText: $transcriptionResult,
+                resultError: $transcriptionError
+            )
+        }
         // Live partial + final transcript updates populate the prompt field
         // as they arrive while a recognition session is running.
         .onChange(of: voice.liveText) { _, newText in
@@ -858,6 +923,64 @@ struct MainView: View {
         log(.status(text: "demo → \(newState.displayName)"))
     }
 
+    // MARK: - Tinfoil attach menu
+
+    /// "+"-style menu offering the Tinfoil-backed document/image/audio/planner features
+    /// alongside the prompt composer. Each option presents its own sheet (see the `.sheet`
+    /// modifiers above); a fresh `tinfoilRequestID` is minted per-open so results correlate to
+    /// the request that produced them, not a stale one from a previous sheet visit.
+    private var tinfoilAttachMenu: some View {
+        Menu {
+            Button {
+                tinfoilRequestID = UUID().uuidString
+                documentResult = nil
+                documentError = nil
+                showDocumentAttachSheet = true
+            } label: {
+                Label("Attach Document", systemImage: "doc")
+            }
+            Button {
+                tinfoilRequestID = UUID().uuidString
+                imageResult = nil
+                imageError = nil
+                showImageAttachSheet = true
+            } label: {
+                Label("Attach Image", systemImage: "photo")
+            }
+            Button {
+                tinfoilRequestID = UUID().uuidString
+                planSteps = nil
+                planError = nil
+                showPlanSheet = true
+            } label: {
+                Label("Plan a Task", systemImage: "list.bullet.rectangle")
+            }
+            if tinfoilAudioEnabled {
+                Button {
+                    tinfoilRequestID = UUID().uuidString
+                    showTinfoilRecordSheet = true
+                } label: {
+                    Label("Record & Transcribe", systemImage: "waveform")
+                }
+            }
+        } label: {
+            Image(systemName: "plus.circle")
+                .font(.system(size: 17))
+                .foregroundStyle(Color(white: 0.75))
+                .frame(width: 30, height: 38)
+        }
+        .accessibilityLabel("Attach or plan with Tinfoil")
+    }
+
+    /// Sends a Tinfoil-backed `ClientMessage` (document/image/audio/plan/speech) over the
+    /// control channel. A thin named wrapper over `sendControlMessage` so call sites in the
+    /// attach/plan/record sheets read as "send a Tinfoil request", matching `dispatchPrompt`'s
+    /// own naming convention for the desktop-task path.
+    private func sendTinfoilMessage(_ message: ClientMessage) {
+        sendControlMessage(message)
+        log(.status(text: "→ \(message.wireKindLabel)"))
+    }
+
     // MARK: - Session action wiring
 
     /// The control callbacks handed to `SessionView`. The task-committing
@@ -1064,6 +1187,34 @@ struct MainView: View {
             )
         case .secureInputState(let active):
             isMacAtLockScreen = active
+        case .documentProcessed(_, let markdown):
+            documentError = nil
+            documentResult = markdown
+        case .documentProcessFailed(_, let error):
+            documentResult = nil
+            documentError = error
+        case .imageAnalyzed(_, let text):
+            imageError = nil
+            imageResult = text
+        case .imageAnalysisFailed(_, let error):
+            imageResult = nil
+            imageError = error
+        case .audioTranscribed(_, let text):
+            transcriptionError = nil
+            transcriptionResult = text
+        case .audioTranscriptionFailed(_, let error):
+            transcriptionResult = nil
+            transcriptionError = error
+        case .speechReady(_, let audioDataBase64):
+            speechPlayback.play(base64WavData: audioDataBase64)
+        case .speechFailed(_, let error):
+            log(.error(text: "speech synthesis failed: \(error)"))
+        case .planReady(_, let steps):
+            planError = nil
+            planSteps = steps
+        case .planFailed(_, let error):
+            planSteps = nil
+            planError = error
         }
     }
 
@@ -1569,6 +1720,11 @@ struct MainView: View {
         case .currentTicket: return .blue
         case .clarifyQuestions: return Self.orbAccent
         case .secureInputState: return .blue
+        case .documentProcessed, .imageAnalyzed, .audioTranscribed, .planReady: return .green
+        case .documentProcessFailed, .imageAnalysisFailed, .audioTranscriptionFailed, .planFailed:
+            return .red
+        case .speechReady: return .green
+        case .speechFailed: return .red
         }
     }
 
@@ -1758,6 +1914,8 @@ struct MainView: View {
             .buttonStyle(.plain)
             .sensoryFeedback(.impact(weight: .light), trigger: voice.isRecording)
             .accessibilityLabel(voice.isRecording ? "Stop recording" : "Start voice prompt")
+
+            tinfoilAttachMenu
 
             Button {
                 // Direct send in both modes -- see .onSubmit above for the

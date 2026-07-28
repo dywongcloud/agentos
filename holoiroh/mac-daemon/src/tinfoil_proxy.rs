@@ -161,6 +161,7 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Reque
                     if is_kimi {
                         apply_kimi_tuning(obj);
                     }
+                    redact_image_urls_in_messages(obj);
                 }
                 serde_json::to_vec(&json).unwrap_or_else(|_| bytes.to_vec())
             }
@@ -276,6 +277,90 @@ fn apply_kimi_tuning(obj: &mut serde_json::Map<String, serde_json::Value>) {
         }
     }
     obj.insert("max_completion_tokens".to_string(), serde_json::json!(MIN_MAX_TOKENS));
+}
+
+/// Walks every `messages[].content[]` entry of shape `{"type":"image_url","image_url":{"url":
+/// "data:image/...;base64,<data>"}}` and replaces the base64 payload with an on-device
+/// PII-redacted version (see [`crate::privacy::ocr_and_redact`]) before the request leaves the
+/// loopback boundary. This is the load-bearing fix for the gap `privacy-wire-into-tinfoil-proxy`
+/// (PRD) named: `Cargo.toml`'s dependency comments have described this exact redaction step as
+/// already wired here since before this function existed -- it wasn't, screenshots forwarded
+/// completely unredacted. Best-effort per-image: a decode/OCR/re-encode failure on one image
+/// leaves that image's URL untouched (logged) rather than dropping the whole request -- a
+/// redaction bug must never silently turn into "the agent stopped seeing the screen."
+fn redact_image_urls_in_messages(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    let mut redacted_images = 0usize;
+    for message in messages.iter_mut() {
+        let Some(content) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for part in content.iter_mut() {
+            let is_image_url = part.get("type").and_then(|t| t.as_str()) == Some("image_url");
+            if !is_image_url {
+                continue;
+            }
+            let Some(url) = part
+                .get("image_url")
+                .and_then(|iu| iu.get("url"))
+                .and_then(|u| u.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            match redact_data_url(&url) {
+                Ok(Some(redacted_url)) => {
+                    if let Some(iu) = part.get_mut("image_url") {
+                        iu["url"] = serde_json::Value::String(redacted_url);
+                        redacted_images += 1;
+                    }
+                }
+                Ok(None) => {
+                    // Not a data: URL (e.g. an https:// image reference) -- nothing local to
+                    // redact; the upstream fetches it directly and never touches this proxy's
+                    // memory at all.
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "tinfoil proxy: image redaction failed, forwarding this image unredacted");
+                }
+            }
+        }
+    }
+    if redacted_images > 0 {
+        tracing::info!(redacted_images, "tinfoil proxy: redacted PII in outbound image(s)");
+    }
+}
+
+/// Decodes a `data:image/<fmt>;base64,<data>` URL, runs [`crate::privacy::ocr_and_redact`], and
+/// re-encodes as a PNG data URL. Returns `Ok(None)` for a non-`data:` URL (nothing to do
+/// locally) and `Err` for a malformed/undecodable one (caller logs and leaves the original
+/// untouched).
+fn redact_data_url(url: &str) -> anyhow::Result<Option<String>> {
+    let Some(comma_idx) = url.find(',') else {
+        return Ok(None);
+    };
+    let header = &url[..comma_idx];
+    if !header.starts_with("data:image/") || !header.ends_with(";base64") {
+        return Ok(None);
+    }
+    let b64_data = &url[comma_idx + 1..];
+    let raw_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_data)
+        .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
+    let image = image::load_from_memory(&raw_bytes)
+        .map_err(|e| anyhow::anyhow!("image decode failed: {e}"))?;
+    let (redacted, _count) = crate::privacy::ocr_and_redact(&image)?;
+
+    let mut png_bytes = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut png_bytes);
+        redacted
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| anyhow::anyhow!("PNG re-encode failed: {e}"))?;
+    }
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_bytes);
+    Ok(Some(format!("data:image/png;base64,{encoded}")))
 }
 
 fn status_response(status: StatusCode, msg: &'static str) -> Response {

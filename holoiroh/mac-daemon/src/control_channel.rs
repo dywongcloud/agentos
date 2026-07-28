@@ -257,6 +257,36 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
             ServerMessage::clarify_questions(questions)
         }
         ControlEvent::SecureInputState { active } => ServerMessage::SecureInputState { active },
+        ControlEvent::DocumentProcessed { request_id, markdown } => {
+            ServerMessage::DocumentProcessed { request_id, markdown }
+        }
+        ControlEvent::DocumentProcessFailed { request_id, error } => {
+            ServerMessage::DocumentProcessFailed { request_id, error }
+        }
+        ControlEvent::ImageAnalyzed { request_id, text } => {
+            ServerMessage::ImageAnalyzed { request_id, text }
+        }
+        ControlEvent::ImageAnalysisFailed { request_id, error } => {
+            ServerMessage::ImageAnalysisFailed { request_id, error }
+        }
+        ControlEvent::AudioTranscribed { request_id, text } => {
+            ServerMessage::AudioTranscribed { request_id, text }
+        }
+        ControlEvent::AudioTranscriptionFailed { request_id, error } => {
+            ServerMessage::AudioTranscriptionFailed { request_id, error }
+        }
+        ControlEvent::SpeechReady { request_id, audio_data_base64 } => {
+            ServerMessage::SpeechReady { request_id, audio_data_base64 }
+        }
+        ControlEvent::SpeechFailed { request_id, error } => {
+            ServerMessage::SpeechFailed { request_id, error }
+        }
+        ControlEvent::PlanReady { request_id, steps } => {
+            ServerMessage::PlanReady { request_id, steps }
+        }
+        ControlEvent::PlanFailed { request_id, error } => {
+            ServerMessage::PlanFailed { request_id, error }
+        }
     }
 }
 
@@ -274,13 +304,46 @@ fn event_request_id(event: &ControlEvent) -> Option<String> {
         | ControlEvent::Done { request_id, .. }
         | ControlEvent::Error { request_id, .. }
         | ControlEvent::Queued { request_id, .. }
-        | ControlEvent::InputRequested { request_id, .. } => request_id,
+        | ControlEvent::InputRequested { request_id, .. }
+        | ControlEvent::DocumentProcessed { request_id, .. }
+        | ControlEvent::DocumentProcessFailed { request_id, .. }
+        | ControlEvent::ImageAnalyzed { request_id, .. }
+        | ControlEvent::ImageAnalysisFailed { request_id, .. }
+        | ControlEvent::AudioTranscribed { request_id, .. }
+        | ControlEvent::AudioTranscriptionFailed { request_id, .. }
+        | ControlEvent::SpeechReady { request_id, .. }
+        | ControlEvent::SpeechFailed { request_id, .. }
+        | ControlEvent::PlanReady { request_id, .. }
+        | ControlEvent::PlanFailed { request_id, .. } => request_id,
         ControlEvent::DaemonStatus { .. }
         | ControlEvent::TaskActive { .. }
         | ControlEvent::ClarifyQuestions { .. }
         | ControlEvent::SecureInputState { .. } => return None,
     };
     if id.is_empty() { None } else { Some(id.clone()) }
+}
+
+/// Logs one [`crate::audit_log::CloudEgressEntry`], warning (never propagating) on failure --
+/// matching [`AuditLogger::append`]'s documented best-effort posture for its other caller
+/// (never tears down the in-flight turn that produced the entry). Shared by all five
+/// document/image/audio/planner spawn blocks in the read loop below.
+fn log_cloud_egress(
+    audit: &AuditLogger,
+    request_id: &str,
+    capability: crate::audit_log::CloudEgressCapability,
+    success: bool,
+    byte_count: u64,
+) {
+    let entry = crate::audit_log::CloudEgressEntry {
+        request_id: request_id.to_string(),
+        capability,
+        occurred_at_ms: now_ms(),
+        success,
+        byte_count,
+    };
+    if let Err(err) = audit.append(&entry) {
+        warn!(error = %err, request_id, "control channel: failed to append cloud-egress audit entry");
+    }
 }
 
 /// Converts a wire [`ClientMessage`] plus a synthesized `request_id` into
@@ -358,6 +421,13 @@ pub fn to_control_message(request_id: String, msg: ClientMessage) -> Option<Cont
         // Clarification runs off the desktop-task pipeline (handled inline in
         // the control-channel read loop), so it never becomes a ControlMessage.
         ClientMessage::ClarifyRequest { .. } => None,
+        // Handled entirely by their own arms in the read loop below, off the desktop-task
+        // pipeline (same as ClarifyRequest) -- listed only to keep this match exhaustive.
+        ClientMessage::ProcessDocument { .. }
+        | ClientMessage::AnalyzeImage { .. }
+        | ClientMessage::TranscribeAudio { .. }
+        | ClientMessage::RequestSpeech { .. }
+        | ClientMessage::PlanTask { .. } => None,
     }
 }
 
@@ -590,6 +660,13 @@ pub struct ControlChannel {
     /// a `ClarifyRequest` then replies with an empty question set so the app
     /// proceeds with a direct send.
     clarify: Option<crate::clarify::ClarifyConfig>,
+    /// The raw Tinfoil bearer key, shared by the document/image/audio/planner handlers below
+    /// (each of those modules takes the key directly rather than a per-module config struct,
+    /// unlike `clarify`'s `ClarifyConfig` -- there is no per-module model override env var for
+    /// any of them yet, so a bare key is the whole config). `None` disables all four features;
+    /// each replies with its own `*Failed` event stating no key is configured, mirroring
+    /// `clarify`'s empty-questions-when-disabled posture rather than silently hanging.
+    tinfoil_key: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for ControlChannel {
@@ -616,6 +693,7 @@ impl ControlChannel {
         audit: Arc<AuditLogger>,
         current_ticket: Arc<str>,
         clarify: Option<crate::clarify::ClarifyConfig>,
+        tinfoil_key: Option<Arc<str>>,
     ) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
         Self {
@@ -628,6 +706,7 @@ impl ControlChannel {
             audit,
             current_ticket,
             clarify,
+            tinfoil_key,
         }
     }
 
@@ -646,6 +725,7 @@ impl ControlChannel {
         audit: Arc<AuditLogger>,
         current_ticket: Arc<str>,
         clarify: Option<crate::clarify::ClarifyConfig>,
+        tinfoil_key: Option<Arc<str>>,
     ) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
         Self {
@@ -658,6 +738,7 @@ impl ControlChannel {
             audit,
             current_ticket,
             clarify,
+            tinfoil_key,
         }
     }
 
@@ -1352,6 +1433,281 @@ impl ProtocolHandler for ControlChannel {
                         }
                     }
                 }
+                Ok(ClientMessage::ProcessDocument { request_id, filename, data_base64, mode }) => {
+                    // Off the desktop-task pipeline, same shape as ClarifyRequest: spawn the
+                    // (potentially slow, up to 120s per tinfoil_documents) call so the read loop
+                    // keeps draining, deliver the result as a ControlEvent.
+                    let tx = events_tx.clone();
+                    let audit = self.audit.clone();
+                    match self.tinfoil_key.clone() {
+                        Some(key) => {
+                            tokio::spawn(async move {
+                                let bytes = match base64::Engine::decode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    data_base64,
+                                ) {
+                                    Ok(b) => b,
+                                    Err(err) => {
+                                        log_cloud_egress(
+                                            &audit,
+                                            &request_id,
+                                            crate::audit_log::CloudEgressCapability::Document,
+                                            false,
+                                            0,
+                                        );
+                                        let _ = tx.send(ControlEvent::DocumentProcessFailed {
+                                            request_id,
+                                            error: format!("invalid base64: {err}"),
+                                        });
+                                        return;
+                                    }
+                                };
+                                let byte_count = bytes.len() as u64;
+                                let convert_mode = match mode.as_str() {
+                                    "vision" => crate::tinfoil_documents::ConvertMode::Vision,
+                                    "images" => crate::tinfoil_documents::ConvertMode::Images,
+                                    "raw" => crate::tinfoil_documents::ConvertMode::Raw,
+                                    "vlm" => crate::tinfoil_documents::ConvertMode::Vlm,
+                                    _ => crate::tinfoil_documents::ConvertMode::Text,
+                                };
+                                let files = vec![crate::tinfoil_documents::DocumentInput {
+                                    filename,
+                                    bytes,
+                                }];
+                                let audit_request_id = request_id.clone();
+                                let (event, success) = match crate::tinfoil_documents::convert_documents(
+                                    &key,
+                                    &files,
+                                    convert_mode,
+                                )
+                                .await
+                                {
+                                    Ok(docs) => {
+                                        let markdown = docs
+                                            .into_iter()
+                                            .map(|d| d.markdown)
+                                            .collect::<Vec<_>>()
+                                            .join("\n\n---\n\n");
+                                        (ControlEvent::DocumentProcessed { request_id, markdown }, true)
+                                    }
+                                    Err(err) => (
+                                        ControlEvent::DocumentProcessFailed {
+                                            request_id,
+                                            error: err.to_string(),
+                                        },
+                                        false,
+                                    ),
+                                };
+                                log_cloud_egress(
+                                    &audit,
+                                    &audit_request_id,
+                                    crate::audit_log::CloudEgressCapability::Document,
+                                    success,
+                                    byte_count,
+                                );
+                                let _ = tx.send(event);
+                            });
+                        }
+                        None => {
+                            if tx
+                                .send(ControlEvent::DocumentProcessFailed {
+                                    request_id,
+                                    error: "no TINFOIL_API_KEY configured".to_string(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(ClientMessage::AnalyzeImage { request_id, image_data_base64, prompt }) => {
+                    let tx = events_tx.clone();
+                    let audit = self.audit.clone();
+                    match self.tinfoil_key.clone() {
+                        Some(key) => {
+                            tokio::spawn(async move {
+                                let bytes = match base64::Engine::decode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    image_data_base64,
+                                ) {
+                                    Ok(b) => b,
+                                    Err(err) => {
+                                        log_cloud_egress(&audit, &request_id, crate::audit_log::CloudEgressCapability::Image, false, 0);
+                                        let _ = tx.send(ControlEvent::ImageAnalysisFailed {
+                                            request_id,
+                                            error: format!("invalid base64: {err}"),
+                                        });
+                                        return;
+                                    }
+                                };
+                                let byte_count = bytes.len() as u64;
+                                let image = match image::load_from_memory(&bytes) {
+                                    Ok(img) => img,
+                                    Err(err) => {
+                                        log_cloud_egress(&audit, &request_id, crate::audit_log::CloudEgressCapability::Image, false, byte_count);
+                                        let _ = tx.send(ControlEvent::ImageAnalysisFailed {
+                                            request_id,
+                                            error: format!("failed to decode image: {err}"),
+                                        });
+                                        return;
+                                    }
+                                };
+                                let audit_request_id = request_id.clone();
+                                let (event, success) = match crate::tinfoil_vision::analyze_image(
+                                    &key,
+                                    &image,
+                                    &prompt,
+                                    crate::tinfoil_vision::VisionModel::Gemma431b,
+                                )
+                                .await
+                                {
+                                    Ok(text) => (ControlEvent::ImageAnalyzed { request_id, text }, true),
+                                    Err(err) => (ControlEvent::ImageAnalysisFailed {
+                                        request_id,
+                                        error: err.to_string(),
+                                    }, false),
+                                };
+                                log_cloud_egress(&audit, &audit_request_id, crate::audit_log::CloudEgressCapability::Image, success, byte_count);
+                                let _ = tx.send(event);
+                            });
+                        }
+                        None => {
+                            if tx
+                                .send(ControlEvent::ImageAnalysisFailed {
+                                    request_id,
+                                    error: "no TINFOIL_API_KEY configured".to_string(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(ClientMessage::TranscribeAudio { request_id, audio_data_base64, format: _ }) => {
+                    let tx = events_tx.clone();
+                    let audit = self.audit.clone();
+                    match self.tinfoil_key.clone() {
+                        Some(key) => {
+                            tokio::spawn(async move {
+                                let bytes = match base64::Engine::decode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    audio_data_base64,
+                                ) {
+                                    Ok(b) => b,
+                                    Err(err) => {
+                                        log_cloud_egress(&audit, &request_id, crate::audit_log::CloudEgressCapability::AudioTranscribe, false, 0);
+                                        let _ = tx.send(ControlEvent::AudioTranscriptionFailed {
+                                            request_id,
+                                            error: format!("invalid base64: {err}"),
+                                        });
+                                        return;
+                                    }
+                                };
+                                let byte_count = bytes.len() as u64;
+                                let audit_request_id = request_id.clone();
+                                let (event, success) = match crate::tinfoil_audio::transcribe(
+                                    &key, bytes, "audio",
+                                )
+                                .await
+                                {
+                                    Ok(text) => (ControlEvent::AudioTranscribed { request_id, text }, true),
+                                    Err(err) => (ControlEvent::AudioTranscriptionFailed {
+                                        request_id,
+                                        error: err.to_string(),
+                                    }, false),
+                                };
+                                log_cloud_egress(&audit, &audit_request_id, crate::audit_log::CloudEgressCapability::AudioTranscribe, success, byte_count);
+                                let _ = tx.send(event);
+                            });
+                        }
+                        None => {
+                            if tx
+                                .send(ControlEvent::AudioTranscriptionFailed {
+                                    request_id,
+                                    error: "no TINFOIL_API_KEY configured".to_string(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(ClientMessage::RequestSpeech { request_id, text, voice }) => {
+                    let tx = events_tx.clone();
+                    let audit = self.audit.clone();
+                    match self.tinfoil_key.clone() {
+                        Some(key) => {
+                            tokio::spawn(async move {
+                                let byte_count = text.len() as u64;
+                                let audit_request_id = request_id.clone();
+                                let (event, success) = match crate::tinfoil_audio::speech(&key, &text, &voice)
+                                    .await
+                                {
+                                    Ok(wav) => (ControlEvent::SpeechReady {
+                                        request_id,
+                                        audio_data_base64: crate::tinfoil_audio::encode_speech_base64(
+                                            &wav,
+                                        ),
+                                    }, true),
+                                    Err(err) => (ControlEvent::SpeechFailed {
+                                        request_id,
+                                        error: err.to_string(),
+                                    }, false),
+                                };
+                                log_cloud_egress(&audit, &audit_request_id, crate::audit_log::CloudEgressCapability::AudioSpeech, success, byte_count);
+                                let _ = tx.send(event);
+                            });
+                        }
+                        None => {
+                            if tx
+                                .send(ControlEvent::SpeechFailed {
+                                    request_id,
+                                    error: "no TINFOIL_API_KEY configured".to_string(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(ClientMessage::PlanTask { request_id, goal }) => {
+                    let tx = events_tx.clone();
+                    let audit = self.audit.clone();
+                    match self.tinfoil_key.clone() {
+                        Some(key) => {
+                            tokio::spawn(async move {
+                                let byte_count = goal.len() as u64;
+                                let audit_request_id = request_id.clone();
+                                let (event, success) = match crate::tinfoil_planner::plan_task(&key, &goal)
+                                    .await
+                                {
+                                    Ok(steps) => (ControlEvent::PlanReady { request_id, steps }, true),
+                                    Err(err) => (ControlEvent::PlanFailed {
+                                        request_id,
+                                        error: err.to_string(),
+                                    }, false),
+                                };
+                                log_cloud_egress(&audit, &audit_request_id, crate::audit_log::CloudEgressCapability::Planner, success, byte_count);
+                                let _ = tx.send(event);
+                            });
+                        }
+                        None => {
+                            if tx
+                                .send(ControlEvent::PlanFailed {
+                                    request_id,
+                                    error: "no TINFOIL_API_KEY configured".to_string(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
                 Ok(msg) => {
                     debug!(peer = %remote, ?msg, "control channel: received message");
                     // task_id threading: an inbound envelope that already
@@ -1404,7 +1760,15 @@ impl ProtocolHandler for ControlChannel {
                         | ClientMessage::RemoteControl { .. }
                         // ClarifyRequest is handled by its own arm above (never
                         // reaches here); listed only to keep the match exhaustive.
-                        | ClientMessage::ClarifyRequest { .. } => None,
+                        | ClientMessage::ClarifyRequest { .. }
+                        // Same: each has its own arm above, off the desktop-task pipeline, and
+                        // is audited separately by control-channel-audit-logging (cloud egress),
+                        // not as an agent-turn ActionClass.
+                        | ClientMessage::ProcessDocument { .. }
+                        | ClientMessage::AnalyzeImage { .. }
+                        | ClientMessage::TranscribeAudio { .. }
+                        | ClientMessage::RequestSpeech { .. }
+                        | ClientMessage::PlanTask { .. } => None,
                     } {
                         audit_starts.lock().expect("audit_starts lock poisoned").insert(
                             request_id.clone(),
