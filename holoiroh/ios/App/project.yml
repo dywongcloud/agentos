@@ -29,6 +29,9 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.holoiroh.HoloIroh
+        DEVELOPMENT_TEAM: XBBQ2LGY3K
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1,2"
         CODE_SIGN_STYLE: Automatic
+        OTHER_LDFLAGS: "-lc++"
+
