@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(stop_id),
         seq,
-        ClientMessage::Stop,
+        ClientMessage::Stop { context_id: None },
     );
     write_line(&mut send, &env).await?;
     let stop_at = tokio::time::Instant::now();

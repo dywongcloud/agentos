@@ -1550,6 +1550,71 @@ impl HoloControlBridge {
             request_id: request_id.clone(),
         });
 
+        // Scoped-only path: an explicit `context_id` asks to cancel ONE specific turn, so
+        // none of the all-or-nothing machinery below (paused-stash drop, queue drain, global
+        // `holo stop`, force escalation) runs -- scoping exists to shrink the blast radius,
+        // and escalating anyway would defeat it. A scoped stop for a context nothing is
+        // running is a polite status, never a global stop of an unrelated turn.
+        if let Some(ctx) = context_id.as_deref() {
+            // A paused stash belonging to the scoped context is dropped: a stash surviving
+            // its own cancel would resurrect on the next Resume (the same bug the unscoped
+            // path's stash-drop closes). Any other stash is not this stop's business.
+            {
+                let mut paused = self.paused.lock().expect("paused lock poisoned");
+                if paused
+                    .as_ref()
+                    .is_some_and(|p| p.context_id.as_deref() == Some(ctx))
+                {
+                    paused.take();
+                    *self
+                        .pending_consent
+                        .lock()
+                        .expect("pending_consent lock poisoned") = None;
+                    self.emit_daemon_status(
+                        "stop: discarded the paused task for the scoped context",
+                    );
+                }
+            }
+
+            // The A2A task id comes only from the currently running turn, and only when the
+            // target IS that turn -- `tasks/cancel` needs the real `Task.id` to work against
+            // the current holo serve (context-id-only cancels return JSON-RPC -32603 there;
+            // see a2a_client::cancel's doc).
+            let (matches_current, a2a_task_id) = {
+                let current = self.current_turn.lock().expect("current_turn lock poisoned");
+                match current.as_ref() {
+                    Some(t) if t.context_id.as_deref() == Some(ctx) => {
+                        (true, t.a2a_task_id.clone())
+                    }
+                    _ => (false, None),
+                }
+            };
+
+            let client = self.client.read().expect("client lock poisoned").clone();
+            if let Err(err) = client.cancel(ctx, a2a_task_id.as_deref()).await {
+                tracing::warn!(request_id, context_id = ctx, error = %err, "scoped A2A tasks/cancel failed");
+                self.emit(ControlEvent::Error {
+                    request_id: request_id.clone(),
+                    message: format!("A2A cancel failed for context {ctx}: {err}"),
+                });
+                return;
+            }
+            if !matches_current {
+                self.emit_daemon_status(format!(
+                    "stop: cancel requested for context {ctx} (no turn with that context is running here)"
+                ));
+            }
+
+            self.emit(ControlEvent::Done {
+                request_id,
+                context_id: Some(ctx.to_owned()),
+                status: DoneStatus::Canceled,
+                message: Some("stop requested (scoped)".to_owned()),
+            });
+            return;
+        }
+
+
         // The request_id of the turn actually running when this Stop arrived -- captured now
         // so the force-escalation below can tell "the turn we asked to stop is STILL running"
         // from "it stopped and a different turn started". `None` if nothing was running.
@@ -1625,21 +1690,6 @@ impl HoloControlBridge {
                 status: DoneStatus::Canceled,
                 message: Some("canceled: stop requested while queued".to_owned()),
             });
-        }
-
-        // Scoped cancel first, when we have a context to scope it to: the A2A
-        // `tasks/cancel`-equivalent path (HoloExecutor.cancel -> best-effort backend
-        // session cancel; see a2a_client module doc). This is the lower-blast-radius option
-        // and should win when both are meaningful.
-        if let Some(ctx) = context_id.as_deref() {
-            let client = self.client.read().expect("client lock poisoned").clone();
-            if let Err(err) = client.cancel(ctx, None).await {
-                tracing::warn!(request_id, context_id = ctx, error = %err, "A2A tasks/cancel failed");
-                self.emit(ControlEvent::Error {
-                    request_id: request_id.clone(),
-                    message: format!("A2A cancel failed for context {ctx}: {err}"),
-                });
-            }
         }
 
         // Debug-only witness hook: `HOLOIROH_DEBUG_STOP_SKIP_GRACEFUL=1` makes this Stop skip

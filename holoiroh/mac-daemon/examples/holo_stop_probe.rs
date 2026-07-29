@@ -1,7 +1,9 @@
 //! Manual, run-by-hand probe for the **remote kill-switch** path: an iOS `Stop` control sends a
 //! `ClientMessage::Stop` over the control channel, which the daemon maps to an internal
-//! `ControlMessage::Stop` and, for a stop with no `context_id` (exactly what the wire schema
-//! produces), engages the global `holo stop` CLI kill switch.
+//! `ControlMessage::Stop`. The wire variant carries an optional `context_id`: absent (the form
+//! every current client produces) it engages the global kill switch (scoped cancel of the
+//! current turn + queue drain + `holo stop`); present, it scopes the cancel to that one turn
+//! (section 4b below).
 //!
 //! This witnesses the three things the kill-switch row asks for, via real execution (NO test
 //! file, per this repo's no-unit-tests rule -- run with
@@ -83,7 +85,10 @@ fn drain(rx: &mut mpsc::UnboundedReceiver<ControlEvent>) -> Vec<ControlEvent> {
 #[tokio::main]
 async fn main() {
     println!("=== (1) wire ClientMessage::Stop maps to internal ControlMessage::Stop ===");
-    let mapped = to_control_message("req-stop-1".to_string(), ClientMessage::Stop);
+    let mapped = to_control_message(
+        "req-stop-1".to_string(),
+        ClientMessage::Stop { context_id: None },
+    );
     println!("  to_control_message(\"req-stop-1\", ClientMessage::Stop) -> {mapped:?}");
     match mapped {
         Some(ControlMessage::Stop {
@@ -98,6 +103,31 @@ async fn main() {
             );
             assert_eq!(force, false, "wire Stop is never force by construction (force is a daemon-internal escalation)");
             println!("  OK -- ClientMessage::Stop -> ControlMessage::Stop{{context_id:None, force:false}}");
+        }
+        other => panic!("expected Some(ControlMessage::Stop{{..}}), got {other:?}"),
+    }
+
+    let mapped_scoped = to_control_message(
+        "req-stop-2".to_string(),
+        ClientMessage::Stop {
+            context_id: Some("ctx-9".to_string()),
+        },
+    );
+    println!("  to_control_message(\"req-stop-2\", ClientMessage::Stop{{context_id:Some(\"ctx-9\")}}) -> {mapped_scoped:?}");
+    match mapped_scoped {
+        Some(ControlMessage::Stop {
+            request_id,
+            context_id,
+            force,
+        }) => {
+            assert_eq!(request_id, "req-stop-2", "request_id must be threaded through unchanged");
+            assert_eq!(
+                context_id.as_deref(),
+                Some("ctx-9"),
+                "a scoped wire Stop must thread its context_id through unchanged for handle_stop's scoped-only cancel path"
+            );
+            assert_eq!(force, false, "wire Stop is never force by construction");
+            println!("  OK -- scoped ClientMessage::Stop -> ControlMessage::Stop{{context_id:Some(\"ctx-9\"), force:false}}");
         }
         other => panic!("expected Some(ControlMessage::Stop{{..}}), got {other:?}"),
     }
@@ -205,6 +235,94 @@ async fn main() {
     println!("  OK -- stop Ack'd, queued prompt canceled, stop resolved, queue drained, holo stop ran");
 
     println!();
+    println!("=== (4b) scoped Stop{{context_id:Some}} cancels ONLY that context -- no queue drain, no global stop, non-matching paused stash survives ===");
+    // Unreachable backend on purpose: the scoped A2A cancel attempt must surface its own
+    // ControlEvent::Error (cancel was ATTEMPTED for the named context), while every
+    // all-or-nothing behavior (queue drain, paused-stash drop on a non-matching context,
+    // global `holo stop`) must NOT fire. A bogus holo_bin sharpens the last witness: if the
+    // global stop ran at all, it would produce a 'holo stop failed' error.
+    let (bridge, mut rx) = unreachable_bridge("/nonexistent/definitely-not-holo");
+    tokio::join!(
+        bridge.handle(ControlMessage::Prompt {
+            request_id: "running-2".to_string(),
+            text: "long task".to_string(),
+            context_id: None,
+        }),
+        async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            bridge
+                .handle(ControlMessage::Prompt {
+                    request_id: "queued-2".to_string(),
+                    text: "second task".to_string(),
+                    context_id: None,
+                })
+                .await;
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // Pause stashes the turn (context_id: None -- the unreachable backend never
+            // resolves one). This stash must SURVIVE a scoped stop for a different context.
+            bridge.handle(ControlMessage::Pause {
+                request_id: "pause-2".to_string(),
+            }).await;
+            // The scoped stop: context "ctx-9" matches nothing here (no current turn has it,
+            // no paused stash has it).
+            bridge
+                .handle(ControlMessage::Stop {
+                    request_id: "stop-2".to_string(),
+                    context_id: Some("ctx-9".to_string()),
+                    force: false,
+                })
+                .await;
+        }
+    );
+    let events = drain(&mut rx);
+    for e in &events {
+        println!("  event: {e:?}");
+    }
+    let stop_ack = events
+        .iter()
+        .any(|e| matches!(e, ControlEvent::Ack { request_id } if request_id == "stop-2"));
+    println!("  Ack for stop-2 present -> {stop_ack}");
+    assert!(stop_ack, "scoped handle_stop must Ack the stop request");
+    let cancel_attempted = events.iter().any(|e| {
+        matches!(e, ControlEvent::Error { message, .. } if message.contains("A2A cancel failed for context ctx-9"))
+    });
+    println!("  scoped cancel attempted for ctx-9 (its Error surfaced from the unreachable backend) -> {cancel_attempted}");
+    assert!(
+        cancel_attempted,
+        "a scoped stop must issue the A2A cancel for exactly the named context -- here witnessed by its honest failure surfacing"
+    );
+    // The drain signature specifically: a Done{Canceled} carrying the drain message. On an
+    // unreachable backend the queued prompt is also consumed by NORMAL dispatch (its own
+    // message/stream Error), so depth alone cannot be the witness -- the drain MESSAGE is.
+    let queued_drain_canceled = events.iter().any(|e| {
+        matches!(e, ControlEvent::Done { request_id, status: DoneStatus::Canceled, message: Some(m), .. } if request_id == "queued-2" && m.contains("stop requested while queued"))
+    });
+    println!("  queued-2 dropped with the stop-drain message -> {queued_drain_canceled} (expected false: scoped stop never drains the queue)");
+    assert!(!queued_drain_canceled, "scoped stop must NOT drain queued prompts");
+    let stop_done = events.iter().any(|e| {
+        matches!(e, ControlEvent::Done { request_id, .. } if request_id == "stop-2")
+    });
+    println!("  Done for stop-2 itself present -> {stop_done} (expected false: cancel errored -> no false success)");
+    assert!(!stop_done, "a failed scoped cancel must not falsely resolve the stop as Done");
+    let global_stop_ran = events.iter().any(|e| {
+        matches!(e, ControlEvent::Error { message, .. } if message.contains("holo stop failed"))
+    });
+    println!("  'holo stop failed' error (would prove the global stop engaged despite the bogus bin) -> {global_stop_ran} (expected false)");
+    assert!(!global_stop_ran, "scoped stop must NOT engage the global holo stop kill switch");
+    let stash_dropped = events.iter().any(|e| {
+        matches!(e, ControlEvent::DaemonStatus { text } if text.contains("discarded the paused task for the scoped context"))
+    });
+    println!("  paused stash dropped for a NON-matching context -> {stash_dropped} (expected false: ctx-9 matches nothing paused here)");
+    assert!(
+        !stash_dropped,
+        "a scoped stop must leave paused stashes of OTHER contexts alone (the match-drop arm needs a live backend-supplied context, honestly unwitnessable here)"
+    );
+    println!("  OK -- scoped stop: cancel attempted for exactly ctx-9, no queue drain, no global stop, non-matching stash survived");
+
+
+    println!();
     println!("=== (5) bogus holo_bin: Stop surfaces a graceful ControlEvent::Error, never panics ===");
     let (bridge, mut rx) = unreachable_bridge("/nonexistent/definitely-not-holo");
     bridge
@@ -238,9 +356,11 @@ async fn main() {
     println!();
     println!(
         "holo_stop_probe: OK -- remote kill-switch daemon path witnessed via real execution: \
-         ClientMessage::Stop -> ControlMessage::Stop{{context_id:None}} mapping, correct \
+         ClientMessage::Stop (bare + scoped context_id forms) -> ControlMessage::Stop mapping, correct \
          `holo stop`/`holo stop --force` command construction, a real `holo stop` invocation \
-         against the installed holo-desktop-cli, the full handle_stop queue-drain + holo-stop \
-         path, and graceful ControlEvent::Error on a missing holo binary."
+         against the installed holo-desktop-cli, the full unscoped handle_stop queue-drain + holo-stop \
+         path, the scoped-only handle_stop path (cancel attempted for exactly the named context, \
+         no queue drain, no global stop, non-matching paused stash survived), and graceful \
+         ControlEvent::Error on a missing holo binary."
     );
 }

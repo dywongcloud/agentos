@@ -382,7 +382,13 @@ enum ServerMessage: Codable, Equatable {
 enum ClientMessage: Codable, Equatable {
     case prompt(text: String)
     case voiceTranscript(text: String)
-    case stop
+    /// The remote kill-switch. `contextId == nil` is the global form
+    /// (`{"type":"stop"}`, byte-identical to before): the daemon cancels the
+    /// running turn, drains the queue, and engages `holo stop`. A non-nil
+    /// `contextId` scopes the cancel to that one A2A context (no queue
+    /// drain, no global stop) -- no per-turn ids exist on this client today,
+    /// so every Cancel control sends nil.
+    case stop(contextId: String?)
     /// Pause the running task (daemon parks it; `resume` continues it on the
     /// same backend session).
     case pause
@@ -424,6 +430,7 @@ enum ClientMessage: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case type
         case text
+        case contextId = "context_id"
         case requestId = "request_id"
         case selectedOption = "selected_option"
         case event
@@ -464,7 +471,7 @@ enum ClientMessage: Codable, Equatable {
         case .voiceTranscript:
             self = .voiceTranscript(text: try container.decode(String.self, forKey: .text))
         case .stop:
-            self = .stop
+            self = .stop(contextId: try container.decodeIfPresent(String.self, forKey: .contextId))
         case .pause:
             self = .pause
         case .resume:
@@ -522,8 +529,9 @@ enum ClientMessage: Codable, Equatable {
         case .voiceTranscript(let text):
             try container.encode(Kind.voiceTranscript, forKey: .type)
             try container.encode(text, forKey: .text)
-        case .stop:
+        case .stop(let contextId):
             try container.encode(Kind.stop, forKey: .type)
+            try container.encodeIfPresent(contextId, forKey: .contextId)
         case .pause:
             try container.encode(Kind.pause, forKey: .type)
         case .resume:

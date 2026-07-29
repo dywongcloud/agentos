@@ -2375,11 +2375,12 @@ struct MainView: View {
 
     /// Sends the remote kill-switch `ClientMessage.stop`. Wired to every Cancel
     /// control (Working/Connecting/Input-needed/Draft-ready) -- see
-    /// `sessionActions.cancel`. On the daemon this maps to
-    /// `ControlMessage::Stop { context_id: None }` and engages the global
-    /// `holo stop` kill switch (`mac-daemon`'s `HoloControlBridge::handle_stop`).
+    /// `sessionActions.cancel`. The nil contextId is the global form: the daemon
+    /// first scoped-cancels the running turn via its own resolved A2A ids, then
+    /// drains the queue and engages the `holo stop` kill switch
+    /// (`mac-daemon`'s `HoloControlBridge::handle_stop`).
     private func sendStop() {
-        sendControlMessage(.stop)
+        sendControlMessage(.stop(contextId: nil))
     }
 
     // MARK: - Log helper

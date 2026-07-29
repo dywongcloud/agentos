@@ -769,34 +769,45 @@ side** and structured-and-ready on the iOS side:
 
 - **Daemon side (real, wired, probe-witnessed).** A control-channel
   `ClientMessage::Stop` maps (via
-  `control_channel::to_control_message`) to `ControlMessage::Stop` with no
-  `context_id`, which `HoloControlBridge::handle_stop` handles by draining
-  any queued prompts (each gets a terminal `Done{Canceled}`) and then
-  engaging the CLI-level global kill switch: it shells out to the real
-  `holo stop` (see `holo_bridge/stop.rs`), the same pause-then-cancel effect
-  as `holo-desktop-cli`'s own double-Esc / `holo stop`. A `force` variant
-  maps to `holo stop --force`. This whole path is witnessed by
-  `examples/holo_stop_probe.rs` (see "Build status" below): the
-  `ClientMessage::Stop → ControlMessage::Stop{context_id:None}` mapping, the
-  exact `holo stop` / `holo stop --force` argument-vector construction, a
-  **real `holo stop` invocation** against the installed `~/.holo/bin/holo`
-  (a benign no-op with no turn in flight), the full `handle_stop`
-  queue-drain, and the graceful `ControlEvent::Error` when the `holo` binary
-  is missing.
-- **iOS side (structured and ready, one wiring step remaining).** The
-  `SessionView` Working/Connecting/Input-needed/Draft-ready panels' "Cancel"
-  control now routes through a real control-channel send seam
-  (`ControlChannelSender.swift`'s `ControlChannelSending`) and sends the
-  actual `ClientMessage.stop`, JSON-encoded to its exact `{"type":"stop"}`
-  `PROTOCOL.md` wire form. What is **not** yet real is only the byte path off
-  the device: there is no `iroh`/FFI networking in the iOS skeleton yet, so
-  the seam's default `LoggingControlChannelSender` performs the real *encode*
-  and surfaces the message in the status/log panel instead of writing it to a
-  socket. The single remaining wiring step is documented on the
-  `ControlChannelSending` protocol: hand the encoded bytes to the
-  `ios-bridge` control-channel send FFI once that transport is built. So the
-  Stop action is ready to send the right message today; only the transport
-  underneath it is stubbed.
+  `control_channel::to_control_message`) to `ControlMessage::Stop`, carrying
+  an **optional `context_id`**:
+  - *Global form* (`context_id` absent — what every current client sends):
+    `HoloControlBridge::handle_stop` first scoped-cancels the running turn
+    via A2A `tasks/cancel` using the daemon's own resolved
+    `contextId`/`Task.id` (captured mid-stream by `a2a_client`'s `on_ids`
+    callback — the client never has one), drains any queued prompts (each
+    gets a terminal `Done{Canceled}`), discards any paused turn, and then
+    engages the CLI-level global kill switch: it shells out to the real
+    `holo stop` (see `holo_bridge/stop.rs`), the same pause-then-cancel
+    effect as `holo-desktop-cli`'s own double-Esc / `holo stop`, with a
+    `holo stop --force` escalation if the same turn is still running ~3s
+    later.
+  - *Scoped form* (`context_id` present): cancel ONE specific turn — an A2A
+    `tasks/cancel` for exactly that context, with **none** of the
+    all-or-nothing machinery (no queue drain, no global `holo stop`, no
+    force escalation). A paused stash under the same `context_id` is
+    discarded; other stashes survive. A context nothing is running resolves
+    to a polite status note, never a global stop of an unrelated turn.
+  This whole path is witnessed by `examples/holo_stop_probe.rs` (see "Build
+  status" below): the `ClientMessage::Stop → ControlMessage::Stop` mapping
+  in both bare and scoped forms, the exact `holo stop` / `holo stop --force`
+  argument-vector construction, a **real `holo stop` invocation** against
+  the installed `~/.holo/bin/holo` (a benign no-op with no turn in flight),
+  the full unscoped `handle_stop` queue-drain, the scoped-only path (cancel
+  attempted for exactly the named context, no queue drain, no global stop,
+  non-matching paused stash survived), and the graceful
+  `ControlEvent::Error` when the `holo` binary is missing.
+- **iOS side (real over the control channel).** The `SessionView`
+  Working/Connecting/Input-needed/Draft-ready panels' "Cancel" control sends
+  the actual `ClientMessage.stop` — once `HoloConnection` completes the
+  control-ALPN PIN handshake the seam is the real
+  `FFIControlChannelSender`, writing encoded bytes to the daemon over the
+  wire; before that (and in bridge-less simulator/CI builds) the
+  `LoggingControlChannelSender` stand-in performs the same real encode and
+  surfaces it in the status/log panel. The wire payload is the global form
+  (`{"type":"stop"}`): the app's Cancel means "stop everything", and the
+  daemon already scoped-cancels the running turn on its own before the
+  wider kill — no per-turn ids exist on the client to scope with.
 
 **Still missing**: a *different* kill-switch — the Mac-side control to
 immediately stop the **broadcast** / revoke an *active already-open session*
@@ -827,7 +838,7 @@ claim, so here is the exact status of each:
 | Max active tasks per Mac | 1 | **Really enforced.** This was already the exact behavior of `HoloControlBridge`'s pre-existing `busy`/`queue` mechanism (a second prompt while one is in flight is queued, never run concurrently) -- `limits.rs` now names that behavior explicitly and a `debug_assert!` in `handle_prompt` ties the constant to the `bool`-shaped enforcement it models. |
 | Max active controllers per Mac | 1 | **Gap found, honestly reported, not silently fixed.** `ControlChannel::accept` does not reject a second simultaneous connection from an already-allowlisted device -- it runs the same accept path independently and both connections can coexist, with only the most recent sender's connection receiving `ControlEvent`s (via the existing `replace_event_sink` reconnect-redirect mechanism, which was designed for "old connection dropped, new one takes over," not "two connections alive at once"). Not wired here because a real fix changes accept-time rejection behavior for an already-allowlisted device and needs a product decision on which connection should win; see `limits.rs`'s `MAX_ACTIVE_CONTROLLERS_PER_MAC` doc for the exact code path and the proposed fix shape. |
 | Task runtime | 45s default / 120s max | Constants + a real `clamp_task_runtime` function (independently exercised: an over-max request is actually clamped, not passed through), not wired into `HoloControlBridge::run_prompt` -- that function has no per-task deadline/timeout concept today (`send_and_stream` runs to completion with no `tokio::time::timeout` wrapper). |
-| Agent action cap | 100 default | **Really enforced.** `ActionCounter` (real, atomic, independently exercised -- refuses a 101st `try_record`) is constructed per turn in `HoloControlBridge::run_prompt` and counts every `TaskUpdate::Working` update; once the cap is hit, further progress events for that turn are suppressed and the turn ends with a `ControlEvent::Error` reporting the cap. **Documented limitation:** this does not stop `holo serve` from continuing to run the agent server-side past the 100th action -- `A2aClient::send_and_stream`'s callback has no way to signal "abort the stream," and a real `tasks/cancel` needs the resolved `context_id`, which is only available after the stream ends. A true server-side abort needs a callback-contract change out of this pass's scope. |
+| Agent action cap | 100 default | **Really enforced.** `ActionCounter` (real, atomic, independently exercised -- refuses a 101st `try_record`) is constructed per turn in `HoloControlBridge::run_prompt` and counts every `TaskUpdate::Working` update; once the cap is hit, further progress events for that turn are suppressed and the turn ends with a `ControlEvent::Error` reporting the cap. **Documented limitation:** the cap suppresses and errors the turn client-side but does not by itself issue an A2A `tasks/cancel` to halt the agent server-side past the 100th action. (A mid-stream abort channel *does* exist today for the user-driven paths -- `a2a_client::cancel` + the `on_ids` mid-stream `contextId`/`Task.id` capture, used by `handle_stop` and `cancel_current_turn` -- it is simply not wired into the counter's own trip; doing so is a small follow-up, not a contract change.) |
 | Manual input rate | 120 events/s max | Constant only, no channel to attach it to yet. This codebase's wire schema has no `manual_input` message type at all (only `Prompt`/`VoiceTranscript`/`Stop`/`Pin`); the richer 6-stream protocol PRD 7.1 describes (which includes a dedicated `manual_input` stream) is tracked separately under `holoiroh-task-envelope-protocol`. |
 
 Verification: `cargo run --example limits_probe` exercises `ActionCounter`,

@@ -242,19 +242,41 @@ entire bare message body):
   `text` field) but tagged separately so the daemon/UI can distinguish
   input modality for logging/UX (e.g. showing a mic icon in the status
   panel) without re-deriving it from context.
-- `stop`: the remote **kill-switch** — cancels/interrupts whatever
-  `holo-desktop-cli` is currently doing. No `text`. On the daemon this maps
-  (via `control_channel::to_control_message`) to `ControlMessage::Stop` with
-  no `context_id`, which `HoloControlBridge::handle_stop` handles by draining
-  any queued prompts (each gets a terminal `status`/`Done{Canceled}`) and
-  then engaging the CLI-level global kill switch by shelling out to
-  `holo stop` (see `mac-daemon/src/holo_bridge/stop.rs`) — the same
-  pause-then-cancel effect as the double-Esc / `holo stop` kill switch built
-  into `holo-desktop-cli` itself. Because the wire `stop` carries no
-  `context_id`, it always engages this *global* stop ("stop whatever is
-  running") rather than a scoped A2A `tasks/cancel`; a future schema revision
-  that threads a `context_id`/`task_id` through would let a client scope the
-  stop to one specific turn.
+- `stop`: the remote **kill-switch** — cancels/interrupts agent work on the
+  Mac. Two forms, one variant:
+  - **Global form** (`{"type":"stop"}` — `context_id` absent): stop
+    *everything*. On the daemon this maps (via
+    `control_channel::to_control_message`) to `ControlMessage::Stop` with
+    `context_id: None`, which `HoloControlBridge::handle_stop` handles by
+    first scoped-canceling the currently running turn via A2A `tasks/cancel`
+    (using the daemon's own resolved `contextId`/`Task.id` — the client never
+    has one), then draining any queued prompts (each gets a terminal
+    `status`/`Done{Canceled}` with `"canceled: stop requested while queued"`),
+    discarding any paused turn outright, and finally engaging the CLI-level
+    global kill switch by shelling out to `holo stop` (see
+    `mac-daemon/src/holo_bridge/stop.rs`) — the same pause-then-cancel effect
+    as the double-Esc / `holo stop` kill switch built into
+    `holo-desktop-cli` itself, with a `holo stop --force` escalation if the
+    same turn is still running ~3s later.
+  - **Scoped form** (`{"type":"stop","context_id":"<a2a contextId>"}`):
+    cancel ONE specific turn. The daemon issues A2A `tasks/cancel` for exactly
+    that context (with the real `Task.id` when the target is the currently
+    running turn, which is the only place a `Task.id` can come from — a
+    context-id-only cancel returns JSON-RPC `-32603` against the current
+    `holo serve`), and **none** of the all-or-nothing machinery runs: no
+    queue drain, no global `holo stop`, no force escalation. A paused turn
+    stashed under the *same* `context_id` is discarded (it would otherwise
+    resurrect on the next `resume`); stashes of other contexts survive. A
+    scoped stop naming a context nothing is running resolves to a polite
+    `status` note (`stop: cancel requested for context ... (no turn with that
+    context is running here)`) — never a global stop of an unrelated turn. On
+    a failed cancel the stop surfaces a `error` event (`A2A cancel failed for
+    context ...`) and does **not** report a false `Done`.
+  Serde compatibility: the scoped form is additive per this protocol's
+  extension policy — the `context_id` field is `Option<String>` with
+  `skip_serializing_if = "None"`, so the global form serializes
+  byte-identically to the pre-field unit variant (`{"type":"stop"}`) and old
+  `{"type":"stop"}` payloads deserialize unchanged.
 - `pause`: parks the in-flight turn so `resume` can continue it. The Holo
   backend exposes **no pause RPC** over A2A (its own kill switch is
   pause-then-cancel — see `mac-daemon/src/holo_bridge/stop.rs`'s source

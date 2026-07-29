@@ -76,6 +76,21 @@ let package = Package(
                 // `.copy` keeps the "Sounds" subdirectory for Bundle.module
                 // lookups.
                 .copy("Resources/Sounds")
+            ],
+            // `HoloirohIosBridge` is a Rust static library (not a dynamic framework), so it
+            // does not carry its own framework dependencies the way a `.framework` would --
+            // every macOS/iOS system framework its Rust crates call into (`netdev`/
+            // `system_configuration` for network-interface enumeration, `rusty_codecs`'
+            // VideoToolbox H.264 encoder) has to be linked explicitly here, or the final link
+            // step fails with "symbol(s) not found" for framework constants. This was never hit
+            // by a plain `swift build`/`swift build --sdk iphonesimulator` (those only compile
+            // to a relocatable object, `-r` link mode, which never needs full symbol
+            // resolution) -- it only surfaces once something actually links a real, runnable
+            // `.app` executable, which nothing in this repo did until the `ios/App` Xcode
+            // project wrapper (see `REQUIRED_INFO_PLIST_KEYS.md`) started doing so.
+            linkerSettings: [
+                .linkedFramework("SystemConfiguration", .when(platforms: [.iOS])),
+                .linkedFramework("VideoToolbox", .when(platforms: [.iOS])),
             ]
         )
     ]

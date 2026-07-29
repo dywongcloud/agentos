@@ -36,14 +36,45 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_core_graphics::{
-    CGDisplayBounds, CGEvent, CGEventField, CGEventTapLocation, CGEventType, CGMainDisplayID,
-    CGMouseButton, CGScrollEventUnit,
+    CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType,
+    CGMainDisplayID, CGMouseButton, CGScrollEventUnit,
 };
 
 /// Tracks whether a mouse button is currently held, so a `Move` while held is
 /// emitted as a DRAG (the only way a click-and-drag registers in AppKit).
 static LEFT_DOWN: AtomicBool = AtomicBool::new(false);
 static RIGHT_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Tracks which modifier keys the remote client currently reports held, so a plain letter/digit
+/// `key()` press posted while e.g. Cmd is held actually reads as a real shortcut (Cmd+C, not the
+/// literal character `c`) -- see [`current_modifier_flags`] and `key()`'s doc for why this has to
+/// be a keycode-based combo rather than [`text`], which bypasses shortcut interpretation
+/// entirely. Named for the physical key, not the OS concept, to match [`keycode`]'s naming and
+/// what an iOS `UIKeyModifierFlags` reader most naturally maps onto.
+static CMD_DOWN: AtomicBool = AtomicBool::new(false);
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+static OPT_DOWN: AtomicBool = AtomicBool::new(false);
+static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// The combined flags for whichever modifiers are currently held, applied to every keyboard AND
+/// mouse event this module posts (not just keyboard: a real trackpad's Cmd+click / Shift+click
+/// carry the same flags, and AppKit reads modifier state off mouse events too).
+fn current_modifier_flags() -> CGEventFlags {
+    let mut flags = CGEventFlags::empty();
+    if CMD_DOWN.load(Ordering::Relaxed) {
+        flags |= CGEventFlags::MaskCommand;
+    }
+    if CTRL_DOWN.load(Ordering::Relaxed) {
+        flags |= CGEventFlags::MaskControl;
+    }
+    if OPT_DOWN.load(Ordering::Relaxed) {
+        flags |= CGEventFlags::MaskAlternate;
+    }
+    if SHIFT_DOWN.load(Ordering::Relaxed) {
+        flags |= CGEventFlags::MaskShift;
+    }
+    flags
+}
 
 /// Whether the daemon may inject input right now (Accessibility granted).
 pub fn is_permitted() -> bool {
@@ -82,6 +113,15 @@ pub fn release_all() {
             post(&ev);
         }
     }
+    // Same class of bug as an abandoned mouse button: a client that disconnects mid-shortcut
+    // (Cmd held, connection drops before the matching key-up) leaves the Mac believing Cmd is
+    // still physically held, corrupting every subsequent local keystroke/click until someone
+    // presses and releases Cmd by hand. Clear the flags unconditionally; a `key`/`click` with no
+    // modifiers actually held is what every subsequent event already expects.
+    CMD_DOWN.store(false, Ordering::Relaxed);
+    CTRL_DOWN.store(false, Ordering::Relaxed);
+    OPT_DOWN.store(false, Ordering::Relaxed);
+    SHIFT_DOWN.store(false, Ordering::Relaxed);
 }
 
 /// Map a normalized point (`0..=1` within the captured display) to a global CG
@@ -167,6 +207,30 @@ fn record_applied_click(states: &[i64]) {
         .extend_from_slice(states);
 }
 
+/// One resolved key event: `(virtual keycode, down, modifier flags applied)`. Recorded under
+/// `HOLOIROH_INPUT_DRY_RUN` so `remote_input_key_probe` can verify the keycode table and the
+/// held-modifier state machine WITHOUT posting a real CGEvent -- an unrecognized key name
+/// records nothing at all (matching `key()`'s real behavior of silently ignoring it), which is
+/// itself something a probe needs to be able to observe.
+static APPLIED_KEYS: std::sync::Mutex<Vec<(u16, bool, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Drains the key events recorded under `HOLOIROH_INPUT_DRY_RUN`. Same lib-vs-bin situation as
+/// [`take_applied_moves`]; consumed by `remote_input_key_probe`.
+#[allow(dead_code)]
+pub fn take_applied_keys() -> Vec<(u16, bool, u64)> {
+    std::mem::take(&mut *APPLIED_KEYS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn record_applied_key(code: u16, down: bool, flags: CGEventFlags) {
+    if !injection_is_dry_run() {
+        return;
+    }
+    APPLIED_KEYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((code, down, flags.0));
+}
+
 fn record_applied_move(nx: f64, ny: f64) {
     if !injection_is_dry_run() {
         return;
@@ -202,6 +266,7 @@ pub fn move_cursor(nx: f64, ny: f64) {
         (CGEventType::MouseMoved, CGMouseButton::Left)
     };
     if let Some(ev) = CGEvent::new_mouse_event(None, ty, p, btn) {
+        CGEvent::set_flags(Some(&ev), current_modifier_flags());
         post(&ev);
     }
 }
@@ -221,6 +286,7 @@ pub fn button(nx: f64, ny: f64, right: bool, down: bool) {
         LEFT_DOWN.store(down, Ordering::Relaxed);
     }
     if let Some(ev) = CGEvent::new_mouse_event(None, ty, p, cgbtn) {
+        CGEvent::set_flags(Some(&ev), current_modifier_flags());
         post(&ev);
     }
 }
@@ -281,13 +347,16 @@ pub fn click(nx: f64, ny: f64, right: bool, count: u32) {
         vec![next_click_state(p, right)]
     };
     record_applied_click(&states);
+    let flags = current_modifier_flags();
     for state in states {
         if let Some(down) = CGEvent::new_mouse_event(None, dty, p, cgbtn) {
             CGEvent::set_integer_value_field(Some(&down), CGEventField::MouseEventClickState, state);
+            CGEvent::set_flags(Some(&down), flags);
             post(&down);
         }
         if let Some(up) = CGEvent::new_mouse_event(None, uty, p, cgbtn) {
             CGEvent::set_integer_value_field(Some(&up), CGEventField::MouseEventClickState, state);
+            CGEvent::set_flags(Some(&up), flags);
             post(&up);
         }
     }
@@ -313,6 +382,10 @@ pub fn scroll(nx: f64, ny: f64, dx: f64, dy: f64) {
         dx.round() as i32,
         0,
     ) {
+        // A real trackpad's scroll carries whatever modifiers are held too (Shift+scroll for
+        // horizontal in some apps, Option+scroll to zoom in others) -- same held-modifier state
+        // key()/click() already apply.
+        CGEvent::set_flags(Some(&ev), current_modifier_flags());
         post(&ev);
     }
 }
@@ -337,30 +410,101 @@ pub fn text(s: &str) {
     }
 }
 
-/// Press or release a named special key.
+/// Press or release a named key -- either a plain special key (arrows, escape, ...) or a
+/// modifier (cmd/ctrl/option/shift), which additionally updates the held-modifier state
+/// [`current_modifier_flags`] applies to every subsequent key/click/move this module posts.
+///
+/// This is the ONLY path a real keyboard shortcut (Cmd+C, Cmd+Tab, Ctrl+A, ...) can take. A
+/// plain `text()` call injects a literal unicode string via `keyboard_set_unicode_string`,
+/// bypassing macOS's keycode+modifier-flag shortcut interpretation entirely -- typing "c" that
+/// way while Cmd is virtually held does not copy anything, it just types the letter c. A real
+/// shortcut needs a REAL keycode-based keyboard event (this function) with the right
+/// `CGEventFlags` set, which is why [`keycode`] covers every letter/digit/punctuation key, not
+/// only the handful of non-printable special keys this function used to be limited to.
 pub fn key(name: &str, down: bool) {
-    let Some(code) = keycode(name) else {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "cmd" | "command" | "meta" => {
+            CMD_DOWN.store(down, Ordering::Relaxed);
+        }
+        "ctrl" | "control" => {
+            CTRL_DOWN.store(down, Ordering::Relaxed);
+        }
+        "opt" | "option" | "alt" => {
+            OPT_DOWN.store(down, Ordering::Relaxed);
+        }
+        "shift" => {
+            SHIFT_DOWN.store(down, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    let Some(code) = keycode(&lower) else {
         return;
     };
+    let flags = current_modifier_flags();
+    record_applied_key(code, down, flags);
     if let Some(ev) = CGEvent::new_keyboard_event(None, code, down) {
+        CGEvent::set_flags(Some(&ev), flags);
         post(&ev);
     }
 }
 
-/// Map a named special key to its macOS virtual keycode. Returns `None` for
-/// unknown names (the caller then ignores the key event rather than posting a
-/// wrong keystroke).
+/// Map a named key to its macOS virtual keycode (the well-known, stable HIToolbox
+/// `kVK_*` constants). Returns `None` for unknown names (the caller then ignores the key
+/// event rather than posting a wrong keystroke). Covers every key an iOS `UIKey.keyCode`
+/// (`UIKeyboardHIDUsage`) can report while a hardware keyboard shortcut is held, plus the
+/// modifiers themselves (posted as real key events too, in addition to updating the held
+/// state in [`key`], since some apps read raw modifier keycodes rather than only flags).
 fn keycode(name: &str) -> Option<u16> {
-    Some(match name.to_ascii_lowercase().as_str() {
+    Some(match name {
+        // Letters (kVK_ANSI_*), keyboard row order, not alphabetical -- copied directly from
+        // the HIToolbox table, easiest to verify against Apple's own reference that way.
+        "a" => 0, "s" => 1, "d" => 2, "f" => 3, "h" => 4, "g" => 5, "z" => 6, "x" => 7,
+        "c" => 8, "v" => 9, "b" => 11, "q" => 12, "w" => 13, "e" => 14, "r" => 15, "y" => 16,
+        "t" => 17, "o" => 31, "u" => 32, "i" => 34, "p" => 35, "l" => 37, "j" => 38, "k" => 40,
+        "n" => 45, "m" => 46,
+        // Digits.
+        "1" => 18, "2" => 19, "3" => 20, "4" => 21, "6" => 22, "5" => 23, "9" => 25, "7" => 26,
+        "8" => 28, "0" => 29,
+        // Punctuation.
+        "=" | "equal" => 24,
+        "-" | "minus" => 27,
+        "]" | "rightbracket" => 30,
+        "[" | "leftbracket" => 33,
+        "'" | "quote" => 39,
+        ";" | "semicolon" => 41,
+        "\\" | "backslash" => 42,
+        "," | "comma" => 43,
+        "/" | "slash" => 44,
+        "." | "period" => 47,
+        "`" | "grave" => 50,
+        // Editing / whitespace.
         "return" | "enter" => 36,
         "delete" | "backspace" => 51,
+        "forwarddelete" => 117,
         "escape" | "esc" => 53,
         "tab" => 48,
         "space" => 49,
+        // Arrows.
         "left" => 123,
         "right" => 124,
         "down" => 125,
         "up" => 126,
+        // Navigation.
+        "home" => 115,
+        "end" => 119,
+        "pageup" => 116,
+        "pagedown" => 121,
+        // Function keys.
+        "f1" => 122, "f2" => 120, "f3" => 99, "f4" => 118, "f5" => 96, "f6" => 97, "f7" => 98,
+        "f8" => 100, "f9" => 101, "f10" => 109, "f11" => 103, "f12" => 111,
+        // Modifiers (left-hand variants -- iOS reports left/right the same way to us either
+        // side is pressed, and macOS treats either side identically for shortcut purposes).
+        "cmd" | "command" | "meta" => 55,
+        "shift" => 56,
+        "capslock" => 57,
+        "opt" | "option" | "alt" => 58,
+        "ctrl" | "control" => 59,
         _ => return None,
     })
 }

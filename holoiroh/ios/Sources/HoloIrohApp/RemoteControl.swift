@@ -171,7 +171,8 @@ struct RemoteControlSurface: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeUIView(context: Context) -> UIView {
-        let v = UIView()
+        let v = RemoteControlInputView()
+        v.coordinator = context.coordinator
         v.backgroundColor = .clear
         v.isMultipleTouchEnabled = true
 
@@ -205,6 +206,25 @@ struct RemoteControlSurface: UIViewRepresentable {
         pan2.maximumNumberOfTouches = 2
         v.addGestureRecognizer(pan2)
 
+        // Real trackpad/mouse pointer movement WITHOUT a button held. `pan1` only fires once a
+        // touch is actually down, which for a finger is correct (there is no such thing as
+        // "hovering" a finger) but for an attached pointer device is wrong: moving the mouse to
+        // aim before clicking should move the remote cursor, exactly like a real Mac, not be
+        // silently dropped until the button is pressed. `UIHoverGestureRecognizer` only ever
+        // fires for indirect-pointer input (trackpad/mouse) -- a finger touch never triggers it
+        // at all, so this is purely additive and cannot conflict with `pan1`'s touch handling.
+        let hover = UIHoverGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.onHover(_:)))
+        v.addGestureRecognizer(hover)
+
+        // Real secondary-click (right mouse button / two-finger trackpad click) in ADDITION to
+        // the touch two-finger-tap above. `buttonMaskRequired` only matches an actual pointer
+        // device reporting its secondary button, so this never fires from a finger tap and never
+        // double-sends alongside `rightTap`.
+        let pointerRightClick = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.onPointerRightClick(_:)))
+        pointerRightClick.buttonMaskRequired = .secondary
+        pointerRightClick.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        v.addGestureRecognizer(pointerRightClick)
+
         // Silent pinch-detector: never sends anything itself (the LOCAL
         // MagnificationGesture elsewhere in the hierarchy owns the actual visual
         // zoom) -- it exists solely so `pan2.require(toFail:)` can make the
@@ -227,8 +247,9 @@ struct RemoteControlSurface: UIViewRepresentable {
         // reaches `.began`, and a two-touch UIPinchGestureRecognizer has no
         // meaningful scale deadband, so it begins almost immediately on any
         // two-finger gesture. Under either branch of the UIKit state machine
-        // pan2 never delivered a usable scroll, and there is no fallback: the
-        // app never constructs a `.key` event, so there is no Page Down either.
+        // pan2 never delivered a usable scroll, and there was no fallback at the time this
+        // comment was written -- `RemoteControlInputView`'s hardware-keyboard capture now
+        // covers Page Down via a real `.key` event instead.
         //
         // The stray-scroll-during-pinch problem the dependency was meant to
         // solve is instead handled in `onPan2` by consulting this recognizer's
@@ -254,7 +275,7 @@ struct RemoteControlSurface: UIViewRepresentable {
         // else is touching the screen underneath.
         context.coordinator.rightTap = rightTap
         context.coordinator.pan2 = pan2
-        [tap, rightTap, pan1, pan2, pinch].forEach { $0.delegate = context.coordinator }
+        [tap, rightTap, pan1, pan2, pinch, hover, pointerRightClick].forEach { $0.delegate = context.coordinator }
         context.coordinator.prepareHaptics()
         return v
     }
@@ -373,6 +394,34 @@ struct RemoteControlSurface: UIViewRepresentable {
             confirmSent()
         }
 
+        /// A real mouse/trackpad's secondary button, via `buttonMaskRequired = .secondary` on
+        /// `pointerRightClick`. Separate handler from `onTwoFingerTap` (not a shared one) even
+        /// though both ultimately send the same `.click(button: .right)`, so each recognizer's
+        /// own input-source guarantee (finger vs. pointer device) stays explicit at the call
+        /// site rather than folded into one function two different gestures happen to reach.
+        @objc func onPointerRightClick(_ g: UITapGestureRecognizer) {
+            guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
+            parent.onEvent(.click(x: Double(n.x), y: Double(n.y), button: .right, count: 1))
+            confirmSent()
+        }
+
+        /// Pure pointer movement from an attached trackpad/mouse -- no button involved, so this
+        /// only ever sends `.move`, never `.button`. `UIHoverGestureRecognizer` fires
+        /// continuously while an indirect pointer device moves over the view with nothing
+        /// pressed; `onPan1` remains the only path that presses/releases the left button (a
+        /// pointer device's actual click still arrives as a touch through `onPan1`/`onTap`, same
+        /// as today -- iPadOS delivers a pointer click as a normal `.direct`-equivalent touch
+        /// sequence, hover is purely the "aiming" motion in between).
+        @objc func onHover(_ g: UIHoverGestureRecognizer) {
+            guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
+            switch g.state {
+            case .began, .changed:
+                parent.onEvent(.move(x: Double(n.x), y: Double(n.y)))
+            default:
+                break
+            }
+        }
+
         @objc func onPan1(_ g: UIPanGestureRecognizer) {
             guard let v = g.view else { return }
             let loc = g.location(in: v)
@@ -438,6 +487,136 @@ struct RemoteControlSurface: UIViewRepresentable {
                 parent.onEvent(.scroll(x: Double(n.x), y: Double(n.y), dx: dx, dy: dy))
                 g.setTranslation(.zero, in: v)
             }
+        }
+
+        /// Translates one physical key press/release into a remote-control event, if this key
+        /// is one this app forwards at all. Returns whether it was handled, so
+        /// `RemoteControlInputView` can fall through to `super` for anything it doesn't
+        /// recognize (an unhandled key should behave as if this view weren't intercepting
+        /// presses at all, not silently vanish).
+        @discardableResult
+        func handleKeyPress(_ key: UIKey, down: Bool) -> Bool {
+            if let modifierName = RemoteControlInputView.modifierName(for: key.keyCode) {
+                parent.onEvent(.key(key: modifierName, down: down))
+                return true
+            }
+            if let specialName = RemoteControlInputView.specialKeyName(for: key.keyCode) {
+                parent.onEvent(.key(key: specialName, down: down))
+                return true
+            }
+            // A real keyboard SHORTCUT (any of Cmd/Ctrl/Option held) has to go through `.key`
+            // with the daemon's own held-modifier state applying `CGEventFlags` -- `.text`
+            // injects a literal unicode string that bypasses shortcut interpretation entirely
+            // (see remote_input.rs's `key()` doc). `charactersIgnoringModifiers` gives the base
+            // unshifted character, which already matches the daemon's a-z/0-9/punctuation key
+            // names directly -- no separate HID-usage-to-letter table needed.
+            let shortcutModifiers: UIKeyModifierFlags = [.command, .control, .alternate]
+            if !key.modifierFlags.intersection(shortcutModifiers).isEmpty {
+                let name = key.charactersIgnoringModifiers.lowercased()
+                guard !name.isEmpty else { return false }
+                parent.onEvent(.key(key: name, down: down))
+                return true
+            }
+            // Plain typing (no shortcut modifier -- Shift-for-capitals is already reflected in
+            // `characters`). Sent once, on key-down only: `.text` injects a self-contained
+            // down+up pair (see `remote_input.rs::text`'s doc), so a key-up here would double it.
+            guard down, !key.characters.isEmpty else { return false }
+            parent.onEvent(.text(key.characters))
+            return true
+        }
+    }
+}
+
+/// Backs `RemoteControlSurface`'s view: a plain `UIView` cannot become first responder or
+/// receive `UIPress` events, and hardware-keyboard input only ever arrives at the first
+/// responder. Becomes first responder as soon as it's placed in a window (remote control is
+/// only ever shown while actively controlling, so there is no "sometimes wired up" state to
+/// track) and forwards every `UIKey` press to the coordinator via `handleKeyPress`.
+final class RemoteControlInputView: UIView {
+    weak var coordinator: RemoteControlSurface.Coordinator?
+
+    override var canBecomeFirstResponder: Bool { true }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            becomeFirstResponder()
+        }
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let handled = presses.compactMap(\.key).reduce(false) { handledSoFar, key in
+            coordinator?.handleKeyPress(key, down: true) == true || handledSoFar
+        }
+        if !handled {
+            super.pressesBegan(presses, with: event)
+        }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let handled = presses.compactMap(\.key).reduce(false) { handledSoFar, key in
+            coordinator?.handleKeyPress(key, down: false) == true || handledSoFar
+        }
+        if !handled {
+            super.pressesEnded(presses, with: event)
+        }
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        // Same terminal-state discipline as `onPan1`'s letterbox-release case: a press that gets
+        // cancelled (e.g. the app backgrounds mid-keystroke) must still release, or a synthetic
+        // key/modifier is left "held" with nothing left on screen to release it.
+        presses.compactMap(\.key).forEach { coordinator?.handleKeyPress($0, down: false) }
+        super.pressesCancelled(presses, with: event)
+    }
+
+    /// Maps a modifier key's own `UIKeyboardHIDUsage` to the daemon's held-modifier name
+    /// (`remote_input.rs::key`'s `"cmd"`/`"ctrl"`/`"opt"`/`"shift"`), or `nil` for a non-modifier
+    /// key. Left/right variants are folded together -- the daemon (and macOS shortcut handling
+    /// generally) treats either side identically.
+    static func modifierName(for keyCode: UIKeyboardHIDUsage) -> String? {
+        switch keyCode {
+        case .keyboardLeftGUI, .keyboardRightGUI: return "cmd"
+        case .keyboardLeftControl, .keyboardRightControl: return "ctrl"
+        case .keyboardLeftAlt, .keyboardRightAlt: return "opt"
+        case .keyboardLeftShift, .keyboardRightShift: return "shift"
+        default: return nil
+        }
+    }
+
+    /// Maps a non-printable special key's `UIKeyboardHIDUsage` to the daemon's key name (the
+    /// same table `remote_input.rs::keycode` accepts), or `nil` for anything with a printable
+    /// character representation (those go through `charactersIgnoringModifiers`/`characters`
+    /// instead, in `Coordinator.handleKeyPress`).
+    static func specialKeyName(for keyCode: UIKeyboardHIDUsage) -> String? {
+        switch keyCode {
+        case .keyboardEscape: return "escape"
+        case .keyboardTab: return "tab"
+        case .keyboardReturnOrEnter: return "return"
+        case .keyboardDeleteOrBackspace: return "delete"
+        case .keyboardDeleteForward: return "forwarddelete"
+        case .keyboardSpacebar: return "space"
+        case .keyboardLeftArrow: return "left"
+        case .keyboardRightArrow: return "right"
+        case .keyboardUpArrow: return "up"
+        case .keyboardDownArrow: return "down"
+        case .keyboardHome: return "home"
+        case .keyboardEnd: return "end"
+        case .keyboardPageUp: return "pageup"
+        case .keyboardPageDown: return "pagedown"
+        case .keyboardF1: return "f1"
+        case .keyboardF2: return "f2"
+        case .keyboardF3: return "f3"
+        case .keyboardF4: return "f4"
+        case .keyboardF5: return "f5"
+        case .keyboardF6: return "f6"
+        case .keyboardF7: return "f7"
+        case .keyboardF8: return "f8"
+        case .keyboardF9: return "f9"
+        case .keyboardF10: return "f10"
+        case .keyboardF11: return "f11"
+        case .keyboardF12: return "f12"
+        default: return nil
         }
     }
 }

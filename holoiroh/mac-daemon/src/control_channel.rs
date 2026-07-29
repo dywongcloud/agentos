@@ -407,9 +407,9 @@ pub fn to_control_message(request_id: String, msg: ClientMessage) -> Option<Cont
             context_id: None,
             confidence: None,
         }),
-        ClientMessage::Stop => Some(ControlMessage::Stop {
+        ClientMessage::Stop { context_id } => Some(ControlMessage::Stop {
             request_id,
-            context_id: None,
+            context_id,
             force: false,
         }),
         ClientMessage::Pause => Some(ControlMessage::Pause { request_id }),
@@ -1751,7 +1751,7 @@ impl ProtocolHandler for ControlChannel {
                         }
                         // Pause has no terminal of its own (the paused turn's cancel closes
                         // the original entry), same rationale as Stop.
-                        ClientMessage::Stop
+                        ClientMessage::Stop { .. }
                         | ClientMessage::Pause
                         | ClientMessage::Pin { .. }
                         | ClientMessage::InputResponse { .. }

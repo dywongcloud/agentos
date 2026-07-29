@@ -1,0 +1,34 @@
+name: HoloIroh
+options:
+  bundleIdPrefix: com.holoiroh
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  HoloIrohApp:
+    path: ..
+targets:
+  HoloIroh:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    dependencies:
+      - package: HoloIrohApp
+        product: HoloIrohApp
+    info:
+      path: Info.plist
+      properties:
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: "Aro uses the camera to scan the pairing QR code your Mac displays."
+        NSMicrophoneUsageDescription: "Aro uses the microphone to let you speak prompts instead of typing them, and (only if you enable Tinfoil audio transcription) to send your own voice to Tinfoil's confidential-computing cloud."
+        NSSpeechRecognitionUsageDescription: "Aro transcribes your speech on-device (when supported) to turn it into a text prompt."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.holoiroh.HoloIroh
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic

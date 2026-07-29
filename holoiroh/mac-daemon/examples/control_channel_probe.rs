@@ -56,7 +56,18 @@ fn main() {
         },
         r#"{"type":"voice_transcript","text":"what's on my screen right now"}"#,
     );
-    round_trip_client("stop", ClientMessage::Stop, r#"{"type":"stop"}"#);
+    round_trip_client(
+        "stop",
+        ClientMessage::Stop { context_id: None },
+        r#"{"type":"stop"}"#,
+    );
+    round_trip_client(
+        "stop-scoped",
+        ClientMessage::Stop {
+            context_id: Some("ctx-9".to_string()),
+        },
+        r#"{"type":"stop","context_id":"ctx-9"}"#,
+    );
     round_trip_client(
         "pin",
         ClientMessage::Pin {

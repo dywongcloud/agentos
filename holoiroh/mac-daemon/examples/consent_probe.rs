@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
                     session_id.clone(),
                     Some(uuid::Uuid::new_v4().to_string()),
                     seq,
-                    ClientMessage::Stop,
+                    ClientMessage::Stop { context_id: None },
                 );
                 write_line(&mut send, &env).await?;
                 let _ = std::process::Command::new("osascript")
@@ -224,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
             session_id.clone(),
             Some(uuid::Uuid::new_v4().to_string()),
             seq,
-            ClientMessage::Stop,
+            ClientMessage::Stop { context_id: None },
         );
         write_line(&mut send, &env).await?;
         let _ = std::process::Command::new("osascript")
@@ -313,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(uuid::Uuid::new_v4().to_string()),
         seq,
-        ClientMessage::Stop,
+        ClientMessage::Stop { context_id: None },
     );
     write_line(&mut send, &env).await?;
     let _ = std::process::Command::new("osascript")

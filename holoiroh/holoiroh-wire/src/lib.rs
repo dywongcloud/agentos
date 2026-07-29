@@ -343,8 +343,17 @@ pub enum ClientMessage {
     VoiceTranscript {
         text: String,
     },
-    /// Cancel/interrupt whatever is currently running.
-    Stop,
+    /// Cancel/interrupt whatever is currently running. With `context_id`
+    /// absent this is the global kill-switch (the daemon cancels the running
+    /// turn, drains the queue, and engages `holo stop`); with `context_id`
+    /// present it scopes the cancel to that one turn -- no queue drain, no
+    /// global stop (see `PROTOCOL.md`'s `stop` bullet). `None` serializes
+    /// byte-identically to the pre-field unit variant (`{"type":"stop"}`),
+    /// so this stays additive per the protocol's extension policy.
+    Stop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_id: Option<String>,
+    },
     /// Pause the in-flight turn. The Holo backend exposes no pause RPC over
     /// A2A, so the daemon implements this as a scoped cancel of the running
     /// turn while remembering its instruction text and `contextId`; a later
@@ -584,7 +593,7 @@ impl ClientMessage {
         match self {
             ClientMessage::Prompt { .. } => "prompt",
             ClientMessage::VoiceTranscript { .. } => "voice_transcript",
-            ClientMessage::Stop => "stop",
+            ClientMessage::Stop { .. } => "stop",
             ClientMessage::Pause => "pause",
             ClientMessage::Resume => "resume",
             ClientMessage::Redirect { .. } => "redirect",

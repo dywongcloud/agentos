@@ -163,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(stop_id.clone()),
         next_seq(),
-        ClientMessage::Stop,
+        ClientMessage::Stop { context_id: None },
     );
     write_line(&mut send, &env).await?;
     let stop_sent = tokio::time::Instant::now();
@@ -266,7 +266,7 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(uuid::Uuid::new_v4().to_string()),
         next_seq(),
-        ClientMessage::Stop,
+        ClientMessage::Stop { context_id: None },
     );
     write_line(&mut send, &env).await?;
     println!("-> cleanup stop");
