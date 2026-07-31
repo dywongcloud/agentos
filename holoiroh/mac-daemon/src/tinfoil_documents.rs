@@ -1,16 +1,22 @@
-//! Document processing: converts a PDF/DOCX/PPTX/XLSX/HTML/CSV/image file to markdown via
-//! Tinfoil's `/v1/convert/file` endpoint (docs.tinfoil.sh/guides/document-processing).
+//! Document processing. This module converts a PDF, DOCX, PPTX, XLSX,
+//! HTML, CSV, or image file to markdown. It uses Tinfoil's
+//! `/v1/convert/file` endpoint (docs.tinfoil.sh/guides/document-processing).
 //!
-//! Same posture as [`crate::clarify`]: a direct `reqwest` call carrying the real bearer key,
-//! not routed through [`crate::tinfoil_proxy`]'s loopback proxy. The proxy exists solely to
-//! solve `holo serve`'s inability to express an `Authorization: Bearer <key>` header (see that
-//! module's doc); this daemon's own native code has no such constraint and just sets the
+//! This module uses the same posture as [`crate::clarify`]: a direct
+//! `reqwest` call that carries the real bearer key. It does not route
+//! through [`crate::tinfoil_proxy`]'s loopback proxy.
+//!
+//! The proxy exists solely to solve `holo serve`'s inability to express an
+//! `Authorization: Bearer <key>` header (see that module's doc). This
+//! daemon's own native code has no such constraint. It just sets the
 //! header directly, matching `clarify.rs`.
 //!
-//! The daemon uses the **direct-conversion** multipart endpoint (`POST /v1/convert/file`)
-//! rather than the API-attachment path (`POST /v1/responses` with a base64 `input_file`) --
-//! the direct endpoint is the one the docs name as "primary" and avoids a redundant
-//! base64-encode-then-decode round trip for what is already binary file data.
+//! The daemon uses the **direct-conversion** multipart endpoint
+//! (`POST /v1/convert/file`), rather than the API-attachment path
+//! (`POST /v1/responses` with a base64 `input_file`). The docs name the
+//! direct endpoint as "primary". The direct endpoint also avoids a
+//! redundant base64-encode-then-decode round trip for data that is
+//! already binary.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -20,15 +26,20 @@ use crate::tinfoil_models::TINFOIL_BASE_URL;
 
 const CONVERT_ENDPOINT_PATH: &str = "/v1/convert/file";
 
-/// Tinfoil's documented per-file and per-request caps (docs.tinfoil.sh/guides/document-processing:
-/// "up to 10 files per request", "50 MB maximum per file"). Enforced client-side, before the
-/// network call, so an oversized/over-count request fails fast with a clear message instead of
-/// a slow upload followed by a server-side rejection.
+/// Tinfoil's documented per-file and per-request caps
+/// (docs.tinfoil.sh/guides/document-processing: "up to 10 files per
+/// request", "50 MB maximum per file").
+///
+/// The client enforces these caps before the network call. As a result,
+/// an oversized or over-count request fails fast with a clear message.
+/// This avoids a slow upload followed by a server-side rejection.
 pub const MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
 pub const MAX_FILES_PER_REQUEST: usize = 10;
 
-/// Which extraction mode to request. Mirrors the five modes docs.tinfoil.sh/guides/document-processing
-/// lists under "processing modes"; `Text` (markdown only) is the default the docs describe.
+/// Which extraction mode to request. This enum mirrors the five modes
+/// that docs.tinfoil.sh/guides/document-processing lists under
+/// "processing modes". `Text` (markdown only) is the default the docs
+/// describe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertMode {
     /// Markdown only. The default.
@@ -55,16 +66,16 @@ impl ConvertMode {
     }
 }
 
-/// One file to convert: its name (used for server-side format detection by extension) and raw
-/// bytes.
+/// One file to convert. It has a name, used for server-side format
+/// detection by extension, and raw bytes.
 pub struct DocumentInput {
     pub filename: String,
     pub bytes: Vec<u8>,
 }
 
-/// A successfully converted document's markdown content, per the response shape documented at
-/// docs.tinfoil.sh/guides/document-processing (`{"document": {"md_content": "..."}, "status":
-/// "success", ...}`).
+/// A successfully converted document's markdown content. This follows the
+/// response shape documented at docs.tinfoil.sh/guides/document-processing:
+/// `{"document": {"md_content": "..."}, "status": "success", ...}`.
 #[derive(Debug, Clone)]
 pub struct ConvertedDocument {
     pub markdown: String,
@@ -81,11 +92,15 @@ struct ConvertResponseDocument {
     md_content: String,
 }
 
-/// Converts one or more files to markdown. Validates the client-side size/count limits before
-/// making any network call. Unlike [`crate::clarify::generate_clarifying_questions`] (which
-/// swallows every failure into an empty result because it sits off a task's critical path),
-/// this returns `Result` -- document processing is something a caller explicitly requested and
-/// is waiting on, so a failure must be reported, not silently downgraded to "no documents."
+/// Converts one or more files to markdown. Validates the client-side size
+/// and count limits before making any network call.
+///
+/// Unlike [`crate::clarify::generate_clarifying_questions`], this function
+/// returns `Result`. That function swallows every failure into an empty
+/// result, because it sits off a task's critical path. Document
+/// processing is different: a caller explicitly requested it and is
+/// waiting on it. So a failure must be reported, not silently downgraded
+/// to "no documents."
 pub async fn convert_documents(
     api_key: &str,
     files: &[DocumentInput],
@@ -153,16 +168,22 @@ pub async fn convert_documents(
     parse_convert_response(&raw)
 }
 
-/// Parses a `/v1/convert/file` response body. Extracted from [`convert_documents`] as its own
-/// pure, synchronous, testable function (no network) so malformed-response handling can be
-/// witnessed directly with fixture strings, not only via a live network round trip -- see
-/// `verify-malformed-tinfoil-response` (PRD) and `examples/tinfoil_error_handling_probe.rs`.
+/// Parses a `/v1/convert/file` response body. This function is extracted
+/// from [`convert_documents`] as its own pure, synchronous, testable
+/// function. It performs no network I/O. As a result, tests can witness
+/// malformed-response handling directly with fixture strings, not only
+/// via a live network round trip. See `verify-malformed-tinfoil-response`
+/// (PRD) and `examples/tinfoil_error_handling_probe.rs`.
 ///
-/// The endpoint's real response shape for a multi-file request is not fully pinned down in the
-/// docs summary (single-document envelope shown); accepts either a single envelope or an array
-/// of them so a multi-file request does not spuriously fail to parse. The single-document shape
-/// was confirmed live against the real endpoint (`tinfoil_live_probe.rs`); the array shape
-/// remains an educated guess pending a real multi-file live request.
+/// The docs summary does not fully pin down the endpoint's real response
+/// shape for a multi-file request. It shows only a single-document
+/// envelope. This function accepts either a single envelope or an array
+/// of them. This way, a multi-file request does not spuriously fail to
+/// parse.
+///
+/// A live request against the real endpoint confirmed the single-document
+/// shape (`tinfoil_live_probe.rs`). The array shape remains an educated
+/// guess. It is pending a real multi-file live request.
 pub fn parse_convert_response(raw: &str) -> Result<Vec<ConvertedDocument>> {
     if let Ok(single) = serde_json::from_str::<ConvertResponseEnvelope>(raw) {
         return Ok(vec![ConvertedDocument {

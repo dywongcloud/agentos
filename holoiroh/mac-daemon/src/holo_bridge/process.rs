@@ -1,4 +1,4 @@
-//! Spawns and supervises `holo serve` as a managed child process, and recovers the bearer
+//! Spawns and supervises `holo serve` as a managed child process. It also recovers the bearer
 //! token it prints to stderr on startup.
 //!
 //! ## Source grounding
@@ -7,12 +7,12 @@
 //! (`src/holo_desktop/cli/serve.py`, commit reachable from `main` as of 2026-07-17):
 //!
 //! - `holo serve` binds `127.0.0.1:<port>` (default port 18794, `A2A_DEFAULT_PORT` in
-//!   `serve.py`) and serves both the A2A JSON-RPC surface and a plain `/health` route.
+//!   `serve.py`). It serves both the A2A JSON-RPC surface and a plain `/health` route.
 //! - Every route except `/health` requires `Authorization: Bearer <token>`
 //!   (`BearerAuthMiddleware` in `serve.py`).
 //! - The token comes from the `HOLO_AUTH_TOKEN` env var if set (`ServeSettings.auth_token`
-//!   in `settings.py`); otherwise `serve()` generates one with
-//!   `secrets.token_urlsafe(32)` and **only ever surfaces it by printing it to stderr**:
+//!   in `settings.py`). Otherwise, `serve()` generates one with
+//!   `secrets.token_urlsafe(32)`. It **only ever surfaces it by printing it to stderr**:
 //!   ```text
 //!   holo serve · v<version>
 //!     http://127.0.0.1:<port>/a2a
@@ -24,13 +24,14 @@
 //!   module instead **always sets `HOLO_AUTH_TOKEN` itself** before spawning, generating a
 //!   fresh random token daemon-side. This sidesteps stderr-scraping entirely and is strictly
 //!   more robust than depending on the printed line's format not changing across releases.
-//!   (The stderr-parsing fallback path is kept, gated off by default, only for the case where
-//!   an operator points this daemon at a `holo serve` invocation it did not itself launch.)
+//!   (This module keeps the stderr-parsing fallback path, gated off by default. It exists only
+//!   for the case where an operator points this daemon at a `holo serve` invocation it did not
+//!   itself launch.)
 //! - Health check: `GET /health` (no auth) returns
-//!   `{"service": "holo-desktop", "status": "ok", "version": "<semver>"}` once the
-//!   underlying `hai-agent-runtime` binary has been spawned/attached by `HoloExecutor.startup()`
-//!   and the Starlette app has finished its lifespan startup. Before that, connections are
-//!   simply refused (nothing is bound yet).
+//!   `{"service": "holo-desktop", "status": "ok", "version": "<semver>"}`. This happens once
+//!   `HoloExecutor.startup()` spawns or attaches the underlying `hai-agent-runtime` binary, and
+//!   the Starlette app finishes its lifespan startup. Before that, connections are simply
+//!   refused (nothing is bound yet).
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,34 +44,36 @@ use tokio::time::{Instant, sleep};
 
 use crate::holo_bridge::a2a_client::A2aClient;
 
-/// Process-wide guard ensuring at most one `holo serve` child is ever tracked as running by
+/// This process-wide guard ensures at most one `holo serve` child is ever tracked as running by
 /// this daemon at a time. [`HoloServeProcess::spawn`] refuses to spawn a second child while this
-/// is `true`. Held via an owned [`GuardClaim`] token rather than raw stores, so release is tied
-/// to ownership: only the object that acquired the claim can release it, and it does so exactly
-/// once. This exists because the earlier raw-`store(false)` design had two real bugs (witnessed
-/// live via `holo_bridge::health`'s "restart failed: failed to respawn holo serve" loop, and by
-/// `examples/serve_guard_probe.rs`):
+/// is `true`. An owned [`GuardClaim`] token holds this flag, rather than raw stores. So release
+/// ties to ownership: only the object that acquired the claim can release it. It does so exactly
+/// once. This exists because the earlier raw-`store(false)` design had two real bugs. Live use
+/// witnessed both: via `holo_bridge::health`'s "restart failed: failed to respawn holo serve"
+/// loop, and via `examples/serve_guard_probe.rs`:
 ///
 /// 1. **Restart could never succeed.** `HoloBridge::restart_process` spawned the NEW child while
-///    the old (dead-child) `HoloServeProcess` still held the guard -- `compare_exchange` failed
-///    every time, deterministically, so the health loop errored every tick forever.
+///    the old (dead-child) `HoloServeProcess` still held the guard. `compare_exchange` failed
+///    every time, deterministically. So the health loop errored every tick forever.
 /// 2. **The old process's `Drop` released the new process's guard.** `Drop` did an unconditional
-///    `store(false)`; after a (hypothetically successful) restart replaced the old object, the
-///    old `Drop` would clear the claim the NEW child had just acquired, re-opening the
+///    `store(false)`. After a (hypothetically successful) restart replaced the old object, the
+///    old `Drop` would clear the claim the NEW child just acquired. This would re-open the
 ///    double-spawn hole the guard exists to close.
 ///
 /// With [`GuardClaim`], the restart path disarms the old process (drops its claim) before
-/// spawning the replacement, and a claim-less process's `Drop` cannot touch the flag at all.
+/// spawning the replacement. A claim-less process's `Drop` cannot touch the flag at all.
 static HOLO_SERVE_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Owned claim on [`HOLO_SERVE_RUNNING`]. Acquiring ([`GuardClaim::try_acquire`]) atomically
-/// flips the flag `false -> true`; dropping the claim releases it (`-> false`), exactly once,
-/// and only for the claim that actually holds it. Zero-sized -- the token IS the ownership.
+/// Owned claim on [`HOLO_SERVE_RUNNING`]. Acquiring the claim ([`GuardClaim::try_acquire`])
+/// atomically flips the flag `false -> true`. Dropping the claim releases it (`-> false`). This
+/// happens exactly once, and only for the claim that actually holds it. Zero-sized -- the token
+/// IS the ownership.
 ///
-/// Public (not just `pub(crate)`) so `examples/serve_guard_probe.rs` can witness the
-/// acquire/second-acquire-fails/release/re-acquire lifecycle and the restart-ordering
-/// (disarm-old-then-acquire-new leaves the flag held by the new claim; dropping the disarmed
-/// old is a no-op) against the REAL static, per this repo's probe-witness rule.
+/// This type is public (not just `pub(crate)`), so `examples/serve_guard_probe.rs` can witness
+/// two things against the REAL static, per this repo's probe-witness rule:
+/// - The acquire/second-acquire-fails/release/re-acquire lifecycle.
+/// - The restart-ordering: disarm-old-then-acquire-new leaves the flag held by the new claim,
+///   and dropping the disarmed old is a no-op.
 #[derive(Debug)]
 pub struct GuardClaim(());
 
@@ -99,21 +102,21 @@ pub const HOLO_AUTH_TOKEN_ENV: &str = "HOLO_AUTH_TOKEN";
 
 /// Env var that redirects `holo`'s **model inference** to a self-hosted OpenAI-compatible
 /// endpoint. When a local base URL is configured (alpha's local-only path, Project Aro PRD
-/// P0-11), this daemon sets it -- alongside passing `holo serve --base-url <url>` -- so
-/// inference goes to the local `llama-server` instead of H Company's hosted gateway.
+/// P0-11), this daemon sets it, alongside passing `holo serve --base-url <url>`. So inference
+/// goes to the local `llama-server` instead of H Company's hosted gateway.
 ///
 /// This is deliberately **not** `HAI_BASE_URL`. Verified against the installed
 /// `holo-desktop-cli` source (`~/.holo/tools/holo-desktop-cli/.../holo_desktop/`):
 ///
 /// - `cli/agent_api.py` maps the `--base-url` CLI flag to `HAI_AGENT_RUNTIME_BASE_URL`
 ///   (`extra["HAI_AGENT_RUNTIME_BASE_URL"] = base_url`).
-/// - `agent_client/launcher.py::runtime_child_env` propagates `HAI_AGENT_RUNTIME_BASE_URL` to the
-///   runtime child **and removes `HAI_API_KEY`** from that child's env when it is set ("a custom
-///   base URL points the runtime at a self-hosted endpoint; the portal `HAI_API_KEY` must not leak
-///   to it"). That deletion is the concrete no-cloud enforcement.
-/// - `agent_client/model_gateway.py` shows `HAI_BASE_URL` only overrides the *cloud entitlement
-///   gateway region*, **not** the inference endpoint -- so `HAI_BASE_URL` is the wrong variable
-///   for local inference and is never used here.
+/// - `agent_client/launcher.py::runtime_child_env` propagates `HAI_AGENT_RUNTIME_BASE_URL` to
+///   the runtime child. It also removes `HAI_API_KEY` from that child's env when it is set ("a
+///   custom base URL points the runtime at a self-hosted endpoint; the portal `HAI_API_KEY`
+///   must not leak to it"). That deletion is the concrete no-cloud enforcement.
+/// - `agent_client/model_gateway.py` shows that `HAI_BASE_URL` only overrides the *gateway
+///   region for cloud entitlement*, not the inference endpoint. So `HAI_BASE_URL` is the wrong
+///   variable for local inference. This module never uses it here.
 ///
 /// See [`crate::local_model`]'s module doc for the full citation chain.
 pub const HAI_RUNTIME_BASE_URL_ENV: &str = crate::local_model::RUNTIME_BASE_URL_ENV;
@@ -121,18 +124,20 @@ pub const HAI_RUNTIME_BASE_URL_ENV: &str = crate::local_model::RUNTIME_BASE_URL_
 /// Env var naming the port `holo serve`'s underlying `hai-agent-runtime` child binds
 /// (`settings.py`: `runtime.port`, read via `HAI_AGENT_RUNTIME_PORT`; default 18795).
 ///
-/// The daemon ALWAYS sets this to its own private port ([`daemon_runtime_port`]): the
-/// launcher (`launcher.py::ensure_running`) ATTACHES to any healthy runtime already on the
-/// port instead of spawning, and spawn-time knobs -- `--base-url`, `--model` -- "only reach
-/// a freshly spawned process" (SpawnConfig's own doc). Without a private port, a runtime
-/// left over from the operator's own `holo run` on the default port would be silently
-/// attached and every inference-backend setting this daemon passes would be IGNORED --
-/// which would make the rate-limit fallback (and local no-cloud mode) silent no-ops.
+/// The daemon ALWAYS sets this to its own private port ([`daemon_runtime_port`]). The launcher
+/// (`launcher.py::ensure_running`) ATTACHES to any healthy runtime already on the port, instead
+/// of spawning. Spawn-time knobs -- `--base-url`, `--model` -- "only reach a freshly spawned
+/// process" (SpawnConfig's own doc).
+///
+/// Without a private port, this fails silently in two ways. A runtime left over from the
+/// operator's own `holo run` on the default port would attach silently. Every
+/// inference-backend setting this daemon passes would then be IGNORED. This would make the
+/// rate-limit fallback (and local no-cloud mode) silent no-ops.
 pub const HAI_RUNTIME_PORT_ENV: &str = "HAI_AGENT_RUNTIME_PORT";
 
-/// The daemon's private `hai-agent-runtime` port. Env-overridable via
-/// `HOLOIROH_AGENT_RUNTIME_PORT`; defaults to 18899 (distinct from the runtime's own 18795
-/// default so operator-run `holo` CLI sessions and this daemon never share a runtime).
+/// The daemon's private `hai-agent-runtime` port. This is env-overridable via
+/// `HOLOIROH_AGENT_RUNTIME_PORT`. It defaults to 18899, distinct from the runtime's own 18795
+/// default, so operator-run `holo` CLI sessions and this daemon never share a runtime.
 pub fn daemon_runtime_port() -> u16 {
     std::env::var("HOLOIROH_AGENT_RUNTIME_PORT")
         .ok()
@@ -141,11 +146,11 @@ pub fn daemon_runtime_port() -> u16 {
 }
 
 /// Best-effort teardown of a stale `hai-agent-runtime` on the daemon's private port before
-/// (re)spawning `holo serve`. Needed because a SIGKILLed `holo serve` (the escalation path
-/// in [`HoloServeProcess::shutdown`]) can orphan the runtime child it spawned; the NEXT
-/// `holo serve` would then attach to that still-healthy runtime and inherit its OLD
+/// (re)spawning `holo serve`. This function is needed because a SIGKILLed `holo serve` (the
+/// escalation path in [`HoloServeProcess::shutdown`]) can orphan the runtime child it spawned.
+/// The NEXT `holo serve` would then attach to that still-healthy runtime and inherit its OLD
 /// inference-backend config (see [`HAI_RUNTIME_PORT_ENV`] -- attach ignores spawn knobs).
-/// The pid comes from the launcher's own `~/.holo/agent-pid-<port>` file; the port is
+/// The pid comes from the launcher's own `~/.holo/agent-pid-<port>` file. The port is
 /// daemon-private by construction, so any process recorded there is ours to reap.
 fn reap_stale_runtime(runtime_port: u16) {
     let pid_path = dirs_home().join(format!(".holo/agent-pid-{runtime_port}"));
@@ -186,18 +191,20 @@ fn dirs_home() -> std::path::PathBuf {
 }
 
 /// Default A2A port per `serve.py`'s `A2A_DEFAULT_PORT`. The daemon does not have to use this
-/// default -- `main.rs` picks its own port explicitly (env-overridable, defaulting to a
-/// different value to avoid colliding with a `holo serve` an operator might run by hand
-/// alongside this daemon) -- but it's recorded here since it's the value `holo serve` binds
-/// to when `--port` is omitted, and is useful documentation/a fallback for any call site that
-/// wants "the CLI's own default" specifically.
+/// default. `main.rs` picks its own port explicitly. That port is env-overridable, and it
+/// defaults to a different value, to avoid colliding with a `holo serve` an operator might run
+/// by hand alongside this daemon.
+///
+/// This constant is recorded here for two reasons. First, it is the value `holo serve` binds to
+/// when `--port` is omitted. Second, it is useful documentation, and a fallback, for any call
+/// site that wants "the CLI's own default" specifically.
 #[allow(dead_code)]
 pub const HOLO_SERVE_DEFAULT_PORT: u16 = 18794;
 
 /// How long to wait for `holo serve`'s `/health` to come up after spawn. `hai-agent-runtime`
-/// itself may need to download on first run (`runtime_install.py`), so this is generous --
-/// longer than the ~45s `SPAWN_TIMEOUT_S` the CLI's own inner spawn uses for the runtime binary,
-/// to leave room for the outer `holo serve` process startup on top of that.
+/// itself may need to download on first run (`runtime_install.py`), so this is generous. It is
+/// longer than the ~45s `SPAWN_TIMEOUT_S` the CLI's own inner spawn uses for the runtime
+/// binary. This leaves room for the outer `holo serve` process startup, on top of that.
 pub const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(2000);
 
 pub const LONGEST_OBSERVED_PORT_HOLD_AFTER_KILL: Duration = Duration::from_secs(30);
@@ -215,18 +222,18 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// A running `holo serve` child process plus everything needed to talk to it.
 pub struct HoloServeProcess {
     child: Child,
-    /// Not read internally today (`base_url` already embeds it) -- kept as a plain field for
-    /// diagnostics/logging call sites that want the bare port number without re-parsing it out
-    /// of `base_url`.
+    /// This field is not read internally today (`base_url` already embeds it). It stays as a
+    /// plain field for diagnostics/logging call sites that want the bare port number, without
+    /// re-parsing it out of `base_url`.
     #[allow(dead_code)]
     pub port: u16,
     pub base_url: String,
     pub auth_token: String,
     /// This process's claim on the single-instance guard. `Some` while this object is the
-    /// tracked live child; taken (dropped -> released) by `shutdown()` and by
-    /// [`Self::disarm_guard`] (the restart path's disarm-old-before-spawn-new step). A `None`
-    /// claim means this object is a known-dead placeholder whose `Drop` must not (and cannot)
-    /// touch the shared flag.
+    /// tracked live child. `shutdown()` and [`Self::disarm_guard`] take it -- dropping it
+    /// releases it. [`Self::disarm_guard`] is the restart path's disarm-old-before-spawn-new
+    /// step. A `None` claim means this object is a known-dead placeholder whose `Drop` must
+    /// not (and cannot) touch the shared flag.
     guard: Option<GuardClaim>,
 }
 

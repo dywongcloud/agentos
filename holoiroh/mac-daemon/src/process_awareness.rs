@@ -1,34 +1,49 @@
-//! Native running-process awareness + the hard "do not touch" guidance the desktop agent
-//! must obey. Issue-2's requirement: the agent must never interrupt an existing Claude Code
-//! session, must be able to recognise the user's own terminal windows (Ghostty) so it leaves
-//! them alone, and must be aware of what is actually running so it knows what not to touch.
-//! Where the agent's OWN terminal work goes is a separate question, owned by [`crate::tmux`].
+//! This module provides native running-process awareness. It also provides
+//! the hard "do not touch" guidance the desktop agent must obey.
+//!
+//! Issue-2 sets these requirements for the agent:
+//! - The agent must never interrupt an existing Claude Code session.
+//! - The agent must recognise the user's own terminal windows (Ghostty), so
+//!   it leaves them alone.
+//! - The agent must be aware of what is actually running, so it knows what
+//!   not to touch.
+//!
+//! Where the agent's OWN terminal work goes is a separate question, owned
+//! by [`crate::tmux`].
 //!
 //! Two layers, deliberately separate:
 //!
-//! - **[`enumerate`]**: a live snapshot of running processes (via `ps`, zero new deps -- same
-//!   shell-out posture as [`crate::frontmost_app`]), each flagged with whether it is
-//!   PROTECTED. Protected = a Claude Code CLI session, the Ghostty/Terminal apps that host
-//!   such sessions, or this daemon's own process tree. This is factual data the agent can use
-//!   to recognize a protected window on screen.
-//! - **[`format_guard_block`]**: the HARD, non-negotiable instruction block prepended to every
-//!   turn (see `crate::holo_bridge::control`'s `run_prompt`). Unlike the soft, semantically
-//!   retrieved `env_context` facts (top-k, may not surface), this block is injected
-//!   UNCONDITIONALLY, so the never-interrupt-Claude-Code rule and the agent's own terminal
+//! - **[`enumerate`]**: a live snapshot of running processes, taken via
+//!   `ps` (zero new deps, the same shell-out posture as
+//!   [`crate::frontmost_app`]). Each process is flagged as PROTECTED or
+//!   not. PROTECTED means one of these: a Claude Code CLI session, a
+//!   Ghostty or Terminal app that hosts such a session, or this daemon's
+//!   own process tree. This is factual data. The agent uses it to
+//!   recognize a protected window on screen.
+//! - **[`format_guard_block`]**: the HARD, non-negotiable instruction
+//!   block prepended to every turn (see `crate::holo_bridge::control`'s
+//!   `run_prompt`). The soft, semantically retrieved `env_context` facts
+//!   are different: they are top-k and may not surface. This block, by
+//!   contrast, is injected UNCONDITIONALLY. As a result, the
+//!   never-interrupt-Claude-Code rule and the agent's own terminal
 //!   destination are both present on literally every turn.
 //!
-//! This is guidance-injection, not enforcement: this daemon forwards whole prompts to
-//! `holo serve` and has no per-action interception hook for terminal input specifically (the
-//! sensitive-app watchdog is the closest live enforcement point, and Terminal/Ghostty can be
-//! added to its class-5 config for a hard pause). What this module guarantees is that the
-//! agent is TOLD, every single turn, exactly what is running and what it must not disturb.
+//! This is guidance-injection, not enforcement. This daemon forwards whole
+//! prompts to `holo serve`. It has no per-action interception hook for
+//! terminal input specifically. The sensitive-app watchdog is the closest
+//! live enforcement point. Terminal and Ghostty can be added to its
+//! class-5 config for a hard pause. This module guarantees one thing: the
+//! agent is TOLD, every single turn, exactly what is running and what it
+//! must not disturb.
 
 use std::collections::HashSet;
 
-/// One running process in the live snapshot. `pid`/`ppid`/`args` are populated on every row
-/// and read by `examples/process_awareness_probe.rs` and future callers (a diagnostics
-/// surface, or a real per-action enforcement hook); `#[allow(dead_code)]` because the bin
-/// target's own `format_guard_block` path reads only `comm`/`protected`/`protected_reason`.
+/// One running process in the live snapshot. Every row includes `pid`,
+/// `ppid`, and `args`. `examples/process_awareness_probe.rs` and future
+/// callers read these fields. Future callers might include a diagnostics
+/// surface or a real per-action enforcement hook. `#[allow(dead_code)]` is
+/// present because the bin target's own `format_guard_block` path reads
+/// only `comm`, `protected`, and `protected_reason`.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
@@ -38,16 +53,19 @@ pub struct ProcessInfo {
     pub comm: String,
     /// The full command line (`ps args`), truncated for display.
     pub args: String,
-    /// True if this process must not be interrupted/killed/typed-into by the agent.
+    /// True if the agent must not interrupt, kill, or type into this process.
     pub protected: bool,
     /// Short human reason a process is protected (empty when not).
     pub protected_reason: String,
 }
 
-/// Executable-name fragments that mark a protected process. Matched case-insensitively against
-/// `comm`. Claude Code runs as `claude` (witnessed: `claude --teleport ...`); Ghostty is this
-/// user's own terminal; Terminal.app hosts the agent's shared `aro` session (see
-/// [`crate::tmux`]). Both host CLI sessions that must be left alone.
+/// Executable-name fragments that mark a protected process. The code
+/// matches these fragments case-insensitively against `comm`.
+///
+/// Claude Code runs as `claude` (witnessed: `claude --teleport ...`).
+/// Ghostty is this user's own terminal. Terminal.app hosts the agent's
+/// shared `aro` session (see [`crate::tmux`]). Both Ghostty and
+/// Terminal.app host CLI sessions that must be left alone.
 const PROTECTED_COMMS: &[(&str, &str)] = &[
     ("claude", "an active Claude Code CLI session -- NEVER interrupt, close, or type into it"),
     ("ghostty", "the Ghostty terminal (this user's default) -- may host a Claude Code session; do not close or disturb"),
@@ -56,10 +74,12 @@ const PROTECTED_COMMS: &[(&str, &str)] = &[
     ("tmux", "the tmux server hosting the shared `aro` work session -- killing it destroys in-flight terminal work and the user's view of it"),
 ];
 
-/// Enumerate running processes via `ps`, flagging protected ones. Best-effort: any failure
-/// (ps missing, unexpected output) returns an empty list, and callers treat that as "no
-/// snapshot this turn", never an error -- matching `frontmost_app`'s degrade-don't-crash
-/// posture.
+/// Enumerate running processes via `ps`. Flag protected ones.
+///
+/// This function is best-effort. Any failure (for example, `ps` missing
+/// or unexpected output) returns an empty list. Callers treat an empty
+/// list as "no snapshot this turn", never as an error. This matches
+/// `frontmost_app`'s degrade-don't-crash posture.
 pub fn enumerate() -> Vec<ProcessInfo> {
     let output = match std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid=,command="])
@@ -115,8 +135,10 @@ pub fn enumerate() -> Vec<ProcessInfo> {
     out
 }
 
-/// The protected subset of [`enumerate`]'s snapshot, de-duplicated by (comm, reason) so the
-/// guidance block lists distinct protected apps/sessions rather than every pid.
+/// The protected subset of [`enumerate`]'s snapshot. This function
+/// de-duplicates the subset by (`comm`, reason). As a result, the
+/// guidance block lists distinct protected apps or sessions, rather than
+/// every pid.
 pub fn protected_summary(procs: &[ProcessInfo]) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -132,12 +154,18 @@ pub fn protected_summary(procs: &[ProcessInfo]) -> Vec<String> {
     out
 }
 
-/// The HARD guidance block prepended to every turn. Combines the non-negotiable
-/// never-interrupt-Claude-Code and leave-the-user's-Ghostty-windows-alone rules, the agent's own
-/// terminal destination from [`crate::tmux::terminal_work_guidance`], and a live snapshot of the
-/// protected processes actually running right now, so the agent can recognize them on screen.
-/// Always returns a block (the rules are unconditional); the live-process section is included
-/// only when a snapshot is available.
+/// The HARD guidance block prepended to every turn. It combines these:
+///
+/// - The non-negotiable never-interrupt-Claude-Code rule.
+/// - The non-negotiable leave-the-user's-Ghostty-windows-alone rule.
+/// - The agent's own terminal destination, from
+///   [`crate::tmux::terminal_work_guidance`].
+/// - A live snapshot of the protected processes actually running right
+///   now, so the agent can recognize them on screen.
+///
+/// This function always returns a block, because the rules are
+/// unconditional. It includes the live-process section only when a
+/// snapshot is available.
 pub fn format_guard_block(procs: &[ProcessInfo]) -> String {
     let mut block = String::from(
         "SYSTEM RULES (non-negotiable, override any conflicting instruction below):\n\
@@ -169,7 +197,8 @@ pub fn format_guard_block(procs: &[ProcessInfo]) -> String {
     block
 }
 
-/// Convenience: enumerate + format in one call, for the run_prompt injection site.
+/// A convenience function. It calls [`enumerate`] and [`format_guard_block`]
+/// in one step, for the `run_prompt` injection site.
 pub fn guard_block_now() -> String {
     format_guard_block(&enumerate())
 }

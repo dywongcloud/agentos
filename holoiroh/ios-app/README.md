@@ -1,19 +1,21 @@
 # HoloIroh iOS app wrapper (device deploy)
 
-Thin Xcode APP target around the `../ios` Swift package (which holds the real
-`@main` + all app code) plus the Rust iroh-live bridge xcframework. Exists
-because SPM cannot produce an iOS `.app` bundle -- this wrapper is what gets
-signed and installed on a phone. First deployed to a physical iPhone 14
-(iOS 26.5.2) on 2026-07-19, personal-team signed, and witnessed running.
+This wrapper is a thin Xcode APP target around the `../ios` Swift package,
+plus the Rust iroh-live bridge xcframework. The Swift package holds the real
+`@main` and all app code. This wrapper exists because SPM cannot produce an
+iOS `.app` bundle. It is what gets signed and installed on a phone. The app
+was first deployed to a physical iPhone 14 (iOS 26.5.2) on 2026-07-19. It was
+personal-team signed. It was witnessed running.
 
 ## One-time prerequisites (already done on this Mac)
 
 - Apple ID signed into Xcode (Settings -> Accounts) -> personal team
   `XBBQ2LGY3K`, pinned in `project.yml` (`DEVELOPMENT_TEAM`).
-- On the iPhone: Developer Mode on, and after the first install the developer
-  cert trusted via Settings -> General -> VPN & Device Management.
-- `brew install xcodegen` (generates `HoloIroh.xcodeproj` from `project.yml`;
-  the xcodeproj is gitignored -- regenerate, never hand-edit).
+- On the iPhone, turn on Developer Mode.
+- After the first install, trust the developer cert via Settings -> General
+  -> VPN & Device Management.
+- `brew install xcodegen` (generates `HoloIroh.xcodeproj` from `project.yml`.
+  The xcodeproj is gitignored. Regenerate it. Never hand-edit it.)
 
 ## Full rebuild + redeploy (the whole pipeline)
 
@@ -48,21 +50,23 @@ xcrun devicectl device process launch --device <DEVICE-UDID> com.dylanwong.holoi
 
 ## Gotchas (each one hit for real during the first deploy)
 
-- **Personal-team apps expire after 7 days** -- rerun steps 4-5 to re-sign.
-- **`canImport(HoloirohIosBridge)` is decided at PACKAGE compile time**, so
-  the bridge must be a package `binaryTarget` (see `../ios/Package.swift`),
-  not an app-target link flag. Without the xcframework present the package
-  still builds everywhere via the stub path (platform-conditioned dep).
-- **Opaque FFI handles must be INCOMPLETE C types.** A defined struct (even
-  zero-sized `uint8_t _private[0]`) imports into Swift as
-  `UnsafeMutablePointer<T>`, breaking the wrapper's `OpaquePointer` fields;
-  forward declarations import as `OpaquePointer`. Fixed in
-  `../ios-bridge/include/HoloirohIosBridge.h` the first time the module was
-  genuinely imported.
-- The staticlib links against `SystemConfiguration`/`Security`/`Network`
-  frameworks + `libc++` (openh264) + `libresolv` -- declared as sdk
-  dependencies in `project.yml`; missing ones surface as undefined-symbol
-  link errors.
-- Rust objects carry the SDK's own min-iOS (26.4) -- harmless ld warnings on
-  a 17.0-deployment app as long as the device runs >= that iOS; pass
-  `IPHONEOS_DEPLOYMENT_TARGET` to the cargo build to silence properly.
+- **Personal-team apps expire after 7 days.** Rerun steps 4-5 to re-sign.
+- **`canImport(HoloirohIosBridge)` is decided at PACKAGE compile time.** So
+  the bridge must be a package `binaryTarget` (see `../ios/Package.swift`). It
+  cannot be an app-target link flag. Without the xcframework present, the
+  package still builds everywhere via the stub path (platform-conditioned
+  dep).
+- **Opaque FFI handles must be INCOMPLETE C types.** A defined struct imports
+  into Swift as `UnsafeMutablePointer<T>`. This is true even for a zero-sized
+  struct (`uint8_t _private[0]`). This breaks the wrapper's `OpaquePointer`
+  fields. Forward declarations import as `OpaquePointer` instead. This was
+  fixed in `../ios-bridge/include/HoloirohIosBridge.h` the first time the
+  build genuinely imported the module.
+- The staticlib links against the `SystemConfiguration`, `Security`, and
+  `Network` frameworks. It also links against `libc++` (openh264) and
+  `libresolv`. These are declared as sdk dependencies in `project.yml`.
+  Missing dependencies surface as undefined-symbol link errors.
+- Rust objects carry the SDK's own min-iOS (26.4). This causes ld warnings on
+  a 17.0-deployment app. The warnings are harmless as long as the device runs
+  >= that iOS. Pass `IPHONEOS_DEPLOYMENT_TARGET` to the cargo build to
+  silence them properly.

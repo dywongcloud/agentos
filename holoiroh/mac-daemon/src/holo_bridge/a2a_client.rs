@@ -1,5 +1,5 @@
-//! Minimal A2A (Agent2Agent Protocol, <https://a2a-protocol.org>) JSON-RPC client scoped to
-//! exactly what this daemon needs from `holo serve`: submit a prompt and stream back
+//! Minimal A2A (Agent2Agent Protocol, <https://a2a-protocol.org>) JSON-RPC client. It is
+//! scoped to exactly what this daemon needs from `holo serve`: submit a prompt, stream back
 //! task/status events, and cancel a task.
 //!
 //! ## Source grounding -- what is confirmed vs. what is spec-inferred
@@ -8,40 +8,42 @@
 //! (`src/holo_desktop/cli/serve.py`, read via the GitHub API on 2026-07-17):
 //!
 //! - `holo serve` mounts a standard `a2a-sdk` (`a2a-sdk[http-server]>=1.0.3` per
-//!   `pyproject.toml`) server: `create_agent_card_routes(card)` for agent-card discovery and
-//!   `create_jsonrpc_routes(handler, "/a2a", enable_v0_3_compat=True)` for the RPC endpoint
-//!   itself, so JSON-RPC requests go to `POST {base_url}/a2a`.
+//!   `pyproject.toml`) server. It uses `create_agent_card_routes(card)` for agent-card
+//!   discovery, and `create_jsonrpc_routes(handler, "/a2a", enable_v0_3_compat=True)` for the
+//!   RPC endpoint itself. So JSON-RPC requests go to `POST {base_url}/a2a`.
 //! - The published `AgentCard` declares
-//!   `capabilities=AgentCapabilities(streaming=True, push_notifications=False)` and
-//!   `supported_interfaces=[AgentInterface(url=..., protocol_binding="JSONRPC",
+//!   `capabilities=AgentCapabilities(streaming=True, push_notifications=False)`. It also
+//!   declares `supported_interfaces=[AgentInterface(url=..., protocol_binding="JSONRPC",
 //!   protocol_version="0.3.0")]`.
 //! - Every request except `GET /health` requires `Authorization: Bearer <token>`
-//!   (`BearerAuthMiddleware`), checked with `hmac.compare_digest` against the token `holo
-//!   serve` was started with.
+//!   (`BearerAuthMiddleware`). The server checks this with `hmac.compare_digest`, against the
+//!   token `holo serve` was started with.
 //! - One A2A **`contextId`** maps 1:1 to one `hai-agent-runtime` agent-API session
 //!   (`HoloExecutor._sessions: OrderedDict[str, Session]`, keyed by a sanitized `contextId`).
-//!   Reusing the same `contextId` across calls continues the same conversation/session;
-//!   a new/absent `contextId` starts a fresh one. Sessions are capped at 256 concurrent
-//!   (`MAX_RETAINED_SESSIONS`), LRU-evicted (with best-effort cancel of the evicted session)
-//!   once the cap is hit.
+//!   Reusing the same `contextId` across calls continues the same conversation or session. A
+//!   new or absent `contextId` starts a fresh one. The executor caps sessions at 256
+//!   concurrent (`MAX_RETAINED_SESSIONS`). Once the cap is hit, it LRU-evicts a session, with
+//!   a best-effort cancel of the evicted session.
 //! - Streamed progress: for each backend `TrajectoryEvent`, the executor emits one A2A
-//!   `TaskStatusUpdateEvent` with `status.state = TASK_STATE_WORKING` and
-//!   `status.message` = a **data message** (`a2a.helpers.new_data_message`) whose payload is
-//!   the raw `TrajectoryEvent`, serialized as JSON, under
-//!   media type `application/vnd.holo-desktop.event+json`
-//!   (`translate_event()` / `EVENT_MEDIA_TYPE` in `serve.py`). The exact shape of a
-//!   `TrajectoryEvent` (fields like `type`, `data`, event `kind` discriminators such as
-//!   `PolicyEvent`/`ToolResultEvent`/`AnswerEvent`/`ErrorEvent`) lives in the closed-source
-//!   `agp_types`/`agent_interface` packages (`hai-agent-api` on PyPI) and was **not**
-//!   independently confirmed here -- this client treats each such payload as an opaque
-//!   `serde_json::Value` and forwards it, rather than guessing at a typed Rust shape for it.
-//! - On completion the executor emits one `TaskArtifactUpdateEvent` (artifact name
-//!   `"answer"`, text content) followed by a final `TaskStatusUpdateEvent` with
-//!   `state = TASK_STATE_COMPLETED` (success), or `TASK_STATE_FAILED` /
-//!   `TASK_STATE_CANCELED` on failure/interruption, each carrying a text message.
-//! - Cancellation: A2A's own task-cancel path reaches `HoloExecutor.cancel(context, ...)`,
-//!   which resolves the `Session` for that `contextId` and issues a best-effort cancel
-//!   against the backend agent-API session, then emits a final
+//!   `TaskStatusUpdateEvent`. This event carries `status.state = TASK_STATE_WORKING` and a
+//!   `status.message` set to a **data message** (`a2a.helpers.new_data_message`). That data
+//!   message's payload is the raw `TrajectoryEvent`, serialized as JSON, under media type
+//!   `application/vnd.holo-desktop.event+json` (`translate_event()` / `EVENT_MEDIA_TYPE` in
+//!   `serve.py`).
+//!
+//!   The exact shape of a `TrajectoryEvent` (fields like `type`, `data`, event `kind`
+//!   discriminators such as `PolicyEvent`/`ToolResultEvent`/`AnswerEvent`/`ErrorEvent`) lives
+//!   in the closed-source `agp_types`/`agent_interface` packages (`hai-agent-api` on PyPI).
+//!   This client did **not** independently confirm that shape here. Instead, this client
+//!   treats each such payload as an opaque `serde_json::Value` and forwards it, rather than
+//!   guessing at a typed Rust shape for it.
+//! - On completion, the executor emits one `TaskArtifactUpdateEvent` (artifact name
+//!   `"answer"`, text content). This is followed by a final `TaskStatusUpdateEvent`:
+//!   `state = TASK_STATE_COMPLETED` on success, or `TASK_STATE_FAILED` / `TASK_STATE_CANCELED`
+//!   on failure or interruption. Each of these carries a text message.
+//! - Cancellation: A2A's own task-cancel path reaches `HoloExecutor.cancel(context, ...)`.
+//!   This function resolves the `Session` for that `contextId`. It issues a best-effort
+//!   cancel against the backend agent-API session, then emits a final
 //!   `TaskStatusUpdateEvent(state=TASK_STATE_CANCELED)`. This is "the A2A cancel equivalent"
 //!   referenced in the task description.
 //!
@@ -49,22 +51,27 @@
 //! `a2a-sdk` PyPI package itself was not fetched -- only the fact that `holo serve` is a
 //! stock `a2a-sdk` server using its stock route helpers):
 //!
+//! The following are the public, versioned A2A Protocol specification
+//! (<https://a2a-protocol.org>, JSON-RPC transport, protocol version 0.3.0 -- matching the
+//! exact `protocol_version` `holo serve`'s agent card declares):
+//!
 //! - The exact JSON-RPC 2.0 method names (`message/send`, `message/stream`, `tasks/get`,
-//!   `tasks/cancel`), the `Message`/`Task`/`TaskStatusUpdateEvent`/`TaskArtifactUpdateEvent`
-//!   JSON field names, and the fact that a streaming call
-//!   (`message/stream`) returns `text/event-stream` Server-Sent Events where each `data:`
-//!   line is one JSON-RPC 2.0 **response** object (`{"jsonrpc":"2.0","id":...,"result":
-//!   <Task | TaskStatusUpdateEvent | TaskArtifactUpdateEvent>}`) are the public, versioned
-//!   A2A Protocol specification (<https://a2a-protocol.org>, JSON-RPC transport, protocol
-//!   version 0.3.0 -- matching the exact `protocol_version` `holo serve`'s agent card
-//!   declares). This is the standard this daemon is coded against; it is not an invention,
-//!   but it is *not* re-derived from `holo-desktop-cli`'s own source since the RPC dispatch
-//!   itself lives inside the `a2a-sdk` dependency, not in this repo.
-//! - If a future `holo-desktop-cli` release changes `a2a-sdk` major version or opts out of
-//!   `enable_v0_3_compat`, the wire shape below could drift; the `/health`, agent-card, and
-//!   `EVENT_MEDIA_TYPE` details above are the ones this module can and does defend with a
-//!   real source citation, so those are checked at runtime (see `A2aClient::new` +
-//!   `probe_agent_card`) before the daemon trusts a `holo serve` instance.
+//!   `tasks/cancel`).
+//! - The `Message`/`Task`/`TaskStatusUpdateEvent`/`TaskArtifactUpdateEvent` JSON field names.
+//! - The fact that a streaming call (`message/stream`) returns `text/event-stream`
+//!   Server-Sent Events, where each `data:` line is one JSON-RPC 2.0 **response** object
+//!   (`{"jsonrpc":"2.0","id":...,"result": <Task | TaskStatusUpdateEvent |
+//!   TaskArtifactUpdateEvent>}`).
+//!
+//! This is the standard this daemon is coded against. It is not an invention. But it is *not*
+//! re-derived from `holo-desktop-cli`'s own source, because the RPC dispatch itself lives
+//! inside the `a2a-sdk` dependency, not in this repo.
+//!
+//! If a future `holo-desktop-cli` release changes `a2a-sdk` major version, or opts out of
+//! `enable_v0_3_compat`, the wire shape below could drift. The `/health`, agent-card, and
+//! `EVENT_MEDIA_TYPE` details above are the ones this module can and does defend with a real
+//! source citation. So this client confirms those details at runtime (see `A2aClient::new`
+//! and `probe_agent_card`), before the daemon trusts a `holo serve` instance.
 
 use std::time::Duration;
 
@@ -88,8 +95,8 @@ const HOLO_EVENT_MEDIA_TYPE: &str = "application/vnd.holo-desktop.event+json";
 /// see module doc for exactly which parts of the wire shape are confirmed vs. spec-inferred.
 #[derive(Debug, Clone)]
 pub enum TaskUpdate {
-    /// Task is running; carries the raw backend `TrajectoryEvent` JSON if this update wrapped
-    /// one (`HOLO_EVENT_MEDIA_TYPE`), or a plain human-readable status text otherwise.
+    /// Task is running. It carries the raw backend `TrajectoryEvent` JSON if this update
+    /// wrapped one (`HOLO_EVENT_MEDIA_TYPE`), or a plain human-readable status text otherwise.
     Working {
         raw_event: Option<Value>,
         text: Option<String>,
@@ -113,8 +120,9 @@ pub enum TerminalState {
 /// `Clone` is cheap: `reqwest::Client` is internally `Arc`-based (connection pool shared across
 /// clones), and `base_url`/`auth_token` are small owned `String`s. Used by
 /// `HoloControlBridge`'s call sites to clone the current client out from behind its `RwLock`
-/// before an `.await` (the guard itself can't cross one), and by `HoloBridge::restart_process`
-/// to swap in a freshly-built client after respawning `holo serve`.
+/// before an `.await` (the guard itself can't cross one). Also used by
+/// `HoloBridge::restart_process` to swap in a freshly-built client after respawning
+/// `holo serve`.
 #[derive(Clone)]
 pub struct A2aClient {
     http: reqwest::Client,

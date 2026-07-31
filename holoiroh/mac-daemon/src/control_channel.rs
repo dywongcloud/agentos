@@ -1,75 +1,102 @@
-//! Bidirectional control channel: carries small JSON messages between the
-//! Mac daemon and the iOS app, alongside the `iroh-live` media broadcast,
-//! and bridges them to [`crate::holo_bridge`].
+//! Bidirectional control channel.
 //!
-//! Schema is defined in `holoiroh/PROTOCOL.md`; keep the two in sync.
+//! The channel carries small JSON messages between the Mac daemon and the
+//! iOS app, alongside the `iroh-live` media broadcast. The channel bridges
+//! the messages to [`crate::holo_bridge`].
+//!
+//! `holoiroh/PROTOCOL.md` defines the schema. Keep the two in sync.
 //!
 //! ## Relationship to `holoiroh-wire`
 //!
-//! The literal wire-schema types this module used to define --
-//! [`ClientMessage`]/[`ServerMessage`], [`TaskEnvelope<T>`],
-//! [`CONTROL_ALPN`], [`write_line`]/[`read_line`], and
-//! [`InboundEnvelopeState::validate_inbound`] -- now live in the
-//! `holoiroh-wire` crate and are re-exported here (see that crate's module
-//! doc for exactly why: `ios-bridge` needs them without pulling in this
-//! crate's macOS-only `holo_bridge`/`audit_log` dependencies). This module
-//! now owns only the *connection-handling logic that uses that schema*:
-//! the `iroh` `ProtocolHandler` impl, the PIN/allowlist auth gate, the
-//! `iroh::protocol::Router` wiring, per-connection outbound sequence state,
-//! and the audit-log bookkeeping -- none of which is portable to iOS (or
-//! is even meaningful there, since `ios-bridge` is the *client* side of
-//! this protocol, not a second implementation of the daemon's connection
-//! handling).
+//! This module used to define the literal wire-schema types directly.
+//! These types now live in the `holoiroh-wire` crate:
+//!
+//! - [`ClientMessage`] / [`ServerMessage`]
+//! - [`TaskEnvelope<T>`]
+//! - [`CONTROL_ALPN`]
+//! - [`write_line`] / [`read_line`]
+//! - [`InboundEnvelopeState::validate_inbound`]
+//!
+//! This module re-exports them here. See `holoiroh-wire`'s module doc for
+//! the exact reason: `ios-bridge` needs these types without pulling in this
+//! crate's macOS-only `holo_bridge`/`audit_log` dependencies.
+//!
+//! This module now owns only the connection-handling logic that uses that
+//! schema:
+//!
+//! - the `iroh` `ProtocolHandler` impl
+//! - the PIN/allowlist auth gate
+//! - the `iroh::protocol::Router` wiring
+//! - per-connection outbound sequence state
+//! - the audit-log bookkeeping
+//!
+//! None of this logic is portable to iOS. It is not even meaningful there:
+//! `ios-bridge` is the client side of this protocol, not a second
+//! implementation of the daemon's connection handling.
 //!
 //! ## Relationship to `holo_bridge::control`
 //!
 //! There are two distinct "control message" concepts in this crate, kept
 //! deliberately separate:
 //!
-//! - **This module** (`control_channel`) owns the literal wire schema named
-//!   in the task this module was built for: [`ClientMessage`] /
-//!   [`ServerMessage`], exactly `{type, text?}` as documented in
-//!   `PROTOCOL.md`, plus the actual `iroh` transport that carries them
-//!   (ALPN registration, `accept_bi`/`open_bi`, NDJSON framing).
-//! - [`crate::holo_bridge::control`] owns a richer *internal* schema
-//!   (`ControlMessage` / `ControlEvent`, correlated by `request_id` and
-//!   `context_id`) used to talk to the `holo serve` A2A bridge; it does not
-//!   know about `iroh` or any wire framing at all (see its own module doc).
+//! - **This module** (`control_channel`) owns the literal wire schema:
+//!   [`ClientMessage`] / [`ServerMessage`], exactly `{type, text?}` as
+//!   documented in `PROTOCOL.md`. This is the schema named in the task
+//!   this module was built for. This module also owns the actual `iroh`
+//!   transport that carries the schema: ALPN registration,
+//!   `accept_bi`/`open_bi`, and NDJSON framing.
+//! - [`crate::holo_bridge::control`] owns a richer, internal schema:
+//!   `ControlMessage` / `ControlEvent`, correlated by `request_id` and
+//!   `context_id`. This schema talks to the `holo serve` A2A bridge. It
+//!   does not know about `iroh` or any wire framing at all. See its own
+//!   module doc for details.
 //!
-//! [`ControlChannel`] is the seam between them: each accepted connection
-//! decodes wire [`ClientMessage`]s, synthesizes a `request_id`, forwards a
-//! translated [`crate::holo_bridge::control::ControlMessage`] into a
-//! [`crate::holo_bridge::HoloBridge`], and translates the
-//! [`crate::holo_bridge::control::ControlEvent`]s that come back into wire
-//! [`ServerMessage`]s written back out on the same stream. This keeps
-//! `holo_bridge` transport-agnostic (as its own docs intend) while giving
-//! this module a real consumer instead of a dangling internal channel.
+//! [`ControlChannel`] is the seam between them. For each accepted
+//! connection, it does the following:
+//!
+//! - Decodes wire [`ClientMessage`]s.
+//! - Synthesizes a `request_id`.
+//! - Forwards a translated [`crate::holo_bridge::control::ControlMessage`]
+//!   into a [`crate::holo_bridge::HoloBridge`].
+//! - Translates the [`crate::holo_bridge::control::ControlEvent`]s that
+//!   come back into wire [`ServerMessage`]s, and writes them back out on
+//!   the same stream.
+//!
+//! This keeps `holo_bridge` transport-agnostic, matching its own docs'
+//! intent. It also gives this module a real consumer instead of a
+//! dangling internal channel.
 //!
 //! ## Why a second ALPN, not a second stream multiplexed into the media
 //! `Connection`
 //!
-//! `iroh`'s connection model is one `iroh::endpoint::Connection` per ALPN
-//! (see `iroh::protocol::Router`, which dispatches an *incoming connection*
-//! to a `ProtocolHandler` keyed by the negotiated ALPN -- it does not hand
-//! out already-open connections to be shared across handlers). `iroh-live`
-//! itself follows this exact pattern: `Live::register_protocols` mounts
-//! `iroh_moq::ALPN` (media) and, when gossip is enabled, `iroh_gossip::ALPN`
-//! as two *separate* ALPNs on the *same* `iroh::Endpoint` /
-//! `iroh::protocol::Router` (see the vendored `iroh-live` source,
-//! `iroh-live/src/live.rs::register_protocols`). This module mirrors that
-//! idiom: `CONTROL_ALPN` is a third ALPN mounted on the same `Endpoint` via
-//! [`ControlChannel::register_protocols`].
+//! `iroh`'s connection model uses one `iroh::endpoint::Connection` per
+//! ALPN. See `iroh::protocol::Router`: it dispatches an incoming
+//! connection to a `ProtocolHandler` keyed by the negotiated ALPN. It
+//! does not hand out already-open connections for handlers to share.
 //!
-//! This *is* "a second logical stream on the same iroh QUIC connection" in
-//! the sense the surrounding architecture (see `holoiroh/README.md`) means
-//! it: same `iroh::Endpoint`, same peer `EndpointId`, same NAT-punch/relay
-//! path and connection-lifecycle/reconnect story as the media broadcast --
-//! `iroh` just represents "a second logical stream to the same peer" as a
-//! second `Connection` object over that shared transport rather than as a
-//! stream nested inside the first `Connection`. Within that one control
-//! `Connection`, the actual bidirectional data path is a single QUIC stream
-//! opened with [`iroh::endpoint::Connection::open_bi`] (dial side) /
-//! accepted with [`iroh::endpoint::Connection::accept_bi`] (accept side).
+//! `iroh-live` itself follows this exact pattern. `Live::register_protocols`
+//! mounts `iroh_moq::ALPN` (media) and, when gossip is enabled,
+//! `iroh_gossip::ALPN`, as two separate ALPNs on the same `iroh::Endpoint` /
+//! `iroh::protocol::Router`. See the vendored `iroh-live` source at
+//! `iroh-live/src/live.rs::register_protocols`.
+//!
+//! This module mirrors that idiom. `CONTROL_ALPN` is a third ALPN mounted
+//! on the same `Endpoint` via [`ControlChannel::register_protocols`].
+//!
+//! This module IS "a second logical stream on the same iroh QUIC
+//! connection," in the sense the surrounding architecture means it (see
+//! `holoiroh/README.md`). It shares the same `iroh::Endpoint`, the same
+//! peer `EndpointId`, and the same NAT-punch/relay path and
+//! connection-lifecycle/reconnect story as the media broadcast.
+//!
+//! `iroh` represents "a second logical stream to the same peer" as a
+//! second `Connection` object over that shared transport. It does not
+//! represent it as a stream nested inside the first `Connection`.
+//!
+//! Within that one control `Connection`, the actual bidirectional data
+//! path is a single QUIC stream. The dial side opens it with
+//! [`iroh::endpoint::Connection::open_bi`]. The accept side accepts it
+//! with [`iroh::endpoint::Connection::accept_bi`].
 
 use std::sync::Arc;
 
@@ -112,20 +139,22 @@ pub use holoiroh_wire::{
     TaskEnvelope, epoch_millis_now, input_request_expired_text, read_line, write_line,
 };
 
-/// Per-connection *outbound* envelope state: this connection's minted
-/// `session_id` plus a monotonic counter for the daemon's own outbound
+/// Per-connection outbound envelope state: this connection's minted
+/// `session_id`, plus a monotonic counter for the daemon's own outbound
 /// `sequence_number`s.
 ///
-/// Owned entirely by [`ProtocolHandler::accept`]'s writer task (`send_task`)
-/// -- kept separate from [`InboundEnvelopeState`] (rather than one combined
-/// struct) because the two live in genuinely different places: the writer
-/// task owns `send` for the connection's whole lifetime and needs this
-/// state moved into it, while the read loop needs `InboundEnvelopeState`
-/// mutably available on every line it reads. A single shared struct would
-/// require the read loop and writer task to fight over one lock for two
-/// logically-independent counters (inbound sequence tracking has nothing
-/// to do with outbound sequence numbering -- see `next_outbound_sequence`'s
-/// own doc).
+/// [`ProtocolHandler::accept`]'s writer task (`send_task`) owns this state
+/// entirely. This state stays separate from [`InboundEnvelopeState`]
+/// rather than combined into one struct, because the two live in
+/// genuinely different places. The writer task owns `send` for the
+/// connection's whole lifetime and needs this state moved into it. The
+/// read loop needs `InboundEnvelopeState` mutably available on every line
+/// it reads.
+///
+/// A single shared struct would force the read loop and writer task to
+/// fight over one lock for two logically-independent counters. Inbound
+/// sequence tracking has nothing to do with outbound sequence numbering --
+/// see `next_outbound_sequence`'s own doc.
 pub struct OutboundEnvelopeState {
     pub session_id: String,
     next_outbound_sequence: u64,
@@ -142,12 +171,13 @@ impl OutboundEnvelopeState {
     }
 
     /// Returns the next `sequence_number` to stamp on an outbound
-    /// [`TaskEnvelope`] for this connection, advancing the counter.
-    /// Independent of inbound sequence tracking -- the daemon's own
-    /// outbound stream is numbered separately from whatever the peer
-    /// sends, since the two are different logical sequences (matching the
-    /// envelope being scoped per `session_id` per direction, not a single
-    /// shared counter).
+    /// [`TaskEnvelope`] for this connection. It advances the counter.
+    ///
+    /// This counter is independent of inbound sequence tracking. The
+    /// daemon's own outbound stream is numbered separately from whatever
+    /// the peer sends, because the two are different logical sequences.
+    /// The envelope is scoped per `session_id` per direction, not by a
+    /// single shared counter.
     pub fn next_outbound_sequence(&mut self) -> u64 {
         let n = self.next_outbound_sequence;
         self.next_outbound_sequence += 1;
@@ -163,45 +193,52 @@ impl Default for OutboundEnvelopeState {
 
 /// Translates a [`crate::holo_bridge::control::ControlEvent`] (the
 /// internal, `request_id`/`context_id`-correlated bridge schema) down
-/// to the minimal wire [`ServerMessage`] schema this module's
-/// `PROTOCOL.md` defines. The correlation ids themselves are not part
-/// of the wire schema (the task's literal ask has no such fields), so
-/// they're folded into human-readable `text` rather than dropped
-/// silently -- a future PROTOCOL.md revision may promote them to real
-/// fields (see PROTOCOL.md's "Future extension" section).
+/// to the minimal wire [`ServerMessage`] schema. This module's
+/// `PROTOCOL.md` defines that wire schema.
 ///
-/// A free function (rather than an inherent `impl ServerMessage` method,
-/// which is how this was originally written) because `ServerMessage` now
-/// lives in `holoiroh-wire` -- Rust's orphan rule forbids `impl`ing
-/// inherent methods on a foreign type from this crate, and this function
-/// specifically depends on `ControlEvent`/`DoneStatus`
-/// (`crate::holo_bridge`'s internal, non-wire, desktop-side schema), which
-/// is exactly the kind of dependency `holoiroh-wire` exists to keep out of
-/// the wire-schema crate. Call sites (this module's own writer task, plus
-/// `examples/control_channel_probe.rs`) now read
-/// `control_channel::from_control_event(event)` instead of
-/// `ServerMessage::from_control_event(event)` -- same behavior, different
-/// call syntax.
+/// The wire schema does not include the correlation ids themselves. The
+/// task's literal ask has no fields for them. This function folds the ids
+/// into human-readable `text` instead of dropping them silently. A future
+/// `PROTOCOL.md` revision may promote them to real fields. See
+/// `PROTOCOL.md`'s "Future extension" section.
+///
+/// This is a free function, not an inherent `impl ServerMessage` method
+/// (which is how the code originally worked). `ServerMessage` now lives
+/// in `holoiroh-wire`. Rust's orphan rule forbids `impl`ing inherent
+/// methods on a foreign type from this crate. This function also depends
+/// on `ControlEvent`/`DoneStatus` (`crate::holo_bridge`'s internal,
+/// non-wire, desktop-side schema); `holoiroh-wire` exists specifically to
+/// keep that kind of dependency out of the wire-schema crate.
+///
+/// Call sites now read `control_channel::from_control_event(event)`
+/// instead of `ServerMessage::from_control_event(event)`. These call
+/// sites are this module's own writer task, plus
+/// `examples/control_channel_probe.rs`. The behavior is the same; only
+/// the call syntax changed.
 ///
 /// ## Not wired to [`crate::task_state::TaskState`]
 ///
 /// [`crate::task_state::TaskState`] is this crate's Project Aro PRD
 /// task-lifecycle enum (created/queued/connecting/.../completed, plus
-/// interactive-wait and terminal states) -- deliberately **not**
-/// threaded into this function. The one variant here with any real
-/// per-state correspondence, [`ControlEvent::Queued`] below, already
-/// has a byte-exact wire string (`"queued, N ahead"`) asserted by
-/// `examples/control_channel_probe.rs`; embedding `TaskState`'s
-/// serialized value into it would be a breaking, unrequested wire
-/// change, not a natural hook. Every other arm carries either free
-/// text or the unrelated 3-way `DoneStatus`, with no correspondence to
-/// `TaskState`'s finer granularity -- `holo_bridge::a2a_client`'s
-/// `TaskUpdate` (`Working`/`Answer`/`Terminal`) is the actual upstream
-/// event source, and it does not report which fine-grained lifecycle
-/// state a task is in. The next task that gives this bridge a
-/// fine-grained event source (e.g. `holo-desktop-cli` trajectory
-/// events that name a specific step) is the one that should wire
-/// `TaskState` in here, not this one.
+/// interactive-wait and terminal states). This function deliberately
+/// does not thread `TaskState` in.
+///
+/// [`ControlEvent::Queued`] below is the one variant here with any real
+/// per-state correspondence. It already has a byte-exact wire string
+/// (`"queued, N ahead"`) asserted by `examples/control_channel_probe.rs`.
+/// Embedding `TaskState`'s serialized value into it would be a breaking,
+/// unrequested wire change, not a natural hook.
+///
+/// Every other arm carries either free text or the unrelated 3-way
+/// `DoneStatus`, with no correspondence to `TaskState`'s finer
+/// granularity. `holo_bridge::a2a_client`'s `TaskUpdate`
+/// (`Working`/`Answer`/`Terminal`) is the actual upstream event source,
+/// and it does not report which fine-grained lifecycle state a task is
+/// in.
+///
+/// The next task that gives this bridge a fine-grained event source (for
+/// example, `holo-desktop-cli` trajectory events that name a specific
+/// step) should wire `TaskState` in here.
 pub fn from_control_event(event: ControlEvent) -> ServerMessage {
     match event {
         ControlEvent::Ack { .. } => ServerMessage::ack(),
@@ -290,12 +327,16 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
     }
 }
 
-/// The `request_id` a [`ControlEvent`] itself carries, when it names a real one -- used by
-/// the writer task to stamp the correct envelope `task_id` on each outbound event. Before
-/// turns were spawned off the read loop, the last-inbound-envelope's task_id was a safe
-/// stand-in (one turn at a time, strictly request/response); with concurrent turns, an event
-/// must correlate by its OWN id, else e.g. a mid-turn `Stop`'s inbound envelope would
-/// re-stamp the still-streaming prompt's progress events with the stop's task_id.
+/// The `request_id` a [`ControlEvent`] itself carries, when it names a
+/// real one. The writer task uses this to stamp the correct envelope
+/// `task_id` on each outbound event.
+///
+/// Before turns were spawned off the read loop, the last-inbound-envelope's
+/// task_id was a safe stand-in, because only one turn ran at a time in
+/// strict request/response order. With concurrent turns, an event must
+/// correlate by its own id. Otherwise, for example, a mid-turn `Stop`'s
+/// inbound envelope would re-stamp the still-streaming prompt's progress
+/// events with the stop's task_id.
 fn event_request_id(event: &ControlEvent) -> Option<String> {
     let id = match event {
         ControlEvent::Ack { request_id }
@@ -323,10 +364,13 @@ fn event_request_id(event: &ControlEvent) -> Option<String> {
     if id.is_empty() { None } else { Some(id.clone()) }
 }
 
-/// Logs one [`crate::audit_log::CloudEgressEntry`], warning (never propagating) on failure --
-/// matching [`AuditLogger::append`]'s documented best-effort posture for its other caller
-/// (never tears down the in-flight turn that produced the entry). Shared by all five
-/// document/image/audio/planner spawn blocks in the read loop below.
+/// Logs one [`crate::audit_log::CloudEgressEntry`]. On failure, it warns
+/// and never propagates the error. This matches [`AuditLogger::append`]'s
+/// documented best-effort posture for its other caller: a logging failure
+/// never tears down the in-flight turn that produced the entry.
+///
+/// Shared by all five document/image/audio/planner spawn blocks in the
+/// read loop below.
 fn log_cloud_egress(
     audit: &AuditLogger,
     request_id: &str,
@@ -348,38 +392,41 @@ fn log_cloud_egress(
 
 /// Converts a wire [`ClientMessage`] plus a synthesized `request_id` into
 /// the internal [`ControlMessage`] shape [`crate::holo_bridge::HoloBridge`]
-/// expects. The wire schema has no `context_id` (each `ClientMessage`
-/// carries no session-continuity field per `PROTOCOL.md`), so every
-/// message starts a fresh `holo serve` A2A context; per-connection
-/// conversation continuity can be layered on later by threading a
-/// connection-scoped `context_id` through here without any wire-format
+/// expects. The wire schema has no `context_id`: each `ClientMessage`
+/// carries no session-continuity field, per `PROTOCOL.md`. So every
+/// message starts a fresh `holo serve` A2A context. A later change can
+/// layer on per-connection conversation continuity, by threading a
+/// connection-scoped `context_id` through here, without any wire-format
 /// change.
 ///
-/// Returns `None` for [`ClientMessage::Pin`] -- that variant is consumed
-/// entirely by [`ControlChannel::authenticate`]'s gate before the main
-/// accept loop (below) ever calls this function; a `Pin` arriving mid-
-/// stream (after auth already succeeded) has no `HoloBridge` equivalent to
-/// translate to, so the accept loop acks it locally instead of forwarding
-/// it (see the `Ok(ClientMessage::Pin { .. })` arm in
-/// [`ProtocolHandler::accept`]).
+/// Returns `None` for [`ClientMessage::Pin`]. [`ControlChannel::authenticate`]'s
+/// gate consumes that variant entirely, before the main accept loop
+/// (below) ever calls this function. A `Pin` arriving mid-stream, after
+/// auth already succeeded, has no `HoloBridge` equivalent to translate
+/// to. So the accept loop acks it locally instead of forwarding it. See
+/// the `Ok(ClientMessage::Pin { .. })` arm in [`ProtocolHandler::accept`].
 ///
-/// Also returns `None` for [`ClientMessage::InputResponse`] -- that variant
-/// answers a pending [`ServerMessage::InputRequest`] the accept loop itself
-/// is tracking (matching `request_id` against the outstanding request and
-/// clearing its expiry timer), not something `HoloBridge`'s A2A-oriented
-/// `ControlMessage` has any equivalent shape for today.
+/// Also returns `None` for [`ClientMessage::InputResponse`]. That variant
+/// answers a pending [`ServerMessage::InputRequest`] the accept loop
+/// itself is tracking, by matching `request_id` against the outstanding
+/// request and clearing its expiry timer. `HoloBridge`'s A2A-oriented
+/// `ControlMessage` has no equivalent shape for this today.
 ///
-/// `pub` (rather than private) specifically so `examples/holo_stop_probe.rs`
-/// -- the run-by-hand witness for the remote kill-switch path (this repo's
-/// no-unit-tests rule) -- can assert the exact wire-[`ClientMessage::Stop`]
-/// -> internal-[`ControlMessage::Stop`] mapping directly, without spinning up
-/// a live `iroh` connection to reach it through [`ProtocolHandler::accept`].
-/// Still called internally by that accept loop, so it is not dead code from
-/// the bin target's perspective.
-/// Injection carries ABSOLUTE cursor positions, so an out-of-order apply teleports the pointer
-/// backwards rather than merely arriving late. These variants are synchronous CGEvent posts and
-/// must be awaited in stream order; `TakeControl`/`ReleaseControl` take the pause path and are
-/// deliberately excluded so they keep the spawn.
+/// This function is `pub`, not private, specifically so
+/// `examples/holo_stop_probe.rs` can assert the exact
+/// wire-[`ClientMessage::Stop`] -> internal-[`ControlMessage::Stop`]
+/// mapping directly. `examples/holo_stop_probe.rs` is the run-by-hand
+/// witness for the remote kill-switch path, per this repo's no-unit-tests
+/// rule. It reaches this mapping without spinning up a live `iroh`
+/// connection through [`ProtocolHandler::accept`]. That accept loop still
+/// calls this function internally, so it is not dead code from the bin
+/// target's perspective.
+///
+/// Injection carries ABSOLUTE cursor positions. So an out-of-order apply
+/// teleports the pointer backwards rather than merely arriving late.
+/// These variants are synchronous CGEvent posts. The caller must await
+/// them in stream order. `TakeControl`/`ReleaseControl` take the pause
+/// path. They are deliberately excluded here so they keep the spawn.
 pub fn must_preserve_arrival_order(message: &ControlMessage) -> bool {
     matches!(
         message,
@@ -431,39 +478,40 @@ pub fn to_control_message(request_id: String, msg: ClientMessage) -> Option<Cont
     }
 }
 
-/// One [`ServerMessage::InputRequest`] a connection is currently waiting on
-/// a [`ClientMessage::InputResponse`] for (or expiry of).
+/// One [`ServerMessage::InputRequest`] a connection is currently waiting
+/// on. The connection waits for a [`ClientMessage::InputResponse`], or for
+/// the request to expire.
 ///
-/// [`ControlChannel::accept`] tracks **at most one** of these per
-/// connection at a time, matching `HoloControlBridge`'s existing
-/// single-active-turn concurrency model (`busy`/`queue` in
-/// `holo_bridge::control`) -- a turn that needs user input pauses that one
-/// turn; it does not make sense for a single control-channel connection to
-/// have multiple simultaneous outstanding input requests today, and
-/// tracking more than one would need its own bounded-queue design this row
-/// does not need to solve. A future multi-outstanding-request design would
-/// replace this `Option` with a keyed map, but nothing in this daemon
-/// currently produces more than one at a time.
+/// [`ControlChannel::accept`] tracks at most one of these per connection at
+/// a time. This matches `HoloControlBridge`'s existing single-active-turn
+/// concurrency model (`busy`/`queue` in `holo_bridge::control`): a turn
+/// that needs user input pauses that one turn. A single control-channel
+/// connection does not need multiple simultaneous outstanding input
+/// requests today. Tracking more than one would need its own
+/// bounded-queue design this row does not need to solve. A future
+/// multi-outstanding-request design would replace this `Option` with a
+/// keyed map, but nothing in this daemon currently produces more than one
+/// at a time.
 ///
-/// Fields are private (constructed only by [`ControlChannel::accept`]'s
-/// internal bookkeeping in real use); [`Self::for_probing`] is the one
-/// exception, mirroring [`AuthState::for_probing`]'s rationale exactly --
-/// `examples/input_request_probe.rs` needs to build one directly to witness
-/// [`wait_for_expiry`]'s real timing behavior without spinning up a live
-/// `iroh` connection.
+/// Fields are private. In real use, only [`ControlChannel::accept`]'s
+/// internal bookkeeping constructs this struct. [`Self::for_probing`] is
+/// the one exception, mirroring [`AuthState::for_probing`]'s rationale
+/// exactly: `examples/input_request_probe.rs` needs to build one directly
+/// to witness [`wait_for_expiry`]'s real timing behavior, without spinning
+/// up a live `iroh` connection.
 pub struct PendingInputRequest {
     request_id: String,
-    /// Epoch millis, same unit as [`ServerMessage::InputRequest::expires_at`]
-    /// -- copied here (rather than re-deriving from a stored
-    /// `ServerMessage`) so [`wait_for_expiry`] only needs this one `u64` to
+    /// Epoch millis, same unit as [`ServerMessage::InputRequest::expires_at`].
+    /// This value is copied here, rather than re-derived from a stored
+    /// `ServerMessage`, so [`wait_for_expiry`] only needs this one `u64` to
     /// compute the sleep duration.
     expires_at: u64,
 }
 
 impl PendingInputRequest {
     /// Builds a `PendingInputRequest` directly for
-    /// `examples/input_request_probe.rs` (see struct doc) -- not called
-    /// from `main.rs`'s binary path, same status as
+    /// `examples/input_request_probe.rs` (see struct doc). `main.rs`'s
+    /// binary path does not call this function, the same status as
     /// [`AuthState::for_probing`].
     #[allow(dead_code)]
     pub fn for_probing(request_id: impl Into<String>, expires_at: u64) -> Self {
@@ -475,23 +523,24 @@ impl PendingInputRequest {
 }
 
 /// Resolves once `pending`'s deadline (`expires_at`, epoch millis) has
-/// passed, or never resolves at all if `pending` is `None` -- letting this
-/// be used directly as one arm of `tokio::select!` in
-/// [`ControlChannel::accept`]'s connection loop without that arm ever
+/// passed. Never resolves at all if `pending` is `None`. This lets code
+/// use this function directly as one arm of `tokio::select!` in
+/// [`ControlChannel::accept`]'s connection loop, without that arm ever
 /// firing spuriously when no request is outstanding.
 ///
-/// Computes the sleep duration from *real* wall-clock time
-/// ([`epoch_millis_now`]) on every poll rather than once up front, so a
-/// deadline that is already in the past (or arrives while this future is
-/// first constructed) resolves on the very next `.await` point instead of
-/// via any special-cased branch -- `Duration::ZERO` sleeps resolve
-/// immediately, which is exactly the desired "already expired -> safe-pause
-/// right away" behavior for a degenerate past-`expires_at` request.
+/// This function computes the sleep duration from real wall-clock time
+/// ([`epoch_millis_now`]) on every poll, rather than once up front. So a
+/// deadline that is already in the past, or that arrives while this
+/// future is first constructed, resolves on the very next `.await` point
+/// instead of through any special-cased branch. `Duration::ZERO` sleeps
+/// resolve immediately, which is exactly the desired "already expired ->
+/// safe-pause right away" behavior for a degenerate past-`expires_at`
+/// request.
 ///
-/// `pub` (rather than private) so `examples/input_request_probe.rs` can
-/// race real `tokio::time` against a real [`PendingInputRequest`] the same
-/// way [`ControlChannel::accept`]'s own `tokio::select!` does -- same
-/// probe-access rationale as [`ControlChannel::authenticate`].
+/// This function is `pub`, not private, so `examples/input_request_probe.rs`
+/// can race real `tokio::time` against a real [`PendingInputRequest`] the
+/// same way [`ControlChannel::accept`]'s own `tokio::select!` does. This
+/// is the same probe-access rationale as [`ControlChannel::authenticate`].
 pub async fn wait_for_expiry(pending: &Option<PendingInputRequest>) {
     match pending {
         Some(p) => {
@@ -503,27 +552,35 @@ pub async fn wait_for_expiry(pending: &Option<PendingInputRequest>) {
     }
 }
 
-/// Audit-log start metadata for one in-flight task, recorded by the main [`ProtocolHandler::accept`]
-/// loop at dispatch time and consumed by the `send_task` spawned in that same function when the
-/// matching [`ControlEvent::Done`] arrives -- see the audit-log bookkeeping comment where
-/// `audit_starts` is constructed in `accept` for why this is split across the two tasks.
+/// Audit-log start metadata for one in-flight task. The main
+/// [`ProtocolHandler::accept`] loop records this at dispatch time. The
+/// `send_task` spawned in that same function consumes it when the
+/// matching [`ControlEvent::Done`] arrives. See the audit-log bookkeeping
+/// comment where `accept` constructs `audit_starts`, for why this is
+/// split across the two tasks.
 struct AuditTaskStart {
     started_at_ms: u64,
     action_class: ActionClass,
 }
 
-/// Applies one [`ControlEvent`] to the running audit-log bookkeeping for its connection: tallies
-/// `Progress` events into `action_counts`, and on `Done`, looks up (and removes) the matching
-/// [`AuditTaskStart`] recorded at dispatch time to build and [`AuditLogger::append`] a complete
-/// [`AuditEntry`] -- the "one entry when a task completes" half of this module's P0-12 wiring (the
-/// "one entry when a task starts" half is the `audit_starts.lock()...insert(..)` call in `accept`
-/// itself). A `request_id` with no matching `audit_starts` entry (i.e. not a `Prompt`/
-/// `VoiceTranscript` -- see that insert's own doc for which `ClientMessage` kinds get a start
-/// record) is silently skipped: nothing to close out, not an error.
+/// Applies one [`ControlEvent`] to the running audit-log bookkeeping for
+/// its connection. It tallies `Progress` events into `action_counts`. On
+/// `Done`, it looks up and removes the matching [`AuditTaskStart`]
+/// recorded at dispatch time, then builds and appends a complete
+/// [`AuditEntry`] via [`AuditLogger::append`]. This is the "one entry
+/// when a task completes" half of this module's P0-12 wiring. The "one
+/// entry when a task starts" half is the `audit_starts.lock()...insert(..)`
+/// call in `accept` itself.
 ///
-/// Free function (rather than a `ControlChannel` method) because it needs to run inside
-/// `send_task`'s spawned `async move` block, which does not hold `&self` -- taking every piece of
-/// state it needs as an explicit parameter instead.
+/// A `request_id` with no matching `audit_starts` entry is silently
+/// skipped: nothing to close out, not an error. This happens for any
+/// `ClientMessage` kind other than `Prompt`/`VoiceTranscript` -- see that
+/// insert's own doc for which kinds get a start record.
+///
+/// This is a free function, not a `ControlChannel` method, because it
+/// needs to run inside `send_task`'s spawned `async move` block, which
+/// does not hold `&self`. It takes every piece of state it needs as an
+/// explicit parameter instead.
 fn audit_on_control_event(
     audit: &AuditLogger,
     connection_path: &ConnectionPath,
@@ -579,36 +636,42 @@ fn audit_on_control_event(
 /// Shared auth state consulted by [`ControlChannel::accept`]'s gate: the
 /// persisted device allowlist plus the PIN generated for this daemon run.
 ///
-/// Held behind `std::sync::Mutex` (not `tokio::sync::Mutex`): every access
-/// is a short, synchronous critical section (a `HashSet`/`Vec` lookup, or a
-/// JSON file write on the rare add-device path) with no `.await` inside the
-/// lock, so a std lock is both correct and cheaper than an async one here --
-/// the same reasoning `HoloControlBridge::events_tx` uses for its own
-/// `std::sync::RwLock` (see that type's doc comment).
+/// This state is held behind `std::sync::Mutex`, not `tokio::sync::Mutex`.
+/// Every access is a short, synchronous critical section: a `HashSet`/`Vec`
+/// lookup, or a JSON file write on the rare add-device path, with no
+/// `.await` inside the lock. So a std lock is both correct and cheaper
+/// than an async one here. `HoloControlBridge::events_tx` uses the same
+/// reasoning for its own `std::sync::RwLock` (see that type's doc
+/// comment).
 pub struct AuthState {
     allowlist: Allowlist,
     allowlist_path: std::path::PathBuf,
     /// The PIN this daemon process generated at startup. `None` means PIN
     /// auth is disabled for this run (see [`ControlChannel::new`] /
-    /// [`ControlChannel::with_auth`]) -- every connection is then gated on
-    /// the allowlist alone, and an unknown device is rejected outright with
-    /// no PIN-entry path offered (matching "reject unknown/wrong-PIN
-    /// connections": with no PIN configured, there is no correct PIN to
-    /// enter, so unknown devices are simply rejected).
+    /// [`ControlChannel::with_auth`]). Every connection is then gated on
+    /// the allowlist alone, and an unknown device is rejected outright
+    /// with no PIN-entry path offered. This matches "reject
+    /// unknown/wrong-PIN connections": with no PIN configured, there is
+    /// no correct PIN to enter, so unknown devices are simply rejected.
     expected_pin: Option<String>,
 }
 
 impl AuthState {
-    /// Constructs an `AuthState` directly, bypassing the real `~/.holoiroh/allowlist.json`
-    /// load `ControlChannel::new`/`with_auth` normally perform. `pub` (rather than only
-    /// reachable via those constructors) specifically so `examples/auth_gate_probe.rs` -- a
-    /// real, run-by-hand live witness for [`ControlChannel::authenticate`]'s PIN/allowlist gate
-    /// logic (see this repo's no-unit-tests rule) -- can exercise the actual gate function
-    /// against a real in-memory `AuthState` and a real `tokio::io::Lines` reader, the same seam
-    /// the removed `#[tokio::test]` async tests used, just driven by `cargo run` instead of
-    /// `cargo test`. Not called from `main.rs`'s binary target (which builds real `AuthState`
-    /// only via `ControlChannel::new`/`with_auth`'s real allowlist load) -- `#[allow(dead_code)]`
-    /// there, same status as `allowlist.rs`'s own probe-only convenience methods.
+    /// Constructs an `AuthState` directly, bypassing the real
+    /// `~/.holoiroh/allowlist.json` load that `ControlChannel::new`/`with_auth`
+    /// normally perform. This function is `pub`, not only reachable via
+    /// those constructors, specifically so `examples/auth_gate_probe.rs`
+    /// can exercise the actual gate function against a real in-memory
+    /// `AuthState` and a real `tokio::io::Lines` reader.
+    /// `examples/auth_gate_probe.rs` is a real, run-by-hand live witness
+    /// for [`ControlChannel::authenticate`]'s PIN/allowlist gate logic
+    /// (see this repo's no-unit-tests rule). It uses the same seam the
+    /// removed `#[tokio::test]` async tests used, just driven by
+    /// `cargo run` instead of `cargo test`. `main.rs`'s binary target does
+    /// not call this function; it builds real `AuthState` only via
+    /// `ControlChannel::new`/`with_auth`'s real allowlist load. This
+    /// function carries `#[allow(dead_code)]` there, the same status as
+    /// `allowlist.rs`'s own probe-only convenience methods.
     #[allow(dead_code)]
     pub fn for_probing(expected_pin: Option<&str>, pre_allowed: &[&str], allowlist_path: std::path::PathBuf) -> Self {
         let mut allowlist = Allowlist::default();
@@ -622,50 +685,58 @@ impl AuthState {
         }
     }
 
-    /// True if `device_id` is currently allowlisted -- used by the probe to confirm
-    /// `authenticate`'s side effect (adding a newly PIN-verified device) actually happened.
-    /// Same not-called-from-`main.rs` status as [`Self::for_probing`].
+    /// True if `device_id` is currently allowlisted. The probe uses this
+    /// to confirm `authenticate`'s side effect actually happened: adding
+    /// a newly PIN-verified device. This has the same
+    /// not-called-from-`main.rs` status as [`Self::for_probing`].
     #[allow(dead_code)]
     pub fn contains_key(&self, device_id: &str) -> bool {
         self.allowlist.contains_key(device_id)
     }
 }
 
-/// Handle to the control channel: mounts [`CONTROL_ALPN`] on the shared
-/// `iroh` `Endpoint`/`Router` (accept side) and lets the daemon open the
-/// matching stream when dialing a peer (dial side).
+/// Handle to the control channel. It mounts [`CONTROL_ALPN`] on the
+/// shared `iroh` `Endpoint`/`Router` (accept side). It also lets the
+/// daemon open the matching stream when dialing a peer (dial side).
 ///
-/// Each accepted connection is first run through the auth gate documented
-/// on [`ProtocolHandler::accept`] below (allowlist + first-connection PIN);
-/// only a connection that passes is forwarded into the shared [`HoloBridge`]
-/// and gets its [`crate::holo_bridge::control::ControlEvent`]s streamed back
-/// out as [`ServerMessage`]s on the same stream.
+/// Each accepted connection first runs through the auth gate documented
+/// on [`ProtocolHandler::accept`] below (allowlist + first-connection
+/// PIN). Only a connection that passes is forwarded into the shared
+/// [`HoloBridge`]. That connection then gets its
+/// [`crate::holo_bridge::control::ControlEvent`]s streamed back out as
+/// [`ServerMessage`]s on the same stream.
 #[derive(Clone)]
 pub struct ControlChannel {
     bridge: Arc<HoloBridge>,
     auth: Arc<std::sync::Mutex<AuthState>>,
-    /// Metadata-only local audit log (Project Aro PRD row P0-12) -- see `crate::audit_log`'s
-    /// module doc for exactly what is and isn't recorded. `Arc` (not owned) because
-    /// `ControlChannel` is itself cheaply `Clone`d per accepted connection (see this struct's own
-    /// existing `bridge`/`auth` fields) and every clone must append to the same underlying file.
+    /// Metadata-only local audit log (Project Aro PRD row P0-12) -- see
+    /// `crate::audit_log`'s module doc for exactly what is and isn't
+    /// recorded. This field is `Arc`, not owned, because `ControlChannel`
+    /// is itself cheaply `Clone`d per accepted connection (see this
+    /// struct's own existing `bridge`/`auth` fields), and every clone
+    /// must append to the same underlying file.
     audit: Arc<AuditLogger>,
-    /// This daemon's own drift-proof (node-id-only) `iroh-live:` ticket, sent to
-    /// the peer as a [`ServerMessage::CurrentTicket`] right after the greeting so
-    /// a client can refresh a stored default whose ticket went stale on identity
-    /// rotation. `Arc<str>` for the same per-connection cheap-clone reason as the
-    /// fields above.
+    /// This daemon's own drift-proof (node-id-only) `iroh-live:` ticket.
+    /// The daemon sends this to the peer as a
+    /// [`ServerMessage::CurrentTicket`] right after the greeting, so a
+    /// client can refresh a stored default whose ticket went stale on
+    /// identity rotation. This field is `Arc<str>` for the same
+    /// per-connection cheap-clone reason as the fields above.
     current_ticket: Arc<str>,
-    /// Clarifying-questions inference backend (Tinfoil key + model), when a
-    /// `TINFOIL_API_KEY` is configured. `None` disables clarification entirely --
-    /// a `ClarifyRequest` then replies with an empty question set so the app
-    /// proceeds with a direct send.
+    /// Clarifying-questions inference backend (Tinfoil key + model), when
+    /// a `TINFOIL_API_KEY` is configured. `None` disables clarification
+    /// entirely. A `ClarifyRequest` then replies with an empty question
+    /// set, so the app proceeds with a direct send.
     clarify: Option<crate::clarify::ClarifyConfig>,
-    /// The raw Tinfoil bearer key, shared by the document/image/audio/planner handlers below
-    /// (each of those modules takes the key directly rather than a per-module config struct,
-    /// unlike `clarify`'s `ClarifyConfig` -- there is no per-module model override env var for
-    /// any of them yet, so a bare key is the whole config). `None` disables all four features;
-    /// each replies with its own `*Failed` event stating no key is configured, mirroring
-    /// `clarify`'s empty-questions-when-disabled posture rather than silently hanging.
+    /// The raw Tinfoil bearer key, shared by the document/image/audio/planner
+    /// handlers below. Each of those modules takes the key directly,
+    /// rather than a per-module config struct, unlike `clarify`'s
+    /// `ClarifyConfig`. No per-module model override env var exists for
+    /// any of them yet, so a bare key is the whole config. `None`
+    /// disables all four features. Each then replies with its own
+    /// `*Failed` event stating no key is configured, mirroring
+    /// `clarify`'s empty-questions-when-disabled posture rather than
+    /// silently hanging.
     tinfoil_key: Option<Arc<str>>,
 }
 
@@ -677,15 +748,17 @@ impl std::fmt::Debug for ControlChannel {
 
 impl ControlChannel {
     /// Creates a new control channel wrapping an already-started
-    /// [`HoloBridge`], with **no auth enforced**: the allowlist is loaded
-    /// from [`Allowlist::default_path`] (best-effort -- a load failure logs
-    /// a warning and starts from an empty in-memory allowlist rather than
-    /// failing daemon startup) but every device is treated as effectively
-    /// allowlisted (no PIN, no rejection) until [`Self::with_auth`] is used
-    /// instead. Kept as the zero-friction default for local dev/testing
-    /// (matches this crate's existing "best-effort, degrade don't crash"
-    /// posture -- see `main.rs`'s `holo_bridge` startup handling) --
-    /// **not** what a real deployment should call; see `PAIRING.md`'s
+    /// [`HoloBridge`], with no auth enforced. It loads the allowlist from
+    /// [`Allowlist::default_path`], best-effort: a load failure logs a
+    /// warning and starts from an empty in-memory allowlist, rather than
+    /// failing daemon startup. Every device is treated as effectively
+    /// allowlisted, with no PIN and no rejection, until code uses
+    /// [`Self::with_auth`] instead.
+    ///
+    /// This is the zero-friction default for local dev/testing. It
+    /// matches this crate's existing "best-effort, degrade don't crash"
+    /// posture -- see `main.rs`'s `holo_bridge` startup handling. A real
+    /// deployment should not call this constructor. See `PAIRING.md`'s
     /// "Exact remaining wiring step" for what `main.rs` would need to
     /// change to actually enable enforcement by default.
     pub fn new(
@@ -710,15 +783,17 @@ impl ControlChannel {
         }
     }
 
-    /// Creates a new control channel with auth **enforced**: `expected_pin`
-    /// (typically [`crate::allowlist::generate_default_pin`]'s output,
-    /// displayed to the user alongside the ticket/QR at startup) is
-    /// required from any device not already in the persisted allowlist;
-    /// devices that pass the PIN check are added to the allowlist and
-    /// persisted immediately (so they don't need the PIN again on the next
-    /// connection). This is the constructor `PAIRING.md` designs `main.rs`
-    /// around, but `main.rs` does not call it yet -- see that file's
-    /// "Exact remaining wiring step" section.
+    /// Creates a new control channel with auth enforced. Any device not
+    /// already in the persisted allowlist must supply `expected_pin`.
+    /// `expected_pin` is typically [`crate::allowlist::generate_default_pin`]'s
+    /// output, displayed to the user alongside the ticket/QR at startup.
+    /// Devices that pass the PIN check are added to the allowlist and
+    /// persisted immediately, so they don't need the PIN again on the
+    /// next connection.
+    ///
+    /// This is the constructor `PAIRING.md` designs `main.rs` around, but
+    /// `main.rs` does not call it yet. See that file's "Exact remaining
+    /// wiring step" section.
     pub fn with_auth(
         bridge: Arc<HoloBridge>,
         expected_pin: String,
@@ -760,29 +835,31 @@ impl ControlChannel {
 
     /// Runs the auth gate for a newly-accepted `connection`'s peer.
     ///
-    /// Returns `Ok(())` if the connection may proceed (device was already
-    /// allowlisted, or auth is disabled via [`Self::new`]). Returns
-    /// `Err(reason)` if the connection must be rejected -- `reason` is
-    /// meant to be sent back as a [`ServerMessage::auth_rejected`] before
-    /// closing.
+    /// Returns `Ok(())` if the connection may proceed. This happens when
+    /// the device was already allowlisted, or when auth is disabled via
+    /// [`Self::new`]. Returns `Err(reason)` if the connection must be
+    /// rejected; `reason` is meant to be sent back as a
+    /// [`ServerMessage::auth_rejected`] before closing.
     ///
     /// For an unknown device with PIN auth enabled, this reads exactly one
-    /// line off `lines` expecting `{"type":"pin","pin":"..."}` (the very
-    /// first line the peer must send before anything else is processed --
-    /// a `Prompt`/`VoiceTranscript`/`Stop` sent before a successful `Pin`
-    /// from an unknown device is rejected, not queued or buffered). On a
-    /// correct PIN, the device id is persisted to the allowlist immediately
-    /// via [`Allowlist::save`] so future connections skip the PIN step.
+    /// line off `lines`, expecting `{"type":"pin","pin":"..."}`. This must
+    /// be the very first line the peer sends before anything else is
+    /// processed. A `Prompt`/`VoiceTranscript`/`Stop` sent before a
+    /// successful `Pin` from an unknown device is rejected, not queued or
+    /// buffered. On a correct PIN, the device id is persisted to the
+    /// allowlist immediately via [`Allowlist::save`], so future
+    /// connections skip the PIN step.
     ///
-    /// Free function taking `auth` explicitly (rather than a `&self`
-    /// method reaching for `self.auth`) so it can be exercised directly --
-    /// live, via `examples/auth_gate_probe.rs` (`cargo run --example
-    /// auth_gate_probe`) -- without needing a real `Arc<HoloBridge>` (which
-    /// requires a live `holo serve` subprocess) to construct a full
-    /// `ControlChannel`. [`ControlChannel::accept`] simply calls
-    /// `authenticate(&self.auth, ...)`. `pub` (rather than private) so that
-    /// probe, a real run-by-hand live witness for this gate (see this
-    /// repo's no-unit-tests rule), can call the actual function.
+    /// This function takes `auth` explicitly, rather than being a `&self`
+    /// method reaching for `self.auth`, so it can be exercised directly.
+    /// `examples/auth_gate_probe.rs` (`cargo run --example
+    /// auth_gate_probe`) exercises it live, without needing a real
+    /// `Arc<HoloBridge>` (which requires a live `holo serve` subprocess)
+    /// to construct a full `ControlChannel`. [`ControlChannel::accept`]
+    /// simply calls `authenticate(&self.auth, ...)`. This function is
+    /// `pub`, not private, so that probe -- a real run-by-hand live
+    /// witness for this gate, per this repo's no-unit-tests rule -- can
+    /// call the actual function.
     pub async fn authenticate<R>(
         auth: &Arc<std::sync::Mutex<AuthState>>,
         remote: &str,
@@ -850,11 +927,12 @@ impl ControlChannel {
     }
 
     /// Mounts this control channel's [`ProtocolHandler`] onto `router`
-    /// under [`CONTROL_ALPN`], alongside whatever other protocols (e.g.
-    /// `iroh-live`'s MoQ/gossip via `Live::register_protocols`) are already
-    /// registered on the same `Endpoint`. Mirrors
-    /// `iroh_live::Live::register_protocols`'s own signature so the two
-    /// compose in `main.rs` with the same builder-chaining pattern:
+    /// under [`CONTROL_ALPN`], alongside whatever other protocols are
+    /// already registered on the same `Endpoint` (for example,
+    /// `iroh-live`'s MoQ/gossip via `Live::register_protocols`). This
+    /// function mirrors `iroh_live::Live::register_protocols`'s own
+    /// signature, so the two compose in `main.rs` with the same
+    /// builder-chaining pattern:
     ///
     /// ```ignore
     /// let router = live.register_protocols(RouterBuilder::new(endpoint));
@@ -866,13 +944,13 @@ impl ControlChannel {
     }
 
     /// Sends `msg` to a connected peer over a freshly opened bidirectional
-    /// stream (dial side). Used when the Mac daemon needs to push a
-    /// [`ServerMessage`] proactively rather than as a reply within an
+    /// stream (dial side). The Mac daemon uses this when it needs to push
+    /// a [`ServerMessage`] proactively, rather than as a reply within an
     /// already-accepted stream (the common case, handled inline in
-    /// [`ProtocolHandler::accept`] below). Not yet called from `main.rs`
-    /// (nothing today needs to push a message outside of an active
-    /// request/response turn), but it's the dial-side primitive this
-    /// module exists to provide alongside the accept side.
+    /// [`ProtocolHandler::accept`] below). `main.rs` does not call this
+    /// function yet, since nothing today needs to push a message outside
+    /// of an active request/response turn. It is still the dial-side
+    /// primitive this module exists to provide alongside the accept side.
     #[allow(dead_code)]
     pub async fn send_on_new_stream(conn: &Connection, msg: &ServerMessage) -> Result<()> {
         let (mut send, _recv) = conn.open_bi().await.context("opening control stream")?;
@@ -1838,11 +1916,11 @@ impl ProtocolHandler for ControlChannel {
 }
 
 /// Shared handle type, for call sites that want to clone-and-store the
-/// channel behind an `Arc` rather than relying on `ControlChannel`'s own
-/// `Clone` (which is cheap -- it only clones an `Arc<HoloBridge>`). Not
-/// used by `main.rs` today (it clones `ControlChannel` directly), kept as
-/// a documented convenience alias for callers that prefer an explicit
-/// `Arc` (e.g. storing it in a struct field alongside other `Arc`-wrapped
-/// daemon state).
+/// channel behind an `Arc`, rather than relying on `ControlChannel`'s own
+/// `Clone` (which is cheap: it only clones an `Arc<HoloBridge>`).
+/// `main.rs` does not use this type today; it clones `ControlChannel`
+/// directly. This type stays as a documented convenience alias for
+/// callers that prefer an explicit `Arc` (for example, storing it in a
+/// struct field alongside other `Arc`-wrapped daemon state).
 #[allow(dead_code)]
 pub type SharedControlChannel = Arc<ControlChannel>;

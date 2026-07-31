@@ -2,63 +2,101 @@
 //!
 //! ## What this is
 //!
-//! A local, append-only, JSON-Lines log at a configurable path (default
-//! `~/.holoiroh/audit.log`, resolved the same `$HOME`-join way
+//! A local, append-only, JSON-Lines log records task metadata at a
+//! configurable path. The default path is `~/.holoiroh/audit.log`.
 //! [`crate::allowlist::Allowlist::default_path`] resolves
-//! `~/.holoiroh/allowlist.json`) recording **only**: which task ran, when it
-//! started/finished, a coarse app category, a coarse action class, which
-//! inference mode served it, whether Remote View was active, whether the
-//! connection was direct or relayed, how it ended, how long it took, and how
-//! many discrete actions it took.
+//! `~/.holoiroh/allowlist.json` the same way, through a `$HOME` join.
+//!
+//! The log records **only**:
+//!
+//! - which task ran
+//! - when the task started and finished
+//! - a coarse app category
+//! - a coarse action class
+//! - which inference mode served the task
+//! - whether Remote View was active
+//! - whether the connection was direct or relayed
+//! - how the task ended
+//! - how long the task took
+//! - how many discrete actions the task took
 //!
 //! ## Why a typed struct, not a `details: String` field
 //!
-//! [`AuditEntry`] has **exactly** the ten fields the PRD names -- [`task_id`](AuditEntry::task_id),
-//! [`started_at_ms`](AuditEntry::started_at_ms)/[`completed_at_ms`](AuditEntry::completed_at_ms) (the
-//! "timings"), [`app_category`](AuditEntry::app_category), [`action_class`](AuditEntry::action_class),
-//! [`inference_mode`](AuditEntry::inference_mode), [`remote_view_state`](AuditEntry::remote_view_state),
-//! [`connection_path`](AuditEntry::connection_path), [`final_status`](AuditEntry::final_status),
-//! [`latency_ms`](AuditEntry::latency_ms), [`action_count`](AuditEntry::action_count) -- and
-//! deliberately has **no** catch-all `details: String`/`Value`/`HashMap<String, String>` field of
-//! any kind. This is not a style choice: it is what makes it *structurally impossible* for a call
-//! site to accidentally log a dictated transcript, a typed prompt, a recipient name, a video frame,
-//! a keystroke, or a `holo serve` model prompt/response -- there is no field wide enough to hold any
-//! of them. Every field is either a small enum, a `String` restricted by construction to an opaque
-//! correlation id ([`task_id`](AuditEntry::task_id), which is `control_channel`'s synthesized
-//! `request_id` -- a `uuid::Uuid::new_v4()` value, never user-supplied text), or a plain number.
-//! `#[serde(deny_unknown_fields)]` is deliberately **not** used on the way in (this type is
-//! serialize-heavy, not a deserializer for untrusted input -- see [`AuditLogger::append`]'s doc), but
-//! every field is still individually typed narrowly enough that "pass the wrong thing" is a compile
-//! error, not a runtime leak: there is no `String` parameter anywhere in this module's public API
-//! that accepts free-form text from a control-channel message.
+//! [`AuditEntry`] has **exactly** the ten fields the PRD names:
+//!
+//! - [`task_id`](AuditEntry::task_id)
+//! - [`started_at_ms`](AuditEntry::started_at_ms) and
+//!   [`completed_at_ms`](AuditEntry::completed_at_ms) (the "timings")
+//! - [`app_category`](AuditEntry::app_category)
+//! - [`action_class`](AuditEntry::action_class)
+//! - [`inference_mode`](AuditEntry::inference_mode)
+//! - [`remote_view_state`](AuditEntry::remote_view_state)
+//! - [`connection_path`](AuditEntry::connection_path)
+//! - [`final_status`](AuditEntry::final_status)
+//! - [`latency_ms`](AuditEntry::latency_ms)
+//! - [`action_count`](AuditEntry::action_count)
+//!
+//! [`AuditEntry`] deliberately has **no** catch-all `details: String`/`Value`/
+//! `HashMap<String, String>` field of any kind. This is not a style choice.
+//! This design makes it *structurally impossible* for a call site to log any
+//! of the following by accident:
+//!
+//! - a dictated transcript
+//! - a typed prompt
+//! - a recipient name
+//! - a video frame
+//! - a keystroke
+//! - a `holo serve` model prompt/response
+//!
+//! No field is wide enough to hold any of them.
+//!
+//! Every field is one of three kinds: a small enum, a `String`, or a plain
+//! number. Every `String` field is restricted by construction to an opaque
+//! correlation id. For example, [`task_id`](AuditEntry::task_id) is
+//! `control_channel`'s synthesized `request_id` -- a `uuid::Uuid::new_v4()`
+//! value, never user-supplied text.
+//!
+//! `#[serde(deny_unknown_fields)]` is deliberately **not** used on the way
+//! in. This type is serialize-heavy, not a deserializer for untrusted input
+//! -- see [`AuditLogger::append`]'s doc. Every field is still typed narrowly
+//! enough that passing "the wrong thing" is a compile error, not a runtime
+//! leak. No `String` parameter anywhere in this module's public API accepts
+//! free-form text from a control-channel message.
 //!
 //! ## Real vs. honestly-approximated fields
 //!
-//! Three of the ten fields describe daemon/session state this codebase does not yet track with full
-//! fidelity as of this writing; each is modeled as a narrow enum with only the variants this daemon
-//! can actually distinguish today, documented at its definition, rather than invented:
+//! Three of the ten fields describe daemon or session state that this
+//! codebase does not yet track with full fidelity, as of this writing.
+//! Each of the three is modeled as a narrow enum, with only the variants
+//! this daemon can actually distinguish today. Each is documented at its
+//! own definition, rather than invented:
 //!
-//! - [`AppCategory`]: this daemon routes every prompt through exactly one downstream agent
-//!   (`holo-desktop-cli`, itself capable of driving arbitrary Mac apps) -- there is no per-app
-//!   attribution signal anywhere in the control-channel/`holo_bridge` pipeline today, so the only
-//!   honest value is [`AppCategory::Desktop`] (the whole-Mac category), not a fabricated per-app
-//!   breakdown.
-//! - [`InferenceMode`]: `HoloBridge` talks to `holo serve`'s hosted A2A endpoint exclusively (see
-//!   `holo_bridge/mod.rs`'s module doc); the on-device/local model path
-//!   [`README.md`](../../../README.md)'s Tinfoil/Confidential-Cloud mention describes is a Phase
-//!   2/beta item, not built -- so only [`InferenceMode::Cloud`] is ever actually produced today.
-//! - [`RemoteViewState`]: the daemon publishes its `iroh-live` broadcast unconditionally before the
-//!   control channel is ever mounted (see `main.rs`), so at every point a control-channel connection
-//!   can exist, the broadcast is also already live -- there is no code path today where a
-//!   control-channel task runs *without* an active broadcast to observe the daemon "starting to
-//!   stream". [`RemoteViewState::Streaming`] is therefore the only value this daemon can honestly
-//!   report; the variant exists (rather than being collapsed to a bare `bool` hardcoded `true`) so a
-//!   future daemon revision that can pause/detach the broadcast independently of the control channel
-//!   has a real place to report [`RemoteViewState::Inactive`] without a wire-format change.
+//! - [`AppCategory`]: this daemon routes every prompt through exactly one
+//!   downstream agent, `holo-desktop-cli`. `holo-desktop-cli` can drive
+//!   arbitrary Mac apps. The control-channel/`holo_bridge` pipeline has no
+//!   per-app attribution signal today. The only honest value is therefore
+//!   [`AppCategory::Desktop`], the whole-Mac category, not a fabricated
+//!   per-app breakdown.
+//! - [`InferenceMode`]: `HoloBridge` talks only to `holo serve`'s hosted A2A
+//!   endpoint (see `holo_bridge/mod.rs`'s module doc). The on-device/local
+//!   model path that [`README.md`](../../../README.md) describes under
+//!   Tinfoil/Confidential-Cloud is a Phase 2/beta item, not yet built. Only
+//!   [`InferenceMode::Cloud`] is ever actually produced today.
+//! - [`RemoteViewState`]: the daemon publishes its `iroh-live` broadcast
+//!   unconditionally, before the control channel is ever mounted (see
+//!   `main.rs`). At every point a control-channel connection can exist, the
+//!   broadcast is also already live. No code path today runs a
+//!   control-channel task *without* an active broadcast to observe the
+//!   daemon "starting to stream". [`RemoteViewState::Streaming`] is
+//!   therefore the only value this daemon can honestly report. The variant
+//!   exists instead of being collapsed to a bare `bool` hardcoded to `true`.
+//!   A future daemon revision can pause or detach the broadcast
+//!   independently of the control channel. Such a revision can then report
+//!   [`RemoteViewState::Inactive`] without a wire-format change.
 //!
-//! [`ConnectionPath`] is the one of these three that *is* determined from real, live connection
-//! state rather than a fixed default -- see [`ConnectionPath::from_connection`]'s doc for the exact
-//! `iroh` API used.
+//! [`ConnectionPath`] is the one of these three that *is* determined from
+//! real, live connection state, rather than from a fixed default. See
+//! [`ConnectionPath::from_connection`]'s doc for the exact `iroh` API used.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -74,9 +112,10 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppCategory {
-    /// The only category this daemon can currently attribute: `holo-desktop-cli` drives the whole
-    /// Mac desktop (mouse/keyboard/app control) as a single undifferentiated surface, with no
-    /// per-app breakdown surfaced back to this daemon.
+    /// The only category this daemon can currently attribute: `holo-desktop-cli`
+    /// drives the whole Mac desktop (mouse/keyboard/app control) as a single
+    /// undifferentiated surface. `holo-desktop-cli` does not surface any per-app
+    /// breakdown back to this daemon.
     Desktop,
 }
 
@@ -91,13 +130,15 @@ pub enum ActionClass {
     Prompt,
     /// Started by a [`crate::control_channel::ClientMessage::VoiceTranscript`].
     VoiceTranscript,
-    /// Started by a [`crate::control_channel::ClientMessage::Stop`]. Not currently produced by
-    /// `control_channel.rs` (a `Stop` message has no `Done`-shaped terminal event of its own to
-    /// close an audit entry on -- see `control_channel::audit_on_control_event`'s doc for why
-    /// only `Prompt`/`VoiceTranscript` get a start record today), but kept as a real variant
-    /// (matching this crate's existing not-yet-called-but-real-API convention, e.g.
-    /// `allowlist::Allowlist::remove_entry`) rather than omitted, since a future revision that
-    /// audits stop requests as their own task lifecycle would need exactly this variant.
+    /// Started by a [`crate::control_channel::ClientMessage::Stop`]. `control_channel.rs`
+    /// does not produce this variant today. A `Stop` message has no
+    /// `Done`-shaped terminal event of its own to close an audit entry on. See
+    /// `control_channel::audit_on_control_event`'s doc for why only
+    /// `Prompt`/`VoiceTranscript` get a start record today. This crate keeps
+    /// `Stop` as a real variant rather than omitting it, matching this crate's
+    /// existing not-yet-called-but-real-API convention (for example,
+    /// `allowlist::Allowlist::remove_entry`). A future revision that audits stop
+    /// requests as their own task lifecycle needs exactly this variant.
     #[allow(dead_code)]
     Stop,
 }
@@ -111,10 +152,12 @@ pub enum InferenceMode {
     /// H Company's hosted `holo serve` A2A backend -- the only backend `HoloBridge` talks to as of
     /// this writing (see `holo_bridge/mod.rs`'s module doc).
     Cloud,
-    /// Reserved for the not-yet-built on-device/local inference path (Project Aro PRD Phase
-    /// 2/beta, Tinfoil/Confidential Cloud). Never produced by this daemon today -- kept as a real
-    /// enum variant (not added later as a breaking wire change) so a future local-inference build
-    /// can report it without touching every existing log line's shape.
+    /// This variant is reserved for the not-yet-built on-device/local inference
+    /// path (Project Aro PRD Phase 2/beta, Tinfoil/Confidential Cloud). This
+    /// daemon never produces this variant today. This crate keeps it as a real
+    /// enum variant, not added later as a breaking wire change. A future
+    /// local-inference build can report it without touching every existing log
+    /// line's shape.
     #[allow(dead_code)]
     Local,
 }
@@ -125,8 +168,9 @@ pub enum InferenceMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteViewState {
-    /// The `iroh-live` broadcast was publishing. The only value this daemon produces today (see
-    /// module doc) -- every control-channel connection implies an already-live broadcast.
+    /// The `iroh-live` broadcast was publishing. This is the only value this
+    /// daemon produces today (see module doc). Every control-channel connection
+    /// implies an already-live broadcast.
     Streaming,
     /// Reserved for a future daemon revision that can detach/pause the broadcast independently of
     /// the control channel. Never produced today.
@@ -134,8 +178,9 @@ pub enum RemoteViewState {
     Inactive,
 }
 
-/// Whether the control-channel connection this task ran over used a direct P2P path or an `iroh`
-/// relay fallback (see `holoiroh/README.md`'s "NAT traversal" section for what these mean).
+/// Whether the control-channel connection this task ran over used a direct
+/// P2P path or an `iroh` relay fallback. See `holoiroh/README.md`'s "NAT
+/// traversal" section for what these mean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionPath {
@@ -144,10 +189,12 @@ pub enum ConnectionPath {
     /// Traffic relayed through an `iroh` relay server (direct connection could not be
     /// established -- see README's "Relay fallback when direct fails").
     Relay,
-    /// The connection's currently-selected path could not be determined at the time this was
-    /// checked (e.g. no path yet selected -- see [`Self::from_connection`]'s doc). Recorded rather
-    /// than silently defaulting to [`Self::Direct`]/[`Self::Relay`], either of which would assert a
-    /// specific path this daemon did not actually observe.
+    /// At the time of the check, this daemon did not identify the connection's
+    /// currently-selected path -- for example, no path was yet selected (see
+    /// [`Self::from_connection`]'s doc). This daemon records [`Self::Unknown`]
+    /// in that case, instead of silently defaulting to [`Self::Direct`] or
+    /// [`Self::Relay`]. A silent default to either value asserts a specific
+    /// path. This daemon did not actually observe that path.
     Unknown,
 }
 
@@ -155,14 +202,21 @@ impl ConnectionPath {
     /// Determines the connection path from a live `iroh` [`iroh::endpoint::Connection`]'s
     /// currently-selected network path.
     ///
-    /// Real `iroh` 1.0.2 API, not guessed: [`iroh::endpoint::Connection::paths`] returns a
-    /// [`iroh::endpoint::PathList`] snapshot of the connection's currently-open network paths (per
-    /// that method's own doc: "A connection typically has one path via the relay server and, once
-    /// holepunching succeeds, a direct path"); each [`iroh::endpoint::connection::Path`] in that
-    /// list exposes both `is_selected()` (the path traffic is currently sent over) and `is_relay()`
-    /// (delegates to `iroh_base::TransportAddr::is_relay()`). This finds the selected path and maps
-    /// it to [`Self::Direct`]/[`Self::Relay`]; [`Self::Unknown`] covers the (normally momentary)
-    /// window where no path is yet marked selected.
+    /// Real `iroh` 1.0.2 API, not guessed. [`iroh::endpoint::Connection::paths`]
+    /// returns a [`iroh::endpoint::PathList`] snapshot of the connection's
+    /// currently-open network paths. Per that method's own doc: "A connection
+    /// typically has one path via the relay server and, once holepunching
+    /// succeeds, a direct path."
+    ///
+    /// Each [`iroh::endpoint::connection::Path`] in that list exposes two
+    /// methods:
+    ///
+    /// - `is_selected()`: the path traffic is currently sent over
+    /// - `is_relay()`: delegates to `iroh_base::TransportAddr::is_relay()`
+    ///
+    /// This function finds the selected path and maps it to [`Self::Direct`] or
+    /// [`Self::Relay`]. [`Self::Unknown`] covers the window, normally
+    /// momentary, where no path is yet marked selected.
     pub fn from_connection(connection: &iroh::endpoint::Connection) -> Self {
         match connection.paths().iter().find(|p| p.is_selected()) {
             Some(path) if path.is_relay() => ConnectionPath::Relay,
@@ -197,11 +251,13 @@ impl From<crate::holo_bridge::control::DoneStatus> for FinalStatus {
 
 /// One append-only audit log record for a single completed control-channel task.
 ///
-/// See this module's doc comment for the full "why exactly these fields, why no catch-all" design
-/// rationale. `Serialize`-only (no `Deserialize`): this daemon never needs to parse its own audit
-/// log back out of the wire it writes into -- [`examples/audit_log_probe.rs`](../../examples/audit_log_probe.rs)
-/// reads it back as a `serde_json::Value` purely to inspect field presence/absence, not to
-/// reconstruct an `AuditEntry`.
+/// See this module's doc comment for the full "why exactly these fields,
+/// why no catch-all" design rationale. This type is `Serialize`-only. It has
+/// no `Deserialize`. This daemon never needs to parse its own audit log
+/// back out of the wire it writes into.
+/// [`examples/audit_log_probe.rs`](../../examples/audit_log_probe.rs) reads
+/// the log back as a `serde_json::Value`, purely to inspect field
+/// presence/absence. That probe does not reconstruct an `AuditEntry`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
     /// Opaque correlation id for this task -- `control_channel`'s synthesized `request_id`
@@ -243,17 +299,21 @@ pub enum CloudEgressCapability {
 /// One record of data leaving the device to Tinfoil's confidential-computing cloud
 /// (`tinfoil_documents`/`tinfoil_vision`/`tinfoil_audio`/`tinfoil_planner`).
 ///
-/// A **sibling** to [`AuditEntry`], not a repurposing of it: `AuditEntry` is a closed 10-field
-/// schema purpose-built for `holo-desktop-cli` task lifecycle (see this module's doc on why it
-/// has no catch-all field), and none of its fields (`app_category`, `inference_mode`,
-/// `remote_view_state`, `action_count`, ...) have a meaningful value for "a document was
-/// uploaded" -- forcing this event shape into that one would mean inventing fake values for
-/// fields that don't apply, which is the exact "no fabricated per-app breakdown" failure mode
-/// this module's own doc already rejects for `AppCategory`. This type follows the identical
-/// design discipline instead: exactly the fields that describe *what left the device and
-/// whether it succeeded*, deliberately no `details`/`text`/`Value` catch-all, so it is
-/// structurally impossible for a call site to log a document's content, an image, a transcript,
-/// or a plan's text here.
+/// A **sibling** to [`AuditEntry`], not a repurposing of it. `AuditEntry` is
+/// a closed 10-field schema, purpose-built for `holo-desktop-cli` task
+/// lifecycle (see this module's doc on why it has no catch-all field). None
+/// of its fields -- `app_category`, `inference_mode`, `remote_view_state`,
+/// `action_count`, and so on -- have a meaningful value for "a document was
+/// uploaded". Forcing this event shape into `AuditEntry` means inventing
+/// fake values for fields that don't apply. That is the exact "no
+/// fabricated per-app breakdown" failure mode this module's own doc already
+/// rejects for `AppCategory`.
+///
+/// This type follows the identical design discipline instead: exactly the
+/// fields that describe *what left the device and whether it succeeded*,
+/// with deliberately no `details`/`text`/`Value` catch-all. Because of this
+/// design, it is structurally impossible for a call site to log a
+/// document's content, an image, a transcript, or a plan's text here.
 #[derive(Debug, Clone, Serialize)]
 pub struct CloudEgressEntry {
     /// Opaque correlation id -- the wire `request_id` the client supplied, never user-supplied
@@ -270,44 +330,56 @@ pub struct CloudEgressEntry {
 
 /// Metadata-only, append-only audit logger.
 ///
-/// Writes one [`AuditEntry`] per line as JSON (JSON Lines / NDJSON, matching
-/// `control_channel`'s own newline-delimited wire framing convention) to a file at a configurable
-/// path -- default [`AuditLogger::default_path`], `~/.holoiroh/audit.log`.
+/// Writes one [`AuditEntry`] per line as JSON (JSON Lines / NDJSON). This
+/// format matches `control_channel`'s own newline-delimited wire framing
+/// convention. The logger writes to a file at a configurable path -- the
+/// default is [`AuditLogger::default_path`], `~/.holoiroh/audit.log`.
 ///
 /// ## Concurrency model
 ///
-/// `append` opens the file in append mode (`OpenOptions::append(true)`, i.e. `O_APPEND` on macOS)
-/// and writes+flushes synchronously on every call, rather than funneling writes through an
-/// `mpsc`-fed background task. This matches `control_channel.rs`'s own documented concurrency
-/// model: "this daemon supports exactly one concurrent control-channel connection today" (see
-/// `ControlChannel::accept`'s doc comment on `events_tx`), so there is exactly one call site
-/// (`ControlChannel::accept`'s per-connection loop, itself single-threaded per connection) that
-/// will ever call `append` at a time in practice. `O_APPEND` writes are also atomic at the OS level
-/// for writes below the platform pipe/block-size limit (single audit lines are always far under
-/// this), so even a hypothetical future second concurrent connection could not interleave partial
-/// lines. A background-task/`mpsc` design was considered (see PRD row `audit-logger-append-impl`)
-/// and rejected as unneeded complexity for a single-writer daemon; if a future revision adds real
-/// multi-connection support, revisit this alongside the same `events_tx`-per-connection redesign
-/// `control_channel.rs`'s own doc comment already flags as needed at that point.
+/// `append` opens the file in append mode: `OpenOptions::append(true)`, i.e.
+/// `O_APPEND` on macOS. `append` writes and flushes synchronously on every
+/// call, instead of funneling writes through an `mpsc`-fed background task.
+/// This matches `control_channel.rs`'s own documented concurrency model:
+/// "this daemon supports exactly one concurrent control-channel connection
+/// today" (see `ControlChannel::accept`'s doc comment on `events_tx`).
+/// Because of that model, exactly one call site --
+/// `ControlChannel::accept`'s per-connection loop, itself single-threaded
+/// per connection -- ever calls `append` at a time in practice.
+///
+/// `O_APPEND` writes are also atomic at the OS level, for writes below the
+/// platform pipe/block-size limit. Single audit lines are always far under
+/// this limit. So even a hypothetical future second concurrent connection
+/// cannot interleave partial lines.
+///
+/// This module's design rejects a background-task/`mpsc` alternative (see
+/// PRD row `audit-logger-append-impl`) as unneeded complexity for a
+/// single-writer daemon. If a future revision adds real multi-connection
+/// support, revisit this decision alongside the same
+/// `events_tx`-per-connection redesign that `control_channel.rs`'s own doc
+/// comment already flags as needed at that point.
 #[derive(Debug, Clone)]
 pub struct AuditLogger {
     path: PathBuf,
 }
 
 impl AuditLogger {
-    /// Default location: `~/.holoiroh/audit.log`. Resolved via `$HOME` the same way
-    /// [`crate::allowlist::Allowlist::default_path`] resolves `~/.holoiroh/allowlist.json` -- this
-    /// daemon is macOS-only, where `$HOME` is always set for an interactive login/launchd session.
+    /// Default location: `~/.holoiroh/audit.log`. This path is resolved via
+    /// `$HOME`, the same way [`crate::allowlist::Allowlist::default_path`]
+    /// resolves `~/.holoiroh/allowlist.json`. This daemon is macOS-only, where
+    /// `$HOME` is always set for an interactive login or launchd session.
     pub fn default_path() -> Result<PathBuf> {
         let home = std::env::var_os("HOME")
             .context("HOME environment variable is not set (required to locate ~/.holoiroh/)")?;
         Ok(PathBuf::from(home).join(".holoiroh").join("audit.log"))
     }
 
-    /// Resolves the audit log path from the `HOLOIROH_AUDIT_LOG_PATH` environment variable if set,
-    /// falling back to [`Self::default_path`] otherwise -- the "configurable path" the PRD names,
-    /// following the same env-var-overrides-a-default convention `main.rs`'s `holo_bin()`/
-    /// `holo_serve_port()` already use for `HOLOIROH_HOLO_BIN`/`HOLOIROH_HOLO_PORT`.
+    /// Resolves the audit log path from the `HOLOIROH_AUDIT_LOG_PATH`
+    /// environment variable, if that variable is set. Falls back to
+    /// [`Self::default_path`] otherwise. This is the "configurable path" the
+    /// PRD names. It follows the same env-var-overrides-a-default convention
+    /// that `main.rs`'s `holo_bin()`/`holo_serve_port()` already use for
+    /// `HOLOIROH_HOLO_BIN`/`HOLOIROH_HOLO_PORT`.
     pub fn resolve_path() -> Result<PathBuf> {
         match std::env::var_os("HOLOIROH_AUDIT_LOG_PATH") {
             Some(path) => Ok(PathBuf::from(path)),
@@ -315,13 +387,16 @@ impl AuditLogger {
         }
     }
 
-    /// Constructs a logger writing to `path` directly, without touching env vars or `$HOME` --
-    /// the constructor a caller with an already-resolved/overridden path (tests, probes, a future
-    /// CLI flag) should use. Creates the parent directory (`~/.holoiroh/` for the default path) if
-    /// it doesn't exist yet, matching [`crate::allowlist::Allowlist::save`]'s
-    /// `create_dir_all`-on-write pattern -- done eagerly here (at construction) rather than lazily
-    /// on first `append`, so a permissions/disk problem is discovered at daemon startup, not
-    /// silently on the first real task.
+    /// Constructs a logger that writes to `path` directly, without touching env
+    /// vars or `$HOME`. A caller with an already-resolved or overridden path --
+    /// tests, probes, or a future CLI flag -- should use this constructor.
+    ///
+    /// This constructor creates the parent directory (`~/.holoiroh/` for the
+    /// default path) if it doesn't exist yet. This matches
+    /// [`crate::allowlist::Allowlist::save`]'s `create_dir_all`-on-write
+    /// pattern. It creates the directory eagerly, at construction, rather than
+    /// lazily on first `append`. This way, a permissions or disk problem is
+    /// discovered at daemon startup, not silently on the first real task.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
@@ -331,8 +406,8 @@ impl AuditLogger {
         Ok(Self { path })
     }
 
-    /// Convenience wrapper: [`Self::resolve_path`] then [`Self::new`]. The constructor `main.rs`
-    /// calls at daemon startup.
+    /// Convenience wrapper: calls [`Self::resolve_path`] then [`Self::new`].
+    /// This is the constructor that `main.rs` calls at daemon startup.
     pub fn from_env() -> Result<Self> {
         Self::new(Self::resolve_path()?)
     }
@@ -342,22 +417,28 @@ impl AuditLogger {
         &self.path
     }
 
-    /// Appends `entry` to the log file as one JSON line, opening the file in true append mode
-    /// (`OpenOptions::append(true)`, never truncating existing history) and flushing before
-    /// returning, so a crash immediately after `append` returns `Ok` cannot lose the line to an
-    /// OS-level write buffer.
+    /// Appends `entry` to the log file as one JSON line. This method opens the
+    /// file in true append mode: `OpenOptions::append(true)`, which never
+    /// truncates existing history. This method flushes the file before
+    /// returning. Because of the flush, a crash immediately after `append`
+    /// returns `Ok` cannot lose the line to an OS-level write buffer.
     ///
-    /// Returns `Err` on any I/O failure (serialize failure is not expected -- every [`AuditEntry`]
-    /// field is a plain enum/number/opaque-id `String`, none of which can fail to serialize as
-    /// JSON) rather than silently dropping the entry; see [`Self::append`]'s callers in
-    /// `control_channel.rs` for how a write failure is handled without tearing down the in-flight
-    /// control-channel turn that produced it (logged as a warning, not propagated -- matching
-    /// `holo_bridge`'s own best-effort/degrade-don't-crash posture).
-    /// Generic over `T: Serialize` so both [`AuditEntry`] (task lifecycle) and
-    /// [`CloudEgressEntry`] (Tinfoil cloud-egress) share this one write path -- the body below
-    /// was never actually specific to `AuditEntry`'s shape (it only serializes+appends+flushes),
-    /// so widening the bound is a pure generalization, not a behavior change for existing
-    /// `AuditEntry` call sites.
+    /// Returns `Err` on any I/O failure, rather than silently dropping the
+    /// entry. A serialize failure is not expected. Every [`AuditEntry`] field
+    /// is a plain enum, number, or opaque-id `String`. None of these types can
+    /// fail to serialize as JSON. See [`Self::append`]'s callers in
+    /// `control_channel.rs` for how a write failure is handled without tearing
+    /// down the in-flight control-channel turn that produced it. A write
+    /// failure is logged as a warning, not propagated, matching
+    /// `holo_bridge`'s own best-effort/degrade-don't-crash posture.
+    ///
+    /// This method is generic over `T: Serialize`. Because of this, both
+    /// [`AuditEntry`] (task lifecycle) and [`CloudEgressEntry`] (Tinfoil
+    /// cloud-egress) share this one write path. The method body was never
+    /// actually specific to `AuditEntry`'s shape -- it only serializes,
+    /// appends, and flushes. Widening the bound is therefore a pure
+    /// generalization, not a behavior change for existing `AuditEntry` call
+    /// sites.
     pub fn append<T: Serialize>(&self, entry: &T) -> Result<()> {
         let mut line = serde_json::to_string(entry).context("serializing audit log entry")?;
         line.push('\n');
@@ -374,10 +455,11 @@ impl AuditLogger {
     }
 }
 
-/// Current Unix epoch time in milliseconds, clamped to `0` on a pre-epoch system clock (matching
-/// `allowlist.rs::Allowlist::add_entry`'s own `unwrap_or(0)` fallback for the same
-/// `SystemTime::now().duration_since(UNIX_EPOCH)` call, which can only fail if the system clock is
-/// set before 1970).
+/// Current Unix epoch time in milliseconds, clamped to `0` on a pre-epoch
+/// system clock. This matches `allowlist.rs::Allowlist::add_entry`'s own
+/// `unwrap_or(0)` fallback for the same
+/// `SystemTime::now().duration_since(UNIX_EPOCH)` call. That call can only
+/// fail if the system clock is set before 1970.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -3096,6 +3096,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "holoiroh-wire-wasm-demo"
+version = "0.1.0"
+dependencies = [
+ "holoiroh-wire",
+ "serde_json",
+]
+
+[[package]]
 name = "home"
 version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

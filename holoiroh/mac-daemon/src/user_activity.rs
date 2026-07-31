@@ -1,28 +1,31 @@
-//! Physical user-input activity tracking, for cooperative auto-yield (see
-//! `crate::auto_yield`): the agent shares the user's Mac, so the daemon must
-//! know when the *human* is actively using the mouse/keyboard in order to step
-//! aside (pause) and resume once they go idle.
+//! This module tracks physical user-input activity for cooperative auto-yield
+//! (see `crate::auto_yield`). The agent shares the user's Mac with a human.
+//! The daemon must know when the human actively uses the mouse or keyboard.
+//! The daemon then pauses. The daemon resumes once the human goes idle.
 //!
 //! ## Why a CGEventTap, and not an idle timer
 //!
-//! The obvious primitive -- "seconds since last input" via `ioreg
-//! IOHIDSystem HIDIdleTime` or `CGEventSourceSecondsSinceLastEventType` -- is
-//! **reset by the agent's own synthetic events**, witnessed this session:
-//! posting synthetic `CGEvent`s dropped `HIDIdleTime` 173s->0.04s and the CG
-//! per-type idle 30s->0.02s. So no idle timer can tell the user's input apart
-//! from the agent's clicks; auto-yield keyed off one would fire on the agent's
-//! own actions.
+//! The obvious primitive is "seconds since last input", via `ioreg
+//! IOHIDSystem HIDIdleTime` or `CGEventSourceSecondsSinceLastEventType`. The
+//! agent's own synthetic events reset this primitive. This session witnessed
+//! the reset directly: posting synthetic `CGEvent`s dropped `HIDIdleTime`
+//! from 173s to 0.04s. The same synthetic events dropped the CG per-type idle
+//! value from 30s to 0.02s. So an idle timer cannot tell the user's input
+//! apart from the agent's clicks. Auto-yield keyed off an idle timer fires on
+//! the agent's own actions.
 //!
-//! A `CGEventTap` can: every event carries `kCGEventSourceUnixProcessID`, which
-//! is `0` for real hardware input and the *injecting process's pid* for a
-//! software-posted (synthetic) event (witnessed: synthetic mouse-moves tapped
-//! with `sourcePID == <our pid>`). So we tap all input events and record the
-//! timestamp only for `sourcePID == 0` -- the physical human -- ignoring the
-//! agent entirely.
+//! A `CGEventTap` can tell human input apart from agent input. Every event
+//! carries `kCGEventSourceUnixProcessID`. This field is `0` for real hardware
+//! input. For a software-posted (synthetic) event, this field holds the
+//! injecting process's pid (witnessed: synthetic mouse-moves tapped with
+//! `sourcePID == <our pid>`). So this module taps all input events. This
+//! module records the timestamp only for `sourcePID == 0`, the physical
+//! human. This module ignores the agent entirely.
 //!
-//! The tap needs Accessibility / Input-Monitoring permission; if `tap_create`
-//! returns `None` (not granted), this module reports *unavailable* and
-//! `crate::auto_yield` disables itself gracefully rather than misbehaving.
+//! The tap needs Accessibility or Input-Monitoring permission. If
+//! `tap_create` returns `None` (permission not granted), this module reports
+//! itself as unavailable. `crate::auto_yield` then disables itself
+//! gracefully instead of misbehaving.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -36,26 +39,31 @@ use objc2_core_graphics::{
     CGEventTapProxy, CGEventType,
 };
 
-/// Milliseconds (since `START`) at which the last PHYSICAL input event was seen.
+/// This field stores the milliseconds since `START` when the module last saw
+/// a physical input event.
 static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
-/// True once a tap has been successfully created and is delivering events.
+/// This flag becomes true once the daemon creates the tap and the tap
+/// delivers events.
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
-/// True once `start()` has spawned the tap thread (idempotency guard).
+/// This flag becomes true once `start()` spawns the tap thread. The flag acts
+/// as an idempotency guard for `start()`.
 static STARTED: AtomicBool = AtomicBool::new(false);
-/// Monotonic base so `LAST_INPUT_MS` is a small, comparable millisecond count.
+/// This value is the monotonic base that keeps `LAST_INPUT_MS` a small,
+/// comparable millisecond count.
 static START: OnceLock<Instant> = OnceLock::new();
-/// Borrowed pointer to the live tap's `CFMachPort` (owned for the process life
-/// on the tap thread), so the callback can re-enable the tap if the OS disables
-/// it. Null until the tap is created.
+/// This is a borrowed pointer to the live tap's `CFMachPort`. The tap thread
+/// owns this pointer for the life of the process. The callback uses this
+/// pointer to re-enable the tap if the OS disables the tap. This pointer is
+/// null until the tap exists.
 static TAP_PORT: AtomicPtr<CFMachPort> = AtomicPtr::new(std::ptr::null_mut());
 
 fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-/// The tap callback: fires for every input event. Records a fresh timestamp only
-/// for physical input (`kCGEventSourceUnixProcessID == 0`), and re-enables the
-/// tap if the system ever disables it.
+/// This is the tap callback. It fires for every input event. It records a
+/// fresh timestamp only for physical input (`kCGEventSourceUnixProcessID ==
+/// 0`). It re-enables the tap if the system disables the tap.
 unsafe extern "C-unwind" fn tap_callback(
     _proxy: CGEventTapProxy,
     event_type: CGEventType,
@@ -90,9 +98,13 @@ unsafe extern "C-unwind" fn tap_callback(
     event.as_ptr()
 }
 
-/// The set of input event types we care about, as a `CGEventMask` bitfield
-/// (`1 << CGEventType` per type): mouse move/drag/up/down (all buttons),
-/// key up/down, modifier changes, and scroll.
+/// This function returns the input event types this module cares about, as
+/// a `CGEventMask` bitfield (one bit per type, `1 << CGEventType`). The
+/// types are:
+/// - mouse move, drag, up, and down, for all buttons
+/// - key up and key down
+/// - modifier changes
+/// - scroll
 fn input_event_mask() -> CGEventMask {
     // Raw CGEventType values (stable ABI constants): left/right/other mouse
     // down(1,3,25)/up(2,4,26)/dragged(6,7,27), mouseMoved(5), keyDown(10),
@@ -105,11 +117,12 @@ fn input_event_mask() -> CGEventMask {
     mask as CGEventMask
 }
 
-/// Start the physical-input tap on a dedicated CFRunLoop thread. Idempotent:
-/// only the first call spawns the thread. Non-blocking; the thread runs for the
-/// life of the process. If the tap cannot be created (no Accessibility /
-/// Input-Monitoring permission), the thread exits and [`is_available`] stays
-/// `false` so `crate::auto_yield` disables itself.
+/// Start the physical-input tap on a dedicated `CFRunLoop` thread.
+/// This function is idempotent. Only the first call spawns the thread.
+/// This function does not block. The thread runs for the life of the process.
+/// If the daemon lacks Accessibility or Input-Monitoring permission, the tap
+/// cannot be created. In that case, the thread exits. [`is_available`] then
+/// stays `false`. `crate::auto_yield` disables itself as a result.
 pub fn start() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -171,15 +184,17 @@ pub fn start() {
         .expect("spawn user-activity tap thread");
 }
 
-/// Whether the tap is live (permission granted + delivering events).
+/// Reports whether the tap is live. The tap is live when the daemon holds
+/// permission and delivers events.
 pub fn is_available() -> bool {
     AVAILABLE.load(Ordering::SeqCst)
 }
 
-/// Seconds since the last PHYSICAL user input, or `None` if the tap is
-/// unavailable (no permission) -- in which case auto-yield must disable itself
-/// rather than guess. A freshly-started monitor reports ~0 until real input,
-/// which harmlessly makes the very first poll treat the user as "just active".
+/// Returns the seconds since the last PHYSICAL user input.
+/// If the tap is unavailable (no permission granted), this function returns
+/// `None`. In that case, auto-yield must disable itself instead of guessing.
+/// A freshly-started monitor reports ~0 seconds until real input arrives.
+/// This harmlessly makes the first poll treat the user as "just active".
 pub fn seconds_since_user_input() -> Option<f64> {
     // Test seam: physical input cannot be injected synthetically (that is the
     // whole point of the source-PID classifier), so to witness the auto-yield
@@ -199,8 +214,10 @@ pub fn seconds_since_user_input() -> Option<f64> {
     Some((now.saturating_sub(last)) as f64 / 1000.0)
 }
 
-/// Reads the debug idle override file, if `HOLOIROH_AUTO_YIELD_FORCE_IDLE_FILE`
-/// is set and the file parses to a number. Returns `None` in normal operation.
+/// Reads the debug idle override file.
+/// This override applies only when `HOLOIROH_AUTO_YIELD_FORCE_IDLE_FILE` is
+/// set. The override also requires the file content to parse as a number.
+/// This function returns `None` during normal operation.
 fn forced_idle_override() -> Option<f64> {
     let path = std::env::var("HOLOIROH_AUTO_YIELD_FORCE_IDLE_FILE").ok()?;
     let raw = std::fs::read_to_string(path).ok()?;

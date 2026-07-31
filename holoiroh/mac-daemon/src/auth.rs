@@ -1,34 +1,34 @@
-//! Startup check for an existing Holo auth token.
+//! This is the startup check for an existing Holo auth token.
 //!
 //! `holo-desktop-cli` (the `holo` CLI) stores its auth token at
-//! `~/.holo/.env` as a `HAI_API_KEY=...` line, written by `holo login`
-//! (browser sign-in flow against portal.hcompany.ai). This daemon shells
-//! out to `holo serve` (see `crate::holo_serve`) and therefore depends on
-//! that login having already happened -- if it hasn't, `holo serve` would
-//! itself fail confusingly (or worse, partially start) rather than giving
-//! the user a clear "you forgot a step" message. We check for the token
-//! file ourselves, up front, so the daemon never proceeds into that
-//! broken state.
+//! `~/.holo/.env`, as a `HAI_API_KEY=...` line. `holo login` writes this
+//! line, through a browser sign-in flow against portal.hcompany.ai. This
+//! daemon shells out to `holo serve` (see `crate::holo_serve`). This daemon
+//! therefore depends on that login happening first. If the user has not
+//! logged in, `holo serve` fails confusingly. In some cases, `holo serve`
+//! partially starts instead. Either way, the user does not see a clear "you
+//! forgot a step" message. This module checks for the token file first, so
+//! the daemon never proceeds into that broken state.
 
 use std::fmt;
 use std::path::PathBuf;
 
-/// Why the Holo auth token check failed.
+/// This enum lists why the Holo auth token check failed.
 #[derive(Debug)]
 pub enum AuthCheckError {
-    /// `$HOME` is unset/empty in this process's environment -- can't even
-    /// compute where `~/.holo/.env` would live.
+    /// `$HOME` is unset or empty in this process's environment. The daemon
+    /// cannot compute where `~/.holo/.env` lives.
     NoHomeDir,
-    /// `~/.holo/.env` does not exist at all -- the user has never run
-    /// `holo login`.
+    /// `~/.holo/.env` does not exist. The user never ran `holo login`.
     MissingTokenFile { path: PathBuf },
-    /// `~/.holo/.env` exists but could not be read (permissions, I/O
-    /// error, etc.) -- distinct from "missing" so the instruction can be
-    /// accurate.
+    /// `~/.holo/.env` exists, but the daemon could not read it (a
+    /// permissions error or I/O error, for example). This case is distinct
+    /// from "missing", so the remediation message stays accurate.
     UnreadableTokenFile { path: PathBuf, source: std::io::Error },
-    /// `~/.holo/.env` exists and was readable, but is empty or does not
-    /// contain a `HAI_API_KEY=` line -- login was started but never
-    /// completed, or the file was truncated/corrupted.
+    /// `~/.holo/.env` exists and the daemon can read it. The file is empty,
+    /// or the file does not contain a `HAI_API_KEY=` line. Either the login
+    /// started but never finished, or the file became truncated or
+    /// corrupted.
     MissingApiKey { path: PathBuf },
     /// `~/.holo/.env` has a `HAI_API_KEY=` line but the value after `=` is
     /// empty.
@@ -73,29 +73,32 @@ impl fmt::Display for AuthCheckError {
 impl std::error::Error for AuthCheckError {}
 
 impl AuthCheckError {
-    /// User-facing remediation text. Always points at the exact command
-    /// to run, never a generic "check your setup" message.
+    /// This is the user-facing remediation text. This function always
+    /// points at the exact command to run. This function never returns a
+    /// generic "check your setup" message.
     pub fn remediation(&self) -> &'static str {
         "Run 'holo login' first, then try again."
     }
 }
 
-/// A successfully-located, non-empty Holo API key. The value itself is
-/// intentionally not exposed via `Debug`/`Display` so it doesn't end up in
-/// logs by accident.
+/// This struct holds a successfully-located, non-empty Holo API key. This
+/// struct deliberately does not expose the value via `Debug` or `Display`.
+/// This prevents the value from ending up in logs by accident.
 pub struct HoloToken {
     api_key: String,
     path: PathBuf,
 }
 
 impl HoloToken {
-    /// The resolved key value. Not yet called from `main.rs` (`holo serve` inherits
-    /// `HAI_API_KEY` from the parent process's environment directly -- see
-    /// `holo_bridge::process` and this crate's `Cargo.toml` comment on `dotenvy` -- so nothing
-    /// today needs the parsed value threaded through explicitly). Kept as the natural accessor
-    /// a future caller that must pass the key explicitly (rather than relying on inherited env)
-    /// would need, same status as the `#[allow(dead_code)]` convenience methods in
-    /// `allowlist.rs`.
+    /// This function returns the resolved key value. No code calls this
+    /// function yet from `main.rs`. `holo serve` inherits `HAI_API_KEY`
+    /// directly from the parent process's environment (see
+    /// `holo_bridge::process` and this crate's `Cargo.toml` comment on
+    /// `dotenvy`). So nothing today needs the parsed value threaded through
+    /// explicitly. This function stays as the natural accessor for a future
+    /// caller that must pass the key explicitly, instead of relying on
+    /// inherited env. This function has the same status as the
+    /// `#[allow(dead_code)]` convenience methods in `allowlist.rs`.
     #[allow(dead_code)]
     pub fn api_key(&self) -> &str {
         &self.api_key
@@ -122,16 +125,21 @@ fn token_file_path(home: &std::path::Path) -> PathBuf {
 
 /// Parse a `HAI_API_KEY=...` line out of `.env`-style file contents.
 ///
-/// Deliberately minimal: this is a single-purpose reader for the one key
-/// this daemon needs, not a general `.env` parser. Handles the common
-/// `.env` conventions this file is documented to use: `KEY=value` lines,
-/// optional surrounding whitespace, `#`-prefixed comment lines, and
-/// optional matching single/double quotes around the value.
+/// This function is deliberately minimal. This function is a single-purpose
+/// reader for the one key this daemon needs. This function is not a general
+/// `.env` parser. This function handles the common `.env` conventions this
+/// file is documented to use:
+/// - `KEY=value` lines
+/// - optional surrounding whitespace
+/// - `#`-prefixed comment lines
+/// - optional matching single or double quotes around the value
 ///
-/// `pub` (rather than private) so `examples/auth_probe.rs` -- a real,
-/// run-by-hand live witness for this parsing logic (see this repo's
-/// no-unit-tests rule) -- can call the actual function instead of a
-/// reimplemented copy of it.
+/// This function is `pub`, rather than private. This visibility lets
+/// `examples/auth_probe.rs` call the actual function directly.
+/// `examples/auth_probe.rs` is a real, run-by-hand live witness for this
+/// parsing logic (see this repo's no-unit-tests rule). This visibility
+/// avoids a reimplemented copy of the function inside
+/// `examples/auth_probe.rs`.
 pub fn extract_api_key(contents: &str) -> Option<String> {
     for line in contents.lines() {
         let line = line.trim();
@@ -155,19 +163,21 @@ pub fn extract_api_key(contents: &str) -> Option<String> {
     None
 }
 
-/// Check for an existing Holo auth token, in the same precedence order
-/// `holo-desktop-cli` itself documents: a local `.env` (already loaded into
-/// process env by `main.rs`'s `dotenvy::dotenv()` call before this runs),
-/// then `~/.holo/.env` (written by `holo login`'s browser-OAuth flow), then
-/// a bare already-exported process env var (covered by the same process-env
-/// check as the first case, since `dotenvy` only ever *adds* to it).
+/// Check for an existing Holo auth token. This function checks in the same
+/// precedence order that `holo-desktop-cli` itself documents:
+/// 1. a local `.env` (already loaded into process env by `main.rs`'s
+///    `dotenvy::dotenv()` call, before this function runs)
+/// 2. `~/.holo/.env` (written by `holo login`'s browser-OAuth flow)
+/// 3. a bare, already-exported process env var (covered by the same
+///    process-env check as the first case, since `dotenvy` only ever adds
+///    to the environment)
 ///
-/// This is the startup gate: call it before doing anything else (spawning
-/// `holo serve`, touching the network, checking permissions). On success,
-/// returns the parsed token. On failure, the caller should print
-/// `error` + `error.remediation()` to stderr and exit non-zero -- never
-/// proceed into a broken state where `holo serve` is spawned without a
-/// valid token behind it.
+/// This function is the startup gate. Call this function before doing
+/// anything else. Call it before spawning `holo serve`, before touching the
+/// network, and before checking permissions. Never let `holo serve` run
+/// without a valid token behind it. On success, this function returns the
+/// parsed token. On failure, the caller must print `error` and
+/// `error.remediation()` to stderr, then exit non-zero.
 pub fn check_holo_token() -> Result<HoloToken, AuthCheckError> {
     if let Ok(api_key) = std::env::var("HAI_API_KEY") {
         if !api_key.is_empty() {
@@ -180,8 +190,9 @@ pub fn check_holo_token() -> Result<HoloToken, AuthCheckError> {
     check_holo_token_in(&home_dir().ok_or(AuthCheckError::NoHomeDir)?)
 }
 
-/// Same as [`check_holo_token`] but with an explicit home directory --
-/// the seam that makes this testable without mutating the real `$HOME`.
+/// This function behaves the same as [`check_holo_token`], but takes an
+/// explicit home directory. This parameter is the seam that makes this
+/// function testable without mutating the real `$HOME`.
 pub fn check_holo_token_in(home: &std::path::Path) -> Result<HoloToken, AuthCheckError> {
     let path = token_file_path(home);
 
@@ -202,10 +213,11 @@ pub fn check_holo_token_in(home: &std::path::Path) -> Result<HoloToken, AuthChec
     }
 }
 
-/// Resolve the current user's home directory the same way
-/// `holo-desktop-cli`'s own `~/.holo/.env` convention implies: `$HOME` on
-/// Unix. This daemon is macOS-only, so `$HOME` is authoritative here (no
-/// extra crate dependency needed for a single env var read).
+/// Resolve the current user's home directory. This function uses the same
+/// convention that `holo-desktop-cli`'s own `~/.holo/.env` path implies:
+/// `$HOME` on Unix. This daemon is macOS-only, so `$HOME` is authoritative
+/// here. This function needs no extra crate dependency for a single env var
+/// read.
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|v| !v.is_empty())

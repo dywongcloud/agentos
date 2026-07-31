@@ -1,6 +1,6 @@
 //! Local app registry (Project Aro PRD §8, "target-resolution pipeline",
-//! row P0-4): a user-editable mapping from spoken destination aliases to
-//! **deterministic launch routes**, plus alias resolution and the
+//! row P0-4). A user-editable mapping from spoken destination aliases to
+//! **deterministic launch routes**. It provides alias resolution and the
 //! deterministic-launch step that runs *before* any visual automation.
 //!
 //! ## Where this sits in PRD §8's pipeline
@@ -10,68 +10,79 @@
 //!
 //! 1. Take the spoken destination (e.g. "open Slack", "go to Slack").
 //! 2. Resolve it against this registry ([`Registry::resolve`]).
-//! 3. If exactly one [`RegistryEntry`] matches, that is the target -- no
-//!    guessing, no vision. If several match, the PRD is explicit that the
-//!    system must **ask the user which one** (a `ambiguous_choice`
-//!    `input_request`, see `PROTOCOL.md`), never silently pick one; this
-//!    module surfaces that as [`Resolution::Ambiguous`] carrying every
-//!    candidate so the caller can build that choice prompt. If none match,
-//!    [`Resolution::NotFound`].
+//! 3. Resolution has three possible outcomes:
+//!    - Exactly one [`RegistryEntry`] matches: that is the target, with no
+//!      guessing and no vision needed.
+//!    - Several entries match: the PRD requires the system to **ask the
+//!      user which one** (an `ambiguous_choice` `input_request`, see
+//!      `PROTOCOL.md`), never to silently pick one. This module surfaces
+//!      that as [`Resolution::Ambiguous`], carrying every candidate so the
+//!      caller can build that choice prompt.
+//!    - No entry matches: the result is [`Resolution::NotFound`].
 //! 4. For a resolved `native_app` entry, **launch it deterministically**
 //!    via `open -b <bundle_id>` ([`RegistryEntry::launch_command`] /
-//!    [`RegistryEntry::launch`]) -- a stable macOS API call keyed on a
-//!    bundle ID, not a screenshot-and-click.
+//!    [`RegistryEntry::launch`]). This is a stable macOS API call keyed on
+//!    a bundle ID, not a screenshot-and-click.
 //!
-//! Only **step 5+** (locating and operating UI *inside* the launched app,
-//! where the target is visually ambiguous) hands off to the computer-use
-//! executor. Nothing in this module invokes that executor: this is the
-//! deterministic half, and its whole point is to shrink how often the
-//! non-deterministic vision path is needed at all.
+//! Only **step 5+** hands off to the computer-use executor. Step 5+ covers
+//! locating and operating UI *inside* the launched app, where the target
+//! is visually ambiguous. Nothing in this module invokes that executor.
+//! This is the deterministic half. Its whole point is to shrink how often
+//! the non-deterministic vision path is needed at all.
 //!
 //! ## What this module is *not* (yet)
 //!
 //! Same honest posture as `sensitive_categories.rs`: this is the data
 //! model, config-file persistence, resolution logic, and the real
-//! `open -b` launch primitive. It is **not** wired into a live voice/prompt
-//! path -- nothing in `main.rs`/`control_channel.rs`/`holo_bridge` calls
+//! `open -b` launch primitive.
+//!
+//! It is **not** wired into a live voice/prompt path. Nothing in
+//! `main.rs`/`control_channel.rs`/`holo_bridge` calls
 //! [`Registry::resolve`] or [`RegistryEntry::launch`] on a real spoken
-//! destination today. The daemon still forwards prompts straight through to
-//! `holo serve`. Wiring this in requires a spoken-destination extraction
-//! step (turning a transcript into a candidate destination string) and a
+//! destination today. The daemon still forwards prompts straight through
+//! to `holo serve`.
+//!
+//! Wiring this in requires two things: a spoken-destination extraction
+//! step (turning a transcript into a candidate destination string), and a
 //! place in the turn lifecycle to run the deterministic route before the
-//! executor -- neither exists in this crate yet. This module makes the
-//! deterministic route *possible and testable*; it does not yet make the
-//! live turn use it.
+//! executor. Neither exists in this crate yet.
+//!
+//! This module makes the deterministic route *possible and testable*. It
+//! does not yet make the live turn use it.
 //!
 //! ## Encryption status: PLAINTEXT with a documented TODO -- NOT encrypted
 //!
 //! PRD §8 calls for the registry to be **encrypted at rest**. This pass
-//! does **not** implement encryption. The registry is written and read as
-//! plaintext TOML/JSON at `~/.holoiroh/registry.{toml,json}`, exactly like
-//! `sensitive_categories.rs`. This is called out loudly rather than
-//! silently skipped:
+//! does **not** implement encryption. This module writes and reads the
+//! registry as plaintext TOML/JSON at `~/.holoiroh/registry.{toml,json}`,
+//! exactly like `sensitive_categories.rs`. This is called out loudly
+//! rather than silently skipped:
 //!
-//! > **TODO(encryption, PRD §8):** persist this file encrypted at rest
-//! > (e.g. a macOS Keychain-held key wrapping an AEAD-encrypted blob) and
-//! > decrypt on load. Until then `~/.holoiroh/registry.*` is human-readable
-//! > plaintext -- do not put secrets in it; aliases/bundle IDs/URLs are not
-//! > secret, but the file location and format are not to be mistaken for
+//! > **TODO(encryption, PRD §8):** Persist this file encrypted at rest
+//! > (for example, a macOS Keychain-held key wrapping an AEAD-encrypted
+//! > blob). Decrypt on load.
+//! >
+//! > Until this TODO is done, `~/.holoiroh/registry.*` is human-readable
+//! > plaintext. Do not put secrets in it. Aliases, bundle IDs, and URLs
+//! > are not secret, but do not mistake the file location and format for
 //! > the encrypted-at-rest store the PRD ultimately requires.
 //!
 //! No function in this module claims to encrypt anything, and none does.
 //! The load/save path is byte-for-byte the plaintext pattern from
-//! `sensitive_categories.rs`, deliberately, so the encryption TODO is a
-//! single well-marked seam rather than scattered.
+//! `sensitive_categories.rs`, deliberately. This keeps the encryption TODO
+//! a single well-marked seam rather than scattered.
 //!
 //! ## Why `#![allow(dead_code)]`
 //!
 //! Nothing in `main.rs` calls into this module yet (see "What this module
-//! is not" above). It is registered via `mod registry;` so it compiles and
-//! is reachable for a future live target-resolution row, and so
-//! `examples/registry_probe.rs` can exercise it for real. Every item here
-//! is real, working, documented public API -- this module-level attribute
-//! just avoids repeating `#[allow(dead_code)]` on each not-yet-called item,
-//! same convention as `sensitive_categories.rs`.
+//! is not" above). It is registered via `mod registry;`. This makes it
+//! compile and stay reachable for a future live target-resolution row. It
+//! also lets `examples/registry_probe.rs` exercise it for real.
+//!
+//! Every item here is real, working, documented public API. This
+//! module-level attribute just avoids repeating `#[allow(dead_code)]` on
+//! each not-yet-called item. This follows the same convention as
+//! `sensitive_categories.rs`.
 
 #![allow(dead_code)]
 
@@ -88,10 +99,10 @@ use serde::{Deserialize, Serialize};
 ///   launched deterministically by bundle ID (`open -b <bundle_id>`). This
 ///   is the P0 verified-tier shape (Slack, see [`Registry::default_registry`]).
 /// - [`EntryType::BrowserUrl`]: a destination that is really a URL to open
-///   in a browser. Modeled here for schema completeness per the PRD;
-///   deterministic *launch* for this variant is intentionally **not**
-///   implemented in this pass (see [`RegistryEntry::launch_command`]), since
-///   the alpha's verified example is the native-app path.
+///   in a browser. Modeled here for schema completeness per the PRD.
+///   Deterministic *launch* for this variant is intentionally **not**
+///   implemented in this pass (see [`RegistryEntry::launch_command`]). The
+///   alpha's verified example is the native-app path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryType {
@@ -101,20 +112,21 @@ pub enum EntryType {
 
 /// Per-entry action policy, matching PRD §8's example `policy` object.
 ///
-/// This is carried through resolution so a caller has the entry's policy in
-/// hand at the moment it decides what to do -- it is **not enforced** by
-/// this module (there is no live executor here to enforce against; same
-/// gap as `sensitive_categories.rs`).
+/// This is carried through resolution, so a caller has the entry's policy
+/// in hand at the moment it decides what to do. It is **not enforced** by
+/// this module. There is no live executor here to enforce against -- the
+/// same gap as `sensitive_categories.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     /// The actions allowed at this destination (PRD §8 example:
-    /// `["send_message", "read"]`). Free-form action identifiers here; a
+    /// `["send_message", "read"]`). Free-form action identifiers here. A
     /// real executor-side allowlist would define the closed vocabulary.
     #[serde(default)]
     pub allowed_actions: Vec<String>,
     /// PRD §8 `remote_view_required`: whether operating this destination
-    /// requires the iPhone-side remote view to be active (e.g. because the
-    /// user must watch a sensitive action). Defaults to `false`.
+    /// requires the iPhone-side remote view to be active. For example,
+    /// this applies when the user must watch a sensitive action. Defaults
+    /// to `false`.
     #[serde(default)]
     pub remote_view_required: bool,
 }
@@ -128,11 +140,11 @@ impl Default for Policy {
     }
 }
 
-/// Per-entry defaults, matching PRD §8's example `defaults` object. Kept as
-/// its own struct (rather than inlining `workspace`) so the PRD's
-/// `defaults: { workspace }` shape round-trips on disk exactly, and so more
-/// default fields (channel, account, ...) can be added later without
-/// changing the entry's top-level shape.
+/// Per-entry defaults, matching PRD §8's example `defaults` object. Kept
+/// as its own struct, rather than inlining `workspace`. This way, the
+/// PRD's `defaults: { workspace }` shape round-trips on disk exactly. It
+/// also means more default fields (channel, account, ...) can be added
+/// later without changing the entry's top-level shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Defaults {
     /// Default workspace to assume for this destination when the spoken
@@ -150,19 +162,19 @@ pub struct RegistryEntry {
     /// The spoken destination aliases that resolve to this entry (PRD §8
     /// `alias`), e.g. `["slack", "slack app", "team chat"]`. Matching is
     /// case-insensitive and whitespace-normalized (see
-    /// [`Registry::resolve`]); store them however reads naturally.
+    /// [`Registry::resolve`]). Store them however reads naturally.
     pub alias: Vec<String>,
     /// Whether this is a native app or a browser URL (PRD §8 `entry_type`).
     pub entry_type: EntryType,
     /// macOS bundle ID for [`EntryType::NativeApp`] entries (PRD §8
     /// `bundle_id`), e.g. `com.tinyspeck.slackmacgap`. Required for a
-    /// native-app launch; `None` (and unused) for browser-URL entries.
+    /// native-app launch. `None` (and unused) for browser-URL entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id: Option<String>,
     /// The URL to open for [`EntryType::BrowserUrl`] entries. `None` for
-    /// native-app entries. (Not in PRD §8's *native-app* example object,
-    /// but required to make the browser-URL `entry_type` a real, non-empty
-    /// route rather than a bare tag.)
+    /// native-app entries. (This field is not in PRD §8's *native-app*
+    /// example object. It is required to make the browser-URL
+    /// `entry_type` a real, non-empty route, rather than a bare tag.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_url: Option<String>,
     /// Per-entry defaults (PRD §8 `defaults`, e.g. `{ workspace }`).
@@ -178,10 +190,10 @@ impl RegistryEntry {
     /// Builds the deterministic launch [`Command`] for this entry **without
     /// running it** -- the `open -b <bundle_id>` invocation (PRD §8 step 4).
     ///
-    /// Returned as a not-yet-spawned [`Command`] on purpose: it lets a
-    /// caller (or a probe) inspect/print exactly what would run before
-    /// deciding to actually launch, and keeps the "construct the route" and
-    /// "run the route" concerns separate.
+    /// Returned as a not-yet-spawned [`Command`] on purpose. It lets a
+    /// caller (or a probe) inspect or print exactly what would run before
+    /// deciding to actually launch. This also keeps the "construct the
+    /// route" and "run the route" concerns separate.
     ///
     /// Errors (rather than launching the wrong thing) if this entry is not
     /// a launchable native app:
@@ -213,13 +225,13 @@ impl RegistryEntry {
     /// **Actually runs** the deterministic launch (PRD §8 step 4): builds
     /// the [`Self::launch_command`] and spawns it, opening the app.
     ///
-    /// On macOS `open -b <bundle_id>` exits 0 immediately once it has asked
-    /// LaunchServices to open (or foreground) the app; a non-zero exit
-    /// (e.g. the bundle ID isn't installed) is surfaced as an error here.
-    /// This blocks only for the brief lifetime of the `open` helper itself,
-    /// not for the launched app.
+    /// On macOS, `open -b <bundle_id>` exits 0 immediately after it asks
+    /// LaunchServices to open (or foreground) the app. This function treats
+    /// a non-zero exit (for example, the bundle ID isn't installed) as an
+    /// error. This blocks only for the brief lifetime of the `open` helper
+    /// itself, not for the launched app.
     ///
-    /// This is the deterministic route and runs **before** any visual
+    /// This is the deterministic route, and it runs **before** any visual
     /// automation -- see the module doc. It never touches the computer-use
     /// executor.
     pub fn launch(&self) -> Result<()> {
@@ -248,17 +260,18 @@ pub struct Registry {
 /// The outcome of resolving a spoken destination against the registry
 /// (PRD §8 steps 2-3).
 ///
-/// The three variants are exhaustive and force the caller to handle
-/// ambiguity explicitly -- the PRD's core requirement is that ambiguity
-/// **must** become a user choice, never an autonomous guess, so there is
-/// deliberately no "best match" or "first match" convenience that would let
-/// a caller collapse [`Resolution::Ambiguous`] into a silent pick.
+/// The three variants are exhaustive. They force the caller to handle
+/// ambiguity explicitly. The PRD's core requirement is that ambiguity
+/// **must** become a user choice, never an autonomous guess. So there is
+/// deliberately no "best match" or "first match" convenience. Such a
+/// convenience would let a caller collapse [`Resolution::Ambiguous`] into
+/// a silent pick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution<'a> {
     /// Exactly one entry matched -- the deterministic target.
     Single(&'a RegistryEntry),
     /// More than one entry matched. Per PRD §8 this **must** produce a user
-    /// choice prompt (a `ambiguous_choice` `input_request`, see
+    /// choice prompt (an `ambiguous_choice` `input_request`, see
     /// `PROTOCOL.md`), never an autonomous guess. Carries every candidate
     /// so the caller can present them all.
     Ambiguous(Vec<&'a RegistryEntry>),
@@ -267,8 +280,8 @@ pub enum Resolution<'a> {
 }
 
 /// Which on-disk format to read/write. Same two-format support and
-/// TOML-first default as `sensitive_categories.rs`'s `ConfigFormat`: TOML
-/// is the friendlier format for a human to hand-edit, JSON is offered for
+/// TOML-first default as `sensitive_categories.rs`'s `ConfigFormat`. TOML
+/// is the friendlier format for a human to hand-edit. JSON is offered for
 /// tooling that prefers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFormat {
@@ -277,10 +290,11 @@ pub enum ConfigFormat {
 }
 
 impl ConfigFormat {
-    /// Infers the format from a path's extension, defaulting to
+    /// Infers the format from a path's extension. It defaults to
     /// [`ConfigFormat::Toml`] for anything other than a recognized `.json`
-    /// (including no extension), matching the TOML-first default path. Same
-    /// rule as `sensitive_categories::ConfigFormat::from_path`.
+    /// (including no extension). This matches the TOML-first default path.
+    /// It follows the same rule as
+    /// `sensitive_categories::ConfigFormat::from_path`.
     pub fn from_path(path: &Path) -> Self {
         match path.extension().and_then(|ext| ext.to_str()) {
             Some(ext) if ext.eq_ignore_ascii_case("json") => ConfigFormat::Json,
@@ -289,11 +303,11 @@ impl ConfigFormat {
     }
 }
 
-/// Normalizes an alias / spoken destination for matching: trims, lowercases
-/// (ASCII), and collapses internal whitespace runs to a single space, so
-/// `"  Slack   App "` and `"slack app"` compare equal. Kept private and
-/// applied to *both* sides of every comparison in [`Registry::resolve`] so
-/// the two can never drift.
+/// Normalizes an alias or spoken destination for matching. It trims,
+/// lowercases (ASCII), and collapses internal whitespace runs to a single
+/// space, so `"  Slack   App "` and `"slack app"` compare equal. Kept
+/// private and applied to *both* sides of every comparison in
+/// [`Registry::resolve`], so the two can never drift.
 fn normalize(s: &str) -> String {
     s.split_whitespace()
         .map(|w| w.to_ascii_lowercase())
@@ -304,9 +318,9 @@ fn normalize(s: &str) -> String {
 impl Registry {
     /// Default config file location: `~/.holoiroh/registry.toml`. Resolved
     /// via `$HOME`, same approach as
-    /// `SensitiveCategories::default_path`/`Allowlist::default_path` -- this
-    /// daemon is macOS-only, where `$HOME` is always set for an interactive
-    /// login session.
+    /// `SensitiveCategories::default_path`/`Allowlist::default_path`. This
+    /// daemon is macOS-only, where `$HOME` is always set for an
+    /// interactive login session.
     pub fn default_path() -> Result<PathBuf> {
         let home = std::env::var_os("HOME")
             .context("HOME environment variable is not set (required to locate ~/.holoiroh/)")?;
@@ -323,14 +337,16 @@ impl Registry {
 
     /// The built-in default registry. Alpha scope per PRD §8: a single
     /// Slack `native_app` entry, the P0 **verified-tier** example
-    /// (`bundle_id = com.tinyspeck.slackmacgap`). This is a seed a real
-    /// deployment is expected to extend via the config file, not a finished
-    /// registry -- exactly why the file is user-editable.
+    /// (`bundle_id = com.tinyspeck.slackmacgap`). This is a seed, not a
+    /// finished registry. A real deployment is expected to extend it via
+    /// the config file. That is exactly why the file is user-editable.
     ///
-    /// The Slack entry mirrors PRD §8's example schema field-for-field: a
-    /// small set of spoken aliases, `entry_type = native_app`, the verified
-    /// bundle ID, a `defaults.workspace`, and a `policy` with
-    /// `allowed_actions` + `remote_view_required`.
+    /// The Slack entry mirrors PRD §8's example schema field-for-field:
+    /// - a small set of spoken aliases
+    /// - `entry_type = native_app`
+    /// - the verified bundle ID
+    /// - a `defaults.workspace`
+    /// - a `policy` with `allowed_actions` and `remote_view_required`
     pub fn default_registry() -> Self {
         Registry {
             entries: vec![RegistryEntry {
@@ -355,14 +371,17 @@ impl Registry {
     }
 
     /// Loads the registry from `path`, in the format inferred by
-    /// [`ConfigFormat::from_path`]. A missing file is **not** an error --
-    /// it's the expected first-run state, and this returns
-    /// [`Self::default_registry`] then (call [`Self::save`] to persist it,
-    /// or use [`Self::load_or_init`] which does that for you). Any other I/O
-    /// error, or a parse failure, is a real error -- a corrupt registry
-    /// silently treated as "just use defaults" would discard a user's
-    /// hand-added destinations, which is exactly the kind of silent config
-    /// loss this file exists to avoid.
+    /// [`ConfigFormat::from_path`].
+    ///
+    /// A missing file is **not** an error. It is the expected first-run
+    /// state, and this function returns [`Self::default_registry`] in
+    /// that case. Call [`Self::save`] to persist it, or use
+    /// [`Self::load_or_init`], which does that for you.
+    ///
+    /// Any other I/O error, or a parse failure, is a real error. Treating
+    /// a corrupt registry silently as "just use defaults" would discard a
+    /// user's hand-added destinations. That is exactly the kind of silent
+    /// config loss this file exists to avoid.
     ///
     /// PLAINTEXT read -- see the module doc's encryption TODO. This does not
     /// decrypt anything because nothing writes an encrypted file yet.
@@ -397,11 +416,11 @@ impl Registry {
         Self::load(Self::default_path()?)
     }
 
-    /// Loads from `path` if it exists; otherwise builds
-    /// [`Self::default_registry`] **and persists it** to `path` so the file
-    /// exists (with the alpha Slack seed) after the first run, ready for the
-    /// user to hand-edit. Returns the loaded or newly-defaulted-and-saved
-    /// value either way.
+    /// Loads from `path` if it exists. Otherwise, it builds
+    /// [`Self::default_registry`] **and persists it** to `path`. This way
+    /// the file exists (with the alpha Slack seed) after the first run,
+    /// ready for the user to hand-edit. Returns the loaded or
+    /// newly-defaulted-and-saved value either way.
     pub fn load_or_init(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if path.exists() {
@@ -427,7 +446,7 @@ impl Registry {
     /// `Allowlist::save`.
     ///
     /// PLAINTEXT write -- see the module doc's encryption TODO. This writes
-    /// human-readable TOML/JSON on purpose (for now); it does **not**
+    /// human-readable TOML/JSON on purpose (for now). It does **not**
     /// encrypt, and does not pretend to.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
@@ -464,17 +483,17 @@ impl Registry {
     ///   alias -- the deterministic target, no vision needed.
     /// - [`Resolution::Ambiguous`] when **more than one** entry matches.
     ///   Per PRD §8 this must become a user choice prompt, never an
-    ///   autonomous guess -- so every matching entry is returned and the
-    ///   caller is forced to disambiguate (there is deliberately no
-    ///   "pick the first" shortcut).
+    ///   autonomous guess. So every matching entry is returned, and the
+    ///   caller is forced to disambiguate. There is deliberately no
+    ///   "pick the first" shortcut.
     /// - [`Resolution::NotFound`] when no entry matches.
     ///
     /// "Matches" means an entry has at least one alias equal (after
-    /// normalization) to the spoken destination. A single entry that lists
-    /// the same alias twice, or matches on two of its own aliases, still
-    /// counts as one match (dedup is by entry identity/position, not by
-    /// alias), so a well-formed entry can never make *itself* ambiguous --
-    /// ambiguity only arises across *distinct* entries.
+    /// normalization) to the spoken destination. A single entry might list
+    /// the same alias twice, or match on two of its own aliases. That
+    /// still counts as one match: dedup is by entry identity or position,
+    /// not by alias. So a well-formed entry can never make *itself*
+    /// ambiguous. Ambiguity only arises across *distinct* entries.
     pub fn resolve<'a>(&'a self, spoken_destination: &str) -> Resolution<'a> {
         let needle = normalize(spoken_destination);
         if needle.is_empty() {

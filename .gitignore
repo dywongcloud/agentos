@@ -37,6 +37,13 @@ encrypted_secrets.json
 .gm/residual-check-fired
 .gm/claim-audit-fired
 .gm/.instructions-shipped-manifest.json
+# agentplug's own local key-value cache, root-anchored (holoiroh/.agentplug-kv/ above covers a
+# different, nested location) -- rewritten on essentially every gm dispatch, same runtime-state
+# class as the exec-spool/rs-learn.db entries above.
+.agentplug-kv/
+# gm's own embed-model-version marker, rewritten whenever the code-index embed generation
+# changes -- same class as .gm-continue-count above (no human edits this file).
+.gm/.embed-generation
 .claude/
 .turbo/
 coverage/
@@ -67,3 +74,9 @@ holoiroh/hello_world/
 **/.gm/browser-state/
 **/.gm/rs-learn.db
 **/.gm/gm.db
+
+# Cloned working copy of the remote gm config repo plus its sync marker, both
+# fetched at runtime and re-created on demand -- committing a nested checkout
+# would embed another repo's history in this one.
+**/.gm/config-source-cache*/
+**/.gm/config-source-cache*.sync.json

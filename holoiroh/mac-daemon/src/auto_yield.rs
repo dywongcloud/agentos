@@ -1,19 +1,22 @@
-//! Cooperative auto-yield: the agent shares the user's Mac, so when the human
-//! starts using the mouse/keyboard the daemon steps the agent aside (pauses the
-//! running turn) and resumes once the human goes idle. This is the reachable,
-//! honest form of "the agent works in its own space without colliding with you"
-//! on macOS -- true input isolation is impossible on a single login session
-//! (CGEvents share one global focus), and the computer-use backend is a sealed
-//! signed app, so the lever we have is *when* the agent is allowed to act.
+//! Cooperative auto-yield: the agent shares the user's Mac. When the human
+//! starts using the mouse or keyboard, the daemon steps the agent aside.
+//! This pauses the running turn. The daemon resumes the agent once the
+//! human goes idle. This is the reachable, honest form of "the agent works
+//! in its own space without colliding with you" on macOS. True input
+//! isolation is impossible on a single login session, because CGEvents
+//! share one global focus. The computer-use backend is a sealed signed
+//! app. So the lever we have is *when* the agent is allowed to act.
 //!
-//! Physical-vs-synthetic input is distinguished by [`crate::user_activity`] (a
-//! CGEventTap keyed on `kCGEventSourceUnixProcessID`), so the agent's own clicks
-//! never look like the user and never trigger a self-yield.
+//! [`crate::user_activity`] distinguishes physical input from synthetic
+//! input. It uses a CGEventTap keyed on `kCGEventSourceUnixProcessID`. As
+//! a result, the agent's own clicks never look like the user. They never
+//! trigger a self-yield.
 //!
-//! Pause/resume reuse the existing control machinery (`HoloControlBridge`): a
-//! pause cancels the backend turn but keeps its A2A `context_id`, so resume
-//! continues on the same session (history preserved) rather than blindly
-//! re-running -- see `control.rs`'s pause/resume notes.
+//! Pause and resume reuse the existing control machinery
+//! (`HoloControlBridge`). A pause cancels the backend turn but keeps its
+//! A2A `context_id`. As a result, resume continues on the same session,
+//! with history preserved, rather than blindly re-running. See
+//! `control.rs`'s pause/resume notes for details.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +31,7 @@ pub enum YieldAction {
     None,
     /// The user is active while the agent is running -- step the agent aside.
     Pause,
-    /// The user has gone idle and the agent is auto-yielded -- let it resume.
+    /// The user is idle. The agent is auto-yielded. Let it resume.
     Resume,
 }
 
@@ -40,7 +43,7 @@ pub struct AutoYieldConfig {
     /// The user counts as "active" (yield to them) if their last physical input
     /// was more recent than this many seconds. Small = responsive yielding.
     pub activity_secs: f64,
-    /// Resume only after the user has been idle for at least this many seconds.
+    /// Resume only after the user is idle for at least this many seconds.
     /// Larger than `activity_secs` gives hysteresis so brief pauses in the
     /// user's own typing don't thrash the agent between pause and resume.
     pub resume_secs: f64,
@@ -60,9 +63,13 @@ impl Default for AutoYieldConfig {
 }
 
 impl AutoYieldConfig {
-    /// Read config from the environment, falling back to [`Default`]. Hooks:
-    /// `HOLOIROH_AUTO_YIELD` (0/false/no disables), `HOLOIROH_AUTO_YIELD_ACTIVITY_SECS`,
-    /// `HOLOIROH_AUTO_YIELD_RESUME_SECS`.
+    /// Read config from the environment. Fall back to [`Default`] when a
+    /// variable is not set.
+    ///
+    /// Hooks:
+    /// - `HOLOIROH_AUTO_YIELD`: `0`, `false`, or `no` disables auto-yield.
+    /// - `HOLOIROH_AUTO_YIELD_ACTIVITY_SECS`
+    /// - `HOLOIROH_AUTO_YIELD_RESUME_SECS`
     pub fn from_env() -> Self {
         let d = Self::default();
         let enabled = match std::env::var("HOLOIROH_AUTO_YIELD") {
@@ -87,13 +94,15 @@ impl AutoYieldConfig {
     }
 }
 
-/// The pure auto-yield decision -- no I/O, so it is exercised directly by
-/// `examples/auto_yield_probe.rs`. `user_idle` is `None` when the input tap is
-/// unavailable (no permission), in which case we never act.
+/// This function makes the pure auto-yield decision. It performs no I/O,
+/// so `examples/auto_yield_probe.rs` exercises it directly. `user_idle` is
+/// `None` when the input tap is unavailable (no permission). In that case,
+/// the function never acts.
 ///
 /// - `busy`: a turn is currently running.
-/// - `auto_yielded`: the current pause was created by auto-yield (not the user).
-/// - `user_paused`: the user themselves paused (we must never override that).
+/// - `auto_yielded`: auto-yield, not the user, created the current pause.
+/// - `user_paused`: the user themselves paused the agent. The daemon must
+///   never override this pause.
 pub fn decide(
     cfg: &AutoYieldConfig,
     busy: bool,
@@ -121,10 +130,13 @@ pub fn decide(
     YieldAction::None
 }
 
-/// Spawn the background monitor. Starts the physical-input tap and then samples
-/// state on `cfg.poll`, driving [`HoloBridge::auto_yield_pause`] /
-/// [`HoloBridge::auto_yield_resume`]. No-op (logs once) if disabled or if the
-/// tap never becomes available.
+/// Spawn the background monitor. It starts the physical-input tap. Then it
+/// samples state on `cfg.poll`. Each sample drives
+/// [`HoloBridge::auto_yield_pause`] or [`HoloBridge::auto_yield_resume`].
+///
+/// The function does nothing, but logs once, in these cases:
+/// - Auto-yield is disabled.
+/// - The tap never becomes available.
 pub fn spawn_monitor(bridge: Arc<HoloBridge>) {
     let cfg = AutoYieldConfig::from_env();
     if !cfg.enabled {

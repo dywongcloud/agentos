@@ -1,21 +1,32 @@
-//! Agentic task planning via Tinfoil's tool-calling (docs.tinfoil.sh/guides/tool-calling:
-//! "GLM-5.2 is recommended for agentic workflows and complex tool calling scenarios").
+//! This module plans agentic tasks through Tinfoil's tool-calling. See
+//! docs.tinfoil.sh/guides/tool-calling: "GLM-5.2 is recommended for agentic
+//! workflows and complex tool calling scenarios".
 //!
-//! This module **plans**, it does not **execute**. Given a natural-language `goal`, it asks
-//! glm-5.2 (with a fixed tool schema describing what this daemon can actually do) to propose an
-//! ordered sequence of steps, and returns that sequence as human-readable strings
-//! (`holoiroh_wire::ServerMessage::PlanReady::steps`) for the iOS client to show the user
-//! *before* anything runs. Turning a plan step into real action is unchanged: a
-//! `start_desktop_task` step still goes through [`crate::executor::ComputerUseExecutor`]
-//! exactly as a typed/spoken prompt already does (see `control_channel.rs`'s existing
-//! `ClientMessage::Prompt` handling) -- this module never calls `execute` itself, it only
-//! *describes* the tool a caller would invoke to do so. That split is deliberate: it composes
-//! over the seam ([`crate::executor::ComputerUseExecutor`]) from the outside, per that module's
-//! own doc ("Swapping HoloDesktop for a different backend... means writing a second
-//! `impl ComputerUseExecutor` -- the product code above the seam... never changes"), rather than
-//! reaching into it.
+//! This module **plans**. This module does not **execute**. Given a
+//! natural-language `goal`, this module asks glm-5.2 to propose an ordered
+//! sequence of steps. This module gives glm-5.2 a fixed tool schema that
+//! describes what this daemon can actually do. This module returns the
+//! sequence as human-readable strings
+//! (`holoiroh_wire::ServerMessage::PlanReady::steps`). The iOS client shows
+//! this sequence to the user before anything runs.
 //!
-//! Direct-reqwest-with-bearer style, matching every other new `tinfoil_*` module.
+//! Turning a plan step into real action stays unchanged. A
+//! `start_desktop_task` step still goes through
+//! [`crate::executor::ComputerUseExecutor`]. A typed or spoken prompt already
+//! goes through the same path (see `control_channel.rs`'s existing
+//! `ClientMessage::Prompt` handling). This module never calls `execute`
+//! itself. This module only describes the tool that a caller invokes to do
+//! so.
+//!
+//! That split is deliberate. This module composes over the seam
+//! ([`crate::executor::ComputerUseExecutor`]) from the outside. This module
+//! does not reach into the seam. That module's own doc explains why:
+//! "Swapping HoloDesktop for a different backend... means writing a second
+//! `impl ComputerUseExecutor` -- the product code above the seam... never
+//! changes".
+//!
+//! This module uses a direct-reqwest-with-bearer style, matching every other
+//! new `tinfoil_*` module.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -32,13 +43,16 @@ runs -- you are proposing a plan, not executing one, so call every tool you'd wa
 order you'd want it run, in a single response. If the goal is already a single simple action, \
 propose exactly one step.";
 
-/// The tools this daemon can actually perform, exposed to glm-5.2 exactly once here so every
-/// caller shares the same schema (no duplicated tool-definition literals drifting apart).
-/// Mirrors real capabilities only: `start_desktop_task` maps to
-/// [`crate::executor::ComputerUseExecutor::execute`]; the other three map to
-/// [`crate::tinfoil_documents::convert_documents`], [`crate::tinfoil_vision::analyze_image`],
-/// and [`crate::tinfoil_audio::transcribe`] respectively. No tool here does anything this
-/// daemon cannot already, honestly, do.
+/// This function returns the tools this daemon can actually perform. This function exposes
+/// the tools to glm-5.2 exactly once, here, so every caller shares the same schema. This
+/// avoids duplicated tool-definition literals that drift apart. This function mirrors real
+/// capabilities only:
+/// - `start_desktop_task` maps to [`crate::executor::ComputerUseExecutor::execute`]
+/// - `process_document` maps to [`crate::tinfoil_documents::convert_documents`]
+/// - `analyze_image` maps to [`crate::tinfoil_vision::analyze_image`]
+/// - `transcribe_audio` maps to [`crate::tinfoil_audio::transcribe`]
+///
+/// No tool here does anything this daemon cannot already do, honestly.
 pub fn tool_schema() -> serde_json::Value {
     serde_json::json!([
         {
@@ -126,16 +140,19 @@ struct ToolCall {
 #[derive(Deserialize)]
 struct ToolCallFunction {
     name: String,
-    /// Raw JSON-string arguments, per docs.tinfoil.sh/guides/tool-calling's documented
-    /// response shape ("function.arguments: JSON string of parameters"). Parsed defensively --
-    /// a malformed-JSON arguments string degrades this one step's description rather than
-    /// failing the whole plan (see [`describe_step`]).
+    /// This field holds raw JSON-string arguments, per
+    /// docs.tinfoil.sh/guides/tool-calling's documented response shape
+    /// ("function.arguments: JSON string of parameters"). This module
+    /// parses the field defensively. A malformed-JSON arguments string
+    /// degrades only this one step's description. A malformed-JSON
+    /// arguments string does not fail the whole plan (see
+    /// [`describe_step`]).
     arguments: String,
 }
 
-/// Plans `goal` into an ordered list of human-readable step descriptions. Returns `Result`
-/// (not best-effort) -- like the other new Tinfoil modules, this is on the critical path of an
-/// explicit user request.
+/// Plans `goal` into an ordered list of human-readable step descriptions. This function
+/// returns `Result`, not a best-effort value. Like the other new Tinfoil modules, this
+/// function sits on the critical path of an explicit user request.
 pub async fn plan_task(api_key: &str, goal: &str) -> Result<Vec<String>> {
     let trimmed = goal.trim();
     if trimmed.is_empty() {

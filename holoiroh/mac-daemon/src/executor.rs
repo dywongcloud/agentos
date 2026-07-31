@@ -5,16 +5,19 @@
 //! The PRD's section 7.3 states the invariant this module implements: *"HoloDesktop sits
 //! behind the executor interface ... can be replaced without changing product behavior."*
 //! That is the entire point of this file. Everything the daemon does to actually drive a Mac
-//! today goes through H Company's `holo-desktop-cli` (`holo serve` + the `hai-agent-runtime`
-//! it fronts), reached via [`crate::holo_bridge::HoloBridge`] / [`HoloControlBridge`]. This
-//! module does **not** re-implement any of that. It defines a single trait,
-//! [`ComputerUseExecutor`], describing *what a computer-use backend must offer the product*
-//! (start a task, watch it, pause/resume/cancel it, report its capabilities, shut down), and
-//! one adapter, [`HoloDesktopExecutor`], that satisfies that trait by delegating to the
-//! already-built `HoloBridge`. Swapping HoloDesktop for a different backend (a cloud
-//! computer-use agent, a local vision-model loop, a mock) means writing a second
-//! `impl ComputerUseExecutor` -- the product code above the seam (anything that holds a
-//! `E: ComputerUseExecutor`) never changes.
+//! today goes through H Company's `holo-desktop-cli` (`holo serve` and the `hai-agent-runtime`
+//! it fronts). The daemon reaches it via [`crate::holo_bridge::HoloBridge`] /
+//! [`HoloControlBridge`]. This module does **not** re-implement any of that.
+//!
+//! This module defines a single trait, [`ComputerUseExecutor`]. The trait describes *what a
+//! computer-use backend must offer the product*: start a task, watch it, pause/resume/cancel
+//! it, report its capabilities, and shut down. This module also defines one adapter,
+//! [`HoloDesktopExecutor`], that satisfies the trait by delegating to the already-built
+//! `HoloBridge`.
+//!
+//! Swapping HoloDesktop for a different backend (a cloud computer-use agent, a local
+//! vision-model loop, a mock) means writing a second `impl ComputerUseExecutor`. The product
+//! code above the seam (anything that holds a `E: ComputerUseExecutor`) never changes.
 //!
 //! ```text
 //!            product / control-channel layer
@@ -39,45 +42,53 @@
 //!
 //! ## What is HoloDesktop-specific, and therefore kept inside `HoloDesktopExecutor`
 //!
-//! Everything below the trait: `ControlMessage` construction, the `request_id`/`context_id`
-//! correlation scheme, the `holo serve` A2A/`tasks/cancel` semantics, the `holo stop` global
-//! kill switch, the busy/queue single-active-task model, the agent-action cap. None of those
-//! nouns appears in the trait or the shared types -- they are all reached only through
-//! [`HoloDesktopExecutor`]'s private methods. A caller written against the trait cannot even
-//! name them.
+//! Everything below the trait stays HoloDesktop-specific:
+//!
+//! - `ControlMessage` construction
+//! - the `request_id`/`context_id` correlation scheme
+//! - the `holo serve` A2A/`tasks/cancel` semantics
+//! - the `holo stop` global kill switch
+//! - the busy/queue single-active-task model
+//! - the agent-action cap
+//!
+//! None of those nouns appears in the trait or the shared types. Only
+//! [`HoloDesktopExecutor`]'s private methods reach them. A caller written against the trait
+//! cannot even name them.
 //!
 //! ## What the trait deliberately generalizes (backend-agnostic types)
 //!
 //! [`ExecutorConfig`], [`ExecutionTask`], [`ExecutionRun`], [`ExecutorEvent`], and
 //! [`ExecutorCapabilities`] are plain data with no HoloDesktop vocabulary. They carry `serde`
-//! derives on the types that cross a real boundary (the event stream that would be forwarded
-//! to the iOS app, and the capabilities report a client would read) -- see each type's own
-//! doc. [`ExecutorEvent`] is intentionally the *same coarse shape* the existing
-//! [`crate::holo_bridge::ControlEvent`] already exposes (ack / progress / answer / done /
-//! error / queued), because that is the real granularity `holo serve`'s A2A stream provides
-//! today (the finer `crate::task_state::TaskState` machine is deliberately not wired to a live
-//! event source yet -- see its module doc). A future backend that can report richer states
-//! would extend [`ExecutorEvent`], not work around it.
+//! derives on the types that cross a real boundary. Two examples: the event stream the daemon
+//! forwards to the iOS app, and the capabilities report a client reads. See each type's own
+//! doc for detail.
+//!
+//! [`ExecutorEvent`] intentionally matches the *same coarse shape* that
+//! [`crate::holo_bridge::ControlEvent`] already exposes today (ack / progress / answer / done /
+//! error / queued). This shape is the real granularity `holo serve`'s A2A stream provides. The
+//! finer `crate::task_state::TaskState` machine is deliberately not wired to a live event
+//! source yet -- see its module doc. A future backend that can report richer states will extend
+//! [`ExecutorEvent`], not work around it.
 //!
 //! ## Honest capability mapping (no silent fakes)
 //!
 //! HoloDesktop has exactly one interruption primitive: stop/cancel (A2A `tasks/cancel` scoped
 //! to a context, or the global `holo stop`). It has **no** mid-turn *pause-and-later-resume*
-//! primitive -- `session_runner`'s stop path does pause-then-cancel as a single terminal
-//! action, not a resumable suspend. Rather than pretend otherwise, [`HoloDesktopExecutor`]:
+//! primitive. `session_runner`'s stop path does pause-then-cancel as a single terminal action,
+//! not a resumable suspend. Rather than pretend otherwise, [`HoloDesktopExecutor`]:
 //!
 //! - maps [`ComputerUseExecutor::cancel`] onto a real `ControlMessage::Stop` (the natural,
 //!   fully-supported operation),
-//! - maps [`ComputerUseExecutor::pause`] onto that same terminal stop **and says so** in its
-//!   return value ([`PauseOutcome::CanceledNotSuspended`]) and in
-//!   [`ExecutorCapabilities::can_pause_resume`] `== false`, so a caller is never misled into
+//! - maps [`ComputerUseExecutor::pause`] onto that same terminal stop **and says so**: it
+//!   returns [`PauseOutcome::CanceledNotSuspended`] and sets
+//!   [`ExecutorCapabilities::can_pause_resume`] to `false`, so a caller is never misled into
 //!   thinking a later `resume` will continue the turn, and
 //! - makes [`ComputerUseExecutor::resume`] a no-op that returns
 //!   [`ResumeOutcome::Unsupported`], again matching the advertised capability.
 //!
 //! This mirrors the rest of this daemon's convention (see `README.md`'s repeated
-//! real-vs-honestly-approximated breakdowns): the seam is real, and the one place the backend
-//! can't honor an interface verb literally is reported through the interface, not hidden.
+//! real-vs-honestly-approximated breakdowns). The seam is real. When the backend cannot honor
+//! an interface verb literally, the interface itself reports that gap -- nothing is hidden.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -95,12 +106,12 @@ use crate::holo_bridge::{ControlEvent, ControlMessage, HoloBridge, HoloControlBr
 /// [`ComputerUseExecutor::execute`]. Every later call that references a running execution
 /// ([`observe`](ComputerUseExecutor::observe), [`pause`](ComputerUseExecutor::pause),
 /// [`resume`](ComputerUseExecutor::resume), [`cancel`](ComputerUseExecutor::cancel)) is keyed
-/// by this id, so the product never needs to know how a given backend correlates work
+/// by this id. The product therefore never needs to know how a given backend correlates work
 /// internally.
 ///
 /// For [`HoloDesktopExecutor`] this is exactly the bridge's `request_id` (the key every
-/// [`ControlEvent`] already carries), but that mapping is a HoloDesktop implementation detail
-/// -- callers treat it as an opaque token.
+/// [`ControlEvent`] already carries). That mapping is a HoloDesktop implementation detail.
+/// Callers treat it as an opaque token.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunId(pub String);
 
@@ -117,11 +128,11 @@ impl std::fmt::Display for RunId {
 }
 
 /// Backend-agnostic configuration handed to [`ComputerUseExecutor::initialize`] once, before
-/// any task runs. Kept intentionally small and backend-neutral: HoloDesktop's *own* config
-/// (which `holo` binary, which port, the `holo serve` subprocess lifecycle) is established
-/// when the underlying [`HoloBridge`] is built, so this only carries product-level knobs that
-/// any executor would honor. `serde` derives because a real deployment would load this from a
-/// config file / control message rather than hard-code it.
+/// any task runs. This struct is kept intentionally small and backend-neutral. HoloDesktop's
+/// *own* config (which `holo` binary, which port, the `holo serve` subprocess lifecycle) is
+/// established when the underlying [`HoloBridge`] is built. This struct therefore only carries
+/// product-level knobs that any executor honors. It carries `serde` derives because a real
+/// deployment loads this from a config file or a control message, instead of hard-coding it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorConfig {
     /// Whether the product wants the executor to accept new tasks at all. A backend that is
@@ -149,13 +160,13 @@ impl Default for ExecutorConfig {
 }
 
 /// One unit of work the product asks the executor to carry out -- the backend-agnostic
-/// equivalent of "a prompt". `serde` because this is exactly the shape that crosses the
-/// control-channel boundary from the iOS app (a text instruction plus optional continuation
-/// context), and a second backend would deserialize the same thing.
+/// equivalent of "a prompt". It carries `serde` derives because this is exactly the shape
+/// that crosses the control-channel boundary from the iOS app: a text instruction plus
+/// optional continuation context. A second backend deserializes the same shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionTask {
     /// The natural-language instruction to carry out. For HoloDesktop this becomes the A2A
-    /// message text; a different backend would interpret it however it drives its own agent.
+    /// message text. A different backend interprets it however it drives its own agent.
     pub instruction: String,
     /// Continue a prior conversation/session when the backend supports it, or start fresh when
     /// `None`. HoloDesktop maps this to the A2A `contextId`; other backends may ignore it.
@@ -182,35 +193,38 @@ pub enum TaskSource {
 /// product uses `run_id` for every subsequent [`observe`](ComputerUseExecutor::observe) /
 /// [`cancel`](ComputerUseExecutor::cancel) / etc. call.
 ///
-/// `serde` because a control-channel `execute` acknowledgement would serialize this back to
-/// the client so it learns the id to observe and whether it's running yet.
+/// This struct carries `serde` derives because a control-channel `execute` acknowledgement
+/// serializes it back to the client. The client then learns the id to observe, and whether
+/// the run is already active.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRun {
     pub run_id: RunId,
-    /// Best-effort hint: `false` when, at the moment `execute` returned, the backend was already
-    /// running another task and this one will queue behind it (HoloDesktop enforces one active
-    /// task per Mac -- see [`crate::limits::MAX_ACTIVE_TASKS_PER_MAC`]). The task is never lost;
-    /// if queued it starts when the one ahead finishes.
+    /// Best-effort hint. It is `false` when, at the moment `execute` returned, the backend was
+    /// already running another task, and this one will queue behind it. (HoloDesktop enforces
+    /// one active task per Mac -- see [`crate::limits::MAX_ACTIVE_TASKS_PER_MAC`].) The task is
+    /// never lost; if queued, it starts when the one ahead finishes.
     ///
-    /// **This is a snapshot, not a guarantee, and is inherently racy.** For HoloDesktop, `execute`
-    /// hands the task to the bridge on a spawned task and returns immediately, so two `execute`
-    /// calls in quick succession can *both* observe "not busy yet" and both report `true` even
-    /// though the second will in fact queue once the first's spawned turn starts. The
-    /// **authoritative** queue signal is therefore the [`ExecutorEvent::Queued`] event on the
-    /// run's [`observe`](ComputerUseExecutor::observe) stream (emitted iff the run actually
-    /// queued), not this field -- treat `started_immediately` as a fast optimistic hint for UI,
-    /// and the observe stream as ground truth.
+    /// **This is a snapshot, not a guarantee, and is inherently racy.** For HoloDesktop,
+    /// `execute` hands the task to the bridge on a spawned task and returns immediately. Two
+    /// `execute` calls in quick succession can therefore *both* observe "not busy yet" and both
+    /// report `true`. This happens even though the second call will in fact queue once the
+    /// first call's spawned turn starts. The **authoritative** queue signal is therefore the
+    /// [`ExecutorEvent::Queued`] event on the run's [`observe`](ComputerUseExecutor::observe)
+    /// stream, emitted only if the run actually queued -- not this field. Treat
+    /// `started_immediately` as a fast, optimistic hint for the UI. Treat the observe stream as
+    /// ground truth.
     pub started_immediately: bool,
 }
 
 /// One backend-agnostic progress/lifecycle event for a run, as seen by
 /// [`ComputerUseExecutor::observe`]. This is the coarse union `holo serve`'s A2A stream
-/// actually provides today (see this module's doc on why it is not the finer
-/// [`crate::task_state::TaskState`] machine). Every variant carries the [`RunId`] it belongs
-/// to so a demultiplexed stream is unambiguous.
+/// actually provides today. See this module's doc for why it is not the finer
+/// [`crate::task_state::TaskState`] machine. Every variant carries the [`RunId`] it belongs
+/// to, so a demultiplexed stream is unambiguous.
 ///
-/// `serde` (tagged, snake_case) because this is precisely the shape that would be forwarded
-/// out over the control channel to the iOS app's status panel -- it crosses a real boundary.
+/// This enum carries `serde` derives (tagged, snake_case) because this is precisely the shape
+/// the daemon forwards out over the control channel to the iOS app's status panel -- it
+/// crosses a real boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum ExecutorEvent {
@@ -244,8 +258,8 @@ pub enum ExecutorEvent {
 
 impl ExecutorEvent {
     /// The run this event belongs to, for demultiplexing a shared event flow by [`RunId`].
-    /// Returns `None` for events that are not scoped to a single run (there are none today,
-    /// but the accessor keeps callers total over future out-of-band variants).
+    /// Returns `None` for events that are not scoped to a single run. There are none today,
+    /// but the accessor keeps callers total over future out-of-band variants.
     pub fn run_id(&self) -> Option<&RunId> {
         match self {
             ExecutorEvent::Accepted { run_id }
@@ -266,10 +280,10 @@ impl ExecutorEvent {
     }
 
     /// Probe-support: run one bridge [`ControlEvent`] through the exact same translation the
-    /// executor's fan-out task uses, so `examples/executor_probe.rs` can witness the
-    /// `ControlEvent -> ExecutorEvent` mapping against real bridge output without reaching into
-    /// the private translation fn. Returns `None` for events with no per-run identity (mirrors
-    /// the fan-out task's own filtering).
+    /// executor's fan-out task uses. This lets `examples/executor_probe.rs` witness the
+    /// `ControlEvent -> ExecutorEvent` mapping against real bridge output, without reaching
+    /// into the private translation fn. Returns `None` for events with no per-run identity
+    /// (mirrors the fan-out task's own filtering).
     pub fn from_control_for_probe(event: &ControlEvent) -> Option<ExecutorEvent> {
         translate_control_event(event.clone())
     }
@@ -296,11 +310,12 @@ impl From<DoneStatus> for RunOutcome {
 }
 
 /// What a given [`ComputerUseExecutor`] implementation can actually do. Returned by
-/// [`ComputerUseExecutor::get_capabilities`] so the product can enable/disable UI affordances
-/// (a pause button, a resume button) truthfully per backend rather than assuming every backend
-/// supports every verb.
+/// [`ComputerUseExecutor::get_capabilities`] so the product can enable or disable UI
+/// affordances (a pause button, a resume button) truthfully per backend. The product therefore
+/// never has to assume every backend supports every verb.
 ///
-/// `serde` because a client (the iOS app) would read this to decide which controls to show.
+/// This struct carries `serde` derives because a client (the iOS app) reads this to decide
+/// which controls to show.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutorCapabilities {
     /// Stable identifier of the backend behind the seam (e.g. `"holo-desktop"`).
@@ -326,8 +341,8 @@ pub struct ExecutorCapabilities {
     pub protocol_version: Option<String>,
 }
 
-/// Result of [`ComputerUseExecutor::pause`]. Because not every backend can genuinely suspend
-/// a run, this reports what the pause request actually did rather than returning `()` and
+/// Result of [`ComputerUseExecutor::pause`]. Not every backend can genuinely suspend a run.
+/// This type reports what the pause request actually did, instead of returning `()` and
 /// leaving the caller to guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -335,11 +350,11 @@ pub enum PauseOutcome {
     /// The run was genuinely suspended and can be continued with
     /// [`resume`](ComputerUseExecutor::resume). (No current backend returns this.)
     Suspended,
-    /// The backend has no resumable-pause primitive, so the pause request was honored as a
-    /// terminal cancel instead. A later `resume` will report [`ResumeOutcome::Unsupported`];
+    /// The backend has no resumable-pause primitive, so the daemon honors the pause request as
+    /// a terminal cancel instead. A later `resume` will report [`ResumeOutcome::Unsupported`];
     /// the run is over. This is what [`HoloDesktopExecutor`] returns.
     CanceledNotSuspended,
-    /// There was no such run to pause (unknown or already-finished [`RunId`]).
+    /// There is no such run to pause (unknown or already-finished [`RunId`]).
     NoSuchRun,
 }
 
@@ -349,25 +364,25 @@ pub enum PauseOutcome {
 pub enum ResumeOutcome {
     /// The suspended run was continued.
     Resumed,
-    /// This backend cannot resume (it has no suspend primitive); the call was a no-op. This is
+    /// This backend cannot resume (it has no suspend primitive); the call is a no-op. This is
     /// what [`HoloDesktopExecutor`] always returns.
     Unsupported,
-    /// There was no such run to resume.
+    /// There is no such run to resume.
     NoSuchRun,
 }
 
 /// The stream type [`ComputerUseExecutor::observe`] returns. Boxed (rather than an
-/// `impl Stream` associated type) so the trait stays simple to hold behind a generic bound and
-/// the concrete stream machinery is a backend detail. `Send` so the product can drive it from
-/// any task.
+/// `impl Stream` associated type) so the trait stays simple to hold behind a generic bound.
+/// The concrete stream machinery stays a backend detail. `Send` so the product can drive it
+/// from any task.
 pub type EventStream = Pin<Box<dyn Stream<Item = ExecutorEvent> + Send>>;
 
 /// Errors an executor operation can surface. Kept small and backend-agnostic; the underlying
 /// backend-specific error text rides in the `String`s.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
-    /// The executor was asked to do something after [`ComputerUseExecutor::shutdown`], or
-    /// before [`ComputerUseExecutor::initialize`].
+    /// The caller asked the executor to do something after [`ComputerUseExecutor::shutdown`],
+    /// or before [`ComputerUseExecutor::initialize`].
     #[error("executor is not in a state to accept this operation: {0}")]
     NotReady(String),
     /// The backend rejected or failed the operation.
@@ -376,29 +391,29 @@ pub enum ExecutorError {
 }
 
 /// The abstraction seam (Project Aro PRD 7.3). A computer-use backend the product can start
-/// tasks on, watch, interrupt, interrogate for capabilities, and shut down -- without the
-/// product knowing which backend it is.
+/// tasks on, watch, interrupt, interrogate for capabilities, and shut down. The product does
+/// this without knowing which backend it is.
 ///
 /// Uses native `async fn` in traits (this crate is edition 2024). Callers hold an
-/// implementation by a generic bound (`fn drive<E: ComputerUseExecutor>(e: &E)`), which keeps
-/// the trait free of `dyn`-object-safety constraints while still being the single point of
+/// implementation by a generic bound (`fn drive<E: ComputerUseExecutor>(e: &E)`). This keeps
+/// the trait free of `dyn`-object-safety constraints, while still being the single point of
 /// substitution.
 #[allow(async_fn_in_trait)]
 pub trait ComputerUseExecutor {
-    /// One-time setup before any task runs. For [`HoloDesktopExecutor`] the heavy lifting
-    /// (spawning `holo serve`, health-checking it) already happened when its [`HoloBridge`]
-    /// was built, so this only records product-level config; a different backend might do its
-    /// real connection setup here.
+    /// One-time setup before any task runs. For [`HoloDesktopExecutor`], the heavy lifting
+    /// (spawning `holo serve`, health-checking it) already happened when the daemon built its
+    /// [`HoloBridge`]. This method therefore only records product-level config. A different
+    /// backend might do its real connection setup here.
     async fn initialize(&self, config: ExecutorConfig) -> Result<(), ExecutorError>;
 
-    /// Start one task. Returns as soon as the backend has accepted (and either started or
-    /// queued) it -- progress is delivered via [`observe`](Self::observe), not this return
+    /// Start one task. Returns as soon as the backend accepts the task, and either starts or
+    /// queues it. Progress arrives via [`observe`](Self::observe), not through this return
     /// value.
     async fn execute(&self, task: ExecutionTask) -> Result<ExecutionRun, ExecutorError>;
 
     /// Stream every [`ExecutorEvent`] for `run_id`, in order, until the run terminates (a
-    /// [`ExecutorEvent::is_terminal`] event) and the stream then ends. Observing an unknown or
-    /// already-finished run yields an immediately-empty stream rather than hanging.
+    /// [`ExecutorEvent::is_terminal`] event). The stream then ends. Observing an unknown or
+    /// already-finished run yields an immediately-empty stream, instead of hanging.
     fn observe(&self, run_id: &RunId) -> EventStream;
 
     /// Ask the backend to suspend `run_id`. See [`PauseOutcome`]: a backend without a real
@@ -428,9 +443,9 @@ pub trait ComputerUseExecutor {
 
 /// How the executor reaches the real queue/stop/event bridge. The daemon path holds the
 /// process-owning [`HoloBridge`] (whose `handle_message`/`busy_state` delegate to its inner
-/// [`HoloControlBridge`]); the control-bridge-only path (the probe) holds the
-/// [`HoloControlBridge`] directly. Both expose the same two operations the executor needs, so
-/// this enum just dispatches between them -- keeping the two construction paths from leaking into
+/// [`HoloControlBridge`]). The control-bridge-only path (the probe) holds the
+/// [`HoloControlBridge`] directly. Both expose the same two operations the executor needs.
+/// This enum simply dispatches between them, so the two construction paths never leak into
 /// every method.
 enum ControlHandle {
     Bridge(Arc<HoloBridge>),
@@ -461,33 +476,34 @@ impl ControlHandle {
     }
 }
 
-/// Adapts H Company's `holo serve` / `hai-agent-runtime` Holo3 desktop agent (reached through the
-/// existing [`HoloControlBridge`](crate::holo_bridge::HoloControlBridge) and its process-owning
-/// wrapper [`HoloBridge`]) to the [`ComputerUseExecutor`] seam. This is the concrete backend the
-/// alpha daemon uses; per PRD 7.3 it "can be replaced without changing product behavior" by
-/// providing a different `impl ComputerUseExecutor`.
+/// Adapts H Company's `holo serve` / `hai-agent-runtime` Holo3 desktop agent to the
+/// [`ComputerUseExecutor`] seam. The daemon reaches the agent through the existing
+/// [`HoloControlBridge`](crate::holo_bridge::HoloControlBridge) and its process-owning wrapper
+/// [`HoloBridge`]. This is the concrete backend the alpha daemon uses. Per PRD 7.3, it "can be
+/// replaced without changing product behavior" by providing a different `impl
+/// ComputerUseExecutor`.
 ///
 /// ## What it wraps, and why two handles
 ///
 /// The queue / single-active-task / stop / event-emit logic all lives in
-/// [`HoloControlBridge`], which is publicly constructable and holds no process of its own -- so
-/// that is what the executor drives for `execute`/`cancel`/`pause` and taps for `observe`. The
-/// process-owning [`HoloBridge`] adds one thing on top the control bridge cannot: graceful
+/// [`HoloControlBridge`], which is publicly constructable and holds no process of its own.
+/// That is what the executor drives for `execute`/`cancel`/`pause`, and taps for `observe`.
+/// The process-owning [`HoloBridge`] adds one thing on top the control bridge cannot: graceful
 /// teardown of the `holo serve` subprocess. The executor therefore holds an
-/// `Option<Arc<HoloBridge>>` *only* for [`shutdown`](ComputerUseExecutor::shutdown); the daemon
-/// path (`start_holo_desktop_executor`) sets it, and every other trait method reaches only the
-/// control bridge. Keeping the `HoloBridge` handle optional is also what lets the seam be
-/// exercised without spawning a real `holo serve` (see `examples/executor_probe.rs`).
+/// `Option<Arc<HoloBridge>>` *only* for [`shutdown`](ComputerUseExecutor::shutdown). The daemon
+/// path (`start_holo_desktop_executor`) sets it. Every other trait method reaches only the
+/// control bridge. Keeping the `HoloBridge` handle optional is also what lets a caller exercise
+/// the seam without spawning a real `holo serve` (see `examples/executor_probe.rs`).
 ///
 /// ## How it taps the bridge's event flow
 ///
 /// [`HoloControlBridge`] emits every [`ControlEvent`] into a single `events_tx` (see its
-/// `emit`/`replace_event_sink`). This executor owns the matching receiver: it is constructed
-/// from the *same* channel the control bridge was built with, and a background fan-out task
-/// drains that one receiver and re-broadcasts each event, tagged by [`RunId`], to whatever
-/// [`observe`](ComputerUseExecutor::observe) streams are currently interested. This is why
-/// `execute`/`observe` do not each spin up their own event pipe -- they share the bridge's real
-/// one rather than duplicating its production.
+/// `emit`/`replace_event_sink`). This executor owns the matching receiver. The executor is
+/// constructed from the *same* channel the control bridge was built with. A background
+/// fan-out task drains that one receiver and re-broadcasts each event, tagged by [`RunId`], to
+/// whatever [`observe`](ComputerUseExecutor::observe) streams are currently interested. This
+/// is why `execute`/`observe` do not each spin up their own event pipe -- they share the
+/// bridge's real one, instead of duplicating its production.
 pub struct HoloDesktopExecutor {
     /// The real queue/stop/event-emitting bridge (see module doc), reached either directly
     /// (control-bridge-only path) or through the process-owning [`HoloBridge`] (daemon path).
@@ -496,14 +512,14 @@ pub struct HoloDesktopExecutor {
     control: ControlHandle,
     /// Process-owning wrapper, present on the daemon path so
     /// [`shutdown`](ComputerUseExecutor::shutdown) can gracefully stop the `holo serve` child.
-    /// `None` when the executor was built directly over a control bridge (no owned process to
-    /// tear down, e.g. the probe) -- shutdown then has nothing subprocess-level to do.
+    /// `None` when a caller built the executor directly over a control bridge (no owned process
+    /// to tear down, e.g. the probe). Shutdown then has nothing subprocess-level to do.
     bridge: Option<Arc<HoloBridge>>,
     /// Broadcast hub the fan-out task publishes translated [`ExecutorEvent`]s to; each
     /// [`observe`](ComputerUseExecutor::observe) subscribes a fresh receiver and filters by
-    /// [`RunId`]. `tokio::sync::broadcast` (not a per-run map of senders) so a subscriber that
-    /// starts observing slightly after `execute` still receives events from that moment on, and
-    /// so multiple observers of the same run are naturally supported.
+    /// [`RunId`]. This hub uses `tokio::sync::broadcast` (not a per-run map of senders), so a
+    /// subscriber that starts observing slightly after `execute` still receives events from
+    /// that moment on. Multiple observers of the same run are therefore naturally supported.
     hub: tokio::sync::broadcast::Sender<ExecutorEvent>,
     /// Backend version discovered from the bridge's agent card at construction, surfaced in
     /// [`get_capabilities`](ComputerUseExecutor::get_capabilities).
@@ -512,21 +528,22 @@ pub struct HoloDesktopExecutor {
     accept_tasks: std::sync::atomic::AtomicBool,
 }
 
-/// Depth of the broadcast hub. Generous: events are small and the single-active-task model
-/// means bursts are bounded by one turn's progress updates; a slow observer that lags past
-/// this many events will see a `Lagged` skip on its own receiver (handled in `observe`) rather
-/// than blocking the fan-out task.
+/// Depth of the broadcast hub. Generous: events are small, and the single-active-task model
+/// means bursts are bounded by one turn's progress updates. A slow observer that lags past
+/// this many events sees a `Lagged` skip on its own receiver (handled in `observe`), instead
+/// of blocking the fan-out task.
 const HUB_CAPACITY: usize = 1024;
 
 impl HoloDesktopExecutor {
     /// Build an executor over an already-started [`HoloBridge`] (the daemon path). Taps the
     /// bridge's [`HoloControlBridge`] for all task-driving work and keeps the process-owning
     /// [`HoloBridge`] handle for graceful [`shutdown`](ComputerUseExecutor::shutdown). Takes
-    /// ownership of the receiver end of the same event channel the bridge sends [`ControlEvent`]s
-    /// into, and spawns the fan-out task that translates and re-broadcasts by [`RunId`].
+    /// ownership of the receiver end of the same event channel the bridge sends
+    /// [`ControlEvent`]s into. It then spawns the fan-out task that translates and
+    /// re-broadcasts events by [`RunId`].
     ///
     /// `protocol_version` is the value the caller already learned from the bridge's agent card
-    /// (`HoloBridge::start` logs it); pass `None` if unknown.
+    /// (`HoloBridge::start` logs it). Pass `None` if unknown.
     pub fn new(
         bridge: Arc<HoloBridge>,
         bridge_events_rx: mpsc::UnboundedReceiver<ControlEvent>,
@@ -547,9 +564,10 @@ impl HoloDesktopExecutor {
 
     /// Build an executor directly over a [`HoloControlBridge`], with no process-owning
     /// [`HoloBridge`] (so [`shutdown`](ComputerUseExecutor::shutdown) has no subprocess to stop).
-    /// This is the constructor the seam exposes for driving the control bridge on its own -- used
-    /// by `examples/executor_probe.rs` to exercise every trait method without spawning a real
-    /// `holo serve`. Takes the receiver end of the same channel the control bridge was built with.
+    /// This is the constructor the seam exposes for driving the control bridge on its own.
+    /// `examples/executor_probe.rs` uses it to exercise every trait method without spawning a
+    /// real `holo serve`. Takes the receiver end of the same channel the control bridge was
+    /// built with.
     pub fn over_control_bridge(
         control: Arc<HoloControlBridge>,
         bridge_events_rx: mpsc::UnboundedReceiver<ControlEvent>,
@@ -596,10 +614,10 @@ impl HoloDesktopExecutor {
 }
 
 /// Drains the bridge's single [`ControlEvent`] receiver forever, translating each into an
-/// [`ExecutorEvent`] and publishing it to the broadcast hub. Ends when the bridge's sender is
-/// dropped (daemon shutdown), which closes the receiver. A hub `send` error (no live
-/// subscribers) is ignored -- events with no current observer are simply not buffered per-run,
-/// matching the bridge's own "dropped receiver is fine" stance.
+/// [`ExecutorEvent`] and publishing it to the broadcast hub. Ends when the daemon drops the
+/// bridge's sender at shutdown, which closes the receiver. This function ignores a hub `send`
+/// error (no live subscribers). Events with no current observer are simply not buffered
+/// per-run, matching the bridge's own "dropped receiver is fine" stance.
 async fn fan_out_events(
     mut rx: mpsc::UnboundedReceiver<ControlEvent>,
     hub: tokio::sync::broadcast::Sender<ExecutorEvent>,
@@ -623,8 +641,9 @@ async fn fan_out_events(
 }
 
 /// Translate one bridge [`ControlEvent`] into the seam's [`ExecutorEvent`]. Returns `None` for
-/// events that carry no per-run identity and thus have no place in a run-scoped observe stream
-/// (`DaemonStatus` -- an out-of-band supervisor notification, not a task-progress event).
+/// events that carry no per-run identity, and thus have no place in a run-scoped observe
+/// stream. Example: `DaemonStatus`, an out-of-band supervisor notification, not a
+/// task-progress event.
 fn translate_control_event(event: ControlEvent) -> Option<ExecutorEvent> {
     match event {
         ControlEvent::Ack { request_id } => Some(ExecutorEvent::Accepted {
@@ -846,7 +865,8 @@ impl ComputerUseExecutor for HoloDesktopExecutor {
 impl HoloDesktopExecutor {
     /// HoloDesktop-specific stop path shared by `cancel` and `pause`. Issues a
     /// `ControlMessage::Stop` for `run_id` through the bridge's existing stop handling
-    /// (queue-drain + A2A `tasks/cancel` + `holo stop`), rather than duplicating any of it.
+    /// (queue-drain + A2A `tasks/cancel` + `holo stop`). This avoids duplicating any of that
+    /// handling.
     async fn stop_run(&self, run_id: &RunId, force: bool) -> Result<(), ExecutorError> {
         let stop = ControlMessage::Stop {
             request_id: run_id.0.clone(),
@@ -860,9 +880,10 @@ impl HoloDesktopExecutor {
         Ok(())
     }
 
-    /// Probe-support: the underlying control bridge's `(busy, queued)` state, so
-    /// `examples/executor_probe.rs` can log/assert the queue transitions it drives through the
-    /// real trait methods. Not part of the seam (a product holding the trait never needs it).
+    /// Probe-support: exposes the underlying control bridge's `(busy, queued)` state.
+    /// `examples/executor_probe.rs` uses it to log and assert the queue transitions it drives
+    /// through the real trait methods. Not part of the seam -- a product holding the trait
+    /// never needs it.
     pub fn control_busy_for_probe(&self) -> (bool, usize) {
         self.control.busy_state()
     }

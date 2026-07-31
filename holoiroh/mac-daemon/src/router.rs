@@ -2,41 +2,46 @@
 //!
 //! ## Why this exists
 //!
-//! `holo3-1-35b-a3b` (fast, cheap, 4k max output) is what `holo serve` uses by default (the
-//! only shipped desktop agent config pins it -- see `holo_bridge::process`'s module doc). For
-//! complex multi-step tasks a bigger model, `holo3-122b-a10b` (32k max output, ~1.6x the
-//! price), does better. Both ids are real and currently live on H Company's hosted gateway
-//! (`GET https://api.hcompany.ai/v1/models`, verified 2026-07-20: both `is_active`/`is_ready`,
-//! `holo3-1-35b-a3b` supports `["reasoning","tools"]`, `holo3-122b-a10b` supports
-//! `["reasoning"]` only -- see this module's "122b caveat" note below).
+//! `holo3-1-35b-a3b` (fast, cheap, 4k max output) is what `holo serve` uses by default. The
+//! only shipped desktop agent config pins this model (see `holo_bridge::process`'s module
+//! doc). For complex, multi-step tasks, a bigger model does better: `holo3-122b-a10b` (32k
+//! max output, ~1.6x the price).
 //!
-//! Model selection is a SPAWN-TIME knob on `holo serve` (`--model` / `HAI_AGENT_RUNTIME_MODEL`
-//! -- see `holo_bridge::process::HoloServeProcess::build_command`), not a per-request
-//! parameter (`agent_client/requests.py` in the installed CLI sets `model=None` with the
-//! literal comment "spawn-time HAI_AGENT_RUNTIME_MODEL wins, no per-request override"). So
-//! switching models means a full terminate + respawn of `holo serve`, reusing the exact same
-//! process-swap machinery the tinfoil rate-limit failover already uses
-//! (`HoloBridge::switch_to`) -- see [`crate::holo_bridge::HoloBridge::route_model`].
+//! Both ids are real. Both ids are currently live on H Company's hosted gateway
+//! (`GET https://api.hcompany.ai/v1/models`, verified 2026-07-20). Both ids are `is_active`
+//! and `is_ready`. `holo3-1-35b-a3b` supports `["reasoning","tools"]`. `holo3-122b-a10b`
+//! supports `["reasoning"]` only (see this module's "122b caveat" note below).
+//!
+//! Model selection is a SPAWN-TIME knob on `holo serve` (`--model` or
+//! `HAI_AGENT_RUNTIME_MODEL` -- see `holo_bridge::process::HoloServeProcess::build_command`).
+//! Model selection is not a per-request parameter. `agent_client/requests.py` in the
+//! installed CLI sets `model=None`, with the literal comment "spawn-time
+//! HAI_AGENT_RUNTIME_MODEL wins, no per-request override". So switching models means a full
+//! terminate and respawn of `holo serve`. This reuses the exact same process-swap machinery
+//! that the tinfoil rate-limit failover already uses (`HoloBridge::switch_to`; see
+//! [`crate::holo_bridge::HoloBridge::route_model`]).
 //!
 //! ## 122b caveat
 //!
-//! The gateway does not list `"tools"` under `holo3-122b-a10b`'s `supported_features`, and the
-//! only shipped desktop agent prompt/config is 35B-tuned. The runtime binary does carry real
-//! 122b support (a `build_holo_3_122b_a10b_localizer` factory and a `MODEL_DEFAULTS` entry
-//! exist), so routing to it is expected to work, but this has not been exercised end-to-end
-//! with a real paid completion (that would cost money to verify here). If complex-tier turns
-//! come back malformed or tool-call-free, that is the first thing to check.
+//! The gateway does not list `"tools"` under `holo3-122b-a10b`'s `supported_features`. The
+//! only shipped desktop agent prompt and config is 35B-tuned. The runtime binary does carry
+//! real 122b support: a `build_holo_3_122b_a10b_localizer` factory exists, and a
+//! `MODEL_DEFAULTS` entry exists. So routing to `holo3-122b-a10b` is expected to work. This
+//! route stays untested end-to-end with a real paid completion, because a real test would
+//! cost money to run here. If complex-tier turns come back malformed or tool-call-free, check
+//! this route first.
 //!
 //! ## Hysteresis
 //!
-//! Every tier change costs a real respawn (terminate + spawn + health wait + agent-card probe,
-//! typically a few seconds). To avoid thrashing on a queue of alternating light/heavy prompts,
-//! [`should_switch`] only approves a switch when the new classification is DECISIVE relative to
-//! the currently active tier -- see its own doc.
+//! Every tier change costs a real respawn: terminate, spawn, health wait, and agent-card
+//! probe, typically a few seconds total. [`should_switch`] avoids thrashing on a queue of
+//! alternating light and heavy prompts. [`should_switch`] only approves a switch when the new
+//! classification is DECISIVE relative to the currently active tier (see its own doc).
 
-/// Model routing tier. `Tier::Simple` (`holo3-1-35b-a3b`) is the always-safe default: every
-/// path that can't confidently classify a prompt, or that has no prior tier to compare
-/// against, treats it as `Simple`.
+/// This is the model routing tier. `Tier::Simple` (`holo3-1-35b-a3b`) is the always-safe
+/// default. Every path that cannot confidently classify a prompt treats the prompt as
+/// `Simple`. Every path that has no prior tier to compare against also treats the prompt as
+/// `Simple`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Simple,
@@ -44,8 +49,9 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// The real H Company hosted model id for this tier. Both ids verified live against the
-    /// hosted models gateway on 2026-07-20 (see this module's doc) -- not guessed.
+    /// Returns the real H Company hosted model id for this tier. This module verified
+    /// both ids live against the hosted models gateway on 2026-07-20 (see this module's
+    /// doc). This module did not guess these ids.
     pub fn model_id(self) -> &'static str {
         match self {
             Tier::Simple => "holo3-1-35b-a3b",
@@ -53,9 +59,10 @@ impl Tier {
         }
     }
 
-    /// The tier that requests `model_id`, if it names one of the two known models. Used to
-    /// recover "what tier are we currently on" from `HoloBridge`'s stored `routed_model`
-    /// string without a redundant parallel enum field.
+    /// Returns the tier that requests `model_id`, if `model_id` names one of the two
+    /// known models. This function recovers "what tier are we currently on" from
+    /// `HoloBridge`'s stored `routed_model` string. This function avoids a redundant
+    /// parallel enum field.
     pub fn from_model_id(model_id: &str) -> Option<Tier> {
         match model_id {
             "holo3-1-35b-a3b" => Some(Tier::Simple),
@@ -65,24 +72,26 @@ impl Tier {
     }
 }
 
-/// Additive complexity score threshold: `score >= COMPLEX_THRESHOLD` classifies as
-/// [`Tier::Complex`]. See [`classify`]'s heuristics.
+/// This is the additive complexity score threshold. `score >= COMPLEX_THRESHOLD` classifies
+/// the prompt as [`Tier::Complex`]. See [`classify`]'s heuristics.
 const COMPLEX_THRESHOLD: i32 = 4;
 
-/// Hysteresis thresholds for [`should_switch`]: switching FROM [`Tier::Simple`] requires a
-/// score at or above this (stronger evidence than the bare classify threshold) so a
-/// borderline prompt right after a simple streak doesn't trigger a respawn.
+/// This is a hysteresis threshold for [`should_switch`]. Switching FROM [`Tier::Simple`]
+/// requires a score at or above this threshold. This threshold demands stronger evidence
+/// than the bare classify threshold. This stops a borderline prompt, right after a simple
+/// streak, from triggering a respawn.
 const UPGRADE_THRESHOLD: i32 = 5;
 
-/// Switching FROM [`Tier::Complex`] back down requires a score at or below this (a
-/// near-empty complexity score) so a merely-average prompt in the middle of a complex
-/// streak doesn't bounce the model back down.
+/// Switching FROM [`Tier::Complex`] back down requires a score at or below this threshold
+/// (a near-empty complexity score). This stops a merely-average prompt, in the middle of a
+/// complex streak, from bouncing the model back down.
 const DOWNGRADE_THRESHOLD: i32 = 1;
 
-/// Recognized app/target names a prompt might reference. Cross-app prompts (mentioning two or
-/// more of these) tend to need more planning than single-app ones. Seeded from the daemon's
-/// own skill catalog naming plus common aliases; deliberately plain-text substring matching
-/// (no external dependency) -- see this module's doc on why routing stays dependency-free.
+/// These are the recognized app or target names a prompt might reference. Cross-app prompts
+/// that mention two or more of these tend to need more planning than single-app prompts.
+/// This list is seeded from the daemon's own skill-catalog naming, plus common aliases. This
+/// module deliberately uses plain-text substring matching, with no external dependency (see
+/// this module's doc on why routing stays dependency-free).
 const KNOWN_APPS: &[&str] = &[
     "calendar", "contacts", "mail", "email", "messages", "imessage", "text", "notes",
     "reminders", "system settings", "chrome", "safari", "browser", "discord", "finder",
@@ -90,16 +99,16 @@ const KNOWN_APPS: &[&str] = &[
     "numbers", "keynote", "xcode",
 ];
 
-/// Sequencing/connective words whose presence signals a multi-step plan.
+/// These sequencing or connective words signal a multi-step plan when present.
 const SEQUENCING_WORDS: &[&str] = &[
     "then", "after", "next", "once", "before", "finally", "afterward", "afterwards",
 ];
 
-/// Conditional/branching words that stress a smaller model's planning.
+/// These conditional or branching words stress a smaller model's planning.
 const CONDITIONAL_WORDS: &[&str] = &["if", "unless", "otherwise", "depending", "whichever"];
 
-/// Known imperative action verbs. Counted at clause starts as a proxy for "how many distinct
-/// actions does this prompt actually ask for".
+/// These are known imperative action verbs. This module counts these verbs at clause
+/// starts, as a proxy for "how many distinct actions does this prompt actually ask for".
 const ACTION_VERBS: &[&str] = &[
     "open", "click", "type", "search", "send", "reply", "create", "delete", "move", "copy",
     "drag", "compose", "book", "schedule", "download", "install", "compare", "summarize",
@@ -107,9 +116,10 @@ const ACTION_VERBS: &[&str] = &[
 ];
 
 /// Classify a prompt's raw text into a routing tier by an additive, dependency-free heuristic
-/// score. See this module's doc for the design rationale (why per-prompt is spawn-cost-bound,
-/// why hysteresis exists on top of this -- see [`should_switch`], which re-derives the raw
-/// score via [`score`] rather than working off this function's collapsed `Tier`).
+/// score. See this module's doc for the design rationale: why per-prompt classification is
+/// spawn-cost-bound, and why hysteresis exists on top of this. [`should_switch`] re-derives
+/// the raw score via [`score`]. [`should_switch`] does not work off this function's collapsed
+/// `Tier`.
 ///
 /// Heuristics (see [`score`]'s inline comments for exact weights):
 /// - word/char length,
@@ -129,9 +139,9 @@ pub fn classify(prompt: &str) -> Tier {
     }
 }
 
-/// The raw additive complexity score behind [`classify`], exposed separately so
-/// [`should_switch`] can apply its own tighter hysteresis thresholds without re-running (or
-/// duplicating) the scoring logic.
+/// Returns the raw additive complexity score behind [`classify`]. This function is
+/// exposed separately so [`should_switch`] can apply its own tighter hysteresis thresholds.
+/// This avoids re-running or duplicating the scoring logic.
 fn score(prompt: &str) -> i32 {
     let trimmed = prompt.trim();
     let lower = trimmed.to_lowercase();
@@ -218,14 +228,17 @@ fn score(prompt: &str) -> i32 {
     total
 }
 
-/// Decide whether `prompt` should switch `holo serve` away from the currently active `active`
-/// tier, applying decisive hysteresis so a queue of alternating light/heavy prompts doesn't
-/// thrash the model on every turn. `Some(new_tier)` means switch (and to which tier);
-/// `None` means stay on `active`. Scores `prompt` once (via the crate-private [`score`]) and
-/// checks it against the tighter [`UPGRADE_THRESHOLD`]/[`DOWNGRADE_THRESHOLD`] bounds -- the
-/// single real source of truth for "should we actually respawn, and onto what", so the
-/// returned tier can never disagree with the decision that produced it (unlike deciding via
-/// [`classify`]'s separately-thresholded, already-collapsed verdict).
+/// Decides whether `prompt` should switch `holo serve` away from the currently active
+/// `active` tier. This function applies decisive hysteresis, so a queue of alternating
+/// light and heavy prompts does not thrash the model on every turn. `Some(new_tier)` means
+/// switch, and names the tier to switch to. `None` means stay on `active`.
+///
+/// This function scores `prompt` once, via the crate-private [`score`]. This function
+/// checks that score against the tighter [`UPGRADE_THRESHOLD`] and [`DOWNGRADE_THRESHOLD`]
+/// bounds. This check is the single real source of truth for "should we actually respawn,
+/// and onto what". So the returned tier can never disagree with the decision that produced
+/// it. This differs from deciding via [`classify`]'s separately-thresholded,
+/// already-collapsed verdict.
 pub fn should_switch(active: Tier, prompt: &str) -> Option<Tier> {
     let s = score(prompt);
     match active {

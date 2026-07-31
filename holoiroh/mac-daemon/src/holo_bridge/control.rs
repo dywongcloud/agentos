@@ -1,25 +1,29 @@
 //! Control-channel message types and the bridge that dispatches them to `holo serve`'s A2A
-//! endpoint, per the architecture described in `holoiroh/README.md` ("Control channel"
-//! section): text prompts and voice transcripts flow *into* the daemon from the iOS app,
-//! status/log/ack events flow back *out*.
+//! endpoint, per the architecture described in `holoiroh/README.md` (the "Control channel"
+//! section). Text prompts and voice transcripts flow into the daemon from the iOS app.
+//! Status/log/ack events flow back out.
 //!
 //! ## What is and isn't defined elsewhere
 //!
-//! The wire format of the control channel itself (how messages are framed over the `iroh`
-//! control stream) is defined separately in `crate::control_channel` and
-//! `holoiroh/PROTOCOL.md` -- a minimal `ClientMessage`/`ServerMessage` schema
-//! (`{type, text?}`, no correlation ids) carried over a dedicated ALPN on the same `iroh`
-//! `Endpoint` as the media broadcast. This module's `ControlMessage` / `ControlEvent` are a
-//! *richer, internal* schema (`serde`-tagged enums, transport-agnostic) correlated by
-//! `request_id`/`context_id` for talking to `holo serve`'s A2A endpoint; `control_channel`
-//! translates between the two at the transport boundary (see its module doc for the mapping)
-//! rather than this module depending on `iroh` or wire framing at all. `prompt` /
-//! `voice_transcript` / `stop` are exactly the three message kinds named in the task;
-//! `voice_transcript` is modeled identically to `prompt` (both become an A2A `message/stream`
-//! call with the transcript/prompt text as the message body) since `README.md` §"iOS-side" is
-//! explicit that "voice input is transcribed ... before being sent as text over the control
-//! channel, so the wire format is always a text prompt plus metadata, never raw audio" -- i.e.
-//! by the time either message kind reaches this bridge, both are just text.
+//! `crate::control_channel` and `holoiroh/PROTOCOL.md` define the wire format of the
+//! control channel itself: how messages are framed over the `iroh` control stream. That
+//! wire format is a minimal `ClientMessage`/`ServerMessage` schema (`{type, text?}`, no
+//! correlation ids), carried over a dedicated ALPN on the same `iroh` `Endpoint` as the
+//! media broadcast.
+//!
+//! This module's `ControlMessage` / `ControlEvent` are a richer, internal schema:
+//! `serde`-tagged enums, transport-agnostic, correlated by `request_id`/`context_id`, for
+//! talking to `holo serve`'s A2A endpoint. `control_channel` translates between the two
+//! schemas at the transport boundary (see its module doc for the mapping). This module
+//! itself does not depend on `iroh` or wire framing at all.
+//!
+//! `prompt` / `voice_transcript` / `stop` are exactly the three message kinds named in the
+//! task. `voice_transcript` is modeled identically to `prompt`: both become an A2A
+//! `message/stream` call with the transcript/prompt text as the message body.
+//! `README.md` §"iOS-side" is explicit that "voice input is transcribed ... before being
+//! sent as text over the control channel, so the wire format is always a text prompt plus
+//! metadata, never raw audio." So by the time either message kind reaches this bridge, both
+//! are just text.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,72 +38,88 @@ use crate::holo_bridge::a2a_client::{A2aClient, TaskUpdate, TerminalState};
 use crate::limits::ActionCounter;
 use crate::sensitive_categories::{CategorySetting, SensitiveCategories};
 
-/// One incoming control-channel message, keyed by the `type` discriminator the task
-/// description names explicitly (`"prompt"`, `"voice_transcript"`, `"stop"`).
+/// One incoming control-channel message. The `type` discriminator keys it.
+/// The task description names three discriminators explicitly:
+/// `"prompt"`, `"voice_transcript"`, `"stop"`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
     /// A typed text prompt from the iOS app's text field.
     Prompt {
-        /// Free-form id the caller can use to correlate this prompt with the
-        /// `ControlEvent`s it produces; echoed back on every event derived from it.
+        /// Free-form id the caller can use to correlate this prompt with
+        /// the `ControlEvent`s it produces. The bridge echoes this id
+        /// back on every event derived from it.
         request_id: String,
         text: String,
-        /// Continue an existing A2A/`hai-agent-runtime` session (see `a2a_client` module doc
-        /// on `contextId`), or start a new one when absent.
+        /// Continue an existing A2A/`hai-agent-runtime` session (see
+        /// `a2a_client` module doc on `contextId`). Start a new one when
+        /// absent.
         #[serde(default)]
         context_id: Option<String>,
     },
-    /// A transcribed voice instruction. Same handling as `Prompt` (see module doc) -- kept as
-    /// a distinct variant rather than collapsed into `Prompt` so the iOS app / future control
-    /// channel can still distinguish "typed" vs. "spoken" provenance for UI/logging purposes,
-    /// without that distinction leaking into how the daemon talks to `holo serve`.
+    /// A transcribed voice instruction. This variant gets the same
+    /// handling as `Prompt` (see module doc). It stays a distinct
+    /// variant, rather than collapsing into `Prompt`, so the iOS app or a
+    /// future control channel can still distinguish "typed" vs. "spoken"
+    /// provenance for UI/logging purposes. That distinction never leaks
+    /// into how the daemon talks to `holo serve`.
     VoiceTranscript {
         request_id: String,
         text: String,
         #[serde(default)]
         context_id: Option<String>,
-        /// Optional transcription confidence, if the on-device/service transcriber supplies
-        /// one; purely informational, never gates whether the daemon acts on it.
+        /// Optional transcription confidence, if the on-device/service
+        /// transcriber supplies one. This is purely informational; it
+        /// never gates whether the daemon acts on it.
         #[serde(default)]
         confidence: Option<f32>,
     },
-    /// Stop the in-flight turn. `context_id` scopes the stop to one A2A task via the A2A
-    /// `tasks/cancel` equivalent; when absent, this also engages the CLI-level `holo stop`
-    /// kill switch (global to the `holo serve`-spawned runtime, matching the double-Esc /
-    /// `holo stop` behavior documented in the upstream CLI -- see `stop.rs` module doc).
+    /// Stop the in-flight turn. `context_id` scopes the stop to one A2A
+    /// task via the A2A `tasks/cancel` equivalent. When `context_id` is
+    /// absent, this also engages the CLI-level `holo stop` kill switch,
+    /// which is global to the `holo serve`-spawned runtime. This matches
+    /// the double-Esc / `holo stop` behavior documented in the upstream
+    /// CLI -- see `stop.rs` module doc.
     Stop {
         request_id: String,
         #[serde(default)]
         context_id: Option<String>,
-        /// Mirrors `holo stop --force`: after requesting the graceful pause-then-cancel,
-        /// also SIGKILL the underlying `hai-agent-runtime` process. Use only when the
-        /// graceful path is known to be stuck; it ends every in-flight session, not just
-        /// this `context_id`.
+        /// Mirrors `holo stop --force`. After requesting the graceful
+        /// pause-then-cancel, this also sends SIGKILL to the underlying
+        /// `hai-agent-runtime` process. Use only when the graceful path
+        /// is known to be stuck. It ends every in-flight session, not
+        /// just this `context_id`.
         #[serde(default)]
         force: bool,
     },
-    /// Pause the in-flight turn: scoped-cancel it (the backend exposes no real pause RPC --
-    /// see `ClientMessage::Pause`'s doc in `holoiroh-wire`) while stashing its instruction
-    /// text and resolved `contextId` so a later `Resume` continues the same backend session.
+    /// Pause the in-flight turn. This scoped-cancels it, since the
+    /// backend exposes no real pause RPC (see `ClientMessage::Pause`'s
+    /// doc in `holoiroh-wire`), while stashing its instruction text and
+    /// resolved `contextId`. A later `Resume` continues the same backend
+    /// session.
     Pause { request_id: String },
-    /// Resume the turn a previous `Pause` (or a sensitive-app consent gate) stashed.
+    /// Resume the turn a previous `Pause` (or a sensitive-app consent
+    /// gate) stashed.
     Resume { request_id: String },
-    /// Replace whatever is running/queued with `text`: cancel the in-flight turn, drop the
-    /// queue, then run `text` -- reusing the canceled turn's `contextId` when known so the
-    /// agent keeps the history it had built up.
+    /// Replace whatever is running/queued with `text`. This cancels the
+    /// in-flight turn, drops the queue, then runs `text`. It reuses the
+    /// canceled turn's `contextId` when known, so the agent keeps the
+    /// history it had built up.
     Redirect { request_id: String, text: String },
-    /// A hands-on remote-control action the user performed by touching the iOS
-    /// live-share view -- an escalation to direct control. `TakeControl`/
-    /// `ReleaseControl` pause/resume the agent; the other actions are injected
-    /// as real CGEvents on the Mac (see `crate::remote_input`).
+    /// A hands-on remote-control action the user performed by touching
+    /// the iOS live-share view: an escalation to direct control.
+    /// `TakeControl`/`ReleaseControl` pause/resume the agent. The daemon
+    /// injects the other actions as real CGEvents on the Mac (see
+    /// `crate::remote_input`).
     RemoteControl { event: RemoteControlEvent },
 }
 
 impl ControlMessage {
-    /// Not read internally today (`HoloControlBridge::handle` destructures each variant
-    /// itself), but a natural accessor for any future caller that wants to log/correlate a
-    /// message before dispatching it -- kept rather than removed just to silence dead-code.
+    /// Nothing reads this internally today; `HoloControlBridge::handle`
+    /// destructures each variant itself. This function is a natural
+    /// accessor for any future caller that wants to log or correlate a
+    /// message before dispatching it. It stays rather than being removed
+    /// just to silence dead-code.
     #[allow(dead_code)]
     pub fn request_id(&self) -> &str {
         match self {
@@ -115,9 +135,10 @@ impl ControlMessage {
     }
 }
 
-/// Inject a non-take/release remote-control action as real CGEvents on the Mac
-/// (see `crate::remote_input`). `TakeControl`/`ReleaseControl` are handled by
-/// the caller (they pause/resume the agent, not inject input).
+/// Inject a non-take/release remote-control action as real CGEvents on
+/// the Mac (see `crate::remote_input`). The caller handles
+/// `TakeControl`/`ReleaseControl`: they pause/resume the agent, not
+/// inject input.
 fn inject_remote_input(event: RemoteControlEvent) {
     match event {
         RemoteControlEvent::Move { x, y } => crate::remote_input::move_cursor(x, y),
@@ -142,10 +163,11 @@ pub enum ControlEvent {
     /// Acknowledges receipt before any A2A round trip completes, so the UI can show
     /// "sent" immediately rather than waiting on the first task-progress event.
     Ack { request_id: String },
-    /// One step of agent progress. `raw_event`, when present, is the backend
-    /// `TrajectoryEvent` forwarded verbatim (opaque JSON -- see `a2a_client` module doc on
-    /// why this bridge does not attempt to type it); `text`, when present, is a
-    /// human-readable status line extracted from the A2A status message.
+    /// One step of agent progress. `raw_event`, when present, is the
+    /// backend `TrajectoryEvent` forwarded verbatim: opaque JSON. See
+    /// `a2a_client` module doc for why this bridge does not attempt to
+    /// type it. `text`, when present, is a human-readable status line
+    /// extracted from the A2A status message.
     Progress {
         request_id: String,
         context_id: Option<String>,
@@ -168,31 +190,40 @@ pub enum ControlEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
-    /// The bridge itself hit an error before/without a well-formed A2A terminal event (e.g.
-    /// `holo serve` unreachable, malformed control message).
+    /// The bridge itself hit an error before a well-formed A2A terminal
+    /// event arrived, or without one arriving at all. For example, `holo
+    /// serve` was unreachable, or the control message was malformed.
     Error { request_id: String, message: String },
-    /// A `Prompt`/`VoiceTranscript` arrived while a previous turn was still in flight and was
-    /// queued rather than raced against it or dropped. `ahead` is the number of prompts already
-    /// queued in front of this one (0 means "runs as soon as the current turn finishes").
-    /// `crate::control_channel::ServerMessage::from_control_event` maps this to the wire
-    /// `{"type":"status","text":"queued, N ahead"}` the task asks for.
+    /// A `Prompt`/`VoiceTranscript` arrived while a previous turn was
+    /// still in flight. The bridge queued it, rather than racing it
+    /// against the current turn or dropping it. `ahead` is the number of
+    /// prompts already queued in front of this one; 0 means "runs as soon
+    /// as the current turn finishes."
+    /// `crate::control_channel::ServerMessage::from_control_event` maps
+    /// this to the wire `{"type":"status","text":"queued, N ahead"}` the
+    /// task asks for.
     Queued { request_id: String, ahead: usize },
-    /// Out-of-band daemon lifecycle status, not tied to any single request -- e.g.
-    /// `holo_bridge::health`'s crash-detected/restarting/restarted notifications. Carries no
-    /// `request_id` since it isn't a response to a specific prompt.
+    /// Out-of-band daemon lifecycle status, not tied to any single
+    /// request. For example, `holo_bridge::health`'s
+    /// crash-detected/restarting/restarted notifications use this
+    /// variant. It carries no `request_id`, since it isn't a response to
+    /// a specific prompt.
     DaemonStatus { text: String },
-    /// Live task-control state change, not tied to a single request: emitted by
-    /// cooperative auto-yield (`crate::auto_yield`) when it steps the agent
-    /// aside (`paused: true`) or resumes it (`paused: false`), so the phone's
-    /// Pause/Stop pill reflects the yield in real time. Maps to the wire
-    /// `ServerMessage::TaskActive` (the same message used on reconnect).
+    /// Live task-control state change, not tied to a single request.
+    /// Cooperative auto-yield (`crate::auto_yield`) emits this when it
+    /// steps the agent aside (`paused: true`) or resumes it (`paused:
+    /// false`), so the phone's Pause/Stop pill reflects the yield in real
+    /// time. This maps to the wire `ServerMessage::TaskActive`, the same
+    /// message used on reconnect.
     TaskActive { paused: bool, queued: usize },
-    /// The daemon needs structured user input before the paused turn can continue --
-    /// today produced only by the sensitive-app consent gate (see the sensitive-app
-    /// watchdog in this module). Translated by `control_channel::from_control_event` into
-    /// the wire `ServerMessage::InputRequest` (P0-14). `request_id` here is the CONSENT
-    /// request's own id (echoed back by `ClientMessage::InputResponse`), distinct from the
-    /// paused task's id, which the pending-consent state tracks internally.
+    /// The daemon needs structured user input before the paused turn can
+    /// continue. Today, only the sensitive-app consent gate produces
+    /// this variant (see the sensitive-app watchdog in this module).
+    /// `control_channel::from_control_event` translates it into the wire
+    /// `ServerMessage::InputRequest` (P0-14). `request_id` here is the
+    /// CONSENT request's own id, echoed back by
+    /// `ClientMessage::InputResponse`. It is distinct from the paused
+    /// task's id, which the pending-consent state tracks internally.
     InputRequested {
         request_id: String,
         kind: InputRequestKind,
@@ -200,20 +231,23 @@ pub enum ControlEvent {
         response_options: Vec<String>,
         expires_at: u64,
     },
-    /// Clarifying questions generated for a `ClientMessage::ClarifyRequest`
-    /// (empty when the instruction was already clear). Not tied to a task turn;
-    /// `control_channel::from_control_event` maps it to the wire
-    /// `ServerMessage::ClarifyQuestions`. Emitted by the control-channel read
-    /// loop's spawned clarify task, off the desktop-task pipeline.
+    /// Clarifying questions generated for a `ClientMessage::ClarifyRequest`;
+    /// empty when the instruction was already clear. This variant is not
+    /// tied to a task turn. `control_channel::from_control_event` maps it
+    /// to the wire `ServerMessage::ClarifyQuestions`. The control-channel
+    /// read loop's spawned clarify task emits it, off the desktop-task
+    /// pipeline.
     ClarifyQuestions { questions: Vec<ClarifyingQuestion> },
-    /// Whether the Mac's currently-focused field is a secure (password-class)
-    /// input right now -- emitted only on CHANGE by
-    /// `holo_bridge::secure_input_watchdog`'s polling loop. Not tied to a
-    /// task turn; `control_channel::from_control_event` maps it straight to
-    /// the wire `ServerMessage::SecureInputState`.
+    /// Whether the Mac's currently-focused field is a secure
+    /// (password-class) input right now.
+    /// `holo_bridge::secure_input_watchdog`'s polling loop emits this
+    /// only on change. This variant is not tied to a task turn.
+    /// `control_channel::from_control_event` maps it straight to the wire
+    /// `ServerMessage::SecureInputState`.
     SecureInputState { active: bool },
-    /// Successful `ClientMessage::ProcessDocument` result. Off the desktop-task pipeline, same
-    /// posture as `ClarifyQuestions` -- emitted by a spawned `tinfoil_documents` call.
+    /// Successful `ClientMessage::ProcessDocument` result. Off the
+    /// desktop-task pipeline, with the same posture as
+    /// `ClarifyQuestions`. A spawned `tinfoil_documents` call emits this.
     DocumentProcessed { request_id: String, markdown: String },
     /// Failure of a `ClientMessage::ProcessDocument` request.
     DocumentProcessFailed { request_id: String, error: String },
@@ -253,24 +287,26 @@ impl From<TerminalState> for DoneStatus {
     }
 }
 
-/// One `Prompt`/`VoiceTranscript` turn waiting for the in-flight turn ahead of it to finish.
-/// Releases the single-active-turn `busy` flag on ANY exit from a turn.
+/// One `Prompt`/`VoiceTranscript` turn waiting for the in-flight turn
+/// ahead of it to finish. This guard releases the single-active-turn
+/// `busy` flag on any exit from a turn.
 ///
-/// `busy` was previously cleared in exactly one place: `drain_queue`'s normal
-/// return. So a panic anywhere inside a turn -- or cancellation of the task
-/// owning that future -- left `busy == true` forever, and the daemon silently
-/// became "queue every future prompt, run none": the phone shows
-/// `queued, 0 ahead` for every task the user sends, indefinitely, while the
-/// daemon otherwise looks perfectly healthy (video streams, the control channel
-/// answers, nothing logs an error).
+/// `busy` was previously cleared in exactly one place: `drain_queue`'s
+/// normal return. So a panic anywhere inside a turn, or cancellation of
+/// the task owning that future, left `busy == true` forever. The daemon
+/// then silently became "queue every future prompt, run none": the phone
+/// shows `queued, 0 ahead` for every task the user sends, indefinitely,
+/// while the daemon otherwise looks perfectly healthy (video streams, the
+/// control channel answers, nothing logs an error).
 ///
-/// Resetting unconditionally on drop is correct because `drain_queue` only
-/// returns once the queue is empty, and it sets `busy = false` in that case --
-/// so on the normal path this guard is a no-op, and the only time it changes
-/// anything is the abnormal exit it exists for.
+/// Resetting unconditionally on drop is correct, because `drain_queue`
+/// only returns once the queue is empty, and it sets `busy = false` in
+/// that case. So on the normal path this guard is a no-op. The only time
+/// it changes anything is the abnormal exit it exists for.
 ///
-/// Deliberately recovers a poisoned lock instead of unwrapping: this can run
-/// during unwind, where a second panic would abort the process.
+/// This guard deliberately recovers a poisoned lock instead of
+/// unwrapping. It can run during unwind, where a second panic would
+/// abort the process.
 struct BusyGuard<'a> {
     busy: &'a std::sync::Mutex<bool>,
 }
@@ -288,190 +324,225 @@ impl Drop for BusyGuard<'_> {
     }
 }
 
-/// Both `ControlMessage` variants that carry free-form text collapse to this one shape once
-/// queued -- the queue only needs to replay `send_and_stream`'s inputs, not the original
-/// wire-level distinction (which was already informational-only, see `ControlMessage` doc).
+/// Both `ControlMessage` variants that carry free-form text collapse to
+/// this one shape once queued. The queue only needs to replay
+/// `send_and_stream`'s inputs, not the original wire-level distinction,
+/// which was already informational-only (see `ControlMessage` doc).
 struct QueuedPrompt {
     request_id: String,
     text: String,
     context_id: Option<String>,
 }
 
-/// The turn currently inside `run_prompt`, tracked so Stop/Pause/Redirect (and the
-/// sensitive-app watchdog) can scope-cancel it mid-stream. `text` is the ORIGINAL
-/// instruction (pre-env-context augmentation) so a pause stash can honestly replay it;
-/// `context_id` starts as whatever the caller passed and is upgraded to the stream's
-/// resolved `contextId` the moment `send_and_stream`'s `on_context` fires.
+/// The turn currently inside `run_prompt`. The bridge tracks this so
+/// Stop/Pause/Redirect (and the sensitive-app watchdog) can scope-cancel
+/// it mid-stream. `text` is the ORIGINAL instruction, before
+/// env-context augmentation, so a pause stash can honestly replay it.
+/// `context_id` starts as whatever the caller passed. It upgrades to the
+/// stream's resolved `contextId` the moment `send_and_stream`'s
+/// `on_context` fires.
 #[derive(Clone)]
 struct CurrentTurn {
     request_id: String,
     text: String,
     context_id: Option<String>,
-    /// The A2A `Task.id` the stream resolved for this turn -- the id
-    /// `tasks/cancel` actually requires (a context-id stand-in returns
-    /// "Task not found" on the current holo serve; see `A2aClient::cancel`).
+    /// The A2A `Task.id` the stream resolved for this turn: the id
+    /// `tasks/cancel` actually requires. A context-id stand-in returns
+    /// "Task not found" on the current holo serve; see
+    /// `A2aClient::cancel`.
     a2a_task_id: Option<String>,
-    /// [`HoloControlBridge::client_epoch`]'s value at the moment this turn started. If the
-    /// live epoch has since moved on (a crash-restart or a backend switch replaced the
-    /// `holo serve` process this turn's `context_id`/`a2a_task_id` belong to), those ids are
-    /// pointing at a session that no longer exists anywhere -- see `client_epoch`'s doc for
-    /// why a redirect must never inherit them once stale.
+    /// [`HoloControlBridge::client_epoch`]'s value at the moment this
+    /// turn started. The live epoch may have since moved on: a
+    /// crash-restart or a backend switch may have replaced the `holo
+    /// serve` process this turn's `context_id`/`a2a_task_id` belong to.
+    /// When that happens, those ids point at a session that no longer
+    /// exists anywhere -- see `client_epoch`'s doc for why a redirect
+    /// must never inherit them once stale.
     started_epoch: u64,
 }
 
-/// A turn parked by `Pause` (or by the sensitive-app consent gate): everything `Resume`
-/// needs to continue it -- the original instruction plus the backend session (`contextId`)
-/// whose history carries the task's progress so far.
+/// A turn parked by `Pause` (or by the sensitive-app consent gate):
+/// everything `Resume` needs to continue it. This includes the original
+/// instruction, plus the backend session (`contextId`) whose history
+/// carries the task's progress so far.
 #[derive(Clone)]
 struct PausedTurn {
     request_id: String,
     text: String,
     context_id: Option<String>,
-    /// True if this pause was created by cooperative auto-yield (the user
-    /// started using the Mac) rather than a deliberate user Pause. Only an
-    /// auto pause is auto-resumed; a user pause stays paused until the user
-    /// resumes it. See `crate::auto_yield`.
+    /// True if this pause was created by cooperative auto-yield (the
+    /// user started using the Mac), rather than a deliberate user Pause.
+    /// Only an auto pause is auto-resumed; a user pause stays paused
+    /// until the user resumes it. See `crate::auto_yield`.
     auto: bool,
 }
 
-/// One outstanding sensitive-app consent request (`ControlEvent::InputRequested`,
-/// kind `sensitive_access_consent`), resolved by a matching
-/// `ClientMessage::InputResponse` (see [`HoloControlBridge::resolve_consent`]) or by the
-/// expiry timer spawned alongside it.
+/// One outstanding sensitive-app consent request
+/// (`ControlEvent::InputRequested`, kind `sensitive_access_consent`).
+/// A matching `ClientMessage::InputResponse` resolves it (see
+/// [`HoloControlBridge::resolve_consent`]), or the expiry timer spawned
+/// alongside it resolves it.
 struct PendingConsent {
     consent_request_id: String,
     category_id: String,
 }
 
-/// Consent response option meaning "let the agent continue in this app category for the
-/// rest of the current task". Shared between the request's `response_options` and
-/// `resolve_consent`'s match so the two can never drift apart.
+/// Consent response option meaning "let the agent continue in this app
+/// category for the rest of the current task". Shared between the
+/// request's `response_options` and `resolve_consent`'s match, so the
+/// two can never drift apart.
 const CONSENT_ALLOW_ONCE: &str = "Allow once";
 /// Consent response option meaning "abandon the paused task".
 const CONSENT_STOP_TASK: &str = "Stop task";
-/// How long a sensitive-app consent request stays answerable before it expires into the
-/// standard safe-pause state (the task simply stays paused; `Resume` re-asks).
+/// How long a sensitive-app consent request stays answerable before it
+/// expires into the standard safe-pause state. The task simply stays
+/// paused; `Resume` re-asks.
 const CONSENT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// See `crate::holo_bridge::stall_watchdog`'s module doc for the full design. How long a task
-/// may show zero real phase advancement (`TaskFsm::updated_at_ms` unchanged) while still
-/// `Working` before the watchdog nudges it. Conservative on purpose: a genuinely hard step
-/// (a slow page load, a long download) must never be mistaken for a stuck agent.
+/// See `crate::holo_bridge::stall_watchdog`'s module doc for the full
+/// design. This constant sets how long a task may show zero real phase
+/// advancement (`TaskFsm::updated_at_ms` unchanged) while still
+/// `Working` before the watchdog nudges it. It is conservative on
+/// purpose: a genuinely hard step (a slow page load, a long download)
+/// must never be mistaken for a stuck agent.
 const STALL_WATCHDOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(45);
-/// Minimum gap between two nudges for the SAME task, so a still-stuck task after one nudge
-/// gets real time to act on it before a second nudge piles on.
+/// Minimum gap between two nudges for the SAME task, so a still-stuck
+/// task after one nudge gets real time to act on it before a second
+/// nudge piles on.
 const STALL_WATCHDOG_NUDGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
-/// The autonomous self-correction nudge sent (as a redirect on the SAME backend session) when
-/// the watchdog detects a stall. Deliberately echoes `agent_guidance::task_framing_block`'s
-/// self-correction rule so the reinforcement arrives exactly when it's needed.
+/// The autonomous self-correction nudge sent, as a redirect on the SAME
+/// backend session, when the watchdog detects a stall. It deliberately
+/// echoes `agent_guidance::task_framing_block`'s self-correction rule,
+/// so the reinforcement arrives exactly when it's needed.
 const STALL_WATCHDOG_NUDGE_TEXT: &str = "You have not made visible progress for a while. Before continuing: check whether your LAST action actually did what you intended (text in the wrong field, wrong element clicked, an unexpected dialog or state). If it did not, fix just that one step -- do not restart the whole task -- then continue toward the original goal.";
-/// Stable substring of the daemon-status line emitted right before a watchdog nudge, so a
-/// probe (and the iOS log panel) can distinguish a self-correction nudge from ordinary status
-/// text.
+/// Stable substring of the daemon-status line emitted right before a
+/// watchdog nudge, so a probe (and the iOS log panel) can distinguish a
+/// self-correction nudge from ordinary status text.
 const STALL_WATCHDOG_STATUS_MARKER: &str = "self-correction check:";
 
-/// Bridges control-channel messages to `holo serve`'s A2A endpoint and CLI-level stop
-/// handling. Holds no transport of its own -- the caller owns receiving `ControlMessage`s
-/// (from whatever the eventual `iroh` control stream deserializes into them) and sending
-/// `ControlEvent`s back out; this type only owns the A2A/CLI interaction and the
-/// prompt-to-context continuity.
+/// Bridges control-channel messages to `holo serve`'s A2A endpoint and
+/// CLI-level stop handling. This type holds no transport of its own. The
+/// caller owns receiving `ControlMessage`s (from whatever the eventual
+/// `iroh` control stream deserializes into them) and sending
+/// `ControlEvent`s back out. This type only owns the A2A/CLI interaction
+/// and the prompt-to-context continuity.
 pub struct HoloControlBridge {
-    /// `std::sync::RwLock` (not `tokio::sync::RwLock`) matching `events_tx` below -- `client`
-    /// is only ever swapped wholesale (`replace_client`, on `holo_bridge::health` restart), a
-    /// cheap `Clone` of a small struct, never held across an `.await`.
+    /// This field uses `std::sync::RwLock`, not `tokio::sync::RwLock`,
+    /// matching `events_tx` below. `client` is only ever swapped wholesale
+    /// (`replace_client`, on `holo_bridge::health` restart): a cheap
+    /// `Clone` of a small struct, never held across an `.await`.
     client: RwLock<A2aClient>,
-    /// Bumped by [`Self::replace_client`] every time `client` is swapped onto a DIFFERENT
-    /// `holo serve` process -- both `HoloBridge::restart_process` (crash-detected auto-restart)
-    /// and `HoloBridge::switch_to` (rate-limit failover, primary-restore, intent-router tier
-    /// force) funnel through it, so this counts every process replacement uniformly regardless
-    /// of trigger. Each running-process "generation" gets a fresh `hai-agent-runtime` session
-    /// namespace with zero memory of any prior generation's `context_id`/`a2a_task_id` --
-    /// [`CurrentTurn::started_epoch`] lets a turn detect it survived past its own process's
-    /// death, so `handle_redirect`/`maybe_nudge_stalled_turn` can refuse to inherit a context
-    /// that no longer exists anywhere instead of silently misfiring into the new process. Never
-    /// reset; only ever compared for (in)equality, so wraparound is a non-issue at any
-    /// realistic restart rate.
+    /// [`Self::replace_client`] bumps this every time `client` is swapped
+    /// onto a DIFFERENT `holo serve` process. Both
+    /// `HoloBridge::restart_process` (crash-detected auto-restart) and
+    /// `HoloBridge::switch_to` (rate-limit failover, primary-restore,
+    /// intent-router tier force) funnel through it, so this counts every
+    /// process replacement uniformly regardless of trigger. Each
+    /// running-process "generation" gets a fresh `hai-agent-runtime`
+    /// session namespace with zero memory of any prior generation's
+    /// `context_id`/`a2a_task_id`. [`CurrentTurn::started_epoch`] lets a
+    /// turn detect it survived past its own process's death, so
+    /// `handle_redirect`/`maybe_nudge_stalled_turn` can refuse to inherit
+    /// a context that no longer exists anywhere, instead of silently
+    /// misfiring into the new process. This field is never reset; the
+    /// code only ever compares it for (in)equality, so wraparound is a
+    /// non-issue at any realistic restart rate.
     client_epoch: AtomicU64,
-    /// Wrapped in a `std::sync::RwLock` (not `tokio::sync::RwLock`) so the
-    /// active event sink can be swapped per control-channel connection
-    /// (see `crate::control_channel`, which calls
-    /// `HoloBridge::replace_event_sink` once per accepted connection)
-    /// while `emit` stays synchronous -- `emit` is called from inside the
-    /// synchronous `FnMut(TaskUpdate)` callback `A2aClient::send_and_stream`
-    /// takes, so it cannot `.await`. A std lock is safe here because both
-    /// the read (clone a `Sender`, itself a cheap non-blocking op) and the
-    /// write (swap a `Sender`) critical sections are tiny and never hold
-    /// the lock across an `.await` point. This is also exactly the
-    /// mechanism a reconnect relies on: a brand-new control-channel
-    /// connection calls `replace_event_sink` on accept, so any turn that
-    /// was already streaming (from a prompt submitted on a now-dropped
-    /// connection, or drained from the queue below) has its *next* `emit`
-    /// routed to the newly-connected peer -- no daemon restart, no lost
-    /// turn, just a redirected sink.
+    /// This field is wrapped in a `std::sync::RwLock`, not
+    /// `tokio::sync::RwLock`, so the active event sink can be swapped per
+    /// control-channel connection (see `crate::control_channel`, which
+    /// calls `HoloBridge::replace_event_sink` once per accepted
+    /// connection) while `emit` stays synchronous. `emit` is called from
+    /// inside the synchronous `FnMut(TaskUpdate)` callback
+    /// `A2aClient::send_and_stream` takes, so it cannot `.await`. A std
+    /// lock is safe here because both the read (clone a `Sender`, itself
+    /// a cheap non-blocking op) and the write (swap a `Sender`) critical
+    /// sections are tiny and never hold the lock across an `.await`
+    /// point. This is also exactly the mechanism a reconnect relies on.
+    /// A brand-new control-channel connection calls `replace_event_sink`
+    /// on accept. So any turn that was already streaming, from a prompt
+    /// submitted on a now-dropped connection or drained from the queue
+    /// below, has its next `emit` routed to the newly-connected peer. No
+    /// daemon restart, no lost turn, just a redirected sink.
     events_tx: RwLock<mpsc::UnboundedSender<ControlEvent>>,
-    /// Path to (or bare name of) the `holo` CLI binary, for `holo stop` (see `stop.rs`).
+    /// Path to (or bare name of) the `holo` CLI binary, for `holo stop`
+    /// (see `stop.rs`).
     holo_bin: String,
-    /// `true` while a `Prompt`/`VoiceTranscript` turn is actively running against `client`
-    /// (i.e. inside `send_and_stream`). Guards against ever having two simultaneous
-    /// `send_and_stream` calls in flight against the same `holo serve`/`AgentApiClient`
-    /// session -- see `run_or_queue_prompt`. A `std::sync::Mutex<bool>` rather than an
-    /// `AtomicBool` so the "check busy, and if free mark busy" step is one atomic
-    /// critical section together with the queue-length check below (a plain
-    /// compare-and-swap on its own can't also observe/mutate `queue` in the same step).
+    /// `true` while a `Prompt`/`VoiceTranscript` turn is actively running
+    /// against `client` (that is, inside `send_and_stream`). This guards
+    /// against ever having two simultaneous `send_and_stream` calls in
+    /// flight against the same `holo serve`/`AgentApiClient` session --
+    /// see `run_or_queue_prompt`. This field is a `std::sync::Mutex<bool>`,
+    /// not an `AtomicBool`, so the "check busy, and if free mark busy"
+    /// step is one atomic critical section together with the
+    /// queue-length check below. A plain compare-and-swap on its own
+    /// can't also observe/mutate `queue` in the same step.
     ///
     /// This is also the concrete mechanism that enforces
-    /// [`crate::limits::MAX_ACTIVE_TASKS_PER_MAC`] (PRD 10.4): with the cap
-    /// at 1, "at most one task actively running" is exactly "at most one
-    /// `Prompt`/`VoiceTranscript` turn holds `busy == true` at a time" --
-    /// every other concurrent request is queued (see `queue` below), never
-    /// run concurrently. No separate counter is needed for a cap of 1; this
-    /// doc comment exists so that equivalence is explicit rather than an
-    /// unstated coincidence.
+    /// [`crate::limits::MAX_ACTIVE_TASKS_PER_MAC`] (PRD 10.4). With the
+    /// cap at 1, "at most one task actively running" is exactly "at most
+    /// one `Prompt`/`VoiceTranscript` turn holds `busy == true` at a
+    /// time." Every other concurrent request is queued (see `queue`
+    /// below), never run concurrently. No separate counter is needed for
+    /// a cap of 1. This doc comment exists so that equivalence is
+    /// explicit, rather than an unstated coincidence.
     busy: Mutex<bool>,
-    /// Prompts that arrived while `busy` was `true`, oldest-first (`pop_front` drains in
-    /// arrival order). Guarded by the same lock discipline as `busy`: both are read/written
-    /// together under `queue`'s own mutex so "is anything running" and "what's queued" never
-    /// observe a torn state relative to each other.
+    /// Prompts that arrived while `busy` was `true`, oldest-first
+    /// (`pop_front` drains in arrival order). The same lock discipline as
+    /// `busy` guards this field: both are read/written together under
+    /// `queue`'s own mutex, so "is anything running" and "what's queued"
+    /// never observe a torn state relative to each other.
     queue: Mutex<VecDeque<QueuedPrompt>>,
-    /// Weak backref to the owning [`super::HoloBridge`], installed by `main.rs` right after
-    /// the bridge is `Arc`-wrapped (see [`Self::attach_bridge`]). Weak, not `Arc`: the bridge
-    /// OWNS this control bridge, so a strong ref here would be a cycle. Used by the
-    /// rate-limit failover in [`Self::run_prompt`] -- backend switching (terminate + respawn
-    /// `holo serve`) lives on the bridge, which owns the process slot. Empty (never attached,
-    /// or upgrade fails during shutdown) simply disables failover for the turn.
+    /// Weak backref to the owning [`super::HoloBridge`]. `main.rs`
+    /// installs this right after the bridge is `Arc`-wrapped (see
+    /// [`Self::attach_bridge`]). This field is `Weak`, not `Arc`: the
+    /// bridge owns this control bridge, so a strong ref here would be a
+    /// cycle. The rate-limit failover in [`Self::run_prompt`] uses this
+    /// field, since backend switching (terminate + respawn `holo serve`)
+    /// lives on the bridge, which owns the process slot. When this field
+    /// is empty, either never attached or upgrade failed during
+    /// shutdown, it simply disables failover for the turn.
     bridge: std::sync::OnceLock<std::sync::Weak<super::HoloBridge>>,
-    /// Per-task PLAN/EXECUTE/VERIFY/DONE phase tracking -- see `crate::task_fsm`'s module doc
-    /// for the design rationale (a native reimplementation of `rs-plugkit`'s phase-FSM
-    /// pattern, grounded in this daemon's own real A2A `TrajectoryEvent` signal). Owned here
-    /// (not a daemon-wide singleton) since every task this bridge runs is already serialized
-    /// through `busy`/`queue` above.
+    /// Per-task PLAN/EXECUTE/VERIFY/DONE phase tracking -- see
+    /// `crate::task_fsm`'s module doc for the design rationale (a native
+    /// reimplementation of `rs-plugkit`'s phase-FSM pattern, grounded in
+    /// this daemon's own real A2A `TrajectoryEvent` signal). This field
+    /// is owned here, not as a daemon-wide singleton, since every task
+    /// this bridge runs is already serialized through `busy`/`queue`
+    /// above.
     tasks: crate::task_fsm::TaskRegistry,
-    /// Environment/user-context memory (see `crate::env_context`'s module doc). `None` when
-    /// the store failed to open (e.g. `$HOME` unset in some unusual launch environment) --
-    /// degrade-don't-crash, matching every other best-effort subsystem in this bridge; a
-    /// missing store just means no context gets prepended, never a turn failure.
+    /// Environment/user-context memory (see `crate::env_context`'s module
+    /// doc). `None` when the store failed to open (for example, `$HOME`
+    /// unset in some unusual launch environment). This matches
+    /// degrade-don't-crash, the posture of every other best-effort
+    /// subsystem in this bridge. A missing store just means no context
+    /// gets prepended, never a turn failure.
     env_context: Option<Arc<crate::env_context::EnvContextStore>>,
-    /// The turn currently inside [`Self::run_prompt`], if any -- set on entry, `context_id`
-    /// upgraded mid-stream via `send_and_stream`'s `on_context`, cleared by the same guard
-    /// that concludes the task FSM. This is what Stop/Pause/Redirect and the sensitive-app
-    /// watchdog scope their cancels to.
+    /// The turn currently inside [`Self::run_prompt`], if any. This field
+    /// is set on entry, upgraded mid-stream via `send_and_stream`'s
+    /// `on_context` for `context_id`, and cleared by the same guard that
+    /// concludes the task FSM. This is what Stop/Pause/Redirect and the
+    /// sensitive-app watchdog scope their cancels to.
     current_turn: Mutex<Option<CurrentTurn>>,
-    /// The turn parked by `Pause`/consent-gate, waiting for `Resume` (or discarded by
-    /// `Stop`/`Redirect`). At most one -- pausing while paused is a polite no-op.
+    /// The turn parked by `Pause`/consent-gate, waiting for `Resume` (or
+    /// discarded by `Stop`/`Redirect`). At most one turn is parked at a
+    /// time; pausing while paused is a polite no-op.
     paused: Mutex<Option<PausedTurn>>,
-    /// True while the user has escalated to hands-on remote control (between a
-    /// `RemoteControl::TakeControl` and its `ReleaseControl`). Cooperative
-    /// auto-yield stands down while this is set, so the two don't race over the
-    /// pause slot -- the user is deliberately driving.
+    /// True while the user has escalated to hands-on remote control,
+    /// between a `RemoteControl::TakeControl` and its `ReleaseControl`.
+    /// Cooperative auto-yield stands down while this is set, so the two
+    /// don't race over the pause slot; the user is deliberately driving.
     remote_control_active: AtomicBool,
     /// PRD section-9 class-5 sensitive-app categories, loaded once from
-    /// `~/.holoiroh/sensitive_categories.toml` (seeded with defaults on first run). This is
-    /// the live wiring the `sensitive_categories` module's own doc used to disclaim -- the
-    /// per-turn watchdog consults it against the REAL frontmost app while the agent acts.
+    /// `~/.holoiroh/sensitive_categories.toml` (seeded with defaults on
+    /// first run). This is the live wiring the `sensitive_categories`
+    /// module's own doc used to disclaim. The per-turn watchdog consults
+    /// it against the REAL frontmost app while the agent acts.
     sensitive_categories: Mutex<SensitiveCategories>,
-    /// Category ids the user has consented to ("Allow once") for the CURRENT turn only;
-    /// cleared every time a fresh turn starts so consent never silently outlives the task
-    /// it was granted for.
+    /// Category ids the user has consented to ("Allow once") for the
+    /// CURRENT turn only. This field clears every time a fresh turn
+    /// starts, so consent never silently outlives the task it was
+    /// granted for.
     turn_allowances: Mutex<HashSet<String>>,
     /// The outstanding sensitive-app consent request, if any.
     pending_consent: Mutex<Option<PendingConsent>>,
@@ -497,42 +568,53 @@ impl TurnsCanceledByUs {
     }
 }
 
-/// What one streaming attempt of a turn produced -- see [`HoloControlBridge::run_prompt`]'s
-/// retry loop.
+/// What one streaming attempt of a turn produced. See
+/// [`HoloControlBridge::run_prompt`]'s retry loop.
 enum TurnOutcome {
     /// The turn ran to its natural end (success, cancel, cap, or a failure that was already
     /// emitted to the peer). Nothing further to do.
     Completed,
-    /// The turn died with a backend-error shape and its tail events were SUPPRESSED, not
-    /// emitted. The caller decides: switch backends and retry, or emit `original` (in
-    /// order) after all. TWO real shapes arm this, both probe-witnessed:
+    /// The turn died with a backend-error shape. Its tail events were
+    /// SUPPRESSED, not emitted. The caller decides: switch backends and
+    /// retry, or emit `original`, in order, after all. Two real shapes
+    /// arm this variant, both probe-witnessed:
     ///
-    /// 1. `Failed` terminal matching [`is_backend_error_message`] -- the hosted backend's
-    ///    rate-limit 429s reach this bridge as `holo serve`'s generic `"agent backend
-    ///    error"` (serve.py swallows the HTTP detail).
-    /// 2. `Completed` terminal with NO answer text at all -- when the runtime's model calls
-    ///    all error (witnessed against a dead inference endpoint), the runtime "finishes"
-    ///    the run anyway and holo serve reports success with an empty answer. The phone
-    ///    would see a task that silently did nothing. An armed turn treats that empty
-    ///    completion as the failure it is; the retry's own (possibly legitimately empty)
-    ///    result is emitted as-is, so a genuinely-empty turn costs one extra attempt, never
-    ///    a lost result.
+    /// 1. A `Failed` terminal matching [`is_backend_error_message`]. The
+    ///    hosted backend's rate-limit 429s reach this bridge as `holo
+    ///    serve`'s generic `"agent backend error"`. `serve.py` swallows
+    ///    the HTTP detail.
+    /// 2. A `Completed` terminal with no answer text at all. This
+    ///    happens when the runtime's model calls all error, witnessed
+    ///    against a dead inference endpoint: the runtime "finishes" the
+    ///    run anyway, and holo serve reports success with an empty
+    ///    answer. The phone would see a task that silently did nothing.
+    ///    An armed turn treats that empty completion as the failure it
+    ///    is. The retry's own result, possibly legitimately empty, is
+    ///    emitted as-is. So a genuinely-empty turn costs one extra
+    ///    attempt, never a lost result.
     BackendFailure { original: Vec<ControlEvent> },
 }
 
-/// Does this failure text look like the agent backend (rather than this daemon or the A2A
-/// transport) died? `"agent backend error"` is `holo serve`'s literal, generic message for
-/// ANY failed agent-API call (serve.py wraps `httpx.HTTPError` -- the hosted 429 detail is
-/// swallowed before it reaches A2A, so a broader retry-once-on-the-other-backend is the
-/// best available response). The 429/rate-limit forms cover transport-level errors that DO
-/// carry detail.
-/// Pure equality check backing [`HoloControlBridge::is_stale`]: a turn started against process
-/// generation `started_epoch` is stale once the live generation (`current_epoch`, i.e.
-/// [`HoloControlBridge::client_epoch`]) has moved past it -- a crash-restart or backend switch
-/// replaced the `holo serve` process the turn's `context_id`/`a2a_task_id` belong to, and no
-/// process generation ever revisits an earlier epoch, so simple inequality is the whole rule.
-/// Extracted as a standalone `pub fn` (rather than inlined into `is_stale`) so it is directly
-/// probe-testable without needing a live `HoloControlBridge`/`A2aClient` -- see
+/// Does this failure text look like the agent backend died, rather than
+/// this daemon or the A2A transport? `"agent backend error"` is `holo
+/// serve`'s literal, generic message for any failed agent-API call.
+/// `serve.py` wraps `httpx.HTTPError`; the hosted 429 detail is
+/// swallowed before it reaches A2A. So a broader
+/// retry-once-on-the-other-backend is the best available response. The
+/// 429/rate-limit forms cover transport-level errors that do carry
+/// detail.
+/// Pure equality check backing [`HoloControlBridge::is_stale`]. A turn
+/// started against process generation `started_epoch` is stale once the
+/// live generation (`current_epoch`, that is,
+/// [`HoloControlBridge::client_epoch`]) has moved past it. A
+/// crash-restart or backend switch replaced the `holo serve` process the
+/// turn's `context_id`/`a2a_task_id` belong to. No process generation
+/// ever revisits an earlier epoch, so simple inequality is the whole
+/// rule.
+///
+/// This function is extracted as a standalone `pub fn`, rather than
+/// inlined into `is_stale`, so it is directly probe-testable without
+/// needing a live `HoloControlBridge`/`A2aClient` -- see
 /// `examples/epoch_mismatch_probe.rs`.
 pub fn turn_epoch_is_stale(started_epoch: u64, current_epoch: u64) -> bool {
     started_epoch != current_epoch
@@ -617,20 +699,24 @@ impl HoloControlBridge {
         }
     }
 
-    /// Install the weak backref to the owning bridge (see the `bridge` field). Idempotent:
-    /// a second call is ignored (`OnceLock::set`), which cannot happen today -- `main.rs`
-    /// attaches exactly once, right after `Arc::new(bridge)`.
+    /// Install the weak backref to the owning bridge (see the `bridge`
+    /// field). This function is idempotent: a second call is ignored
+    /// (`OnceLock::set`), which cannot happen today. `main.rs` attaches
+    /// exactly once, right after `Arc::new(bridge)`.
     pub fn attach_bridge(&self, bridge: std::sync::Weak<super::HoloBridge>) {
         let _ = self.bridge.set(bridge);
     }
 
-    /// Swap in a freshly-built `A2aClient` pointed at a respawned `holo serve` process. Called
-    /// by `HoloBridge::restart_process` (crash-restart) and `HoloBridge::switch_to` (failover /
-    /// primary-restore / tier force) -- every path that replaces the underlying process funnels
-    /// through here. Does not touch `busy`/`queue`/`events_tx` -- only which process subsequent
-    /// A2A calls go to, plus bumping `client_epoch` so any turn that started against the OLD
-    /// process can detect it and refuse to inherit a now-dead `context_id`/`a2a_task_id` (see
-    /// `client_epoch`'s doc).
+    /// Swap in a freshly-built `A2aClient` pointed at a respawned `holo
+    /// serve` process. `HoloBridge::restart_process` (crash-restart) and
+    /// `HoloBridge::switch_to` (failover / primary-restore / tier force)
+    /// call this; every path that replaces the underlying process funnels
+    /// through here. This function does not touch
+    /// `busy`/`queue`/`events_tx`, only which process subsequent A2A
+    /// calls go to, plus bumping `client_epoch`. That bump lets any turn
+    /// that started against the OLD process detect it, and refuse to
+    /// inherit a now-dead `context_id`/`a2a_task_id` (see `client_epoch`'s
+    /// doc).
     pub fn replace_client(&self, client: A2aClient) {
         *self.client.write().expect("client lock poisoned") = client;
         self.client_epoch.fetch_add(1, Ordering::SeqCst);
@@ -641,39 +727,45 @@ impl HoloControlBridge {
         self.client_epoch.load(Ordering::SeqCst)
     }
 
-    /// Whether `turn` started against a `holo serve` process that has since been replaced (its
-    /// `context_id`/`a2a_task_id`, if any, belong to a session no memory of which survives in
-    /// the currently-running process). Thin wrapper over [`turn_epoch_is_stale`] -- see that
-    /// function for the pure, probe-testable equality check itself.
+    /// Whether `turn` started against a `holo serve` process that has
+    /// since been replaced. Its `context_id`/`a2a_task_id`, if any, then
+    /// belong to a session no memory of which survives in the
+    /// currently-running process. This is a thin wrapper over
+    /// [`turn_epoch_is_stale`] -- see that function for the pure,
+    /// probe-testable equality check itself.
     fn is_stale(&self, turn: &CurrentTurn) -> bool {
         turn_epoch_is_stale(turn.started_epoch, self.current_client_epoch())
     }
 
-    /// Reports whether a turn is currently running and how many more are queued behind it.
-    /// Used by `crate::control_channel::ControlChannel::accept` to greet a freshly (re)connected
-    /// peer with the daemon's actual in-flight/queue state instead of silence -- relevant after
-    /// a reconnect, where a stale in-flight Holo task from before the drop may still be running
-    /// (or queued prompts from it may still be waiting) and the newly-connected peer has no
-    /// other way to learn that without waiting for the next `ControlEvent`.
+    /// Reports whether a turn is currently running and how many more are
+    /// queued behind it. `crate::control_channel::ControlChannel::accept`
+    /// uses this to greet a freshly (re)connected peer with the daemon's
+    /// actual in-flight/queue state instead of silence. This matters
+    /// after a reconnect, where a stale in-flight Holo task from before
+    /// the drop may still be running, or queued prompts from it may still
+    /// be waiting, and the newly-connected peer has no other way to learn
+    /// that without waiting for the next `ControlEvent`.
     pub fn busy_state(&self) -> (bool, usize) {
         let busy = *self.busy.lock().expect("busy lock poisoned");
         let queued = self.queue.lock().expect("queue lock poisoned").len();
         (busy, queued)
     }
 
-    /// Whether a task is currently PARKED (paused) awaiting `Resume`. A parked
-    /// turn is not `busy` (it was canceled on the backend when paused -- see
-    /// `handle_pause`), so `busy_state` alone reports `false` for it; the
-    /// reconnect-visibility path in `crate::control_channel` checks this too so
-    /// a paused task from before a drop still restores the client's Pause/Stop
-    /// pill (in its Paused state) rather than vanishing.
+    /// Whether a task is currently PARKED (paused) awaiting `Resume`. A
+    /// parked turn is not `busy`, since it was canceled on the backend
+    /// when paused (see `handle_pause`), so `busy_state` alone reports
+    /// `false` for it. The reconnect-visibility path in
+    /// `crate::control_channel` checks this too, so a paused task from
+    /// before a drop still restores the client's Pause/Stop pill (in its
+    /// Paused state) rather than vanishing.
     pub fn is_paused(&self) -> bool {
         self.paused.lock().expect("paused lock poisoned").is_some()
     }
 
-    /// Whether the current pause was created by cooperative auto-yield (vs a
-    /// deliberate user Pause). `crate::auto_yield`'s monitor uses this to know
-    /// which pauses it may auto-resume, and to avoid overriding a user pause.
+    /// Whether the current pause was created by cooperative auto-yield,
+    /// versus a deliberate user Pause. `crate::auto_yield`'s monitor uses
+    /// this to know which pauses it may auto-resume, and to avoid
+    /// overriding a user pause.
     pub fn is_auto_yielded(&self) -> bool {
         self.paused
             .lock()
@@ -683,20 +775,23 @@ impl HoloControlBridge {
     }
 
     /// True while the user is in hands-on remote control (see
-    /// `handle_remote_control`); cooperative auto-yield stands down while set.
+    /// `handle_remote_control`). Cooperative auto-yield stands down while
+    /// set.
     pub fn is_remote_control_active(&self) -> bool {
         self.remote_control_active.load(Ordering::SeqCst)
     }
 
-    /// Clears the hands-on-control latch without the usual `ReleaseControl`
-    /// round trip, for when the client vanishes instead of releasing.
+    /// Clears the hands-on-control latch without the usual
+    /// `ReleaseControl` round trip, for when the client vanishes instead
+    /// of releasing.
     ///
-    /// `remote_control_active` was set by `TakeControl` and cleared ONLY by
-    /// `ReleaseControl`. `auto_yield` skips sampling entirely while it is set,
-    /// so a phone that dropped, backgrounded, or was swiped away mid-control
-    /// left it stuck true for the rest of the daemon's process lifetime --
-    /// silently disabling "the agent steps aside while you use your Mac" for
-    /// every later task, with nothing logging that it had happened.
+    /// `TakeControl` set `remote_control_active`, and only `ReleaseControl`
+    /// cleared it. `auto_yield` skips sampling entirely while it is set.
+    /// So a phone that dropped, backgrounded, or was swiped away
+    /// mid-control left it stuck true for the rest of the daemon's
+    /// process lifetime. That silently disabled "the agent steps aside
+    /// while you use your Mac" for every later task, with nothing logging
+    /// that it had happened.
     pub fn clear_remote_control_active(&self) {
         if self.remote_control_active.swap(false, Ordering::SeqCst) {
             tracing::info!(

@@ -1,18 +1,20 @@
 //! holoiroh-daemon: Mac-side daemon.
 //!
-//! This is the P2P publish entrypoint: it brings up an `iroh-live` [`Live`]
-//! session, registers an empty [`LocalBroadcast`], publishes it under a
-//! well-known name, and prints the resulting shareable ticket to stdout so
-//! it can be pasted/scanned into the iOS client (see holoiroh/README.md for
-//! the full architecture). Alongside the broadcast, it mounts the
-//! bidirectional control channel ([`control_channel`]) on the same `iroh`
-//! `Endpoint`/`Router`, and -- best-effort -- starts the `holo serve`
-//! bridge ([`holo_bridge`]) that the control channel forwards prompts to.
+//! This is the P2P publish entrypoint. It performs the following steps:
 //!
-//! Screen capture (via [`capture::setup_screen_video`], macOS
-//! ScreenCaptureKit, `--display <index>` selectable) is wired up as the
-//! broadcast's video source before publish. System/mic audio capture is not
-//! wired up yet.
+//! - brings up an `iroh-live` [`Live`] session
+//! - registers an empty [`LocalBroadcast`]
+//! - publishes the broadcast under a well-known name
+//! - prints the resulting shareable ticket to stdout, so it can be pasted or scanned into the
+//!   iOS client (see holoiroh/README.md for the full architecture)
+//!
+//! Alongside the broadcast, it mounts the bidirectional control channel ([`control_channel`])
+//! on the same `iroh` `Endpoint`/`Router`. Best-effort, it also starts the `holo serve` bridge
+//! ([`holo_bridge`]) that the control channel forwards prompts to.
+//!
+//! The daemon wires up screen capture (via [`capture::setup_screen_video`], macOS
+//! ScreenCaptureKit, `--display <index>` selectable) as the broadcast's video source before
+//! publish. System/mic audio capture is not wired up yet.
 
 mod agent_guidance;
 mod allowlist;
@@ -76,7 +78,7 @@ use holo_bridge::HoloBridge;
 
 /// Name the daemon's broadcast is published under. A future iteration may
 /// make this configurable (per-Mac identity, multiple concurrent
-/// broadcasts); a single well-known name is sufficient for one daemon
+/// broadcasts). A single well-known name is sufficient for one daemon
 /// publishing one stream today.
 const BROADCAST_NAME: &str = "holoiroh";
 
@@ -92,36 +94,38 @@ struct Cli {
     display: Option<usize>,
 
     /// Disable the first-connection PIN gate (see `allowlist.rs` and
-    /// `holoiroh/PAIRING.md`'s "Auth beyond ticket possession" section) --
-    /// every connection is accepted immediately with no PIN and no
-    /// allowlist enforcement, matching this daemon's pre-auth behavior.
-    /// Intended for local dev/testing against a same-machine or trusted-LAN
-    /// peer only; a real deployment should leave PIN auth enabled (the
-    /// default).
+    /// `holoiroh/PAIRING.md`'s "Auth beyond ticket possession" section). Every connection is
+    /// then accepted immediately with no PIN and no allowlist enforcement, matching this
+    /// daemon's pre-auth behavior. Intended only for local dev/testing against a same-machine
+    /// or trusted-LAN peer. A real deployment should leave PIN auth enabled (the default).
     #[arg(long)]
     no_pin_auth: bool,
 
-    /// Re-print the pairing ticket + verification phrase on a fixed interval while the daemon
-    /// keeps running (e.g. `30m`, `2h`, `1h30m`), so a stale QR screenshot stops being the one
-    /// the operator is reading off. See `holoiroh/mac-daemon/PAIRING.md`'s "Ticket rotation"
-    /// section. NOTE: this re-prints the *current* ticket -- a full fresh-keypair-per-tick
-    /// identity rotation (which would invalidate old tickets entirely) requires tearing down and
-    /// rebuilding the iroh `Live` session mid-run and is documented there as a separate, larger
-    /// step. Rotation-on-restart already happens implicitly (fresh keypair per process start
-    /// when `IROH_SECRET` is unset), and the device allowlist gives device-level rotation
-    /// protection regardless.
+    /// Re-print the pairing ticket and verification phrase on a fixed interval while the daemon
+    /// keeps running (e.g. `30m`, `2h`, `1h30m`). This way, a stale QR screenshot stops being
+    /// the one the operator is reading off. See `holoiroh/mac-daemon/PAIRING.md`'s "Ticket
+    /// rotation" section. NOTE: this re-prints the *current* ticket. A full
+    /// fresh-keypair-per-tick identity rotation (which invalidates old tickets entirely)
+    /// requires tearing down and rebuilding the iroh `Live` session mid-run. That is documented
+    /// there as a separate, larger step. Rotation-on-restart already happens implicitly (fresh
+    /// keypair per process start when `IROH_SECRET` is unset). The device allowlist also gives
+    /// device-level rotation protection regardless.
     #[arg(long, value_parser = duration::parse_rotate_duration)]
     rotate_every: Option<std::time::Duration>,
 
-    /// Check that this machine can actually run the daemon, print what it found, and exit.
+    /// Check whether this machine can actually run the daemon. Print what it found. Then exit.
     ///
-    /// Everything a pairing failure usually turns out to be is checked here against the real
-    /// APIs rather than described: Accessibility and Screen Recording grants, which display
-    /// would be captured and at what rate, and whether the iroh endpoint binds with local-network
-    /// discovery registered. Deliberately stops short of publishing a broadcast, spawning
-    /// `holo serve`, or opening the control channel, so it is safe to run while another daemon
-    /// is already serving a phone -- it cannot steal that daemon's single client slot or fight
-    /// it for a port.
+    /// This flag checks, against the real APIs, everything a pairing failure usually turns out
+    /// to be -- rather than only describing it:
+    ///
+    /// - Accessibility and Screen Recording grants
+    /// - which display the daemon would capture, and at what rate
+    /// - whether the iroh endpoint binds with local-network discovery registered
+    ///
+    /// This flag deliberately stops short of publishing a broadcast, spawning `holo serve`, or
+    /// opening the control channel. It is therefore safe to run while another daemon is already
+    /// serving a phone. It cannot steal that daemon's single client slot, and it cannot fight
+    /// that daemon for a port.
     #[arg(long)]
     preflight: bool,
 }
@@ -201,11 +205,11 @@ async fn preflight_checks(live: &Live, display_index: Option<usize>) -> anyhow::
 ///
 /// Falls back to `~/.holo/bin/holo` (the path `holo login`'s own installer
 /// writes -- see `auth.rs`'s module doc) when bare `"holo"` is not resolvable
-/// on `PATH`, rather than always emitting the literal string `"holo"` and
-/// letting `tokio::process::Command::spawn` fail with an opaque
-/// `No such file or directory (os error 2)` -- witnessed live: `holo` is
+/// on `PATH`. Without this fallback, this function would always emit the literal string
+/// `"holo"` and let `tokio::process::Command::spawn` fail with an opaque
+/// `No such file or directory (os error 2)`. This was witnessed live: `holo` is
 /// genuinely absent from a plain non-interactive shell's `PATH` (it's only on
-/// the user's own interactive shell rc), so this fallback is not hypothetical.
+/// the user's own interactive shell rc). This fallback is therefore not hypothetical.
 fn holo_bin() -> String {
     if let Ok(v) = std::env::var("HOLOIROH_HOLO_BIN") {
         return v;
@@ -222,8 +226,8 @@ fn holo_bin() -> String {
 }
 
 /// Minimal `PATH`-search for `name`, mirroring what `Command::spawn` itself
-/// does for a bare (non-slash-containing) program name -- used only to decide
-/// whether [`holo_bin`]'s `~/.holo/bin/holo` fallback is needed, not as a
+/// does for a bare (non-slash-containing) program name. Used only to decide
+/// whether [`holo_bin`]'s `~/.holo/bin/holo` fallback is needed -- not as a
 /// general-purpose `which` replacement.
 fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
     let path_var = std::env::var_os("PATH")?;
@@ -240,10 +244,10 @@ fn holo_serve_port() -> u16 {
         .unwrap_or(8765)
 }
 
-/// Print the shareable ticket as a QR code, its raw text, and its verification phrase -- the
-/// exact block re-emitted both at startup and on each `--rotate-every` rotation tick, so the two
-/// are byte-identical. `context` is a short label (e.g. "pairing" / "rotated") shown in the
-/// header line so the operator can tell a rotation apart from the initial print.
+/// Print the shareable ticket as a QR code, its raw text, and its verification phrase. This is
+/// the exact block re-emitted both at startup and on each `--rotate-every` rotation tick, so
+/// the two stay byte-identical. `context` is a short label (e.g. "pairing" / "rotated") shown
+/// in the header line, so the operator can tell a rotation apart from the initial print.
 fn print_pairing_block(ticket_str: &str, context: &str) {
     println!("--- {context} ticket ---");
     print_ticket_qr(ticket_str);
@@ -255,10 +259,10 @@ fn print_pairing_block(ticket_str: &str, context: &str) {
 }
 
 /// Render `ticket` as a scannable QR code to stdout using unicode block
-/// characters, per PAIRING.md's terminal-rendering design. Best-effort: a
+/// characters, per PAIRING.md's terminal-rendering design. Best-effort: on a
 /// QR-construction failure (e.g. the ticket string somehow exceeding QR
-/// capacity) is logged and skipped rather than aborting startup -- the raw
-/// ticket text printed alongside it is always the authoritative fallback.
+/// capacity), this function logs the error and skips the QR, instead of aborting startup.
+/// The raw ticket text printed alongside it is always the authoritative fallback.
 fn print_ticket_qr(ticket: &str) {
     // EcLevel::L (lowest error correction) minimizes the QR version and thus the
     // module count: the ~230-byte ticket needs version 11 (61x61 modules) at
@@ -288,24 +292,25 @@ fn print_ticket_qr(ticket: &str) {
 }
 
 /// Whether the daemon should run its own local `llama-server` (Aro Private mode) and point
-/// `holo serve` at it, versus leaving `holo serve` on the hosted Holo3 API (via `HAI_API_KEY`).
+/// `holo serve` at it. The alternative is leaving `holo serve` on the hosted Holo3 API (via
+/// `HAI_API_KEY`).
 ///
-/// Defaults to **off** (hosted API) as of this build: starting the local `llama-server` means
+/// Defaults to **off** (hosted API) as of this build. Starting the local `llama-server` means
 /// loading a 21GB model, which can take minutes with no output before the daemon prints
-/// anything -- witnessed live as a silent, indistinguishable-from-hung startup on a plain
-/// `holoiroh-daemon` invocation with no env vars set (the exact symptom reported: "just hangs,
-/// no QR code shows up"). Set `HOLOIROH_LOCAL_MODEL=1` (or `true`/`yes`) to opt IN to local
-/// inference (Project Aro PRD P0-11's no-cloud-path mode) once that tradeoff is wanted again.
+/// anything. This was witnessed live as a silent, indistinguishable-from-hung startup on a
+/// plain `holoiroh-daemon` invocation with no env vars set (the exact symptom reported: "just
+/// hangs, no QR code shows up"). Set `HOLOIROH_LOCAL_MODEL=1` (or `true`/`yes`) to opt IN to
+/// local inference (Project Aro PRD P0-11's no-cloud-path mode), once that tradeoff is wanted
+/// again.
 /// The daemon's iroh identity key, STABLE across restarts.
 ///
 /// `IROH_SECRET` env wins when set (iroh-live's own convention, unchanged).
-/// Otherwise the key is loaded from -- or first generated into --
-/// `~/.holoiroh/iroh_secret` (hex, 0600, same config dir as
-/// `allowlist.json`). Without this, every daemon restart minted a fresh
-/// random identity (`SecretKey::generate` inside
-/// `iroh_live::util::secret_key_from_env`), which changes the node id and
-/// therefore the pairing ticket -- silently invalidating every saved
-/// connection profile in the iOS app and forcing a QR re-scan per restart.
+/// Otherwise, this function loads the key from `~/.holoiroh/iroh_secret` (hex, 0600, same
+/// config dir as `allowlist.json`), or generates it there for the first time. Without this,
+/// every daemon restart minted a fresh random identity (`SecretKey::generate` inside
+/// `iroh_live::util::secret_key_from_env`). This changed the node id, and therefore the
+/// pairing ticket. It silently invalidated every saved connection profile in the iOS app, and
+/// forced a QR re-scan on every restart.
 fn persistent_secret_key() -> anyhow::Result<iroh::SecretKey> {
     if std::env::var("IROH_SECRET").is_ok() {
         return Ok(iroh_live::util::secret_key_from_env()?);

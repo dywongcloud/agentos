@@ -1,21 +1,27 @@
 //! macOS permission preflight checks.
 //!
 //! Broadcasting the Mac's screen requires the Screen Recording TCC
-//! permission, and driving the Mac via `holo-desktop-cli` (mouse/keyboard
+//! permission. Driving the Mac via `holo-desktop-cli` (mouse/keyboard
 //! synthetic events) requires the Accessibility permission. Both are
-//! per-app grants the user makes in System Settings; there is no way to
-//! request-and-block until granted for Screen Recording (macOS shows the
-//! prompt once, then the user must go grant it manually), so the correct
-//! behavior is: check both up front, and if either is missing, tell the
-//! user exactly what to do and refuse to start the broadcast rather than
-//! producing a black/frozen stream or a daemon that can't actually drive
-//! the Mac.
+//! per-app grants. The user makes these grants in System Settings.
+//!
+//! There is no way to request-and-block until the user grants Screen
+//! Recording. macOS shows the prompt once. Then the user must go grant it
+//! manually. The correct behavior is:
+//!
+//! - Check both permissions up front.
+//! - If either permission is missing, tell the user exactly what to do.
+//! - Refuse to start the broadcast.
+//!
+//! This avoids two problems: a black or frozen stream, and a daemon that
+//! cannot actually drive the Mac.
 //!
 //! Bindings come from `objc2-core-graphics` (`CGPreflightScreenCaptureAccess`)
-//! and `objc2-application-services` (`AXIsProcessTrusted`) -- both are
-//! already part of this crate's dependency graph (the former transitively,
-//! via `iroh-live`'s macOS capture backend; the latter added directly for
-//! this check), so no raw FFI `extern "C"` declarations are needed.
+//! and `objc2-application-services` (`AXIsProcessTrusted`). Both are
+//! already part of this crate's dependency graph. The former is included
+//! transitively, via `iroh-live`'s macOS capture backend. The latter was
+//! added directly for this check. As a result, this module needs no raw
+//! FFI `extern "C"` declarations.
 
 use std::fmt;
 
@@ -58,8 +64,9 @@ impl fmt::Display for MissingPermission {
     }
 }
 
-/// Result of the full preflight: every permission that is currently
-/// missing. Empty means the broadcast is clear to start.
+/// This is the result of the full preflight check. It lists every
+/// permission that is currently missing. An empty list means the
+/// broadcast is clear to start.
 #[derive(Debug, Default)]
 pub struct PreflightResult {
     pub missing: Vec<MissingPermission>,
@@ -70,10 +77,11 @@ impl PreflightResult {
         self.missing.is_empty()
     }
 
-    /// Print one clear instruction block per missing permission. Called
-    /// for *all* missing permissions at once (never short-circuits on the
-    /// first one), so the user sees the full list of what to fix in one
-    /// pass instead of discovering them one restart at a time.
+    /// Print one clear instruction block per missing permission. This
+    /// function processes *all* missing permissions at once. It never
+    /// stops after the first one. As a result, the user sees the full
+    /// list of what to fix in one pass, instead of discovering problems
+    /// one restart at a time.
     pub fn report(&self) {
         for permission in &self.missing {
             eprintln!("[holoiroh-daemon] Missing permission: {permission}");
@@ -82,9 +90,10 @@ impl PreflightResult {
     }
 }
 
-/// Run both macOS permission preflight checks. Never panics: both
-/// underlying APIs are simple synchronous TCC queries that return a bool,
-/// no allocation or Objective-C exception path to guard against.
+/// Run both macOS permission preflight checks. This function never
+/// panics. Both underlying APIs are simple, synchronous TCC queries that
+/// return a bool. There is no allocation and no Objective-C exception
+/// path to guard against.
 pub fn preflight() -> PreflightResult {
     let mut missing = Vec::new();
 
@@ -98,12 +107,13 @@ pub fn preflight() -> PreflightResult {
     PreflightResult { missing }
 }
 
-/// `CGPreflightScreenCaptureAccess()` -- returns whether this process
-/// currently has Screen Recording access, without prompting the user.
-/// macOS-only; the crate as a whole only builds for macOS (see
-/// `holoiroh-daemon`'s use of `ScreenCaptureKit` elsewhere in the
-/// broadcast pipeline), but this function is still individually gated so
-/// it can never be referenced on a non-macOS target.
+/// `CGPreflightScreenCaptureAccess()` returns whether this process
+/// currently has Screen Recording access. It does not prompt the user.
+///
+/// This function is macOS-only. The crate as a whole only builds for
+/// macOS. See `holoiroh-daemon`'s use of `ScreenCaptureKit` elsewhere in
+/// the broadcast pipeline. Even so, this function is still individually
+/// gated. As a result, it can never be referenced on a non-macOS target.
 #[cfg(target_os = "macos")]
 pub fn screen_recording_granted() -> bool {
     // objc2-core-graphics binds this as a safe fn (no `unsafe extern` in its
@@ -136,31 +146,44 @@ pub fn accessibility_granted() -> bool {
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     /// `Boolean IsSecureEventInputEnabled(void)` from `<Carbon/HIToolbox/Events.h>`.
-    /// Exported by `Carbon.framework` (the umbrella `HIToolbox` lives under),
-    /// NOT `ApplicationServices.framework` -- live-witnessed: linking against
-    /// `ApplicationServices` alone left `_IsSecureEventInputEnabled`
-    /// undefined at link time despite that framework being otherwise already
-    /// linked transitively via `objc2-application-services`. Public,
-    /// documented, long-stable Apple API; not bound by
-    /// `objc2-application-services` itself, hence the direct declaration
-    /// here rather than a generated binding. `Boolean` is a C
-    /// `unsigned char` (0/1), not the same ABI as Rust `bool`, so the raw
-    /// return type is `u8`.
+    ///
+    /// This function is exported by `Carbon.framework`, the umbrella
+    /// framework `HIToolbox` lives under. It is NOT exported by
+    /// `ApplicationServices.framework`. This was live-witnessed: linking
+    /// against `ApplicationServices` alone left `_IsSecureEventInputEnabled`
+    /// undefined at link time. This happened despite
+    /// `ApplicationServices.framework` being already linked transitively
+    /// via `objc2-application-services`.
+    ///
+    /// This is a public, documented, long-stable Apple API.
+    /// `objc2-application-services` does not bind it. This is why the code
+    /// declares it directly here, instead of using a generated binding.
+    ///
+    /// `Boolean` is a C `unsigned char` (`0`/`1`). This is not the same ABI
+    /// as Rust `bool`. So the raw return type is `u8`.
     fn IsSecureEventInputEnabled() -> u8;
 }
 
 /// Whether the CURRENTLY FOCUSED field anywhere on the system is a secure
-/// (password-class) input field -- true whenever the loginwindow's
-/// authentication UI, a screen-lock password prompt, a `sudo`/Keychain
-/// dialog, or any other app's explicit `EnableSecureEventInput()` call has
-/// focus. This is macOS's own signal for "a screen-capture/keystroke-
-/// synthesis-hostile field is active right now", the exact condition behind
-/// the live-reported black rectangle where the login window's password
-/// field should render: ScreenCaptureKit deliberately excludes secure UI
-/// from every captured frame while this is true, a WindowServer-level
-/// security boundary no process can bypass regardless of privilege.
+/// (password-class) input field. This is true whenever one of these has
+/// focus:
 ///
-/// Read-only query, no side effects, safe to poll on any thread/cadence.
+/// - The loginwindow's authentication UI.
+/// - A screen-lock password prompt.
+/// - A `sudo`/Keychain dialog.
+/// - Any other app's explicit `EnableSecureEventInput()` call.
+///
+/// This is macOS's own signal for "a screen-capture/keystroke-
+/// synthesis-hostile field is active right now". This is the exact
+/// condition behind the live-reported black rectangle where the login
+/// window's password field should render.
+///
+/// ScreenCaptureKit deliberately excludes secure UI from every captured
+/// frame while this is true. This is a WindowServer-level security
+/// boundary. No process can bypass it, regardless of privilege.
+///
+/// This is a read-only query with no side effects. It is safe to poll on
+/// any thread, at any cadence.
 #[cfg(target_os = "macos")]
 pub fn secure_input_active() -> bool {
     // Safety: IsSecureEventInputEnabled takes no arguments and returns a

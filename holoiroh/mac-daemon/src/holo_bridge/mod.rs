@@ -3,18 +3,19 @@
 //! ## Summary of the approach (see submodules for full source citations)
 //!
 //! On daemon startup, [`HoloBridge::start`] spawns `holo serve --port <N>` as a managed
-//! `std::process`-family subprocess (via `tokio::process::Command`, the async equivalent used
-//! throughout this async daemon) -- see [`process`]. `holo serve` is H Company's own A2A
-//! (Agent2Agent Protocol) HTTP server, fronting the closed-source `hai-agent-runtime` binary
-//! that actually runs the Holo3 desktop agent; the daemon does not talk to
-//! `hai-agent-runtime` or its Python `AgentApiClient` directly -- those are internal to
-//! `holo serve` itself. Once `holo serve`'s `/health` reports ok, incoming control-channel
-//! `prompt` / `voice_transcript` messages are submitted to it over its `/a2a` JSON-RPC
-//! endpoint via [`a2a_client::A2aClient`], streaming back task-progress/status as
-//! [`control::ControlEvent`]s -- see [`control`]. `stop` control messages are handled by a
-//! combination of the A2A `tasks/cancel`-equivalent (scoped to one context, preferred) and
-//! shelling out to the real `holo stop` CLI command (global kill switch, used when no context
-//! is given or `--force` is requested) -- see [`stop`].
+//! `std::process`-family subprocess. It does this via `tokio::process::Command`, the async
+//! equivalent used throughout this async daemon -- see [`process`]. `holo serve` is H
+//! Company's own A2A (Agent2Agent Protocol) HTTP server. It fronts the closed-source
+//! `hai-agent-runtime` binary, which actually runs the Holo3 desktop agent. The daemon does not
+//! talk to `hai-agent-runtime` or its Python `AgentApiClient` directly -- those stay internal to
+//! `holo serve` itself. Once `holo serve`'s `/health` reports ok, [`a2a_client::A2aClient`]
+//! submits incoming control-channel `prompt` / `voice_transcript` messages to it, over its
+//! `/a2a` JSON-RPC endpoint. It streams back task-progress/status as
+//! [`control::ControlEvent`]s -- see [`control`]. [`stop`] handles `stop` control messages with
+//! two mechanisms:
+//! - The A2A `tasks/cancel`-equivalent, scoped to one context (preferred).
+//! - Shelling out to the real `holo stop` CLI command, a global kill switch used when no
+//!   context is given or `--force` is requested.
 //!
 //! ## What could not be confirmed from real sources, and how that gap was handled
 //!
@@ -25,52 +26,53 @@
 //!    body, `text/event-stream` framing where each `data:` line is one JSON-RPC response,
 //!    `TaskStatusUpdateEvent`/`TaskArtifactUpdateEvent` field names like `kind`, `status`,
 //!    `artifact`, `parts`). `holo-desktop-cli`'s own source confirms *that* `holo serve` is a
-//!    stock `a2a-sdk>=1.0.3` server speaking A2A protocol version `0.3.0` over JSON-RPC at
-//!    `/a2a` with `streaming=True` -- but the RPC dispatch and event serialization logic
-//!    itself lives inside the `a2a-sdk` PyPI package, which was not fetched (it is not part
-//!    of the `holo-desktop-cli` repo). The exact method/field names implemented in
-//!    `a2a_client.rs` come from the public, versioned A2A Protocol specification at
-//!    <https://a2a-protocol.org>, matched to the exact protocol version (`0.3.0`) and binding
-//!    (`JSONRPC`) `holo serve`'s own agent card declares -- not invented, but also not
-//!    independently re-derived from source the way the rest of the integration is.
+//!    stock `a2a-sdk>=1.0.3` server. It speaks A2A protocol version `0.3.0` over JSON-RPC at
+//!    `/a2a` with `streaming=True`. But the RPC dispatch and event serialization logic itself
+//!    lives inside the `a2a-sdk` PyPI package. This package was not fetched; it is not part of
+//!    the `holo-desktop-cli` repo. The exact method/field names implemented in `a2a_client.rs`
+//!    come from the public, versioned A2A Protocol specification at
+//!    <https://a2a-protocol.org>. They match the exact protocol version (`0.3.0`) and binding
+//!    (`JSONRPC`) that `holo serve`'s own agent card declares. This is not invented, but it is
+//!    also not independently re-derived from source the way the rest of the integration is.
 //!    **Mitigation:** [`a2a_client::A2aClient::probe_agent_card`] fetches and checks the
-//!    agent card before any RPC call, so a version/binding mismatch fails loudly at startup
-//!    instead of the daemon silently sending requests a mismatched server can't parse.
+//!    agent card before any RPC call. So a version/binding mismatch fails loudly at startup,
+//!    instead of the daemon silently sending requests that a mismatched server can't parse.
 //! 2. **The exact shape of a backend `TrajectoryEvent`** (the `PolicyEvent` /
 //!    `ToolResultEvent` / `AnswerEvent` / `ErrorEvent` union `agp_types`/`agent_interface`
 //!    define). These packages are the closed-source-adjacent `hai-agent-api` contract
-//!    package on PyPI, not part of this repo; not fetched. **Mitigation:** rather than invent
-//!    a typed Rust shape for something not confirmed, [`a2a_client::TaskUpdate::Working`]
-//!    carries the raw event as an opaque `serde_json::Value` (`raw_event`) alongside any
-//!    plain-text status line `holo serve` also attaches, and the control-channel layer
-//!    forwards that JSON verbatim to the iOS app rather than guessing at a schema for it.
+//!    package on PyPI. They are not part of this repo. They were not fetched.
+//!    **Mitigation:** this avoids inventing a typed Rust shape for something not confirmed.
+//!    [`a2a_client::TaskUpdate::Working`] carries the raw event as an opaque `serde_json::Value`
+//!    (`raw_event`) instead. It carries this alongside any plain-text status line that
+//!    `holo serve` also attaches. The control-channel layer forwards that JSON verbatim to the
+//!    iOS app, rather than guessing at a schema for it.
 //! 3. **Whether `GET /.well-known/agent-card.json` is exactly the path `a2a-sdk`'s
-//!    `create_agent_card_routes` helper mounts.** Confirmed as the call site in `serve.py`
-//!    (`create_agent_card_routes(card)`), and the path itself is the public A2A spec's
-//!    documented well-known discovery path, but the helper's exact route registration was not
-//!    independently traced into `a2a-sdk` source. If wrong, [`A2aClient::probe_agent_card`]
-//!    fails with a clear "GET ... failed" error rather than a confusing downstream JSON-RPC
-//!    failure.
+//!    `create_agent_card_routes` helper mounts.** This research confirmed the call site in
+//!    `serve.py`: `create_agent_card_routes(card)`. The path itself is the public A2A spec's
+//!    documented well-known discovery path. But the helper's exact route registration was not
+//!    independently traced into `a2a-sdk` source. If this path is wrong,
+//!    [`A2aClient::probe_agent_card`] fails with a clear "GET ... failed" error, rather than a
+//!    confusing downstream JSON-RPC failure.
 //! 4. **`tasks/cancel`'s exact id parameter.** The public spec keys cancellation by A2A
-//!    `Task.id`, but this bridge's continuity key (matching `HoloExecutor._sessions`) is
-//!    `contextId`, and no A2A `Task.id` is captured separately in the streaming loop today
-//!    (only `contextId` is read off each frame). [`a2a_client::A2aClient::cancel`] therefore
-//!    passes `context_id` as the cancel id when no task id is supplied, which is confirmed to
-//!    reach the right server-side effect for *this specific backend*
-//!    (`HoloExecutor.cancel(context, ...)` resolves its `Session` via `context.context_id`,
-//!    not via the task id, per `serve.py`) even though it is not the literal spec-documented
-//!    lookup key for a generic A2A server. Documented in `a2a_client.rs::cancel`.
-//! 5. **iOS-side / control-channel wire framing.** Out of scope for this confirmation list
-//!    in the sense that it isn't a `holo-desktop-cli` question at all. The wire framing itself
-//!    now lives in `crate::control_channel` (`ClientMessage`/`ServerMessage` over a dedicated
-//!    `iroh` ALPN, documented in `holoiroh/PROTOCOL.md`) -- the iOS *app* side (actually
-//!    sending/receiving that JSON from Swift) is still not implemented, per
+//!    `Task.id`. But this bridge's continuity key (matching `HoloExecutor._sessions`) is
+//!    `contextId`. The streaming loop does not capture a separate A2A `Task.id` today; it reads
+//!    only `contextId` off each frame. [`a2a_client::A2aClient::cancel`] therefore passes
+//!    `context_id` as the cancel id when no task id is supplied. This is confirmed to reach the
+//!    right server-side effect for *this specific backend*. `HoloExecutor.cancel(context, ...)`
+//!    resolves its `Session` via `context.context_id`, not via the task id, per `serve.py`.
+//!    Even so, `context_id` is not the literal spec-documented lookup key for a generic A2A
+//!    server. See `a2a_client.rs::cancel` for the details.
+//! 5. **iOS-side / control-channel wire framing.** This item is out of scope for this
+//!    confirmation list, in the sense that it isn't a `holo-desktop-cli` question at all. The
+//!    wire framing itself now lives in `crate::control_channel` (`ClientMessage`/`ServerMessage`
+//!    over a dedicated `iroh` ALPN, documented in `holoiroh/PROTOCOL.md`). The iOS *app* side --
+//!    actually sending or receiving that JSON from Swift -- is still not implemented, per
 //!    `holoiroh/README.md`. [`control::ControlMessage`] / [`control::ControlEvent`] define the
-//!    message contract this module expects/produces as plain `serde`-tagged JSON,
-//!    transport-agnostic; `control_channel::ControlChannel` is the adapter between that and
-//!    the actual `iroh` stream.
+//!    message contract this module expects and produces, as plain `serde`-tagged JSON,
+//!    transport-agnostic. `control_channel::ControlChannel` is the adapter between that and the
+//!    actual `iroh` stream.
 //!
-//! Nothing above was implemented on a guess presented as fact: every wire-shape decision that
+//! Nothing above was implemented on a guess presented as fact. Every wire-shape decision that
 //! isn't independently confirmed is called out at its point of use, not just here.
 
 pub mod a2a_client;
@@ -89,9 +91,12 @@ pub use process::HoloServeProcess;
 
 /// One place `holo serve`'s model inference can be pointed: an OpenAI-compatible base URL
 /// plus (optionally) the model name to request from it. Two of these exist today:
-/// the local `llama-server` (Aro Private mode; no model override -- llama-server ignores the
-/// name) and the loopback tinfoil fallback proxy (`crate::tinfoil_proxy`; model `kimi-k2-6`,
-/// which tinfoil routes by). `label` is for logs/status events only.
+/// - The local `llama-server` (Aro Private mode; no model override -- llama-server ignores the
+///   name).
+/// - The loopback tinfoil fallback proxy (`crate::tinfoil_proxy`; model `kimi-k2-6`, which
+///   tinfoil routes by).
+///
+/// `label` is for logs/status events only.
 #[derive(Clone, Debug)]
 pub struct InferenceTarget {
     pub base_url: String,
@@ -104,7 +109,8 @@ pub struct InferenceTarget {
 /// switch to / already switched, surface the original failure".
 #[derive(Debug)]
 pub enum FallbackActivation {
-    /// Now running on the fallback backend; the A2A client has been swapped. Retry the turn.
+    /// The bridge is now running on the fallback backend. It swapped the A2A client. Retry the
+    /// turn.
     Switched { label: String },
     /// The fallback backend was already active -- the failure happened ON the fallback.
     AlreadyActive,
@@ -122,62 +128,69 @@ pub struct HoloBridge {
     holo_bin: String,
     port: u16,
     /// The A2A agent card's `protocolVersion`, captured at startup (and re-verified on
-    /// `restart_process`). Surfaced via [`HoloBridge::protocol_version`] so a caller building an
-    /// executor over this bridge can report the real backend protocol version in its
-    /// capabilities, rather than guessing. `None` when the card did not advertise one.
+    /// `restart_process`). [`HoloBridge::protocol_version`] surfaces this value. A caller
+    /// building an executor over this bridge can then report the real backend protocol version
+    /// in its capabilities, rather than guessing. `None` when the card did not advertise one.
     ///
-    /// `#[allow(dead_code)]`: read by [`crate::executor::start_holo_desktop_executor`] via the
-    /// accessor below, which lives in the `executor` module -- compiled into the *lib* target
-    /// (and its examples) but not the *bin* target (`main.rs` does not yet route through the
-    /// executor seam; see its `mod executor` note), so from the binary crate's isolated
-    /// perspective this field is not read. Same lib-vs-bin asymmetry `#[allow(dead_code)]` already
-    /// covers elsewhere in this crate.
+    /// `#[allow(dead_code)]`: [`crate::executor::start_holo_desktop_executor`] reads this field
+    /// via the accessor below. That function lives in the `executor` module, which is compiled
+    /// into the *lib* target (and its examples) but not the *bin* target. `main.rs` does not
+    /// yet route through the executor seam (see its `mod executor` note). So from the binary
+    /// crate's isolated perspective, this field is not read. This is the same lib-vs-bin
+    /// asymmetry `#[allow(dead_code)]` already covers elsewhere in this crate.
     #[allow(dead_code)]
     protocol_version: Option<String>,
     /// The backend the daemon was STARTED on: `Some` = the local `llama-server` (alpha,
-    /// no-cloud mode); `None` = `holo serve`'s own configured hosted backend. Every
-    /// crash-restart re-applies whichever backend is CURRENTLY active (primary or fallback)
-    /// -- a restart must never silently fall back from local to cloud, and equally must not
-    /// silently hop backends on its own.
+    /// no-cloud mode); `None` = `holo serve`'s own configured hosted backend. A restart must
+    /// never silently fall back from local to cloud. Equally, it must never silently hop
+    /// backends on its own. Every crash-restart re-applies whichever backend is CURRENTLY
+    /// active (primary or fallback).
     primary: Option<InferenceTarget>,
     /// The rate-limit fallback backend (the loopback tinfoil proxy), when configured.
     /// `None` disables failover entirely -- notably in local (no-cloud) mode, where routing
-    /// to a cloud fallback would violate the mode's whole point.
+    /// to a cloud fallback violates the mode's whole point.
     fallback: Option<InferenceTarget>,
-    /// Whether the fallback backend is the active one. Guarded by the `process` slot lock
-    /// discipline: only mutated while holding `process` (every backend swap holds it), so a
-    /// concurrent restart can never observe a half-switched state. A separate std mutex (not
-    /// a field on the tokio-mutexed slot) so sync readers (`is_on_fallback`) don't need the
-    /// async lock.
+    /// Whether the fallback backend is the active one. The `process` slot lock discipline
+    /// guards this field: code only mutates it while holding `process` (every backend swap
+    /// holds it). So a concurrent restart can never observe a half-switched state. This field
+    /// uses a separate std mutex (not a field on the tokio-mutexed slot), so sync readers
+    /// (`is_on_fallback`) don't need the async lock.
     on_fallback: std::sync::Mutex<bool>,
     /// When the fallback was activated, for the cooldown-based restore to primary.
     fallback_since: std::sync::Mutex<Option<std::time::Instant>>,
     /// How long to stay on the fallback before a new turn probes the primary backend again.
     fallback_cooldown: std::time::Duration,
-    /// The per-prompt intent router's current model choice on the HOSTED primary path, when
-    /// it has switched away from the primary's own default. `None` = no routed override (the
-    /// primary's configured/default model is in effect). Same last-known-good discipline as
-    /// `on_fallback`: only set AFTER a successful [`Self::switch_to`], guarded by the same
-    /// `process` slot lock, and merged into [`Self::current_target`] so crash-restarts and
-    /// fallback-cooldown restores re-apply the routed model instead of silently dropping back
-    /// to the primary's default. Deliberately NOT consulted while `on_fallback` is true (the
-    /// router never fights the tinfoil failover -- see `router::choose_model`'s doc) or when
-    /// `primary` is the local llama-server (a local base URL always spawns with `model: None`;
-    /// see [`Self::route_model`]).
+    /// The per-prompt intent router's current model choice on the HOSTED primary path, after it
+    /// switches away from the primary's own default. `None` = no routed override (the
+    /// primary's configured/default model is in effect).
+    ///
+    /// This field follows the same last-known-good discipline as `on_fallback`. Code sets it
+    /// only AFTER a successful [`Self::switch_to`], guarded by the same `process` slot lock.
+    /// [`Self::current_target`] merges it in, so crash-restarts and fallback-cooldown restores
+    /// re-apply the routed model, instead of silently dropping back to the primary's default.
+    ///
+    /// Code deliberately does not consult this field in two cases:
+    /// - While `on_fallback` is true -- the router never fights the tinfoil failover (see
+    ///   `router::choose_model`'s doc).
+    /// - When `primary` is the local llama-server -- a local base URL always spawns with
+    ///   `model: None` (see [`Self::route_model`]).
     routed_model: std::sync::Mutex<Option<String>>,
     pub control: HoloControlBridge,
 }
 
 impl HoloBridge {
-    /// Spawn `holo serve` on `port`, wait for it to become healthy, verify its agent card,
-    /// and build the control bridge on top of it.
+    /// This function does four things, in order:
+    /// 1. Spawns `holo serve` on `port`.
+    /// 2. Waits for it to become healthy.
+    /// 3. Verifies its agent card.
+    /// 4. Builds the control bridge on top of it.
     ///
     /// `holo_bin` is the `holo` CLI executable (bare `"holo"` to resolve via `PATH`, or an
     /// absolute path). `local_base_url` points `holo serve`'s inference at a local
-    /// OpenAI-compatible server (alpha's local `llama-server`) when `Some`, and leaves it on its
-    /// configured backend when `None` -- see [`HoloServeProcess::build_command`]. `events_tx` is
-    /// where translated [`ControlEvent`]s get sent; the caller is expected to forward those out
-    /// over the (not-yet-implemented) iroh control stream to the iOS app.
+    /// OpenAI-compatible server (alpha's local `llama-server`) when `Some`. It leaves `holo
+    /// serve` on its configured backend when `None` -- see [`HoloServeProcess::build_command`].
+    /// This function sends translated [`ControlEvent`]s to `events_tx`. The caller must forward
+    /// those out over the (not-yet-implemented) iroh control stream to the iOS app.
     pub async fn start(
         holo_bin: impl Into<String>,
         port: u16,
@@ -225,14 +238,17 @@ impl HoloBridge {
         })
     }
 
-    /// The `(base_url, model)` a (re)spawn should use right now: the fallback target while it
-    /// is active, else the primary with the router's current model override merged in (when
-    /// the primary is the hosted path -- a `base_url: Some(..)` target, e.g. local llama-server,
-    /// never gets a model override, since `switch_to`/`build_command` already treat
-    /// `base_url: Some` and `model: Some` as mutually exclusive on the hosted-vs-local axis --
-    /// see [`Self::route_model`]'s doc for why). Returned as owned `String`s (not a borrowed
-    /// `InferenceTarget`) so a routed model -- which has no `base_url` at all -- can be
-    /// expressed without forcing `InferenceTarget::base_url` to become `Option`.
+    /// The `(base_url, model)` a (re)spawn should use right now. This is the fallback target
+    /// while it is active. Otherwise, it is the primary, with the router's current model
+    /// override merged in. This override only applies when the primary is the hosted path.
+    /// A `base_url: Some(..)` target, e.g. local llama-server, never gets a model override.
+    /// This is because `switch_to`/`build_command` already treat `base_url: Some` and
+    /// `model: Some` as mutually exclusive on the hosted-vs-local axis -- see
+    /// [`Self::route_model`]'s doc for why.
+    ///
+    /// This function returns owned `String`s, not a borrowed `InferenceTarget`. A routed model
+    /// has no `base_url` at all, so this avoids forcing `InferenceTarget::base_url` to become
+    /// `Option`.
     fn current_target(&self) -> (Option<String>, Option<String>) {
         let on_fallback = *self.on_fallback.lock().expect("on_fallback lock poisoned");
         if on_fallback {
@@ -263,8 +279,8 @@ impl HoloBridge {
     /// The intent router's current model override on the hosted primary path, if any (for
     /// status/log surfaces).
     ///
-    /// `#[allow(dead_code)]`: no bin-target caller yet (same lib-vs-bin asymmetry as
-    /// `protocol_version` above); kept as real public API for a future status/log surface.
+    /// `#[allow(dead_code)]`: this has no bin-target caller yet (same lib-vs-bin asymmetry as
+    /// `protocol_version` above). It stays as real public API for a future status/log surface.
     #[allow(dead_code)]
     pub fn routed_model(&self) -> Option<String> {
         self.routed_model.lock().expect("routed_model lock poisoned").clone()
@@ -272,15 +288,16 @@ impl HoloBridge {
 
     /// Swap the running `holo serve` onto `(base_url, model)` (terminate live child -> spawn
     /// replacement -> verify agent card -> swap slot + A2A client). The whole swap holds the
-    /// `process` slot lock, same discipline as [`Self::restart_process`]. On spawn failure the
-    /// dead child stays in the slot; the health loop notices and restarts onto whatever backend
-    /// is marked active -- `on_fallback`/`routed_model` are only flipped AFTER a successful
-    /// swap, so a failed switch self-heals back onto the backend that was last known good.
+    /// `process` slot lock, same discipline as [`Self::restart_process`]. On spawn failure, the
+    /// dead child stays in the slot. The health loop notices and restarts onto whatever backend
+    /// is marked active. `on_fallback`/`routed_model` are only flipped AFTER a successful swap.
+    /// So a failed switch self-heals back onto the backend that was last known good.
     ///
     /// `going_to_fallback` and `new_routed_model` are the state-flip instructions applied only
-    /// on success; `new_routed_model` is `Some(None)` to explicitly clear a routed override
-    /// (switching back to the primary's default), `None` to leave `routed_model` untouched
-    /// (the fallback-activation and restore-to-primary call sites, which don't touch routing).
+    /// on success. `new_routed_model` is `Some(None)` to explicitly clear a routed override,
+    /// switching back to the primary's default. It is `None` to leave `routed_model` untouched
+    /// -- the fallback-activation and restore-to-primary call sites use this, since they don't
+    /// touch routing.
     async fn switch_to(
         &self,
         base_url: Option<&str>,
@@ -317,10 +334,10 @@ impl HoloBridge {
         Ok(())
     }
 
-    /// Fail over to the fallback backend (tinfoil), if configured and not already active.
-    /// Called by the control bridge when a turn dies with a backend-error shape (the hosted
+    /// Fail over to the fallback backend (tinfoil), if configured and not already active. The
+    /// control bridge calls this when a turn dies with a backend-error shape. The hosted
     /// backend's 429s surface as `holo serve`'s generic "agent backend error" -- see
-    /// `HoloControlBridge`'s retry path).
+    /// `HoloControlBridge`'s retry path.
     pub async fn activate_fallback(&self) -> Result<FallbackActivation> {
         let Some(target) = self.fallback.clone() else {
             return Ok(FallbackActivation::Unavailable);
@@ -336,14 +353,17 @@ impl HoloBridge {
         })
     }
 
-    /// If the fallback has been active longer than the cooldown, switch back to the primary
-    /// backend so the (presumably no-longer-rate-limited) hosted path gets probed again.
-    /// Called at the start of each new turn. If the hosted backend is still rate-limited,
-    /// that turn's failure re-triggers [`Self::activate_fallback`] -- one failed attempt per
-    /// cooldown window is the probe cost, and the turn itself still completes via the retry.
-    /// Restores whatever model the router had last selected on the primary (`current_target`
-    /// merges `routed_model` in), not the primary's bare default. Returns `true` when a
-    /// restore actually happened.
+    /// If the fallback stayed active longer than the cooldown, this function switches back to
+    /// the primary backend. This lets the (presumably no-longer-rate-limited) hosted path get
+    /// probed again. Call this function at the start of each new turn.
+    ///
+    /// If the hosted backend is still rate-limited, that turn's failure re-triggers
+    /// [`Self::activate_fallback`]. One failed attempt per cooldown window is the probe cost.
+    /// The turn itself still completes via the retry.
+    ///
+    /// This function restores whatever model the router last selected on the primary
+    /// (`current_target` merges `routed_model` in), not the primary's bare default. It returns
+    /// `true` when a restore actually happened.
     pub async fn maybe_restore_primary(&self) -> bool {
         if !self.is_on_fallback() {
             return false;
@@ -387,14 +407,19 @@ impl HoloBridge {
         }
     }
 
-    /// Per-prompt intent routing on the hosted primary path: classify `prompt_text` and, if
-    /// the decision differs (with hysteresis) from the currently active model, respawn `holo
-    /// serve` onto it. No-ops (returns `Ok(())` immediately) when: local (no-cloud) mode is
-    /// active (`primary` has its own `base_url`, i.e. the local llama-server -- routing a
-    /// model NAME at a local server is meaningless, and P0-11 requires the alpha to never
-    /// introduce a hosted-shaped spawn there), or the fallback is currently active (the router
-    /// must never fight the tinfoil failover -- `maybe_restore_primary` re-applies the routed
-    /// model once the cooldown elapses and hosted service resumes). See `router::classify`.
+    /// Per-prompt intent routing on the hosted primary path. This function classifies
+    /// `prompt_text`. If the decision differs (with hysteresis) from the currently active
+    /// model, it respawns `holo serve` onto the new model.
+    ///
+    /// This function no-ops (returns `Ok(())` immediately) in two cases:
+    /// - Local (no-cloud) mode is active (`primary` has its own `base_url`, i.e. the local
+    ///   llama-server). Routing a model NAME at a local server is meaningless, and P0-11
+    ///   requires the alpha to never introduce a hosted-shaped spawn there.
+    /// - The fallback is currently active. The router must never fight the tinfoil failover --
+    ///   `maybe_restore_primary` re-applies the routed model once the cooldown elapses and
+    ///   hosted service resumes.
+    ///
+    /// See `router::classify`.
     pub async fn route_model(&self, prompt_text: &str) -> Result<()> {
         // `primary: Some(..)` means local (no-cloud) mode -- `main.rs` only ever builds a
         // primary `InferenceTarget` for the local llama-server; the hosted path leaves
@@ -426,14 +451,16 @@ impl HoloBridge {
     }
 
     /// Explicitly force `holo serve` onto `tier`, bypassing [`router::should_switch`]'s
-    /// text-based classification entirely. Used by the stall watchdog
-    /// (`crate::holo_bridge::stall_watchdog`) right before redispatching a self-correction
-    /// nudge: the nudge's own short admonishment text ("check your last action...") is not
-    /// representative of the ORIGINAL task's real complexity, so scoring the nudge text alone
-    /// could accidentally downgrade the model right when a stuck agent most needs the
-    /// stronger tier. Same no-op guards as [`Self::route_model`] (local mode / on fallback),
-    /// same underlying [`Self::switch_to`] call -- this is a deliberate override of the
-    /// router's decision, not a parallel routing mechanism.
+    /// text-based classification entirely. The stall watchdog
+    /// (`crate::holo_bridge::stall_watchdog`) uses this function, right before it redispatches a
+    /// self-correction nudge. The nudge's own short admonishment text ("check your last
+    /// action...") is not representative of the ORIGINAL task's real complexity. So scoring the
+    /// nudge text alone could accidentally downgrade the model, right when a stuck agent most
+    /// needs the stronger tier.
+    ///
+    /// This function uses the same no-op guards as [`Self::route_model`] (local mode / on
+    /// fallback), and the same underlying [`Self::switch_to`] call. This is a deliberate
+    /// override of the router's decision, not a parallel routing mechanism.
     pub async fn force_tier(&self, tier: crate::router::Tier) -> Result<()> {
         if self.primary.is_some() {
             return Ok(());
@@ -456,12 +483,12 @@ impl HoloBridge {
     }
 
     /// The A2A agent card's `protocolVersion` this bridge's `holo serve` advertised at startup,
-    /// or `None` if it did not advertise one. See the `protocol_version` field. Used by
-    /// [`crate::executor::start_holo_desktop_executor`] to report the real backend version in
-    /// [`crate::executor::ExecutorCapabilities`].
+    /// or `None` if it did not advertise one. See the `protocol_version` field.
+    /// [`crate::executor::start_holo_desktop_executor`] uses this to report the real backend
+    /// version in [`crate::executor::ExecutorCapabilities`].
     ///
-    /// `#[allow(dead_code)]` for the same lib-vs-bin reason as the field it reads (the only
-    /// caller lives in the `executor` module, absent from the bin target).
+    /// `#[allow(dead_code)]` applies for the same lib-vs-bin reason as the field it reads. The
+    /// only caller lives in the `executor` module, which is absent from the bin target.
     #[allow(dead_code)]
     pub fn protocol_version(&self) -> Option<&str> {
         self.protocol_version.as_deref()
@@ -473,13 +500,15 @@ impl HoloBridge {
         self.process.lock().await.try_wait()
     }
 
-    /// Replace a dead `holo serve` child with a freshly-spawned one, and rebuild
-    /// [`HoloControlBridge`]'s internal A2A client to point at it. Does NOT touch `self.control`'s
-    /// event sink, busy/queue state, or anything else about the bridge's identity -- only the
-    /// underlying process and the client's connection to it change, so in-flight callers holding
-    /// a reference to this `HoloBridge` are unaffected beyond their next A2A call going to the
-    /// new process. See `holo_bridge::health`'s module doc for why this can never reach the iroh
-    /// P2P session (this type has no field referencing it).
+    /// Replace a dead `holo serve` child with a freshly-spawned one. Rebuild
+    /// [`HoloControlBridge`]'s internal A2A client to point at it.
+    ///
+    /// This function does NOT touch `self.control`'s event sink, busy/queue state, or anything
+    /// else about the bridge's identity. Only the underlying process and the client's
+    /// connection to it change. So in-flight callers holding a reference to this `HoloBridge`
+    /// stay unaffected, beyond their next A2A call going to the new process. See
+    /// `holo_bridge::health`'s module doc for why this can never reach the iroh P2P session
+    /// (this type has no field referencing it).
     pub async fn restart_process(&self) -> Result<()> {
         // Take the slot lock for the WHOLE swap (disarm -> spawn -> replace): the health loop's
         // `try_wait_process` (the only other lock taker on a hot path) blocks until the restart
@@ -531,11 +560,10 @@ impl HoloBridge {
         self.control.handle(message).await;
     }
 
-    /// Redirects where this bridge's [`ControlEvent`]s are sent. See
-    /// [`HoloControlBridge::replace_event_sink`] -- used by
-    /// `crate::control_channel::ControlChannel` to point the bridge at the
-    /// currently-connected peer's writer task each time a new
-    /// control-channel connection is accepted.
+    /// This function redirects where this bridge sends its [`ControlEvent`]s. See
+    /// [`HoloControlBridge::replace_event_sink`]. `crate::control_channel::ControlChannel` uses
+    /// this to point the bridge at the currently-connected peer's writer task. It does this
+    /// each time the channel accepts a new control-channel connection.
     pub fn replace_event_sink(&self, events_tx: mpsc::UnboundedSender<ControlEvent>) {
         self.control.replace_event_sink(events_tx);
     }
@@ -546,18 +574,17 @@ impl HoloBridge {
     }
 
     /// `(turn currently in flight, prompts queued behind it)`. See
-    /// [`HoloControlBridge::busy_state`] -- surfaced through the control channel's
-    /// on-connect greeting so a reconnecting peer immediately learns whether a stale
-    /// in-flight/queued turn survived the drop, without needing to wait for the next
-    /// [`ControlEvent`].
+    /// [`HoloControlBridge::busy_state`]. The control channel's on-connect greeting surfaces
+    /// this, so a reconnecting peer immediately learns whether a stale in-flight/queued turn
+    /// survived the drop. The peer does not need to wait for the next [`ControlEvent`].
     pub fn busy_state(&self) -> (bool, usize) {
         self.control.busy_state()
     }
 
     /// Whether a task is currently PARKED (paused) awaiting `Resume`. See
-    /// [`HoloControlBridge::is_paused`] -- surfaced through the control channel's
-    /// on-connect greeting so a reconnecting peer restores the Pause/Stop pill
-    /// even for a paused task (which `busy_state` alone reports as not busy).
+    /// [`HoloControlBridge::is_paused`]. The control channel's on-connect greeting surfaces
+    /// this, so a reconnecting peer restores the Pause/Stop pill, even for a paused task.
+    /// `busy_state` alone reports a paused task as not busy.
     pub fn is_paused(&self) -> bool {
         self.control.is_paused()
     }
@@ -595,12 +622,12 @@ impl HoloBridge {
     /// period). Call this during daemon shutdown so `holo serve` (and, transitively, the
     /// `hai-agent-runtime` process it manages) doesn't outlive the daemon as an orphan.
     ///
-    /// This is the preferred shutdown path (it awaits graceful exit); `HoloBridge` does not
-    /// implement its own `Drop` beyond what its fields already do -- `self.process` is a
-    /// [`HoloServeProcess`], whose own `Drop` impl (see `process.rs`) is the synchronous
-    /// safety net for the case where this method is never reached (e.g. `main.rs`'s
-    /// `Arc::try_unwrap(bridge)` failing because another clone is still alive elsewhere, or a
-    /// panic during shutdown).
+    /// This is the preferred shutdown path, since it awaits graceful exit. `HoloBridge` does
+    /// not implement its own `Drop` beyond what its fields already do. `self.process` is a
+    /// [`HoloServeProcess`]. Its own `Drop` impl (see `process.rs`) is the synchronous safety
+    /// net, for the case where this method is never reached. That can happen if `main.rs`'s
+    /// `Arc::try_unwrap(bridge)` fails because another clone is still alive elsewhere, or if a
+    /// panic happens during shutdown.
     pub async fn shutdown(self) -> Result<()> {
         self.process.into_inner().shutdown().await
     }

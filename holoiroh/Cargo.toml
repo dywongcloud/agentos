@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["mac-daemon", "ios-bridge", "holoiroh-wire"]
+members = ["mac-daemon", "ios-bridge", "holoiroh-wire", "holoiroh-wire-wasm-demo"]
 # `rust_db_project/` is an unrelated local exercise living inside this tree; it
 # was briefly a workspace member, which broke fresh clones (the directory is
 # untracked, so the workspace referenced a member that doesn't exist in git).

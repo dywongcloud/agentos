@@ -1,16 +1,22 @@
-//! A native, per-task finite-state-machine layer over `holo serve`'s A2A event stream,
-//! modeled on the PLAN/EXECUTE/VERIFY/DONE phase discipline of `AnEntrypoint/gm`'s
-//! `rs-plugkit` orchestrator (`crates/plugkit-core/src/orchestrator/transitions.rs`).
+//! A native, per-task finite-state-machine layer sits over `holo serve`'s
+//! A2A event stream. This layer is modeled on the PLAN/EXECUTE/VERIFY/DONE
+//! phase discipline of `AnEntrypoint/gm`'s `rs-plugkit` orchestrator
+//! (`crates/plugkit-core/src/orchestrator/transitions.rs`).
 //!
 //! ## Why port a pattern instead of a dependency
 //!
-//! `rs-plugkit`'s `Phase` enum and CAS-guarded YAML PRD rows are genuinely portable IDEAS, but
-//! not a linkable crate: the phase state (`transitions.rs`), PRD rows (`prd.rs`), and CAS retry
-//! loop (`cas.rs`) all sit on `pkfs`, a filesystem shim whose non-wasm32 stubs are dead no-ops
-//! (`pkfs.rs`) -- the crate only does real I/O inside a `wasm32-wasip1` build loaded by a
-//! separate, unpublished native host (`agentplug-runner`) that implements ~26 `host_*` ABI
-//! functions. There is no `cargo add rs-plugkit` path into this daemon. What DOES port cleanly,
-//! because it's plain logic with no wasm/host coupling, is reimplemented here natively:
+//! `rs-plugkit`'s `Phase` enum and CAS-guarded YAML PRD rows are genuinely
+//! portable ideas. They are not a linkable crate. The phase state
+//! (`transitions.rs`), the PRD rows (`prd.rs`), and the CAS retry loop
+//! (`cas.rs`) all sit on `pkfs`, a filesystem shim. `pkfs`'s non-wasm32
+//! stubs are dead no-ops (`pkfs.rs`). The crate only does real I/O inside a
+//! `wasm32-wasip1` build. A separate, unpublished native host
+//! (`agentplug-runner`) loads that build and implements ~26 `host_*` ABI
+//! functions. There is no `cargo add rs-plugkit` path into this daemon.
+//!
+//! Some of `rs-plugkit`'s logic DOES port cleanly, because it is plain
+//! logic with no wasm/host coupling. This module reimplements that logic
+//! here, natively:
 //!
 //! - The linear phase chain (`Phase::next`), mirroring `transitions.rs`'s `next_phase`.
 //! - A hard code-level gate before advancing to a terminal phase (mirroring `gates.rs`'s
@@ -20,20 +26,32 @@
 //!
 //! ## Why THESE phases, grounded in real backend signal
 //!
-//! `holo serve`'s A2A stream already contains distinguishable `TrajectoryEvent` kinds --
-//! `policy_event` (the model reasoning/deciding what to do next), `tool_result` (an action
-//! actually taken on the desktop), `answer_event` (the final output) -- witnessed directly in
-//! `~/.holo/runs/*/events.jsonl` during this daemon's own development. `raw_event` on
-//! `TaskUpdate::Working` already carries this JSON; it was previously forwarded to the phone
-//! unread (`control::translate_update`). [`Phase::from_trajectory_kind`] reads the REAL `kind`
-//! field rather than inventing synthetic stage labels, so a task's phase reflects what the
-//! backend is actually doing, not a guess.
+//! `holo serve`'s A2A stream already contains distinguishable
+//! `TrajectoryEvent` kinds:
 //!
-//! Four phases (not gm's six): `Plan` (the model is observing/reasoning, no action taken yet),
-//! `Execute` (at least one real tool call has landed), `Verify` (an answer artifact arrived --
-//! the backend's own claim of done, not yet confirmed), `Done`/`Failed` (a real A2A terminal
-//! state closed the turn). gm's EMIT/CONSOLIDATE have no analog here -- this daemon does not
-//! write files or push git commits per task, so those phases would be decorative.
+//! - `policy_event`: the model reasoning or deciding what to do next
+//! - `tool_result`: an action actually taken on the desktop
+//! - `answer_event`: the final output
+//!
+//! Real runs during this daemon's own development witnessed these kinds
+//! directly, in `~/.holo/runs/*/events.jsonl`. `raw_event` on
+//! `TaskUpdate::Working` already carries this JSON. This daemon previously
+//! forwarded that JSON to the phone unread (`control::translate_update`).
+//! [`Phase::from_trajectory_kind`] reads the REAL `kind` field, rather than
+//! inventing synthetic stage labels. Because of this, a task's phase
+//! reflects what the backend is actually doing, not a guess.
+//!
+//! This daemon has four phases, not gm's six:
+//!
+//! - `Plan`: the model is observing or reasoning, no action taken yet
+//! - `Execute`: at least one real tool call has landed
+//! - `Verify`: an answer artifact arrived -- the backend's own claim of
+//!   done, not yet confirmed
+//! - `Done`/`Failed`: a real A2A terminal state closed the turn
+//!
+//! gm's EMIT/CONSOLIDATE phases have no analog here. This daemon does not
+//! write files or push git commits per task. Those phases serve no purpose
+//! for this daemon.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -42,26 +60,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// A task's phase, in the ONLY order it can ever advance through -- see [`Phase::next`].
-/// Mirrors `rs-plugkit`'s `Phase` enum shape (a plain linear chain with a `next()` step
-/// function), scoped to the four phases this daemon has real signal for.
+/// A task's phase advances through one order only -- see [`Phase::next`].
+/// This enum mirrors `rs-plugkit`'s `Phase` enum shape (a plain linear
+/// chain with a `next()` step function). This enum is scoped to the four
+/// phases this daemon has real signal for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// The model is observing the desktop / reasoning about what to do -- no tool call has
-    /// landed yet for this task. Entered on task creation and on every `policy_event`/
+    /// The model is observing the desktop, or reasoning about what to do --
+    /// no tool call has landed yet for this task. This daemon enters this
+    /// phase on task creation, and on every `policy_event`/
     /// `observation_event` seen before the first `tool_result`.
     Plan,
-    /// At least one real desktop action (`tool_result`) has been taken. Sticky: further
-    /// `policy_event`s during a multi-step task do NOT regress the phase back to `Plan` --
-    /// planning between actions is normal mid-execution behavior, not a phase change.
+    /// The task took at least one real desktop action (`tool_result`). This
+    /// phase is sticky: further `policy_event`s during a multi-step task do
+    /// NOT regress the phase back to `Plan`. Planning between actions is
+    /// normal mid-execution behavior, not a phase change.
     Execute,
-    /// An `answer_event`/`TaskUpdate::Answer` arrived -- the backend's OWN claim that the task
-    /// is done. Deliberately NOT the same as `Done`: gm's witness discipline is "a finding is
-    /// only real once witnessed," and an unconfirmed self-reported answer is exactly the
-    /// un-witnessed claim that discipline exists to catch. See [`TaskFsm::advance_terminal`]
-    /// for the real gate: `Verify` can only close to `Done` when the transport's OWN terminal
-    /// signal (`TerminalState::Completed`) independently confirms it, not the answer text alone.
+    /// An `answer_event`/`TaskUpdate::Answer` arrived -- the backend's OWN
+    /// claim that the task is done. This phase is deliberately NOT the same
+    /// as `Done`. gm's witness discipline states: "a finding is only real
+    /// once witnessed," and an unconfirmed self-reported answer is exactly
+    /// the un-witnessed claim that discipline exists to catch. See
+    /// [`TaskFsm::advance_terminal`] for the real gate. `Verify` can only
+    /// close to `Done` when the transport's OWN terminal signal
+    /// (`TerminalState::Completed`) independently confirms it. The answer
+    /// text alone is not enough.
     Verify,
     /// A real A2A terminal state (`TerminalState::Completed`) closed the turn. Terminal.
     Done,
@@ -76,11 +100,19 @@ impl Phase {
         matches!(self, Phase::Done | Phase::Failed)
     }
 
-    /// Classify a real `TrajectoryEvent.kind` string (as emitted by `hai-agent-runtime`,
-    /// witnessed values: `"policy_event"`, `"observation_event"`, `"tool_result"`,
-    /// `"message_event"`, `"answer_event"`) into the phase it implies, when unambiguous.
-    /// `None` for kinds this daemon doesn't have a phase mapping for (e.g. `message_event`,
-    /// the echoed input) -- the caller leaves the phase unchanged rather than guessing.
+    /// Classify a real `TrajectoryEvent.kind` string into the phase it
+    /// implies, when unambiguous. `hai-agent-runtime` emits this string.
+    /// Witnessed values are:
+    ///
+    /// - `"policy_event"`
+    /// - `"observation_event"`
+    /// - `"tool_result"`
+    /// - `"message_event"`
+    /// - `"answer_event"`
+    ///
+    /// Return `None` for kinds this daemon doesn't have a phase mapping for
+    /// (for example, `message_event`, the echoed input). In that case, the
+    /// caller leaves the phase unchanged, rather than guessing.
     fn from_trajectory_kind(kind: &str) -> Option<Phase> {
         match kind {
             "policy_event" | "observation_event" => Some(Phase::Plan),
@@ -91,40 +123,51 @@ impl Phase {
     }
 }
 
-/// Persisted state for one in-flight (or recently concluded) task. Serialized to
-/// `~/.holoiroh/tasks/<request_id>.json` -- see [`TaskFsm::save`]/[`TaskFsm::load`]. Field
-/// shape mirrors `rs-plugkit`'s `TurnState` (`transitions.rs`): phase, an identifying key
-/// (`request_id` here instead of `session_id`), and a timestamp, minus the pending-skill/
-/// pending-step fields that only make sense for a coding-agent's own skill-dispatch loop.
+/// Persisted state for one in-flight, or recently concluded, task. This
+/// state is serialized to `~/.holoiroh/tasks/<request_id>.json` -- see
+/// [`TaskFsm::save`]/[`TaskFsm::load`]. The field shape mirrors
+/// `rs-plugkit`'s `TurnState` (`transitions.rs`): a phase, an identifying
+/// key (`request_id` here instead of `session_id`), and a timestamp. This
+/// shape omits the pending-skill/pending-step fields that only make sense
+/// for a coding-agent's own skill-dispatch loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskFsm {
     pub request_id: String,
     pub phase: Phase,
-    /// Count of real `tool_result` events seen -- the concrete "has the agent actually done
-    /// anything yet" signal, surfaced to the phone as part of phase-change status text so a
-    /// stuck-in-Plan task (the model keeps observing/reasoning with zero actions) is visible
-    /// as a distinct, diagnosable state rather than indistinguishable generic "Working".
+    /// Count of real `tool_result` events seen. This is the concrete "has
+    /// the agent actually done anything yet" signal. This daemon surfaces
+    /// the count to the phone, as part of phase-change status text. Because
+    /// of this, a stuck-in-Plan task -- the model keeps observing or
+    /// reasoning with zero actions -- is visible as a distinct, diagnosable
+    /// state, rather than an indistinguishable generic "Working".
     pub actions_taken: u32,
-    /// The answer text last seen via `TaskUpdate::Answer`, if any -- retained so a `Verify`
-    /// phase can be reported with *what* the backend claimed before it's confirmed.
+    /// The answer text last seen via `TaskUpdate::Answer`, if any. This
+    /// daemon retains the text so a `Verify` phase can be reported with
+    /// *what* the backend claimed, before that claim is confirmed.
     pub claimed_answer: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    /// When the stall watchdog (`crate::holo_bridge::stall_watchdog`) last nudged this task,
-    /// if ever -- see [`Self::should_nudge`]/[`Self::mark_nudged`]. `None` until the first
-    /// nudge; never touched by ordinary phase transitions (a nudge is not itself progress).
+    /// When the stall watchdog (`crate::holo_bridge::stall_watchdog`) last
+    /// nudged this task, if ever -- see
+    /// [`Self::should_nudge`]/[`Self::mark_nudged`]. This field is `None`
+    /// until the first nudge. Ordinary phase transitions never touch this
+    /// field, because a nudge is not itself progress.
     #[serde(default)]
     pub last_nudge_ms: Option<u64>,
 }
 
 impl TaskFsm {
-    /// Start tracking a new task at `Phase::Plan` -- every task begins there; only a real
-    /// `tool_result` can advance it, so a task that finishes via `answer_event` with zero
-    /// actions in between (a pure Q&A turn, no desktop interaction needed) correctly SKIPS
-    /// `Execute` and goes straight `Plan -> Verify -> Done`. This is real skip-ahead, not a
-    /// bug: unlike `rs-plugkit`'s strict linear chain (which never skips because a coding
-    /// agent's PLAN/EXECUTE/EMIT/VERIFY/CONSOLIDATE steps are ALWAYS all real work), a Holo3
-    /// turn that answers from context alone genuinely never executes anything.
+    /// Start tracking a new task at `Phase::Plan`. Every task begins there.
+    /// Only a real `tool_result` can advance the phase past `Plan`. Because
+    /// of this rule, a task that finishes via `answer_event` with zero
+    /// actions in between -- a pure Q&A turn, no desktop interaction needed
+    /// -- correctly SKIPS `Execute` and goes straight `Plan -> Verify ->
+    /// Done`.
+    ///
+    /// This is real skip-ahead, not a bug. `rs-plugkit`'s chain never skips,
+    /// because a coding agent's PLAN/EXECUTE/EMIT/VERIFY/CONSOLIDATE steps
+    /// are ALWAYS all real work. A Holo3 turn that answers from context
+    /// alone genuinely never executes anything.
     pub fn new(request_id: impl Into<String>) -> Self {
         let now = now_ms();
         Self {
@@ -138,10 +181,12 @@ impl TaskFsm {
         }
     }
 
-    /// Feed one `TaskUpdate::Working`'s `raw_event` JSON through the phase classifier.
-    /// Advance-only (`Plan -> Execute` is one-way; a later `policy_event` mid-`Execute` does
-    /// NOT regress the phase -- see [`Phase::Execute`]'s doc). Returns `true` if the phase
-    /// actually changed, so the caller can decide whether to emit a phase-change status line.
+    /// Feed one `TaskUpdate::Working`'s `raw_event` JSON through the phase
+    /// classifier. This method is advance-only: `Plan -> Execute` is
+    /// one-way. A later `policy_event` mid-`Execute` does NOT regress the
+    /// phase -- see [`Phase::Execute`]'s doc. Return `true` if the phase
+    /// actually changed. The caller can then decide whether to emit a
+    /// phase-change status line.
     pub fn observe_working(&mut self, raw_event: Option<&serde_json::Value>) -> bool {
         if self.phase.is_terminal() {
             return false;
@@ -160,8 +205,9 @@ impl TaskFsm {
         changed
     }
 
-    /// Record the backend's self-reported answer -- advances to `Verify` (the un-witnessed
-    /// claim state; see [`Phase::Verify`]'s doc for why this is deliberately not `Done` yet).
+    /// Record the backend's self-reported answer. This method advances the
+    /// phase to `Verify`, the un-witnessed claim state -- see
+    /// [`Phase::Verify`]'s doc for why this is deliberately not `Done` yet.
     pub fn observe_answer(&mut self, text: &str) -> bool {
         if self.phase.is_terminal() {
             return false;
@@ -172,14 +218,18 @@ impl TaskFsm {
         changed
     }
 
-    /// The real witness gate: close to a TERMINAL phase only on the transport's OWN signal
-    /// (`TerminalState`), never on the answer text alone. Mirrors `rs-plugkit`'s `gates.rs`
-    /// discipline -- "a finding is only real once witnessed by execution", here meaning the
-    /// A2A layer's own completion signal is the witness, not the model's self-report parsed
-    /// out of `answer_event` text. A `Completed` state reached with ZERO actions taken and NO
-    /// claimed answer (the empty-completion shape `control.rs`'s failover logic already
-    /// treats as a backend failure) is downgraded to `Failed` here too -- the same real signal,
-    /// checked at the FSM layer instead of only in the retry/failover path.
+    /// The real witness gate: this method closes the phase to a TERMINAL
+    /// phase only on the transport's OWN signal (`TerminalState`), never on
+    /// the answer text alone. This mirrors `rs-plugkit`'s `gates.rs`
+    /// discipline -- "a finding is only real once witnessed by execution".
+    /// Here, the A2A layer's own completion signal is the witness, not the
+    /// model's self-report parsed out of `answer_event` text.
+    ///
+    /// This method downgrades a `Completed` state to `Failed` too, when the
+    /// task took ZERO actions and had NO claimed answer. `control.rs`'s
+    /// failover logic already treats that empty-completion shape as a
+    /// backend failure. This method checks the same real signal at the FSM
+    /// layer, instead of checking it only in the retry/failover path.
     pub fn advance_terminal(&mut self, state: crate::holo_bridge::a2a_client::TerminalState) {
         use crate::holo_bridge::a2a_client::TerminalState as T;
         if self.phase.is_terminal() {
@@ -196,9 +246,10 @@ impl TaskFsm {
         self.updated_at_ms = now_ms();
     }
 
-    /// Fail the task directly (bridge/transport error before any A2A terminal arrived --
-    /// e.g. `send_and_stream` returning `Err`). No witness check needed: an explicit
-    /// transport error IS the evidence.
+    /// Fail the task directly: a bridge or transport error arrived before
+    /// any A2A terminal signal, for example `send_and_stream` returning
+    /// `Err`. No witness check is needed. An explicit transport error IS the
+    /// evidence.
     pub fn fail(&mut self) {
         if !self.phase.is_terminal() {
             self.phase = Phase::Failed;
@@ -206,10 +257,12 @@ impl TaskFsm {
         }
     }
 
-    /// One-way advance: only moves forward along `Plan -> Execute -> Verify -> {Done,Failed}`,
-    /// never backward, and a same-or-earlier target is a no-op. This is what makes
-    /// `observe_working`'s "sticky Execute" and "Plan can jump straight to Verify" behaviors
-    /// both correct with one shared rule instead of two special cases.
+    /// This method advances one-way only. It only moves forward along `Plan
+    /// -> Execute -> Verify -> {Done,Failed}`, never backward. A
+    /// same-or-earlier target is a no-op. This single rule is what makes
+    /// `observe_working`'s "sticky Execute" and "Plan can jump straight to
+    /// Verify" behaviors both correct, with one shared rule instead of two
+    /// special cases.
     fn advance_to(&mut self, target: Phase) -> bool {
         if rank(target) > rank(self.phase) {
             self.phase = target;
@@ -219,9 +272,10 @@ impl TaskFsm {
         }
     }
 
-    /// A short human-readable phase-change line for `ControlEvent::Progress`/`DaemonStatus`,
-    /// so the phone sees "planning -> acting on your Mac -> reviewing the result" instead of
-    /// opaque unlabeled progress dots.
+    /// This method returns a short, human-readable phase-change line for
+    /// `ControlEvent::Progress`/`DaemonStatus`. Because of this line, the
+    /// phone sees "planning -> acting on your Mac -> reviewing the result",
+    /// instead of opaque, unlabeled progress dots.
     pub fn phase_status_text(&self) -> String {
         match self.phase {
             Phase::Plan => "planning".to_string(),
@@ -236,12 +290,18 @@ impl TaskFsm {
         }
     }
 
-    /// Whether `crate::holo_bridge::stall_watchdog` should nudge this task at `now_ms`: not
-    /// terminal, no real phase advancement for at least `stall_window_ms`, and (if it was
-    /// nudged before) at least `nudge_cooldown_ms` since that last nudge -- a nudge is not
-    /// itself progress, so a task that's STILL stuck after one nudge is still eligible once
-    /// the cooldown passes, but never nudged twice in a tight loop while the agent is
-    /// genuinely working through the first nudge's correction.
+    /// Whether `crate::holo_bridge::stall_watchdog` should nudge this task
+    /// at `now_ms`. All of the following must be true:
+    ///
+    /// - the task is not terminal
+    /// - the task had no real phase advancement for at least `stall_window_ms`
+    /// - if the task was nudged before, `now_ms` is at least
+    ///   `nudge_cooldown_ms` after that last nudge
+    ///
+    /// A nudge is not itself progress. So a task that is STILL stuck after
+    /// one nudge remains eligible, once the cooldown passes. But this
+    /// method never nudges the task twice in a tight loop, while the agent
+    /// genuinely works through the first nudge's correction.
     pub fn should_nudge(&self, now_ms: u64, stall_window_ms: u64, nudge_cooldown_ms: u64) -> bool {
         if self.phase.is_terminal() {
             return false;
@@ -262,10 +322,11 @@ impl TaskFsm {
         self.updated_at_ms = now_ms;
     }
 
-    /// Records that a nudge was just sent. Deliberately does NOT touch `updated_at_ms`/`phase`
-    /// -- the nudge itself is not evidence of real progress, only a real `tool_result`/
-    /// `answer_event`/terminal signal (via `observe_working`/`observe_answer`/
-    /// `advance_terminal`) advances those.
+    /// Records that a nudge was just sent. This method deliberately does NOT
+    /// touch `updated_at_ms`/`phase`. The nudge itself is not evidence of
+    /// real progress. Only a real `tool_result`/`answer_event`/terminal
+    /// signal -- via `observe_working`/`observe_answer`/`advance_terminal`
+    /// -- advances those fields.
     pub fn mark_nudged(&mut self, now_ms: u64) {
         self.last_nudge_ms = Some(now_ms);
     }
@@ -292,8 +353,9 @@ impl TaskFsm {
         Ok(Self::tasks_dir()?.join(format!("{safe}.json")))
     }
 
-    /// Persist current state. Best-effort by design at call sites (a failed save should never
-    /// abort a real task turn) -- callers log the error and continue.
+    /// Persist the current state. This method is best-effort by design, at
+    /// call sites: a failed save never aborts a real task turn. Callers log
+    /// the error and continue.
     pub fn save(&self) -> Result<()> {
         let path = Self::path_for(&self.request_id)?;
         let json = serde_json::to_string_pretty(self).context("serializing TaskFsm")?;
@@ -323,10 +385,12 @@ impl TaskFsm {
     }
 }
 
-/// Register storage: the daemon's active tasks, keyed by `request_id`. A daemon-wide singleton
-/// (parallel to how `HoloControlBridge` already tracks `busy`/`queue` -- see `control.rs`) so
-/// the FSM survives across the `run_prompt`/`run_prompt_once` boundary without threading a
-/// mutable reference through every call site.
+/// Register storage: the daemon's active tasks, keyed by `request_id`.
+/// This is a daemon-wide singleton, parallel to how `HoloControlBridge`
+/// already tracks `busy`/`queue` (see `control.rs`). Because of this
+/// singleton, the FSM survives across the `run_prompt`/`run_prompt_once`
+/// boundary, without threading a mutable reference through every call
+/// site.
 #[derive(Default)]
 pub struct TaskRegistry {
     active: Mutex<std::collections::HashMap<String, TaskFsm>>,
@@ -337,10 +401,12 @@ impl TaskRegistry {
         Self::default()
     }
 
-    /// Start tracking a new task, replacing any stale prior entry for the same `request_id`
-    /// (a retried turn, e.g. the tinfoil-failover retry in `control.rs`, reuses the SAME
-    /// `request_id` for its second attempt -- fresh FSM state is correct there, since the
-    /// retry is a genuinely new attempt at the task, not a continuation).
+    /// Start tracking a new task, replacing any stale prior entry for the
+    /// same `request_id`. A retried turn -- for example, the
+    /// tinfoil-failover retry in `control.rs` -- reuses the SAME
+    /// `request_id` for its second attempt. Fresh FSM state is correct
+    /// there, because the retry is a genuinely new attempt at the task, not
+    /// a continuation.
     pub fn begin(&self, request_id: &str) {
         let fsm = TaskFsm::new(request_id);
         if let Err(err) = fsm.save() {
@@ -352,9 +418,11 @@ impl TaskRegistry {
             .insert(request_id.to_string(), fsm);
     }
 
-    /// Run `f` against the task's live FSM (if tracked), persisting afterward. Returns
-    /// `f`'s result, or `None` if this `request_id` isn't tracked (e.g. `begin` was never
-    /// called -- callers treat that as "no phase tracking for this turn", not an error).
+    /// Run `f` against the task's live FSM, if tracked. This method
+    /// persists the FSM afterward. Return `f`'s result, or `None` if this
+    /// `request_id` isn't tracked -- for example, if `begin` was never
+    /// called. Callers treat that case as "no phase tracking for this
+    /// turn", not an error.
     pub fn with_task<R>(&self, request_id: &str, f: impl FnOnce(&mut TaskFsm) -> R) -> Option<R> {
         let mut guard = self.active.lock().expect("task registry lock poisoned");
         let fsm = guard.get_mut(request_id)?;
@@ -365,8 +433,9 @@ impl TaskRegistry {
         Some(result)
     }
 
-    /// Remove a concluded task from the in-memory registry and delete its persisted file.
-    /// Call once its terminal phase has been fully emitted to the phone.
+    /// Remove a concluded task from the in-memory registry. Delete its
+    /// persisted file. Call this method once this daemon fully emits the
+    /// task's terminal phase to the phone.
     pub fn conclude(&self, request_id: &str) {
         let removed = self
             .active

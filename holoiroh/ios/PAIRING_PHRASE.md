@@ -1,84 +1,84 @@
 # Pairing verification phrase — cross-platform derivation spec
 
 This document is the **authoritative, byte-exact specification** of the
-short pairing-verification phrase (a short-authentication-string / SAS) that
-Project Aro PRD **P0-2 / 7.1** requires to be shown on **both** the Mac and
-the iPhone during pairing. The iOS half is implemented in this pass
-(`ios/Sources/HoloIrohApp/PairingPhrase.swift` +
-`PairingWordlist.swift`); the **matching Mac-daemon display is a follow-on**
-(see "Daemon side" at the bottom). This spec exists so that follow-on can be
-implemented with zero guesswork and provably produce the *same* phrase.
+short pairing-verification phrase (a short-authentication-string, or SAS).
+Project Aro PRD **P0-2 / 7.1** requires this phrase to appear on **both**
+the Mac and the iPhone during pairing. This pass implements the iOS half
+(`ios/Sources/HoloIrohApp/PairingPhrase.swift` and
+`PairingWordlist.swift`). The **matching Mac-daemon display is a follow-on**
+(see "Daemon side" at the bottom). This spec removes guesswork from that
+follow-on work, so the follow-on can provably produce the *same* phrase.
 
 ## Why a phrase at all
 
-Scanning/pasting the iroh ticket proves *possession of the ticket*, not
+Scanning or pasting the iroh ticket proves *possession of the ticket*, not
 *who is on the other end*. An attacker who can substitute the QR the user
-scans (a printed/projected fake, a compromised display) can man-in-the-
-middle the pairing. The phrase defeats that: it is derived deterministically
-from the ticket and shown on both ends, and the user confirms the two match.
-A substituted ticket produces a **different** phrase, so the mismatch is
-visible and the user aborts.
+scans (a printed or projected fake, a compromised display) can
+man-in-the-middle the pairing. The phrase defeats that. It derives
+deterministically from the ticket. Both ends show the phrase. The user then
+confirms that the two match. A substituted ticket produces a **different**
+phrase. The user then sees the mismatch. The user aborts the pairing.
 
-This only works if **both ends derive the phrase identically**. Everything
-below is chosen to make that trivially reproducible in Rust as well as
-Swift.
+This only works if **both ends derive the phrase identically**. The choices
+below make that reproduction trivial in both Rust and Swift.
 
 ## The algorithm (version 1)
 
 Given the ticket string:
 
-1. **Canonicalize.** Trim leading/trailing ASCII/Unicode whitespace
+1. **Canonicalize.** Trim leading and trailing ASCII or Unicode whitespace
    (including a trailing newline). Do **not** alter the ticket body. The
    input to the hash is the canonical string's **UTF-8 bytes**.
    - iOS: `ticket.trimmingCharacters(in: .whitespacesAndNewlines)`.
-   - Daemon: hash `ticket.to_string()` directly — it already has no
-     surrounding whitespace, so trimming is a no-op on that side and the two
-     inputs are identical. (`ticket.to_string()` is exactly what
-     `main.rs`'s `print_ticket_qr` encodes into the QR, so the scanned
-     bytes equal the daemon's bytes.)
+   - Daemon: hash `ticket.to_string()` directly. It already has no
+     surrounding whitespace, so trimming is a no-op on that side. The two
+     inputs are therefore identical. (`ticket.to_string()` is exactly what
+     `main.rs`'s `print_ticket_qr` encodes into the QR. The scanned bytes
+     therefore equal the daemon's bytes.)
 
 2. **Hash.** `digest = SHA-256(utf8_bytes)` → 32 bytes.
-   - iOS: `CryptoKit.SHA256.hash(data:)`. **Not** Swift's `Hasher` /
-     `hashValue` — that is per-process seeded and not stable across runs or
-     platforms.
+   - iOS: `CryptoKit.SHA256.hash(data:)`. **Do not use** Swift's `Hasher`
+     or `hashValue`. Both are per-process seeded, so they are not stable
+     across runs or platforms.
    - Daemon: `sha2::Sha256` (the `sha2` crate). Same bytes in → same 32
      bytes out.
 
 3. **Index the wordlist.** The wordlist has **exactly 256 entries**
-   (`2^8`), so each digest byte `0…255` maps to exactly one word — no
-   modulo, no bit-slicing, no bias. The phrase is the first `N` words
-   (`N = 4` by default):
+   (`2^8`). Each digest byte `0…255` therefore maps to exactly one word.
+   The mapping uses no modulo, no bit-slicing, and no bias. The phrase is
+   the first `N` words (`N = 4` by default):
 
    ```
    phrase = wordlist[digest[0]] ++ " " ++ wordlist[digest[1]]
               ++ " " ++ wordlist[digest[2]] ++ " " ++ wordlist[digest[3]]
    ```
 
-   4 words out of 256 gives `256^4 = 2^32 ≈ 4.3 billion` possible phrases —
-   far more than an interactive attacker can grind against a single live
-   pairing attempt.
+   4 words out of 256 gives `256^4 = 2^32 ≈ 4.3 billion` possible phrases.
+   This is far more than an interactive attacker can grind against a single
+   live pairing attempt.
 
-That is the entire algorithm. It is pure and total: SHA-256 is defined for
-any byte length (including the empty string), and `N` is clamped to the
-digest length, so there is no failing input.
+That is the entire algorithm. It is pure and total. SHA-256 works for any
+byte length, including the empty string. The algorithm also clamps `N` to
+the digest length. As a result, no input can fail.
 
 ### Version / wordlist are a contract
 
-`PairingPhrase.algorithmVersion` (iOS) and the wordlist's contents+order are
-**a shared contract**. Changing the hash, the index rule, the word count,
-**or any word / word ordering** is a breaking change: the daemon must embed
-the byte-for-byte identical wordlist and bump its own version in lockstep.
+`PairingPhrase.algorithmVersion` (iOS) and the wordlist's contents and order
+are **a shared contract**. Changing the hash, the index rule, the word
+count, **or any word or word ordering** is a breaking change. The daemon
+must then embed the byte-for-byte identical wordlist. The daemon must also
+bump its own version in lockstep.
 The wordlist is the 256 words in
 `ios/Sources/HoloIrohApp/PairingWordlist.swift`, in that exact order (index
 `i` == digest byte value `i`).
 
 ## Known-answer test vectors (version 1)
 
-These were produced by **running the actual Swift `PairingPhrase`**
-implementation, and independently reproduced by a portable SHA-256 reference
-(Python), so a Rust reimplementation can self-check against them. The
-`sha256[0:4]` column is the first four digest bytes (hex) — the only bytes
-the 4-word phrase depends on.
+The actual Swift `PairingPhrase` implementation **produced these test
+vectors**. A portable SHA-256 reference in Python independently reproduced
+them. A Rust reimplementation can therefore self-check against them. The
+`sha256[0:4]` column shows the first four digest bytes in hex. The 4-word
+phrase depends only on these bytes.
 
 | Input ticket string | `sha256[0:4]` | Phrase (4 words) |
 |---|---|---|
@@ -87,33 +87,37 @@ the 4-word phrase depends on.
 | `` (empty string) | `e3 b0 c4 42` | `razor mound panda coyote` |
 | `not-a-ticket` | `62 d1 ab f0` | `feast pizza metro sedan` |
 
-(The empty-string row is the well-known SHA-256 of the empty input,
-`e3b0c442…`, a convenient cross-check that a reimplementation is hashing the
-right bytes.)
+(The empty-string row shows the well-known SHA-256 of the empty input,
+`e3b0c442…`. This row is a convenient cross-check that confirms a
+reimplementation hashes the right bytes.)
 
 A Rust reimplementation is correct iff it reproduces this table exactly.
 
 ## Daemon side — IMPLEMENTED
 
-The Mac daemon now prints this same phrase next to its QR/ticket at startup
-(`main.rs`, right after `print_ticket_qr` / the raw ticket:
-`verification phrase (must match the iOS app): ...`), so the user has
-something to compare the iPhone's phrase against. It lives in
-`mac-daemon/src/pairing_phrase.rs` (`sha2::Sha256` + the identical 256-word
-`WORDLIST`), and `examples/pairing_phrase_probe.rs` witnesses byte-for-byte
-agreement with the iOS side against this doc's two known-answer vectors
-(`grove cover rival quilt`, `blend patio eagle cliff`) via real execution.
-Both ends of the SAS mutual-verification loop are therefore live.
+The Mac daemon now prints this same phrase next to its QR and ticket at
+startup. It prints the phrase in `main.rs`, right after `print_ticket_qr`
+and the raw ticket, as
+`verification phrase (must match the iOS app): ...`. The user can then
+compare this phrase against the iPhone's phrase. This phrase logic lives in
+`mac-daemon/src/pairing_phrase.rs` (`sha2::Sha256` and the identical
+256-word `WORDLIST`). `examples/pairing_phrase_probe.rs` witnesses
+byte-for-byte agreement with the iOS side. It uses real execution against
+this doc's two known-answer vectors (`grove cover rival quilt`,
+`blend patio eagle cliff`). Both ends of the SAS mutual-verification loop
+are therefore live.
 
-The original follow-on recipe that was implemented, kept for reference:
+The list below shows the original follow-on recipe. The daemon side above
+already implements this recipe. This document keeps the list for reference:
 
-1. Add the `sha2` crate to `mac-daemon/Cargo.toml` (or reuse it if already
-   present transitively — check first).
-2. Embed the **identical 256-word list** (same order) as a Rust
-   `const [&str; 256]`, copied verbatim from `PairingWordlist.swift`. A
-   generator/consistency check (e.g. an `examples/pairing_phrase_probe.rs`
-   that reproduces the KAT table above) is the right witness per this repo's
-   no-unit-tests rule.
+1. Check first whether the `sha2` crate is already present transitively
+   in `mac-daemon/Cargo.toml`. If so, reuse it instead of adding a
+   duplicate. Otherwise, add the `sha2` crate to `mac-daemon/Cargo.toml`.
+2. Embed the **identical 256-word list**, in the same order, as a Rust
+   `const [&str; 256]`. Copy it verbatim from `PairingWordlist.swift`. A
+   generator or consistency check is the right witness per this repo's
+   no-unit-tests rule. For example, `examples/pairing_phrase_probe.rs` can
+   reproduce the KAT table above.
 3. Add a `pairing_phrase(ticket: &str) -> String`:
 
    ```rust
@@ -125,32 +129,34 @@ The original follow-on recipe that was implemented, kept for reference:
    }
    ```
 
-4. In `main.rs`, right after `print_ticket_qr(&ticket.to_string()); println!("{ticket}");`,
-   print the phrase, e.g.:
+4. In `main.rs`, print the phrase right after
+   `print_ticket_qr(&ticket.to_string()); println!("{ticket}");`. For
+   example:
 
    ```rust
    println!("pairing phrase (must match the phrase shown on your iPhone): {}",
             pairing_phrase(&ticket.to_string()));
    ```
 
-5. Verify against the KAT table above (feed the sample ticket strings in and
-   confirm the phrases match) before shipping — that is the cross-platform
+5. Before shipping, verify the implementation against the KAT table above.
+   Feed the sample ticket strings into the implementation. Confirm that
+   the output phrases match the table. This check is the cross-platform
    agreement check.
 
-Once that lands, the Mac prints e.g. `grove cover rival quilt` and the
-iPhone shows the same four words after scanning, and the user confirms they
-match. Until it lands, the iOS verification step still functions (it derives
-and shows the phrase); it just has nothing on the Mac to compare against
-yet, which is the honest current state.
+Once that lands, the Mac prints, for example, `grove cover rival quilt`.
+The iPhone then shows the same four words after scanning. The user
+confirms that the two match. Until it lands, the iOS verification step
+still functions: it derives and shows the phrase. It just has nothing on
+the Mac to compare against yet. This is the honest current state.
 
 ## File map (iOS half, this pass)
 
 - `PairingWordlist.swift` — the fixed 256-word list (the contract).
-- `PairingPhrase.swift` — SHA-256 + index derivation (pure, total).
+- `PairingPhrase.swift` — SHA-256 and index derivation (pure, total).
 - `PairingTicket.swift` — extract the `iroh-live:…` ticket from a scanned
-  QR payload / paste.
+  QR payload or a paste.
 - `QRScannerView.swift` — AVFoundation `.qr` scanner (`UIViewRepresentable`).
-- `QRScannerSheet.swift` — the scanner sheet + permission-denied fallback.
+- `QRScannerSheet.swift` — the scanner sheet and permission-denied fallback.
 - `PairingVerificationView.swift` — shows the phrase, gates Connect on an
   explicit "it matches" confirmation.
 - `PairingView.swift` — wires Scan QR → auto-fill, and Connect → verify → connect.

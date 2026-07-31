@@ -1,60 +1,67 @@
 //! Environment/user-context memory: durable facts about THIS user's specific setup (terminal
-//! app, project locations, tool preferences) that Holo3/Kimi has no other way to know, embedded
-//! and semantically retrieved so the most relevant handful get prepended to a prompt right
-//! before [`crate::holo_bridge::a2a_client::A2aClient::send_and_stream`] sends it.
+//! app, project locations, tool preferences). Holo3/Kimi has no other way to know these facts.
+//! The module embeds each fact and retrieves it by semantic similarity. It prepends the most
+//! relevant handful to a prompt, right before
+//! [`crate::holo_bridge::a2a_client::A2aClient::send_and_stream`] sends the prompt.
 //!
 //! ## The concrete failure this exists to fix
 //!
-//! Live-witnessed: asked to "go to Claude Code" to modify this very project, the agent could not
-//! tell which window the user meant -- Ghostty is this user's terminal app, not Terminal.app, and
-//! the model has zero way to know that from a screenshot alone if the target window isn't
-//! currently visible/focused. There was no mechanism anywhere in this daemon to inject a fact
-//! like "the user's terminal is Ghostty" into a turn; `A2aClient::send_and_stream` sends the raw
-//! prompt text and nothing else (see its own doc). This module is that mechanism.
+//! Live-witnessed: a user asked the agent to "go to Claude Code" to modify this very project.
+//! The agent could not tell which window the user meant. Ghostty is this user's terminal app,
+//! not Terminal.app. The model has no way to know this from a screenshot alone, when the target
+//! window is not currently visible or focused.
 //!
-//! Knowing which windows are the user's is what lets the agent leave them alone; where the
-//! agent's OWN terminal work goes is a separate question, answered by [`crate::tmux`].
+//! There was no mechanism anywhere in this daemon to inject a fact like "the user's terminal is
+//! Ghostty" into a turn. `A2aClient::send_and_stream` sends the raw prompt text and nothing else
+//! (see its own doc). This module is that mechanism.
+//!
+//! Knowing which windows are the user's is what lets the agent leave them alone. Where the
+//! agent's OWN terminal work goes is a separate question; [`crate::tmux`] answers it.
 //!
 //! ## Architecture: pattern-ported from `AnEntrypoint/gm`'s `rs-plugkit`, not vendored
 //!
-//! Two prior research passes (this project's own session history) confirmed neither of
-//! `rs-plugkit`'s real embedding/memory implementation nor `agentplug-libsql` (the real,
-//! standalone libsql-wrapper repo at `AnEntrypoint/agentplug-libsql`) is vendorable into a
-//! native Rust binary:
-//! - `rs-plugkit/crates/plugkit-core/src/embed.rs` is `#![cfg(target_arch = "wasm32")]` in
-//!   its entirety, embedding BGE-small-en-v1.5 weights via `include_bytes!` for
-//!   `wasm32-wasip1`, with candle pinned to 0.8 specifically because 0.11 fails to compile for
-//!   that target.
-//! - `agentplug-libsql`'s `src/lib.rs` line 1 is likewise `#![cfg(target_arch = "wasm32")]`;
-//!   its only real dependency (`libsql-ffi`) is scoped under
-//!   `[target.'cfg(target_arch = "wasm32")'.dependencies]`, and the crate defines raw
-//!   `#[no_mangle] extern "C"` host-ABI functions (`plugkit_alloc`/`plugin_call`) matching a
-//!   wasm-guest-calls-host convention, not a normal linkable Rust API. It also defines NO
-//!   vector schema of its own -- confirmed zero hits for `f32_blob|vector_top_k|embed|bge`
-//!   anywhere in that repo; it is a stateless raw-SQL passthrough over `libsql-ffi`, and any
+//! Two prior research passes (this project's own session history) confirmed this: neither
+//! dependency is vendorable into a native Rust binary. This applies to `rs-plugkit`'s real
+//! embedding/memory implementation. It also applies to `agentplug-libsql` (the real, standalone
+//! libsql-wrapper repo at `AnEntrypoint/agentplug-libsql`):
+//! - `rs-plugkit/crates/plugkit-core/src/embed.rs` is `#![cfg(target_arch = "wasm32")]` in its
+//!   entirety. It embeds BGE-small-en-v1.5 weights via `include_bytes!` for `wasm32-wasip1`. It
+//!   pins candle to version 0.8 because version 0.11 fails to compile for that target.
+//! - `agentplug-libsql`'s `src/lib.rs` line 1 is likewise `#![cfg(target_arch = "wasm32")]`.
+//!   Its only real dependency (`libsql-ffi`) is scoped under
+//!   `[target.'cfg(target_arch = "wasm32")'.dependencies]`. The crate defines raw
+//!   `#[no_mangle] extern "C"` host-ABI functions (`plugkit_alloc`/`plugin_call`). These match a
+//!   wasm-guest-calls-host convention, not a normal linkable Rust API. The crate also defines
+//!   NO vector schema of its own -- confirmed zero hits for `f32_blob|vector_top_k|embed|bge`
+//!   anywhere in that repo. It is a stateless raw-SQL passthrough over `libsql-ffi`. Any
 //!   vector/embedding scheme is entirely the CALLER's responsibility.
 //!
-//! So this module reimplements the same ARCHITECTURE natively instead: `candle-core` +
-//! `candle-transformers`' BERT implementation running the real BGE-small-en-v1.5 weights
-//! (fetched from HuggingFace on first use, cached locally -- see [`EMBEDDING_CACHE_SUBDIR`]),
-//! and the real, native `libsql` crate (from crates.io, NOT `agentplug-libsql`) with the same
-//! `F32_BLOB(384)` + `vector_top_k`/`vector_distance_cos` schema shape `rs-plugkit`'s
+//! So this module reimplements the same ARCHITECTURE natively instead. It uses `candle-core`
+//! and `candle-transformers`' BERT implementation, running the real BGE-small-en-v1.5 weights
+//! (fetched from HuggingFace on first use, cached locally -- see [`EMBEDDING_CACHE_SUBDIR`]). It
+//! also uses the real, native `libsql` crate (from crates.io, NOT `agentplug-libsql`), with the
+//! same `F32_BLOB(384)` + `vector_top_k`/`vector_distance_cos` schema shape that `rs-plugkit`'s
 //! `rssearch_vectors.rs` uses.
 //!
 //! ## On-disk shape (mirrors `.gm/memories/*.md` + `.gm/gm.db`)
 //!
-//! Two stores, same relationship gm's own memory system has between them: the markdown files
-//! under `~/.holoiroh/context/*.md` are the DURABLE, human-readable/editable corpus (frontmatter
-//! `key`/`ns`/`created`/`updated` fields, exactly `rs-plugkit`'s real on-disk format -- verified
-//! directly against a real checked-out `.gm/memories/mem-00135b4a71185432-52.md`), and the
-//! libsql database at `~/.holoiroh/context.db` is a DERIVED vector index over that corpus,
-//! rebuildable from the markdown files at any time (see [`EnvContextStore::reindex`]). `ns`
-//! (namespace) is always `"default"` here too -- the gm research confirmed rs-plugkit's own
-//! store has no category/tag schema either; every real memory file checked had `ns: default`,
-//! disambiguated purely by embedding-similarity at recall time, not by a type field. Facts are
-//! written as present-tense invariants ("the user's terminal app is Ghostty"), matching the
-//! ingestion-time framing constraint the gm research found (`memorize-fire`'s classifier
-//! rejects history-framed text; only present-tense rules about what must be true now).
+//! This module keeps two stores, in the same relationship gm's own memory system has between
+//! them:
+//! - The markdown files under `~/.holoiroh/context/*.md` are the DURABLE, human-readable/editable
+//!   corpus. Frontmatter fields are `key`/`ns`/`created`/`updated`, exactly `rs-plugkit`'s real
+//!   on-disk format -- confirmed directly against a real checked-out
+//!   `.gm/memories/mem-00135b4a71185432-52.md`.
+//! - The libsql database at `~/.holoiroh/context.db` is a DERIVED vector index over that corpus.
+//!   It is rebuildable from the markdown files at any time (see [`EnvContextStore::reindex`]).
+//!
+//! `ns` (namespace) is always `"default"` here too -- the gm research confirmed rs-plugkit's own
+//! store has no category/tag schema either. Every real memory file checked had `ns: default`.
+//! Facts are disambiguated purely by embedding-similarity at recall time, not by a type field.
+//!
+//! Facts are written as present-tense invariants (for example, "the user's terminal app is
+//! Ghostty"). This matches the ingestion-time framing constraint the gm research found.
+//! `memorize-fire`'s classifier rejects history-framed text. It accepts only present-tense rules
+//! about what must be true now.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -66,16 +73,16 @@ use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
 use tokenizers::Tokenizer;
 
 /// BGE-small-en-v1.5: the exact model `rs-plugkit`'s real embedding pipeline uses (confirmed
-/// directly in its `embed.rs`), 384-dim output. Kept identical here so a future genuine port
-/// of `rs-plugkit`'s own vector rows (if that ever becomes possible/desirable) would be
-/// dimension-compatible.
+/// directly in its `embed.rs`), 384-dim output. This module keeps the same model here. If a
+/// future genuine port of `rs-plugkit`'s own vector rows ever becomes possible or desirable, the
+/// two stay dimension-compatible.
 const MODEL_REPO: &str = "BAAI/bge-small-en-v1.5";
 const EMBEDDING_DIM: usize = 384;
 
-/// BGE's own documented query-prefix convention (verified in `rs-plugkit`'s `embed.rs`:
+/// BGE's own documented query-prefix convention (confirmed in `rs-plugkit`'s `embed.rs`:
 /// `"Represent this sentence for searching relevant passages: "` for QUERY embeddings only --
-/// stored documents are embedded WITHOUT this prefix). Asymmetric embedding is how BGE models
-/// are actually trained; using the wrong side's convention measurably hurts retrieval quality.
+/// stored documents are embedded WITHOUT this prefix). BGE models are actually trained on this
+/// asymmetric embedding. Using the wrong side's convention measurably hurts retrieval quality.
 const QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 
 /// Where model weights are cached after first download (see [`EnvContextStore::new`]).
@@ -83,11 +90,11 @@ const EMBEDDING_CACHE_SUBDIR: &str = "models/bge-small-en-v1.5";
 
 /// A single durable environment/user-context fact.
 ///
-/// `#[allow(dead_code)]` on `key`/`ns`/`updated_at_ms`: real fields populated by every
-/// `retrieve()` call (needed to round-trip `reindex()`'s markdown-file identity), but the only
-/// FIELD [`format_context_block`] (today's sole consumer) reads is `text` -- the others are
-/// live API surface for a future admin/debug surface (list facts, show freshness), not unused
-/// code to delete.
+/// `#[allow(dead_code)]` on `key`/`ns`/`updated_at_ms`: these are real fields, populated by
+/// every `retrieve()` call (needed to round-trip `reindex()`'s markdown-file identity). The only
+/// FIELD [`format_context_block`] (today's sole consumer) reads is `text`. The others are live
+/// API surface for a future admin/debug surface (list facts, show freshness), not unused code to
+/// delete.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ContextFact {
@@ -97,17 +104,17 @@ pub struct ContextFact {
     /// Always `"default"` today -- see this module's doc on why no category schema exists.
     pub ns: String,
     /// The fact itself, present-tense, e.g. "The user's screenshots directory is
-    /// ~/Pictures/Screenshots, not the Desktop." Kept policy-free on purpose: the real terminal
-    /// facts live in [`DEFAULT_ENV_FACTS`], and an example that restates one of them is a second
-    /// copy that goes stale the moment the real fact changes.
+    /// ~/Pictures/Screenshots, not the Desktop." This module keeps the field policy-free on
+    /// purpose. The real terminal facts live in [`DEFAULT_ENV_FACTS`]. An example that restates
+    /// one of them becomes a second copy, which goes stale the moment the real fact changes.
     pub text: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
 
 /// The environment-context memory store: an embedding pipeline plus a libsql-backed vector
-/// index over a markdown corpus. One instance is held for the daemon's process lifetime (see
-/// `main.rs`), analogous to how `HoloBridge` is held.
+/// index over a markdown corpus. `main.rs` holds one instance for the daemon's process lifetime,
+/// the same way it holds `HoloBridge`.
 pub struct EnvContextStore {
     corpus_dir: PathBuf,
     db_path: PathBuf,
@@ -128,9 +135,10 @@ struct Embedder {
 impl EnvContextStore {
     /// Open (creating if needed) the store at the daemon's standard location:
     /// `~/.holoiroh/context/*.md` for the durable corpus, `~/.holoiroh/context.db` for the
-    /// derived vector index. Does NOT load the embedding model yet -- that happens lazily on
-    /// first [`Self::retrieve`]/[`Self::remember`] call (see [`Self::ensure_embedder`]), so
-    /// daemon startup never blocks on a ~130MB first-run download.
+    /// derived vector index. This function does NOT load the embedding model yet. Loading
+    /// happens lazily on the first [`Self::retrieve`]/[`Self::remember`] call (see
+    /// [`Self::ensure_embedder`]). So daemon startup never blocks on a ~130MB first-run
+    /// download.
     pub fn open() -> Result<Self> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -140,11 +148,11 @@ impl EnvContextStore {
     }
 
     /// Like [`Self::open`], but with explicit paths -- the real entry point `open()` calls
-    /// with the daemon's standard `~/.holoiroh/*` locations. Exists so
+    /// with the daemon's standard `~/.holoiroh/*` locations. This function exists so
     /// `examples/env_context_probe.rs` can point the CORPUS/DB at an isolated, disposable
-    /// location while still sharing the real `$HOME`-cached model weights (avoiding a
-    /// redundant ~130MB re-download every probe run) -- probing must never touch or depend on
-    /// the real daemon's `~/.holoiroh/context/` corpus.
+    /// location. It still shares the real `$HOME`-cached model weights, avoiding a redundant
+    /// ~130MB re-download on every probe run. Probing must never touch or depend on the real
+    /// daemon's `~/.holoiroh/context/` corpus.
     pub fn open_at(corpus_dir: PathBuf, db_path: PathBuf, model_cache_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&corpus_dir)
             .with_context(|| format!("creating {}", corpus_dir.display()))?;
@@ -156,22 +164,23 @@ impl EnvContextStore {
         })
     }
 
-    /// Lazily load the embedding model, downloading+caching BGE-small-en-v1.5's weights on
-    /// first use if not already cached. Network access here is a one-time cost per machine
-    /// (subsequent calls, even across daemon restarts, hit the local cache).
+    /// Lazily load the embedding model, downloading and caching BGE-small-en-v1.5's weights on
+    /// first use if not already cached. Network access here is a one-time cost per machine.
+    /// Subsequent calls, even across daemon restarts, hit the local cache.
     ///
-    /// Fetches files directly via `reqwest` (already a dependency elsewhere in this crate)
-    /// rather than through `hf_hub`'s own `ApiRepo::get`/`download` -- BOTH of `hf_hub` 0.3.2's
-    /// API surfaces (sync/`ureq` and tokio/`reqwest`) have the same real, live bug in their
-    /// redirect-following `metadata()`: they pass the response's `Location` header straight to
-    /// a fresh request as if it were always an absolute URL. Confirmed directly against the
-    /// real endpoint (`curl -I https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/
-    /// tokenizer.json`): HuggingFace's current CDN returns a genuinely RELATIVE `Location:
-    /// /api/resolve-cache/...` header, which is valid HTTP but breaks both of `hf_hub`'s
+    /// This function fetches files directly via `reqwest` (already a dependency elsewhere in
+    /// this crate), rather than through `hf_hub`'s own `ApiRepo::get`/`download`. BOTH of
+    /// `hf_hub` 0.3.2's API surfaces (sync/`ureq` and tokio/`reqwest`) have the same real, live
+    /// bug in their redirect-following `metadata()`. They pass the response's `Location` header
+    /// straight to a fresh request, as if it were always an absolute URL. Direct testing against
+    /// the real endpoint confirms this bug: `curl -I
+    /// https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json`.
+    /// HuggingFace's current CDN returns a genuinely RELATIVE `Location:
+    /// /api/resolve-cache/...` header. This is valid HTTP, but it breaks both of `hf_hub`'s
     /// hand-rolled redirect-followers. `reqwest`'s own built-in redirect policy resolves
-    /// relative `Location` headers against the request's own URL correctly (per the HTTP
-    /// spec), so calling `.get(url).send()` directly and letting reqwest's normal redirect
-    /// handling run sidesteps the bug entirely instead of working around it in this code.
+    /// relative `Location` headers correctly against the request's own URL (per the HTTP spec).
+    /// So this function calls `.get(url).send()` directly and lets reqwest's normal redirect
+    /// handling run. This sidesteps the bug entirely, instead of working around it in this code.
     async fn ensure_embedder(&self) -> Result<()> {
         {
             let guard = self.embedder.lock().expect("embedder lock poisoned");
@@ -206,7 +215,7 @@ impl EnvContextStore {
     }
 
     /// Fetch one file from `MODEL_REPO`'s `main` branch, using the local cache if already
-    /// present -- see [`Self::ensure_embedder`]'s doc for why this bypasses `hf_hub`'s own
+    /// present. See [`Self::ensure_embedder`]'s doc for why this bypasses `hf_hub`'s own
     /// (broken) fetch methods and drives `reqwest` directly instead.
     async fn fetch_model_file(&self, filename: &str) -> Result<PathBuf> {
         let cached = self.model_cache_dir.join(filename);
@@ -282,11 +291,11 @@ impl EnvContextStore {
         Ok(vec)
     }
 
-    /// Open (creating the schema if needed) the derived libsql vector index. A fresh
-    /// connection per call, matching `agentplug-libsql`'s own "open, do one thing, close"
-    /// discipline (its `db.rs` doc: safe under concurrent access from multiple processes) --
-    /// this daemon has no long-lived writer contention to optimize away, so the simplicity is
-    /// worth the tiny per-call open cost.
+    /// Open (creating the schema if needed) the derived libsql vector index. This function opens
+    /// a fresh connection per call. This matches `agentplug-libsql`'s own "open, do one thing,
+    /// close" discipline (its `db.rs` doc: safe under concurrent access from multiple
+    /// processes). This daemon has no long-lived writer contention to optimize away, so the
+    /// simplicity is worth the tiny per-call open cost.
     async fn open_db(&self) -> Result<libsql::Connection> {
         let db = libsql::Builder::new_local(&self.db_path)
             .build()
@@ -317,11 +326,14 @@ impl EnvContextStore {
         Ok(conn)
     }
 
-    /// Store a new fact (or update an existing one by `key`): write the durable markdown file
-    /// (the primary corpus -- see this module's doc), embed the text, and upsert into the
-    /// derived vector index. Present-tense phrasing is the caller's responsibility (matching
-    /// the ingestion-time constraint the gm research found); this function does not enforce it
-    /// mechanically, only documents the convention.
+    /// Store a new fact, or update an existing one by `key`. This function does three things:
+    /// 1. Writes the durable markdown file (the primary corpus -- see this module's doc).
+    /// 2. Embeds the text.
+    /// 3. Upserts into the derived vector index.
+    ///
+    /// Present-tense phrasing is the caller's responsibility, matching the ingestion-time
+    /// constraint the gm research found. This function does not enforce that phrasing
+    /// mechanically. It only documents the convention.
     pub async fn remember(&self, key: &str, text: &str) -> Result<()> {
         let now = now_ms();
         let existing_created = self.read_markdown(key).ok().flatten().map(|f| f.created_at_ms);
@@ -347,10 +359,10 @@ impl EnvContextStore {
         Ok(())
     }
 
-    /// Semantic top-k retrieval: embed `query_text` (with BGE's query prefix) and return the
-    /// `limit` most similar stored facts by cosine distance, using libsql's real
+    /// Semantic top-k retrieval: embed `query_text` with BGE's query prefix. Return the `limit`
+    /// most similar stored facts by cosine distance. This uses libsql's real
     /// `vector_top_k`/`vector_distance_cos` (the same functions `rs-plugkit`'s
-    /// `rssearch_vectors.rs` uses -- verified real SQL, not a hand-rolled scan).
+    /// `rssearch_vectors.rs` uses -- confirmed real SQL, not a hand-rolled scan).
     pub async fn retrieve(&self, query_text: &str, limit: usize) -> Result<Vec<ContextFact>> {
         let query_embedding = self.embed(query_text, true).await?;
         let query_json = serde_json::to_string(&query_embedding).context("serializing query embedding")?;
@@ -382,10 +394,11 @@ impl EnvContextStore {
         Ok(facts)
     }
 
-    /// Rebuild the entire vector index from the markdown corpus on disk -- the corpus is the
+    /// Rebuild the entire vector index from the markdown corpus on disk. The corpus is the
     /// source of truth (mirrors `rs-plugkit`'s own memory-md-primary/vector-derived
-    /// relationship), so this recovers a deleted/corrupted `context.db` without losing any
-    /// facts, and lets a human hand-edit/add `.md` files directly and have them picked up.
+    /// relationship). This recovers a deleted or corrupted `context.db` without losing any
+    /// facts. It also lets a human hand-edit or add `.md` files directly and have them picked
+    /// up.
     #[allow(dead_code)] // real recovery API; no caller yet in the bin target
     pub async fn reindex(&self) -> Result<usize> {
         let mut count = 0;
@@ -432,9 +445,9 @@ impl EnvContextStore {
     }
 
     /// Parse gm's real frontmatter shape: `---\nkey: ...\nns: ...\ncreated: ...\nupdated:
-    /// ...\n---\n\n<body>`. Deliberately hand-rolled (not a YAML frontmatter crate) since the
-    /// format is this small and fixed-shape -- matching the same "don't add a dependency for
-    /// five fields" judgment call this daemon already makes elsewhere.
+    /// ...\n---\n\n<body>`. This function is deliberately hand-rolled, not a YAML frontmatter
+    /// crate, since the format is small and has a fixed shape. This matches the same "don't add
+    /// a dependency for five fields" judgment call this daemon already makes elsewhere.
     fn parse_markdown_file(&self, path: &Path) -> Result<Option<ContextFact>> {
         let contents = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let Some(rest) = contents.strip_prefix("---\n") else {
@@ -478,8 +491,8 @@ impl EnvContextStore {
 
 /// Build the text actually prepended to a prompt, from a list of retrieved facts. `None` if
 /// `facts` is empty (callers should skip prepending anything in that case, not send an empty
-/// header). Kept as a free function (not a method) since it's pure text formatting with no
-/// need for `&self`.
+/// header). This stays a free function, not a method, because it is pure text formatting with
+/// no need for `&self`.
 pub fn format_context_block(facts: &[ContextFact]) -> Option<String> {
     if facts.is_empty() {
         return None;
@@ -503,13 +516,15 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The built-in environment facts every daemon should know about THIS user's setup, seeded on
-/// startup so the terminal/Claude-Code awareness is always present rather than depending on a
-/// human having run some prior seeding step. `remember` is upsert-by-key, so re-seeding on
-/// every start is idempotent (unchanged text is a cheap no-op re-embed). Best-effort at the
-/// call site (`main.rs`): a seeding failure (e.g. the embedding model can't download offline)
-/// must never block daemon startup -- the hard `process_awareness` guard block still carries
-/// the same rules unconditionally even if these softer semantic facts aren't indexed.
+/// The built-in environment facts every daemon should know about THIS user's setup. The daemon
+/// seeds these facts on startup, so terminal/Claude-Code awareness is always present. No human
+/// needs to run a prior seeding step first. `remember` is upsert-by-key, so re-seeding on every
+/// start is idempotent (unchanged text is a cheap no-op re-embed).
+///
+/// A seeding failure must never block daemon startup (e.g. when the embedding model cannot
+/// download offline). The call site (`main.rs`) treats seeding as best-effort. Even if these
+/// softer semantic facts are not indexed, the hard `process_awareness` guard block still carries
+/// the same rules unconditionally.
 pub const DEFAULT_ENV_FACTS: &[(&str, &str)] = &[
     (
         "terminal-app-ghostty",
@@ -550,8 +565,9 @@ pub const DEFAULT_ENV_FACTS: &[(&str, &str)] = &[
 ];
 
 impl EnvContextStore {
-    /// Seed [`DEFAULT_ENV_FACTS`] into the corpus + vector index (upsert-by-key). Idempotent;
-    /// call once on daemon startup. Returns the number of facts seeded.
+    /// Seed [`DEFAULT_ENV_FACTS`] into the corpus and vector index (upsert-by-key). This
+    /// operation is idempotent. Call it once on daemon startup. It returns the number of facts
+    /// seeded.
     pub async fn seed_defaults(&self) -> Result<usize> {
         let mut n = 0;
         for (key, text) in DEFAULT_ENV_FACTS {

@@ -1,17 +1,24 @@
-//! Manages a local [`llama.cpp`](https://github.com/ggml-org/llama.cpp) `llama-server`
-//! subprocess serving the on-device Holo3.1 vision model, so the daemon's alpha inference path
-//! is **fully local** -- no H Company hosted API, no cloud egress at all (Project Aro PRD row
-//! P0-11, "Aro Private mode": the alpha binary must contain no cloud inference code path).
+//! Manages a local [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
+//! `llama-server` subprocess. This subprocess serves the on-device Holo3.1
+//! vision model. Because of this, the daemon's alpha inference path is
+//! **fully local**: no H Company hosted API, no cloud egress at all
+//! (Project Aro PRD row P0-11, "Aro Private mode": the alpha binary must
+//! contain no cloud inference code path).
 //!
 //! ## What this serves, and why local
 //!
-//! `holo serve` (see [`crate::holo_bridge::process`]) fronts the closed-source
-//! `hai-agent-runtime`, which talks to a model over an **OpenAI-compatible** `chat.completions`
-//! endpoint. By default that endpoint is H Company's hosted gateway. Pointing it instead at a
-//! `llama-server` running on `127.0.0.1` makes every inference call stay on this machine. That is
-//! exactly what [`BENCHMARKS.md`](../../BENCHMARKS.md) measured: `llama-server` on `127.0.0.1:8080`
-//! serving `Hcompany/Holo-3.1-35B-A3B-GGUF:Q4_K_M`, real vision `chat.completions` requests, a
-//! measured **8.3 s/step at 720p** on an Apple M3 Pro / 36 GB Mac.
+//! `holo serve` (see [`crate::holo_bridge::process`]) fronts the
+//! closed-source `hai-agent-runtime`. `hai-agent-runtime` talks to a model
+//! over an **OpenAI-compatible** `chat.completions` endpoint. By default,
+//! that endpoint is H Company's hosted gateway.
+//!
+//! Pointing that endpoint instead at a `llama-server` running on
+//! `127.0.0.1` makes every inference call stay on this machine. That is
+//! exactly what [`BENCHMARKS.md`](../../BENCHMARKS.md) measured:
+//! `llama-server` on `127.0.0.1:8080`, serving
+//! `Hcompany/Holo-3.1-35B-A3B-GGUF:Q4_K_M`, handling real vision
+//! `chat.completions` requests, at a measured **8.3 s/step at 720p** on an
+//! Apple M3 Pro / 36 GB Mac.
 //!
 //! ## The command this builds
 //!
@@ -22,62 +29,88 @@
 //!   --port <N>
 //! ```
 //!
-//! - **`-hf <repo>:<quant>`** resolves the model from the Hugging Face cache (already downloaded
-//!   to `~/.cache/huggingface/hub/models--Hcompany--Holo-3.1-35B-A3B-GGUF` on this machine). The
-//!   repo ships **both** `q4_k_m.gguf` and a vision projector `mmproj.f16.gguf`; `llama-server`'s
-//!   `-hf` flag **auto-downloads/loads the mmproj when the repo has one** (its own `--help`:
-//!   "mmproj is also downloaded automatically if available. to disable, add `--no-mmproj`"). The
-//!   projector is load-bearing here -- Holo3.1 is a *vision* model and the whole point is sending
-//!   desktop screenshots to it -- so this deliberately does **not** pass `--no-mmproj`.
-//! - **`--host 127.0.0.1`** binds loopback only. `llama-server`'s default host is already
-//!   `127.0.0.1`, but this passes it explicitly and never accepts a caller-supplied host, so the
-//!   local inference endpoint is structurally unreachable off-box (defense in depth for the
-//!   no-cloud / no-external-exposure posture; see [`LocalModelConfig::command_args`]).
-//! - **`--port <N>`** is the OpenAI-compatible HTTP port. The daemon defaults this to `8080`
-//!   (matching `BENCHMARKS.md`), env-overridable via `HOLOIROH_LOCAL_MODEL_PORT`. It must differ
-//!   from the `holo serve` A2A port (`HOLOIROH_HOLO_PORT`, default `8765`): these are two distinct
+//! - **`-hf <repo>:<quant>`** resolves the model from the Hugging Face
+//!   cache. This daemon already downloaded the model to
+//!   `~/.cache/huggingface/hub/models--Hcompany--Holo-3.1-35B-A3B-GGUF` on
+//!   this machine. The repo ships **both** `q4_k_m.gguf` and a vision
+//!   projector `mmproj.f16.gguf`. `llama-server`'s `-hf` flag
+//!   **auto-downloads/loads the mmproj when the repo has one**. Its own
+//!   `--help` says: "mmproj is also downloaded automatically if available.
+//!   to disable, add `--no-mmproj`". The projector is load-bearing here:
+//!   Holo3.1 is a *vision* model, and the whole point is sending desktop
+//!   screenshots to it. So this deliberately does **not** pass
+//!   `--no-mmproj`.
+//! - **`--host 127.0.0.1`** binds loopback only. `llama-server`'s default
+//!   host is already `127.0.0.1`. This module passes the host explicitly,
+//!   and never accepts a caller-supplied host. Because of this, the local
+//!   inference endpoint is structurally unreachable off-box. This is
+//!   defense in depth for the no-cloud / no-external-exposure posture --
+//!   see [`LocalModelConfig::command_args`].
+//! - **`--port <N>`** is the OpenAI-compatible HTTP port. This daemon
+//!   defaults the port to `8080`, matching `BENCHMARKS.md`. The
+//!   `HOLOIROH_LOCAL_MODEL_PORT` environment variable can override this
+//!   default. This port must differ from the `holo serve` A2A port
+//!   (`HOLOIROH_HOLO_PORT`, default `8765`): these are two distinct
 //!   listeners.
 //!
-//! The base URL a co-process points at is **`http://127.0.0.1:<N>/v1`** -- `llama-server` serves
-//! the OpenAI-compatible routes (`/v1/chat/completions`, `/v1/models`) under the `/v1` prefix, and
-//! its plain-JSON health/readiness route is `/health` at the root.
+//! The base URL a co-process points at is **`http://127.0.0.1:<N>/v1`**.
+//! `llama-server` serves the OpenAI-compatible routes
+//! (`/v1/chat/completions`, `/v1/models`) under the `/v1` prefix. Its
+//! plain-JSON health/readiness route is `/health`, at the root.
 //!
 //! ## How `holo serve` is pointed here (the env-var that actually matters)
 //!
-//! This is the load-bearing correctness detail, verified directly against the installed
-//! `holo-desktop-cli` source (`~/.holo/tools/holo-desktop-cli/.../holo_desktop/`, the same commit
-//! this daemon's `holo_bridge` is grounded on):
+//! This is the load-bearing correctness detail. This daemon verified it
+//! directly against the installed `holo-desktop-cli` source
+//! (`~/.holo/tools/holo-desktop-cli/.../holo_desktop/`), the same commit
+//! this daemon's `holo_bridge` is grounded on:
 //!
-//! - `holo`'s **`--base-url` CLI flag maps to the `HAI_AGENT_RUNTIME_BASE_URL` env var**
-//!   (`cli/agent_api.py`: `extra["HAI_AGENT_RUNTIME_BASE_URL"] = base_url`), which redirects the
-//!   **model-inference** endpoint the agent runtime calls.
-//! - When that runtime base URL is set, `agent_client/launcher.py::runtime_child_env` **removes
-//!   `HAI_API_KEY` from the runtime child's environment** ("a custom base URL points the runtime
-//!   at a self-hosted endpoint; the portal `HAI_API_KEY` must not leak to it") and skips
-//!   `apply_hosted_gateway_default`. That deletion is the concrete no-cloud enforcement: with a
-//!   local base URL set, the hosted key never reaches the inference path.
-//! - `cli/bootstrap.py::require_api_key` early-returns (skips `holo login`) when a base URL is
-//!   supplied -- "Skip with `--base-url` for a local model."
+//! - `holo`'s **`--base-url` CLI flag maps to the
+//!   `HAI_AGENT_RUNTIME_BASE_URL` env var** (`cli/agent_api.py`:
+//!   `extra["HAI_AGENT_RUNTIME_BASE_URL"] = base_url`). This flag redirects
+//!   the **model-inference** endpoint the agent runtime calls.
+//! - When that runtime base URL is set,
+//!   `agent_client/launcher.py::runtime_child_env` **removes
+//!   `HAI_API_KEY` from the runtime child's environment** ("a custom base
+//!   URL points the runtime at a self-hosted endpoint; the portal
+//!   `HAI_API_KEY` must not leak to it"). `runtime_child_env` also skips
+//!   `apply_hosted_gateway_default`. That deletion is the concrete
+//!   no-cloud enforcement: with a local base URL set, the hosted key never
+//!   reaches the inference path.
+//! - `cli/bootstrap.py::require_api_key` early-returns when a base URL is
+//!   supplied. This early return skips `holo login`: "Skip with
+//!   `--base-url` for a local model."
 //!
-//! **`HAI_BASE_URL` is a different variable and must not be used for this.** Per
-//! `agent_client/model_gateway.py`, `HAI_BASE_URL` only overrides the *entitlement-probe gateway
-//! region* (a cloud control-plane URL), not the inference endpoint. Setting `HAI_BASE_URL=http://
-//! localhost:...` would leave inference pointed at the cloud while breaking the entitlement probe
-//! -- the opposite of the intent. The daemon therefore sets **`HAI_AGENT_RUNTIME_BASE_URL`** (and,
-//! belt-and-suspenders, also passes `holo serve --base-url <url>`, which `cli/serve.py`'s `serve()`
-//! accepts as a real `tyro` CLI argument and threads to the same setting). See
+//! **`HAI_BASE_URL` is a different variable and must not be used for
+//! this.** Per `agent_client/model_gateway.py`, `HAI_BASE_URL` only
+//! overrides the *entitlement-probe gateway region* (a cloud
+//! control-plane URL), not the inference endpoint. Setting
+//! `HAI_BASE_URL=http://localhost:...` leaves inference pointed at the
+//! cloud, and breaks the entitlement probe. That is the opposite of the
+//! intent.
+//!
+//! This daemon therefore sets **`HAI_AGENT_RUNTIME_BASE_URL`**. As a
+//! belt-and-suspenders measure, this daemon also passes `holo serve
+//! --base-url <url>`. `cli/serve.py`'s `serve()` accepts that flag as a
+//! real `tyro` CLI argument, and threads it to the same setting. See
 //! [`RUNTIME_BASE_URL_ENV`] and [`crate::holo_bridge::process`].
 //!
 //! ## What is and is not verified in-repo
 //!
-//! The **command construction and env wiring** are real and are witnessed by
-//! `cargo run --example local_model_probe`, which builds the exact `Command`s this module and
-//! `holo_bridge::process` produce and prints their program/args/env **without spawning the
-//! model**. A **full live model-serving run is intentionally not performed in that verification**:
-//! the GGUF is ~21 GB and takes minutes plus large RAM to load, so re-running it every build would
-//! be wasteful and slow. The real end-to-end latency of actually serving this model locally is
-//! measured separately and honestly in [`BENCHMARKS.md`](../../BENCHMARKS.md) (8.3 s/step @ 720p on
-//! this hardware), not re-derived here.
+//! The **command construction and env wiring** are real. This module
+//! witnesses them with `cargo run --example local_model_probe`. That
+//! example builds the exact `Command`s this module and
+//! `holo_bridge::process` produce, and prints their program, args, and
+//! env, **without spawning the model**.
+//!
+//! A **full live model-serving run is intentionally not performed in that
+//! verification**. The GGUF is ~21 GB, and takes minutes plus large RAM to
+//! load. Re-running it on every build is wasteful and slow.
+//!
+//! [`BENCHMARKS.md`](../../BENCHMARKS.md) measures the real end-to-end
+//! latency of actually serving this model locally, separately and
+//! honestly (8.3 s/step @ 720p on this hardware). This module does not
+//! re-derive that latency here.
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
