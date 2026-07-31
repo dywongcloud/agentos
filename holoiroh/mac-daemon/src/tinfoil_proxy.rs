@@ -1,31 +1,33 @@
-//! Loopback auth-injecting reverse proxy for the Tinfoil inference fallback.
+//! This is a loopback, auth-injecting reverse proxy for the Tinfoil inference fallback.
 //!
 //! ## Why a proxy at all (and not an env var)
 //!
 //! When the H Company hosted backend rate-limits, the daemon fails over to Tinfoil's
 //! OpenAI-compatible endpoint (`https://inference.tinfoil.sh/v1`, model `kimi-k2-6` -- a
-//! vision model, per docs.tinfoil.sh/models/vision) by respawning `holo serve` with
-//! `--base-url` pointed here. Tinfoil requires `Authorization: Bearer <key>` (witnessed:
-//! bare-key `Authorization`, `X-Api-Key`, and `api-key` all 401). The hai-agent-runtime
-//! offers exactly two ways to influence that header, and both were witnessed dead ends:
+//! vision model, per docs.tinfoil.sh/models/vision). It does this by respawning `holo serve`
+//! with `--base-url` pointed here. Tinfoil requires `Authorization: Bearer <key>` (witnessed:
+//! bare-key `Authorization`, `X-Api-Key`, and `api-key` all return 401). The hai-agent-runtime
+//! offers exactly two ways to influence that header. Both are witnessed dead ends:
 //!
-//! - `OPENAI_API_KEY`: ignored by the runtime's vLLM adapter -- its client key comes from
-//!   `getenv("HAI_API_KEY")` (Nuitka string dump of `hai_adapters.dispatchers`), which the
-//!   launcher deliberately pops whenever a custom base URL is set (`launcher.py::
-//!   runtime_child_env`). Witnessed live: 401 `Incorrect API key` with `OPENAI_API_KEY` set.
-//! - `HAI_EXTRA_HEADERS`: parsed as SPACE-separated `k=v` pairs, so the value
-//!   `Bearer <key>` -- which contains a space -- is structurally inexpressible. Witnessed
-//!   live: `httpcore.LocalProtocolError: Illegal header name b'tk_...,X-Holoiroh'` when the
+//! - `OPENAI_API_KEY`: the runtime's vLLM adapter ignores this variable. Its client key comes
+//!   from `getenv("HAI_API_KEY")` (Nuitka string dump of `hai_adapters.dispatchers`). The
+//!   launcher deliberately pops `HAI_API_KEY` whenever a custom base URL is set
+//!   (`launcher.py::runtime_child_env`). Witnessed live: 401 `Incorrect API key`, with
+//!   `OPENAI_API_KEY` set.
+//! - `HAI_EXTRA_HEADERS`: this variable is parsed as SPACE-separated `k=v` pairs. The value
+//!   `Bearer <key>` contains a space, so it is structurally inexpressible here. Witnessed
+//!   live: `httpcore.LocalProtocolError: Illegal header name b'tk_...,X-Holoiroh'`, when the
 //!   value was smuggled through anyway.
 //!
-//! So the daemon owns the auth layer instead: `holo serve` talks plain HTTP to
-//! `127.0.0.1:<port>/v1/...` (no key anywhere in its env, same shape as the local
-//! llama-server path in [`crate::local_model`]) and this proxy forwards each request to the
-//! upstream with the real bearer key attached, streaming both bodies (request bodies carry
-//! multi-hundred-KB base64 screenshots; responses may be SSE).
+//! So the daemon owns the auth layer instead. `holo serve` talks plain HTTP to
+//! `127.0.0.1:<port>/v1/...`, with no key anywhere in its env (the same shape as the local
+//! llama-server path in [`crate::local_model`]). This proxy forwards each request to the
+//! upstream with the real bearer key attached, streaming both bodies. Request bodies carry
+//! multi-hundred-KB base64 screenshots. Responses may be SSE.
 //!
-//! Bound to `127.0.0.1` only, never a caller-supplied host -- structurally unreachable
-//! off-box, matching `local_model.rs`'s defense-in-depth posture for loopback listeners.
+//! This proxy binds to `127.0.0.1` only, never a caller-supplied host. It is structurally
+//! unreachable off-box, matching `local_model.rs`'s defense-in-depth posture for loopback
+//! listeners.
 
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -36,8 +38,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-/// Default upstream. Override via `HOLOIROH_FALLBACK_UPSTREAM` (scheme + host, no trailing
-/// slash; the request path -- `/v1/chat/completions` etc. -- is appended verbatim).
+/// Default upstream. Override this value via `HOLOIROH_FALLBACK_UPSTREAM`: scheme and host,
+/// with no trailing slash. The request path, for example `/v1/chat/completions`, is appended
+/// verbatim.
 pub const DEFAULT_UPSTREAM: &str = "https://inference.tinfoil.sh";
 
 struct ProxyState {
@@ -46,17 +49,17 @@ struct ProxyState {
     client: reqwest::Client,
 }
 
-/// The running proxy. Dropping it aborts the serve task (the daemon holds one for its
-/// whole lifetime, mirroring how `LocalModelServer` is held).
+/// The running proxy. Dropping it aborts the serve task. The daemon holds one proxy for its
+/// whole lifetime, mirroring how `LocalModelServer` is held.
 pub struct TinfoilProxy {
     local_url: String,
     task: JoinHandle<()>,
 }
 
 impl TinfoilProxy {
-    /// Bind `127.0.0.1:0` (ephemeral port) and start forwarding. `api_key` is the Tinfoil
-    /// bearer key (from `TINFOIL_API_KEY` in the gitignored `.env`); it lives only inside
-    /// this process -- it is never placed in any child's env or argv.
+    /// Binds `127.0.0.1:0`, an ephemeral port, and starts forwarding. `api_key` is the Tinfoil
+    /// bearer key, from `TINFOIL_API_KEY` in the gitignored `.env`. It lives only inside this
+    /// process. This function never places it in any child's env or argv.
     pub async fn spawn(upstream: impl Into<String>, api_key: impl Into<String>) -> Result<Self> {
         let upstream = upstream.into().trim_end_matches('/').to_string();
         let state = Arc::new(ProxyState {
@@ -85,8 +88,8 @@ impl TinfoilProxy {
         Ok(Self { local_url, task })
     }
 
-    /// Base URL `holo serve` should be pointed at (append `/v1` at the call site, matching
-    /// the local-model convention where the OpenAI routes live under `/v1`).
+    /// Base URL that `holo serve` should point at. Append `/v1` at the call site. This matches
+    /// the local-model convention, where the OpenAI routes live under `/v1`.
     pub fn local_url(&self) -> &str {
         &self.local_url
     }
@@ -98,8 +101,8 @@ impl Drop for TinfoilProxy {
     }
 }
 
-/// Forward one request to the upstream with the bearer key injected. Everything is
-/// streamed; headers are copied by name/value except the ones this proxy owns
+/// Forwards one request to the upstream, with the bearer key injected. This function streams
+/// everything. It copies headers by name and value, except the ones this proxy owns
 /// (`authorization`, `host`) and the hop-by-hop set the HTTP layers manage themselves.
 async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Request) -> Response {
     let method = req.method().clone();
@@ -204,36 +207,38 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Reque
         })
 }
 
-/// Kimi K2-specific request tuning, applied only when `model == "kimi-k2-6"` (never touches
-/// the primary Holo3-35B request shape). Every change here is a measured fix for a real,
-/// reproduced failure on this exact tinfoil deployment, not a speculative tweak -- probed
-/// directly against `https://inference.tinfoil.sh/v1/chat/completions` with the real
-/// `mac-daemon/.env` key on 2026-07-20:
+/// Kimi K2-specific request tuning. This function applies the tuning only when `model ==
+/// "kimi-k2-6"`. It never touches the primary Holo3-35B request shape. Every change here is a
+/// measured fix for a real, reproduced failure on this exact tinfoil deployment, not a
+/// speculative tweak. Each fix was probed directly against
+/// `https://inference.tinfoil.sh/v1/chat/completions`, with the real `mac-daemon/.env` key, on
+/// 2026-07-20:
 ///
-/// 1. **`chat_template_kwargs: {"thinking": false}`** -- a real vLLM chat-template parameter
-///    (not `extra_body`-wrapped; wrapping it there was measured to have no effect). Kimi K2 is
-///    a heavy reasoner: a trivial "say ok" prompt burned ~1100-1300 *reasoning* tokens before
-///    the model even started its answer (measured completion_tokens with `thinking` unset).
-///    With `thinking: false` the same prompt dropped to 191 completion tokens and 3s latency
-///    (from ~17s), while still returning real content at `finish_reason: "stop"`.
-/// 2. **`guided_json` -> `response_format: {type: "json_schema", ...}`.** The daemon's own
+/// 1. **`chat_template_kwargs: {"thinking": false}`**: a real vLLM chat-template parameter.
+///    This parameter is not `extra_body`-wrapped. Wrapping it there was measured to have no
+///    effect. Kimi K2 is a heavy reasoner. A trivial "say ok" prompt burned ~1100-1300
+///    *reasoning* tokens before the model even started its answer (measured completion_tokens,
+///    with `thinking` unset). With `thinking: false`, the same prompt dropped to 191 completion
+///    tokens and 3s latency, down from ~17s. It still returned real content at
+///    `finish_reason: "stop"`.
+/// 2. **`guided_json` -> `response_format: {type: "json_schema", ...}`**: the daemon's own
 ///    desktop-agent runtime requests structured tool-call output via vLLM's `guided_json`
-///    parameter. Measured directly: Kimi's vLLM deployment does NOT honor `guided_json` --
-///    it returns the JSON wrapped in a markdown code fence (`` ```json\n{...}\n``` ``) instead
-///    of raw structured output, which is a real, silent tool-call-parsing hazard (the same
-///    "silent empty/malformed completion" shape `control.rs`'s failover logic already treats
-///    as a backend failure). The OpenAI-standard `response_format: json_schema` parameter WAS
-///    measured to work correctly on this same endpoint (clean unwrapped JSON, no fence) --
-///    translating the request to it is a straightforward, verified fix, not a workaround.
-/// 3. **`max_tokens` floor of 6000** (only raised, never lowered, so an explicit larger
-///    request from the runtime is respected). The runtime's shipped desktop-agent config caps
-///    every model at 2048 completion tokens (tuned for Holo3-35B, `mac-daemon`'s own captured
-///    runtime logs confirm this literal value reaches Kimi unmodified). Measured directly: a
-///    genuinely complex multi-step prompt (open Mail -> Notes -> Calendar -> reply) exhausted
-///    2048 tokens on reasoning alone with ZERO answer content and `finish_reason: "length"` --
-///    a real, reproduced silent-truncation failure, not a hypothetical one. Combined with fix
-///    1 (`thinking: false`), 6000 tokens was measured sufficient for this exact prompt to reach
-///    `finish_reason: "stop"` with full content.
+///    parameter. Measured directly: Kimi's vLLM deployment does NOT honor `guided_json`. It
+///    returns the JSON wrapped in a markdown code fence (`` ```json\n{...}\n``` ``), instead of
+///    raw structured output. This is a real, silent tool-call-parsing hazard: the same "silent
+///    empty/malformed completion" shape that `control.rs`'s failover logic already treats as a
+///    backend failure. The OpenAI-standard `response_format: json_schema` parameter WAS
+///    measured to work correctly on this same endpoint (clean unwrapped JSON, no fence).
+///    Translating the request to it is a straightforward, verified fix, not a workaround.
+/// 3. **`max_tokens` floor of 6000**: this function only raises the value, never lowers it, so
+///    it respects an explicit larger request from the runtime. The runtime's shipped
+///    desktop-agent config caps every model at 2048 completion tokens, tuned for Holo3-35B.
+///    `mac-daemon`'s own captured runtime logs confirm this literal value reaches Kimi
+///    unmodified. Measured directly: a genuinely complex multi-step prompt (open Mail -> Notes
+///    -> Calendar -> reply) exhausted 2048 tokens on reasoning alone, with ZERO answer content
+///    and `finish_reason: "length"`. This is a real, reproduced silent-truncation failure, not
+///    a hypothetical one. Combined with fix 1 (`thinking: false`), 6000 tokens was measured
+///    sufficient for this exact prompt to reach `finish_reason: "stop"` with full content.
 fn apply_kimi_tuning(obj: &mut serde_json::Map<String, serde_json::Value>) {
     obj.entry("chat_template_kwargs".to_string())
         .or_insert_with(|| serde_json::json!({}));
@@ -280,14 +285,15 @@ fn apply_kimi_tuning(obj: &mut serde_json::Map<String, serde_json::Value>) {
 }
 
 /// Walks every `messages[].content[]` entry of shape `{"type":"image_url","image_url":{"url":
-/// "data:image/...;base64,<data>"}}` and replaces the base64 payload with an on-device
-/// PII-redacted version (see [`crate::privacy::ocr_and_redact`]) before the request leaves the
-/// loopback boundary. This is the load-bearing fix for the gap `privacy-wire-into-tinfoil-proxy`
-/// (PRD) named: `Cargo.toml`'s dependency comments have described this exact redaction step as
-/// already wired here since before this function existed -- it wasn't, screenshots forwarded
-/// completely unredacted. Best-effort per-image: a decode/OCR/re-encode failure on one image
-/// leaves that image's URL untouched (logged) rather than dropping the whole request -- a
-/// redaction bug must never silently turn into "the agent stopped seeing the screen."
+/// "data:image/...;base64,<data>"}}`. This function replaces the base64 payload with an
+/// on-device PII-redacted version (see [`crate::privacy::ocr_and_redact`]), before the request
+/// leaves the loopback boundary. This is the load-bearing fix for the gap
+/// `privacy-wire-into-tinfoil-proxy` (PRD) named. `Cargo.toml`'s dependency comments described
+/// this exact redaction step as already wired here, since before this function existed. It was
+/// not wired: screenshots forwarded completely unredacted. This function is best-effort per
+/// image: a decode/OCR/re-encode failure on one image leaves that image's URL untouched
+/// (logged), rather than dropping the whole request. A redaction bug must never silently turn
+/// into "the agent stopped seeing the screen."
 fn redact_image_urls_in_messages(obj: &mut serde_json::Map<String, serde_json::Value>) {
     let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) else {
         return;
@@ -333,10 +339,10 @@ fn redact_image_urls_in_messages(obj: &mut serde_json::Map<String, serde_json::V
     }
 }
 
-/// Decodes a `data:image/<fmt>;base64,<data>` URL, runs [`crate::privacy::ocr_and_redact`], and
-/// re-encodes as a PNG data URL. Returns `Ok(None)` for a non-`data:` URL (nothing to do
-/// locally) and `Err` for a malformed/undecodable one (caller logs and leaves the original
-/// untouched).
+/// Decodes a `data:image/<fmt>;base64,<data>` URL. Runs [`crate::privacy::ocr_and_redact`].
+/// Re-encodes the result as a PNG data URL. Returns `Ok(None)` for a non-`data:` URL, since
+/// there is nothing to do locally. Returns `Err` for a malformed or undecodable URL. The caller
+/// then logs the error and leaves the original untouched.
 fn redact_data_url(url: &str) -> anyhow::Result<Option<String>> {
     let Some(comma_idx) = url.find(',') else {
         return Ok(None);
