@@ -1,19 +1,25 @@
 //! Short authentication-string (SAS) pairing phrase, derived deterministically from the iroh
-//! ticket so the Mac and the iOS app display the SAME human-readable phrase and the user can
-//! confirm they match -- defeating a QR-substitution MITM (a swapped ticket yields a different
-//! phrase). This is the daemon half of the cross-platform contract specified in
-//! `holoiroh/ios/PAIRING_PHRASE.md`; the iOS half (`PairingPhrase.swift` / `PairingWordlist.swift`)
-//! must derive byte-identical output. See that spec for the full rationale and known-answer
-//! vectors.
+//! ticket. The Mac and the iOS app display the same human-readable phrase, so the user can
+//! confirm the two phrases match. This defeats a QR-substitution MITM attack: a swapped ticket
+//! yields a different phrase. This module is the daemon half of the cross-platform contract
+//! specified in `holoiroh/ios/PAIRING_PHRASE.md`. The iOS half (`PairingPhrase.swift` and
+//! `PairingWordlist.swift`) must derive byte-identical output. See that spec for the full
+//! rationale and known-answer vectors.
 //!
-//! Algorithm (version 1): `SHA-256(utf8 bytes of the ticket string)` -> take the first `N`
-//! digest bytes (default 4) -> index each into a fixed **256-word** list (one word per possible
-//! byte value, so no modulo bias) -> join with spaces. 4 words out of 256 = 256^4 ~= 2^32
-//! possible phrases, far beyond an interactive attacker's reach against one live pairing attempt.
+//! Algorithm (version 1):
 //!
-//! The wordlist below is generated from (and must stay identical to) `PairingWordlist.swift`'s
-//! `WORDLIST` -- both are "version 1" of the shared contract; changing either without the other
-//! silently breaks pairing verification.
+//! 1. Compute `SHA-256(utf8 bytes of the ticket string)`.
+//! 2. Take the first `N` digest bytes (default 4).
+//! 3. Index each byte into a fixed 256-word list (one word per possible byte value, so no
+//!    modulo bias).
+//! 4. Join the words with spaces.
+//!
+//! 4 words out of 256 possible words gives 256^4, or about 2^32, possible phrases -- far beyond
+//! an interactive attacker's reach against one live pairing attempt.
+//!
+//! The wordlist below is generated from `PairingWordlist.swift`'s `WORDLIST`, and must stay
+//! identical to it. Both lists are "version 1" of the shared contract. Changing either list
+//! without the other silently breaks pairing verification.
 
 use sha2::{Digest, Sha256};
 
@@ -57,15 +63,17 @@ pub const WORDLIST: [&str; 256] = [
     "spine", "spoon", "sprout", "squid", "stork", "sugar", "syrup", "tulip",
 ];
 
-/// Derive the pairing phrase for `ticket` (default `PHRASE_WORD_COUNT` words). `ticket` is
-/// hashed as-is: the daemon passes `LiveTicket::to_string()`, which has no surrounding
-/// whitespace, so it equals the iOS side's whitespace-trimmed canonical form (see the spec).
+/// Derives the pairing phrase for `ticket`, using the default `PHRASE_WORD_COUNT` words. This
+/// function hashes `ticket` as-is. The daemon passes `LiveTicket::to_string()`, which has no
+/// surrounding whitespace, so it equals the iOS side's whitespace-trimmed canonical form (see
+/// the spec).
 pub fn pairing_phrase(ticket: &str) -> String {
     pairing_phrase_n(ticket, PHRASE_WORD_COUNT)
 }
 
-/// Same as [`pairing_phrase`] but with an explicit word count (`n` clamped to 1..=32 -- a
-/// SHA-256 digest is 32 bytes, so at most 32 words can be derived without rehashing).
+/// Same as [`pairing_phrase`], but with an explicit word count. This function clamps `n` to the
+/// range 1 to 32: a SHA-256 digest is 32 bytes, so the function can derive at most 32 words
+/// without rehashing.
 pub fn pairing_phrase_n(ticket: &str, n: usize) -> String {
     let n = n.clamp(1, 32);
     let digest = Sha256::digest(ticket.as_bytes());

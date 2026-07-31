@@ -1,27 +1,23 @@
 //! Single-instance guard for the whole `holoiroh-daemon` process.
 //!
-//! Live-witnessed bug this exists to close: with no guard, two
-//! `holoiroh-daemon` processes could run concurrently (e.g. an old
-//! never-closed terminal window from a prior debugging session, plus a
-//! freshly started one). Each publishes its own independent iroh broadcast
-//! and prints its own valid-looking QR code/ticket/phrase -- but only ONE of
-//! them can win `holo serve`'s own single-instance port bind (see
-//! `holo_bridge::process`). The loser's `HoloBridge::start` fails, and
-//! `main.rs` degrades that failure to a quiet `info!` log line with NO
-//! control channel mounted on its router at all -- so a phone that happens
-//! to scan the loser's QR code gets a real endpoint, a real ticket, a real
-//! PIN prompt... and then ALPN negotiation error 120 ("peer doesn't support
-//! any known protocol") on every control-channel dial, indistinguishable
-//! from a crash to the end user. This guard prevents the ambiguous state
-//! from ever existing: the second daemon refuses to start at all, with a
-//! clear error naming the PID already holding the lock.
+//! This guard exists to close a live-witnessed bug. With no guard, two `holoiroh-daemon`
+//! processes could run concurrently -- for example, an old never-closed terminal window from a
+//! prior debugging session, plus a freshly started one. Each process publishes its own
+//! independent iroh broadcast and prints its own valid-looking QR code, ticket, and phrase. But
+//! only one of them can win `holo serve`'s own single-instance port bind (see
+//! `holo_bridge::process`). The loser's `HoloBridge::start` fails. `main.rs` degrades that
+//! failure to a quiet `info!` log line, with no control channel mounted on its router at all. So
+//! a phone that scans the loser's QR code gets a real endpoint, a real ticket, and a real PIN
+//! prompt, then hits ALPN negotiation error 120 ("peer doesn't support any known protocol") on
+//! every control-channel dial -- indistinguishable from a crash to the end user. This guard
+//! prevents that ambiguous state from ever existing. The second daemon refuses to start at all,
+//! with a clear error naming the PID already holding the lock.
 //!
-//! Implementation: an `flock(2)` exclusive, non-blocking lock on a fixed
-//! path under the OS temp dir. `flock` (unlike a plain PID-file existence
-//! check) is automatically released by the kernel if the holding process
-//! dies any way at all (crash, SIGKILL, power loss) -- no stale-lock cleanup
-//! logic needed, which a hand-rolled "read PID, check if alive" scheme would
-//! require and could itself race.
+//! Implementation: an `flock(2)` exclusive, non-blocking lock on a fixed path under the OS temp
+//! dir. Unlike a plain PID-file existence check, the kernel automatically releases `flock` if
+//! the holding process dies for any reason -- crash, SIGKILL, or power loss. This module needs
+//! no stale-lock cleanup logic. A hand-rolled "read PID, check if alive" scheme would need that
+//! logic, and could itself race.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;

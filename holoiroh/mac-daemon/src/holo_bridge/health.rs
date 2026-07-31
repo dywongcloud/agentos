@@ -1,37 +1,37 @@
-//! Health-check loop: periodically verifies the supervised `holo serve` subprocess (owned by
-//! [`crate::holo_bridge::HoloBridge`]) is still alive, and restarts it on crash.
+//! Health-check loop. This module periodically verifies that the supervised `holo serve`
+//! subprocess, owned by [`crate::holo_bridge::HoloBridge`], is still alive. It restarts the
+//! subprocess on crash.
 //!
 //! ## Why this exists on top of `process::wait_for_health`
 //!
-//! `HoloServeProcess::spawn` already waits for `holo serve` to become healthy once, at
-//! startup. That check does not run again afterward -- if `holo serve` (or the
-//! `hai-agent-runtime` process it manages) crashes partway through a session, nothing
+//! `HoloServeProcess::spawn` already waits, once, for `holo serve` to become healthy at
+//! startup. That check does not run again afterward. If `holo serve`, or the
+//! `hai-agent-runtime` process it manages, crashes partway through a session, nothing
 //! currently notices. This module is the ongoing supervisor: it polls
-//! [`HoloBridge::try_wait_process`] on an interval, and on detecting the process has exited,
-//! calls [`HoloBridge::restart_process`] to bring it back.
+//! [`HoloBridge::try_wait_process`] on an interval. When it detects the process has exited, it
+//! calls [`HoloBridge::restart_process`] to bring the process back.
 //!
 //! ## Why the iroh P2P session survives a restart
 //!
-//! `HoloBridge` holds only the `holo serve` child process (behind an interior `Mutex`) and
-//! the A2A control bridge built on top of it -- it has no field referencing the
-//! `iroh_live::Live` session or the `crate::control_channel::ControlChannel` (both owned
-//! separately in `main.rs`, which holds `HoloBridge` itself behind an `Arc` shared with the
-//! control channel). [`HoloBridge::restart_process`] mutates only `HoloBridge`'s own interior
-//! state; there is nothing on the type that could reach into, let alone tear down, the P2P
-//! broadcast or control-channel connection. This is a structural guarantee (the type just
-//! doesn't hold that reference), not a behavioral promise that has to be maintained by
-//! careful coding at each call site.
+//! `HoloBridge` holds only the `holo serve` child process, behind an interior `Mutex`, and the
+//! A2A control bridge built on top of it. It has no field referencing the `iroh_live::Live`
+//! session or the `crate::control_channel::ControlChannel`. `main.rs` owns both of those
+//! separately, and holds `HoloBridge` itself behind an `Arc` shared with the control channel.
+//! [`HoloBridge::restart_process`] mutates only `HoloBridge`'s own interior state. Nothing on
+//! the type could reach into, let alone tear down, the P2P broadcast or control-channel
+//! connection. This is a structural guarantee -- the type simply does not hold that reference --
+//! not a behavioral promise that careful coding at each call site must maintain.
 //!
 //! ## Status reporting
 //!
-//! Every detected crash and every restart attempt (success or failure) is reported via
-//! [`HoloBridge::control`]'s [`HoloControlBridge::emit_daemon_status`] -- the same `emit` path
-//! (and therefore the same live control-channel connection, once `crate::control_channel`
-//! has one mounted) every A2A-derived [`ControlEvent`] already flows through. This is
-//! deliberately the same channel, not a new one: `main.rs` already wires
-//! `HoloBridge::replace_event_sink` to point this at the currently-connected peer, so a
-//! second parallel channel would just be a second thing that wiring has to duplicate for no
-//! benefit.
+//! This module reports every detected crash and every restart attempt, success or failure,
+//! through [`HoloBridge::control`]'s [`HoloControlBridge::emit_daemon_status`]. This is the
+//! same `emit` path, and therefore the same live control-channel connection once
+//! `crate::control_channel` has one mounted, that every A2A-derived [`ControlEvent`] already
+//! flows through. This module deliberately reuses that channel instead of opening a new one:
+//! `main.rs` already wires `HoloBridge::replace_event_sink` to point this channel at the
+//! currently-connected peer, so a second parallel channel would just duplicate that wiring for
+//! no benefit.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,19 +44,20 @@ use super::HoloBridge;
 /// How often the health-check loop polls `holo serve` liveness.
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Crash-loop guard: if a restart is needed again within this long of the previous restart
-/// ATTEMPT (successful or failed -- a deterministic failure must back off too, not spam at
-/// full tick rate), pause before retrying (e.g. a persistently broken install, a squatted
-/// port, missing dependency, or repeatedly-revoked permission).
+/// Crash-loop guard. If a restart is needed again within this long of the previous restart
+/// attempt, successful or failed, this module pauses before retrying. A deterministic failure
+/// must back off too, not spam at full tick rate -- for example, a persistently broken install,
+/// a squatted port, a missing dependency, or a repeatedly-revoked permission.
 const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(30);
 const CRASH_LOOP_BACKOFF: Duration = Duration::from_secs(15);
 
-/// Runs until `shutdown` is cancelled. On each tick, checks whether `bridge`'s supervised
-/// `holo serve` child has exited; if so, restarts it (with crash-loop backoff) and reports a
-/// `DaemonStatus` control event describing what happened either way.
+/// Runs until something cancels `shutdown`. On each tick, this function checks whether
+/// `bridge`'s supervised `holo serve` child has exited. If the child exited, this function
+/// restarts it, with crash-loop backoff, and reports a `DaemonStatus` control event describing
+/// what happened either way.
 ///
-/// Takes `Arc<HoloBridge>` -- the same handle `main.rs` shares with
-/// `crate::control_channel::ControlChannel` -- rather than an owned `HoloBridge`, since both
+/// This function takes `Arc<HoloBridge>`, the same handle `main.rs` shares with
+/// `crate::control_channel::ControlChannel`, rather than an owned `HoloBridge`. Both call sites
 /// need concurrent access to the same bridge for the daemon's lifetime.
 pub async fn run_health_check_loop(bridge: Arc<HoloBridge>, shutdown: CancellationToken) {
     let mut interval = tokio::time::interval(HEALTH_CHECK_INTERVAL);

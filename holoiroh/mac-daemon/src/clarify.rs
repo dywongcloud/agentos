@@ -1,13 +1,13 @@
-//! Clarifying-questions inference: given a possibly-ambiguous user instruction,
-//! ask a Tinfoil-hosted model to produce 1-3 clarifying questions (each with a
-//! few concrete options) BEFORE the desktop agent runs. Empty questions means
-//! the instruction was already clear enough to run as-is.
+//! Clarifying-questions inference. Given a possibly-ambiguous user instruction, this module asks
+//! a Tinfoil-hosted model to produce 1 to 3 clarifying questions, each with a few concrete
+//! options, before the desktop agent runs. An empty questions list means the instruction was
+//! already clear enough to run as-is.
 //!
-//! Entirely best-effort and OFF the desktop-task path: any failure (no key,
-//! timeout, malformed model output) returns an empty list, so a prompt is never
-//! blocked or lost by the clarification layer. The Tinfoil bearer key lives only
-//! inside this daemon process -- same posture as [`crate::tinfoil_proxy`] -- and
-//! is never placed in any child's env or argv.
+//! This module is entirely best-effort, and stays off the desktop-task path. Any failure -- no
+//! key, a timeout, malformed model output -- returns an empty list, so the clarification layer
+//! never blocks or loses a prompt. The Tinfoil bearer key lives only inside this daemon process,
+//! the same posture as [`crate::tinfoil_proxy`]. This module never places the key in any child's
+//! env or argv.
 
 use std::time::Duration;
 
@@ -17,13 +17,12 @@ use serde::Deserialize;
 
 const TINFOIL_ENDPOINT: &str = "https://inference.tinfoil.sh/v1/chat/completions";
 
-/// Default clarification model. Tinfoil's catalog has no DeepSeek model as of
-/// this writing (witnessed model ids: kimi-k2-6, glm-5-2, gemma4-31b,
-/// llama3-3-70b, gpt-oss-120b, ...), so the originally-requested "DeepSeek v4
-/// pro" is expressed as a swappable default here -- point `HOLOIROH_CLARIFY_MODEL`
-/// at a DeepSeek id the moment Tinfoil adds one. `gpt-oss-120b` is the strongest
-/// general reasoner available and was verified to emit clean structured
-/// clarifying questions (and an empty list for clear prompts) under
+/// Default clarification model. Tinfoil's catalog has no DeepSeek model as of this writing.
+/// Witnessed model ids: kimi-k2-6, glm-5-2, gemma4-31b, llama3-3-70b, gpt-oss-120b, and others.
+/// So this module expresses the originally-requested "DeepSeek v4 pro" as a swappable default
+/// here. Point `HOLOIROH_CLARIFY_MODEL` at a DeepSeek id the moment Tinfoil adds one.
+/// `gpt-oss-120b` is the strongest general reasoner available. This module verified that it
+/// emits clean structured clarifying questions, and an empty list for clear prompts, under
 /// `response_format: json_object`.
 const DEFAULT_CLARIFY_MODEL: &str = "gpt-oss-120b";
 

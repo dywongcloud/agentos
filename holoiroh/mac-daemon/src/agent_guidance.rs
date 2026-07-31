@@ -1,32 +1,29 @@
-//! Unconditional, per-turn task-execution guidance injected into every prompt
-//! the daemon forwards to `holo serve` (see `crate::holo_bridge::control`'s
-//! `run_prompt`).
+//! Unconditional, per-turn task-execution guidance. The daemon injects this guidance into every
+//! prompt it forwards to `holo serve` (see `crate::holo_bridge::control`'s `run_prompt`).
 //!
-//! Distinct from the two neighbouring injection surfaces:
-//! - `crate::process_awareness`'s guard block is a SAFETY rule about the
-//!   *environment* ("never interrupt an existing Claude Code session").
-//! - `crate::env_context`'s facts are semantically retrieved (top-k, may not
-//!   surface on a given turn).
+//! This module differs from two neighbouring injection surfaces:
+//! - `crate::process_awareness`'s guard block states a SAFETY rule about the *environment*
+//!   ("never interrupt an existing Claude Code session").
+//! - `crate::env_context`'s facts are retrieved by semantic similarity, top-k, and may not
+//!   surface on a given turn.
 //!
-//! This block is about HOW to carry out the user's request, and -- like the
-//! guard block -- is injected verbatim on EVERY turn so the behaviour can never
-//! silently drop out.
+//! This module's block states HOW to carry out the user's request. Like the guard block, this
+//! daemon injects it verbatim on every turn, so the behavior can never silently drop out.
 //!
-//! Motivating bug: asked to "say hi to the design team on Slack", the agent
-//! would notice the user's own earlier "hi" messages already in the channel and
-//! conclude the task was already done (or stall), instead of posting the new
-//! greeting. The rule below makes the intended behaviour explicit -- a request
-//! is an instruction to ACT, and pre-existing similar content is not completion.
+//! Motivating bug: asked to "say hi to the design team on Slack", the agent noticed the user's
+//! own earlier "hi" messages already in the channel. The agent concluded the task was already
+//! done, or stalled, instead of posting the new greeting. The rule below states the intended
+//! behavior explicitly: a request is an instruction to act, and pre-existing similar content is
+//! not completion.
 //!
-//! Second motivating bug: asked to email someone with the subject "hello", the
-//! agent typed "hello" into the recipients field by mistake, then froze instead
-//! of recognizing and fixing its own error. `holo serve`
-//! (`hcompai/holo-desktop-cli`, using the closed-source `hai-agent-runtime`) is
-//! not vendored source this daemon can edit -- the per-turn guidance block below
-//! is the reachable lever for this class of bug, same mechanism as the first.
+//! Second motivating bug: asked to email someone with the subject "hello", the agent typed
+//! "hello" into the recipients field by mistake, then froze instead of recognizing and fixing
+//! its own error. `holo serve` (`hcompai/holo-desktop-cli`, using the closed-source
+//! `hai-agent-runtime`) is not vendored source this daemon can edit. The per-turn guidance block
+//! below is the reachable lever for this class of bug, the same mechanism as the first.
 
-/// The task-execution framing block, prepended to every turn's prompt. A
-/// `&'static str` (not built per call) since it is constant and unconditional.
+/// The task-execution framing block, prepended to every turn's prompt. This function returns a
+/// `&'static str`, not a string built per call, because the block is constant and unconditional.
 pub fn task_framing_block() -> &'static str {
     "TASK EXECUTION (how to carry out the user's request):\n\
      - Do the specific thing the user asked for, in full. A request is an \
@@ -58,14 +55,14 @@ pub fn task_framing_block() -> &'static str {
      situation is truly ambiguous."
 }
 
-/// A short, stable substring of [`task_framing_block`] that witnesses (in a
-/// probe or the run_prompt assembly) that the guidance is actually present in a
-/// composed prompt -- kept here so the witness and the text share one source.
+/// A short, stable substring of [`task_framing_block`]. A probe, or the run_prompt assembly,
+/// uses this substring to witness that the guidance is actually present in a composed prompt.
+/// This module keeps the witness and the text together, sharing one source.
 #[allow(dead_code)] // used by examples/task_framing_probe.rs, not the bin target
 pub const TASK_FRAMING_MARKER: &str = "Pre-existing similar content is NOT completion";
 
-/// A short, stable substring witnessing the self-correction rule specifically
-/// (distinct from [`TASK_FRAMING_MARKER`] so a probe can assert on this rule in
-/// isolation, and so the two motivating bugs each have their own witness anchor).
+/// A short, stable substring witnessing the self-correction rule specifically. This constant
+/// stays distinct from [`TASK_FRAMING_MARKER`], so a probe can assert on this rule in isolation,
+/// and so each of the two motivating bugs gets its own witness anchor.
 #[allow(dead_code)] // used by examples/self_correction_probe.rs, not the bin target
 pub const SELF_CORRECTION_MARKER: &str = "A mistake in one step is a one-step fix";

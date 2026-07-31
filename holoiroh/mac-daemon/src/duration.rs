@@ -1,15 +1,16 @@
 //! Tiny dependency-free duration parser for the `--rotate-every` CLI flag (see `main.rs`).
 //!
-//! Deliberately hand-rolled rather than pulling `humantime` for one parse: it accepts a single
-//! unit-suffixed integer or a concatenation of them (`30m`, `2h`, `90s`, `1h30m`), with units
-//! `s`/`m`/`h`/`d`. Lives in the lib crate (not just `main.rs`) so
-//! `examples/ticket_rotation_probe.rs` can witness it directly against the real function, per
-//! this repo's no-unit-tests rule.
+//! This module hand-rolls the parser instead of pulling in `humantime` for one parse. It
+//! accepts a single unit-suffixed integer, or a concatenation of them: `30m`, `2h`, `90s`,
+//! `1h30m`. Valid units are `s`, `m`, `h`, and `d`. The parser lives in the lib crate, not just
+//! `main.rs`, so `examples/ticket_rotation_probe.rs` can witness it directly against the real
+//! function, per this repo's no-unit-tests rule.
 
 use std::time::Duration;
 
-/// Parse a `--rotate-every` duration like `30m`, `2h`, `90s`, `1h30m`. Returns an error string on
-/// anything malformed (empty, non-numeric, unknown unit, missing unit, zero total, overflow).
+/// Parses a `--rotate-every` duration like `30m`, `2h`, `90s`, or `1h30m`. Returns an error
+/// string for anything malformed: empty input, non-numeric text, an unknown unit, a missing
+/// unit, a zero total, or an overflow.
 pub fn parse_rotate_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {

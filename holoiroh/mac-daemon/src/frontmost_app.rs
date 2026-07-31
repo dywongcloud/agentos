@@ -1,30 +1,27 @@
 //! Frontmost-application lookup: which macOS app currently owns the screen.
 //!
-//! This is the missing live input `crate::sensitive_categories` documents in
-//! its "What this module is not" section -- `SensitiveCategories::classify`
-//! is a bundle-ID membership check, and until now nothing in the daemon
-//! could *supply* a bundle ID to check. The sensitive-app watchdog
-//! (`crate::holo_bridge::control`) polls this while a turn is running: the
-//! Holo agent drives whatever app is frontmost, so the frontmost bundle ID
-//! is the closest real proxy this daemon has for "the surface the agent is
-//! about to act on". (A finer per-window/per-URL classifier is explicitly
-//! out of scope per `sensitive_categories`' own module doc -- browser tabs
-//! and in-app screens are invisible at this granularity.)
+//! This module supplies the missing live input that `crate::sensitive_categories` documents in
+//! its "What this module is not" section. `SensitiveCategories::classify` is a bundle-ID
+//! membership check. Until this module existed, nothing in the daemon could supply a bundle ID
+//! to check. The sensitive-app watchdog (`crate::holo_bridge::control`) polls this module while
+//! a turn is running. The Holo agent drives whatever app is frontmost, so the frontmost bundle
+//! ID is the closest real proxy this daemon has for "the surface the agent is about to act on".
+//! A finer per-window or per-URL classifier is explicitly out of scope, per
+//! `sensitive_categories`' own module doc: browser tabs and in-app screens stay invisible at
+//! this granularity.
 //!
 //! ## Why `lsappinfo`, not an objc2/NSWorkspace binding
 //!
-//! `lsappinfo` is a macOS-shipped LaunchServices CLI (present on every
-//! supported macOS version, no install step) whose `front` subcommand prints
-//! the frontmost application's ASN and whose `info` subcommand prints that
-//! app's `CFBundleIdentifier` -- exactly the two facts needed, for zero new
-//! crate dependencies. An `NSWorkspace.frontmostApplication` binding via the
-//! `objc2-app-kit` stack would need a new dependency tree plus main-thread
-//! discipline (`NSWorkspace` is main-thread-affine) inside an async daemon;
-//! two short subprocess calls a second, on the watchdog's own interval, cost
-//! effectively nothing by comparison. Failure of either call (unexpected
-//! output shape, sandboxing, future OS change) degrades to `None`, which the
-//! watchdog treats as "no classification possible this tick" -- never a turn
-//! failure.
+//! `lsappinfo` is a macOS-shipped LaunchServices CLI, present on every supported macOS version
+//! with no install step. Its `front` subcommand prints the frontmost application's ASN. Its
+//! `info` subcommand prints that app's `CFBundleIdentifier`. These are exactly the two facts
+//! this module needs, and neither call needs a new crate dependency. An
+//! `NSWorkspace.frontmostApplication` binding through the `objc2-app-kit` stack would instead
+//! need a new dependency tree, plus main-thread discipline inside an async daemon (`NSWorkspace`
+//! is main-thread-affine). Two short subprocess calls a second, on the watchdog's own interval,
+//! cost effectively nothing by comparison. A failure of either call -- an unexpected output
+//! shape, sandboxing, a future OS change -- degrades to `None`. The watchdog treats `None` as
+//! "no classification possible this tick", never as a turn failure.
 
 use tokio::process::Command;
 
