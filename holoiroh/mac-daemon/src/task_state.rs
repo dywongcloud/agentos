@@ -1,49 +1,58 @@
 //! Project Aro PRD task lifecycle state machine.
 //!
-//! [`TaskState`] is the fine-grained state a single Holo-driven task moves
-//! through end to end: from being created on the Mac daemon, through
-//! connecting/authenticating the remote-view session, through the
-//! `holo-desktop-cli` agent's own policy/app/target/draft/verify pipeline,
-//! to a final user confirmation and commit. This is a *design-level*
-//! lifecycle model (the PRD's own state diagram, reproduced here as a real
-//! Rust type), not yet driven by any live event source in this alpha build
-//! -- see "Relationship to `holo_bridge::control`" below for exactly why.
+//! [`TaskState`] is the fine-grained state of a single Holo-driven task. A
+//! task moves through these stages, end to end:
+//!
+//! 1. Creation on the Mac daemon.
+//! 2. Connecting and authenticating the remote-view session.
+//! 3. The `holo-desktop-cli` agent's own policy/app/target/draft/verify
+//!    pipeline.
+//! 4. Final user confirmation and commit.
+//!
+//! This is a *design-level* lifecycle model: the PRD's own state diagram,
+//! reproduced here as a real Rust type. No live event source drives it yet
+//! in this alpha build. See "Relationship to `holo_bridge::control`" below
+//! for the exact reason.
 //!
 //! ## Relationship to `holo_bridge::control`
 //!
 //! This module is deliberately independent of
 //! [`crate::holo_bridge::control::ControlEvent`] and
-//! [`crate::holo_bridge::control::DoneStatus`], which are the *only*
-//! task-progress types actually wired to a live event source today (the
-//! `holo serve` A2A stream, translated to wire [`crate::control_channel::ServerMessage`]s
-//! -- see that module's `from_control_event`). Those types report three
-//! coarse outcomes (`Completed` / `Failed` / `Canceled` via `DoneStatus`)
-//! plus free-text `Progress`/`Answer` strings; they have no concept of
-//! *which* of this module's sixteen-plus finer states a task is currently
-//! in. Promoting `ControlEvent`/`DoneStatus` to carry a real [`TaskState`]
-//! would require `holo-desktop-cli`'s own A2A trajectory events to expose
-//! that granularity in the first place, which they do not today (see
+//! [`crate::holo_bridge::control::DoneStatus`]. Those are the *only*
+//! task-progress types actually wired to a live event source today: the
+//! `holo serve` A2A stream, translated to wire
+//! [`crate::control_channel::ServerMessage`]s. See that module's
+//! `from_control_event`. Those types report three coarse outcomes
+//! (`Completed` / `Failed` / `Canceled` via `DoneStatus`), plus free-text
+//! `Progress`/`Answer` strings. They have no concept of *which* of this
+//! module's sixteen-plus finer states a task is currently in.
+//!
+//! Promoting `ControlEvent`/`DoneStatus` to carry a real [`TaskState`]
+//! needs `holo-desktop-cli`'s own A2A trajectory events to expose that
+//! granularity in the first place. They do not expose it today. See
 //! `holo_bridge::a2a_client`'s module doc on what `TrajectoryEvent` opaque
-//! JSON actually contains). This module is therefore built and exported
-//! ready for that future wiring -- see `holoiroh/mac-daemon/src/control_channel.rs`'s
+//! JSON actually contains. This module is therefore built and exported,
+//! ready for that future wiring. See
+//! `holoiroh/mac-daemon/src/control_channel.rs`'s
 //! `ServerMessage::from_control_event` doc comment for the exact spot a
-//! future change would touch once a fine-grained event source exists.
+//! future change will touch, once a fine-grained event source exists.
 //!
 //! ## Confidential Cloud (Tinfoil) states are unreachable in this alpha build
 //!
 //! [`TaskState::ConfidentialCloudConsentRequired`],
 //! [`TaskState::ConfidentialAttestationFailed`], and
-//! [`TaskState::ConfidentialModelUnavailable`] are present in this enum for
-//! PRD schema completeness -- the Project Aro PRD's full state diagram
-//! includes them -- but are **unreachable in this alpha build**. Tinfoil /
+//! [`TaskState::ConfidentialModelUnavailable`] are present in this enum
+//! for PRD schema completeness. The Project Aro PRD's full state diagram
+//! includes them. They are **unreachable in this alpha build**. Tinfoil /
 //! Confidential Cloud integration is deferred to the Phase 2 / beta
-//! milestone per the PRD's own P0-11 requirement (alpha proceeds
-//! local-only; `TINFOIL_API_KEY` is held in `mac-daemon/.env` but wired
-//! into no code path this build). [`is_valid_transition`] enforces this at
-//! the type level: every transition into or out of these three variants
-//! returns `false` in this build, so accidentally routing a real task
-//! through them is a compile-time-shaped (match-exhaustiveness-checked)
-//! and run-time-checked impossibility, not just an unwritten code path.
+//! milestone, per the PRD's own P0-11 requirement. This alpha build
+//! proceeds local-only. `mac-daemon/.env` holds `TINFOIL_API_KEY`, but no
+//! code path in this build wires it in. [`is_valid_transition`] enforces
+//! this at the type level: every transition into or out of these three
+//! variants returns `false` in this build. So accidentally routing a real
+//! task through them is a compile-time-shaped (match-exhaustiveness-
+//! checked) and run-time-checked impossibility, not just an unwritten
+//! code path.
 
 use serde::Serialize;
 
@@ -69,15 +78,16 @@ use serde::Serialize;
 ///   [`Committing`](TaskState::Committing) →
 ///   [`Completed`](TaskState::Completed).
 /// - **Interactive waiting states** (4): non-terminal states that interrupt
-///   a specific flow state pending a human response, then resume back into
-///   that same flow state -- see [`is_valid_transition`] for the exact
-///   interrupt/resume edges each one supports.
+///   a specific flow state, pending a human response. Each one resumes
+///   back into that same flow state. See [`is_valid_transition`] for the
+///   exact interrupt/resume edges each state supports.
 /// - **Terminal states** (10): [`is_valid_transition`] returns `false` for
-///   every transition *out* of any of these -- 7 real alpha-build
-///   terminals (cancellation/denial/ambiguity/not-found/rejection/timeout/
-///   generic failure) plus the 3 Confidential-Cloud variants noted above,
-///   which are terminal-shaped (no outgoing edges) precisely because they
-///   are unreachable inbound as well in this build.
+///   every transition *out* of any of these. This group has 7 real
+///   alpha-build terminals (cancellation, denial, ambiguity, not-found,
+///   rejection, timeout, generic failure). It also has the 3
+///   Confidential-Cloud variants noted above. Those 3 are terminal-shaped,
+///   with no outgoing edges, precisely because they are also unreachable
+///   inbound in this build.
 ///
 /// Serializes via `serde` as its PRD-specified snake_case wire name (e.g.
 /// `TaskState::RemoteViewStarting` -> `"remote_view_starting"`).
@@ -97,19 +107,20 @@ pub enum TaskState {
     // --- Flow states: the linear happy path, in PRD order. ---
     /// Task record created, not yet scheduled to run.
     Created,
-    /// Waiting for a prior in-flight task to finish (see
+    /// Waiting for a prior in-flight task to finish. See
     /// `crate::holo_bridge::control::ControlEvent::Queued`, the one
-    /// existing live analogue of this state -- see this module's doc on
-    /// the granularity gap between the two).
+    /// existing live analogue of this state. See this module's doc on the
+    /// granularity gap between the two.
     Queued,
     /// Establishing the `iroh` remote-view/control connection to the Mac.
     Connecting,
-    /// Connection's auth gate passed (allowlisted device, or PIN verified
-    /// -- see `crate::control_channel::ControlChannel::authenticate`).
+    /// The connection's auth gate passed: an allowlisted device, or a
+    /// verified PIN. See
+    /// `crate::control_channel::ControlChannel::authenticate`.
     Authenticated,
-    /// Remote-view (screen broadcast) session is being brought up.
+    /// The remote-view (screen broadcast) session comes up.
     RemoteViewStarting,
-    /// Remote-view session is live; the user can see the Mac's screen.
+    /// The remote-view session is live. The user can see the Mac's screen.
     RemoteViewActive,
     /// Evaluating whether the requested action is within policy before
     /// acting (may interrupt into [`NeedsConfirmation`](TaskState::NeedsConfirmation)
@@ -125,7 +136,7 @@ pub enum TaskState {
     TypingDraft,
     /// Checking the entered draft against the original instruction/intent.
     Verifying,
-    /// Draft has passed verification and is ready to show the user.
+    /// The draft passed verification. It is ready to show the user.
     DraftReady,
     /// Waiting for the user's explicit go-ahead before committing.
     AwaitingConfirmation,
@@ -142,20 +153,21 @@ pub enum TaskState {
     /// needs a multi-factor code before the connection can proceed.
     NeedsMfa,
     /// Interrupts [`PolicyChecking`](TaskState::PolicyChecking): the agent
-    /// needs an explicit user confirmation before continuing (distinct from
-    /// [`AwaitingConfirmation`](TaskState::AwaitingConfirmation), which is
-    /// the one-time final-draft confirmation gate; this is a policy-time
-    /// ad hoc confirmation that can occur before a draft exists at all).
+    /// needs an explicit user confirmation before continuing. This differs
+    /// from [`AwaitingConfirmation`](TaskState::AwaitingConfirmation),
+    /// which is the one-time final-draft confirmation gate. This state is
+    /// a policy-time, ad hoc confirmation. It can occur before a draft
+    /// exists at all.
     NeedsConfirmation,
     /// Interrupts [`PolicyChecking`](TaskState::PolicyChecking): the action
-    /// requires access to something sensitive (e.g. a protected app or
-    /// data category) and is paused pending explicit user grant.
+    /// requires access to something sensitive, for example a protected app
+    /// or data category. The task is paused, pending explicit user grant.
     SensitiveAccessRequested,
 
     // --- Terminal alternatives (real in this alpha build). ---
     /// The user cancelled the task.
     UserCancelled,
-    /// The task was denied by policy or OS-level permission.
+    /// Policy or an OS-level permission denied the task.
     PermissionDenied,
     /// [`FindingTarget`](TaskState::FindingTarget) found more than one
     /// plausible target and could not disambiguate.
@@ -174,8 +186,8 @@ pub enum TaskState {
 
     // --- Terminal alternatives: Tinfoil-deferred, unreachable in alpha. ---
     /// PRD-defined state for when Confidential Cloud execution requires
-    /// fresh user consent. **Unreachable in this alpha build** -- see this
-    /// module's doc comment ("Confidential Cloud (Tinfoil) states").
+    /// fresh user consent. **Unreachable in this alpha build.** See this
+    /// module's doc comment, "Confidential Cloud (Tinfoil) states".
     ConfidentialCloudConsentRequired,
     /// PRD-defined state for when Confidential Cloud remote-attestation
     /// verification fails. **Unreachable in this alpha build.**
@@ -188,20 +200,25 @@ pub enum TaskState {
 /// Returns whether transitioning a task from `from` directly to `to` is a
 /// legal move per the Project Aro PRD's task lifecycle diagram.
 ///
-/// This is the type's actual bug-prevention surface: an invalid transition
-/// attempt (skipping states on the happy path, resuming an interactive wait
-/// into the wrong flow state, or emitting any edge into/out of a terminal
-/// state) is a real, silent bug class this function exists to make loud
-/// instead. Callers that drive a task's state forward should check this
-/// before applying a transition, not merely log or ignore an invalid one.
+/// This is the type's actual bug-prevention surface. An invalid transition
+/// attempt is a real, silent bug class. This function exists to make that
+/// bug class loud instead. Examples of an invalid attempt:
 ///
-/// The outer `match from` is intentionally exhaustive with no wildcard arm:
-/// adding a new [`TaskState`] variant in the future forces a compile error
-/// here until that variant's legal transitions are explicitly decided,
-/// rather than silently defaulting to "no transitions allowed" or "all
-/// transitions allowed". Wildcard (`_`) arms are used only on the *inner*
-/// match (deciding which `to` values are valid from a given `from`), never
-/// on this outer one.
+/// - Skipping states on the happy path.
+/// - Resuming an interactive wait into the wrong flow state.
+/// - Emitting any edge into or out of a terminal state.
+///
+/// Callers that drive a task's state forward should check this function
+/// before applying a transition. They should not merely log or ignore an
+/// invalid one.
+///
+/// The outer `match from` is intentionally exhaustive, with no wildcard
+/// arm. Adding a new [`TaskState`] variant in the future forces a compile
+/// error here, until that variant's legal transitions are explicitly
+/// decided. It does not silently default to "no transitions allowed" or
+/// "all transitions allowed". Wildcard (`_`) arms appear only on the
+/// *inner* match, which decides which `to` values are valid from a given
+/// `from`. They never appear on this outer match.
 // Not yet called from `main.rs`'s binary target -- same ready-not-wired
 // status as `TaskState` itself, see that type's doc comment just above.
 #[allow(dead_code)]
