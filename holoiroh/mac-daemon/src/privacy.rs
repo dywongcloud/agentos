@@ -1,29 +1,31 @@
-//! On-device PII redaction for images before they leave the loopback boundary to a cloud
-//! inference backend (Tinfoil). Cargo.toml has documented this module's existence and its
-//! dependency set (`image`/`imageproc`/`ab_glyph`/`regex`/`objc2-vision`) since this crate's
-//! own dependency-justification comments were written, but the module itself was never
-//! actually created or `mod`-declared anywhere -- this is that missing implementation, not new
-//! scope invented for the Tinfoil integration task.
+//! This module redacts PII in images on-device, before the images leave the loopback boundary
+//! to the Tinfoil cloud inference backend. `Cargo.toml` documented this module's existence and
+//! dependency set (`image`/`imageproc`/`ab_glyph`/`regex`/`objc2-vision`) when the crate's own
+//! dependency-justification comments were first written. No one ever created or `mod`-declared
+//! the module itself. This file is that missing implementation. This file is not new scope
+//! invented for the Tinfoil integration task.
 //!
 //! ## Pipeline
 //!
 //! 1. **OCR** (`ocr_text_regions`): Apple's Vision framework (`VNImageRequestHandler` +
 //!    `VNRecognizeTextRequest`, via `objc2-vision`) detects every text region in the image and
-//!    its bounding box, entirely on-device -- no network call, matching this codebase's
-//!    no-cloud-by-default posture ([`crate::local_model`]'s module doc) for anything that can
-//!    stay local.
-//! 2. **Detect** (`detect_pii`): each recognized text string is matched against a small set of
-//!    regexes for common PII shapes (email, phone number, US SSN-shaped, credit-card-shaped).
-//! 3. **Redact** (`redact_image`): every matched region's bounding box is painted over with a
-//!    solid block and a placeholder label (`«EMAIL_1»`, `«PHONE_2»`, ...) so a human glancing at
-//!    the redacted image can still tell *that* something was removed and *what kind*, without
-//!    the original value being recoverable from the image itself. This is one-way: there is no
-//!    vault mapping placeholders back to original values, because the redacted image only ever
-//!    travels *outbound* to Tinfoil -- nothing downstream ever needs to reverse it.
+//!    its bounding box. This step runs entirely on-device, with no network call, matching this
+//!    codebase's no-cloud-by-default posture ([`crate::local_model`]'s module doc) for anything
+//!    that can stay local.
+//! 2. **Detect** (`detect_pii`): this step matches each recognized text string against a small
+//!    set of regexes for common PII shapes (email, phone number, US SSN-shaped,
+//!    credit-card-shaped).
+//! 3. **Redact** (`redact_image`): this step paints a solid block over every matched region's
+//!    bounding box, with a placeholder label (`«EMAIL_1»`, `«PHONE_2»`, ...) on top. A human
+//!    glancing at the redacted image can still tell *that* something was removed, and *what
+//!    kind*. The original value is not recoverable from the image itself. This process is
+//!    one-way: no vault maps placeholders back to original values, because the redacted image
+//!    only ever travels *outbound* to Tinfoil. Nothing downstream ever needs to reverse it.
 //!
-//! Ported as a PATTERN from `dael-amz/browser-agent-privacy-layer` ("PLVA") per Cargo.toml's
-//! existing comment -- that repo is unlicensed and not viable to vendor, so this reimplements
-//! its OCR+regex+placeholder-token architecture natively rather than importing it.
+//! This module is ported as a PATTERN from `dael-amz/browser-agent-privacy-layer` ("PLVA"), per
+//! `Cargo.toml`'s existing comment. That repo is unlicensed and not viable to vendor. So this
+//! module reimplements its OCR+regex+placeholder-token architecture natively, rather than
+//! importing it.
 
 use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
@@ -39,10 +41,10 @@ use objc2_vision::{
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// One block of text Vision recognized, with its bounding box in **pixel** coordinates
-/// (top-left origin, `y` growing downward -- already converted from Vision's normalized
-/// bottom-left-origin convention by [`ocr_text_regions`], so callers never need to know about
-/// that flip).
+/// One block of text that Vision recognized, with its bounding box in **pixel** coordinates.
+/// The origin is top-left; `y` grows downward. [`ocr_text_regions`] already converts this from
+/// Vision's normalized bottom-left-origin convention. So callers never need to know about that
+/// flip.
 #[derive(Debug, Clone)]
 pub struct TextRegion {
     pub text: String,
@@ -52,8 +54,9 @@ pub struct TextRegion {
     pub height: u32,
 }
 
-/// Which PII category a [`TextRegion`] matched, used only to pick the placeholder label prefix
-/// (`EMAIL`, `PHONE`, `SSN`, `CARD`) -- never logged or persisted with the matched value itself.
+/// Which PII category a [`TextRegion`] matched. This module uses the category only to pick the
+/// placeholder label prefix (`EMAIL`, `PHONE`, `SSN`, `CARD`). This module never logs or
+/// persists the category with the matched value itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PiiCategory {
     Email,
@@ -99,9 +102,9 @@ fn credit_card_re() -> &'static Regex {
     })
 }
 
-/// Runs every PII regex against `text`, returning the first category that matches (checked in
-/// email/phone/ssn/credit-card order -- a region rarely matches more than one shape, and the
-/// redaction only needs one label, not an exhaustive list).
+/// Runs every PII regex against `text`. Returns the first category that matches. This function
+/// checks the regexes in email/phone/ssn/credit-card order. A region rarely matches more than
+/// one shape. The redaction only needs one label, not an exhaustive list.
 pub fn detect_pii(text: &str) -> Option<PiiCategory> {
     if email_re().is_match(text) {
         return Some(PiiCategory::Email);
@@ -118,9 +121,9 @@ pub fn detect_pii(text: &str) -> Option<PiiCategory> {
     None
 }
 
-/// Runs on-device OCR (Apple Vision) over `image`, returning every detected text region with
-/// its pixel-space bounding box. Real synchronous Vision call -- no async needed, Vision's
-/// `performRequests` is itself synchronous on the calling thread, matching
+/// Runs on-device OCR (Apple Vision) over `image`. Returns every detected text region with its
+/// pixel-space bounding box. This is a real, synchronous Vision call. It needs no async
+/// handling. Vision's `performRequests` is itself synchronous on the calling thread, matching
 /// `permissions.rs`'s own plain-synchronous-TCC-query posture for other Vision-adjacent calls.
 pub fn ocr_text_regions(image: &DynamicImage) -> anyhow::Result<Vec<TextRegion>> {
     let rgba = image.to_rgba8();
@@ -202,9 +205,9 @@ pub fn ocr_text_regions(image: &DynamicImage) -> anyhow::Result<Vec<TextRegion>>
     Ok(regions)
 }
 
-/// Best-effort system font for placeholder labels. Returns `None` (rather than erroring) when
-/// unavailable so a missing font degrades to "redaction box with no label text" instead of
-/// blocking the redaction itself -- the box is what actually protects privacy; the label is a
+/// Best-effort system font for placeholder labels. Returns `None`, rather than erroring, when
+/// no font is available. A missing font degrades to "redaction box with no label text" instead
+/// of blocking the redaction itself. The box is what actually protects privacy. The label is a
 /// cosmetic aid for a human glancing at the image.
 pub fn load_label_font() -> Option<ab_glyph::FontArc> {
     const CANDIDATE_PATHS: &[&str] = &[
@@ -222,12 +225,13 @@ pub fn load_label_font() -> Option<ab_glyph::FontArc> {
     None
 }
 
-/// Redacts every region in `regions` that [`detect_pii`] flags: paints a solid block over the
-/// region's bounding box (padded by [`REDACT_PADDING_PX`] on each side so OCR's occasionally
-/// tight box doesn't leave a sliver of the original glyph visible at the edge) and draws a
-/// `«CATEGORY_N»` placeholder label on top when a system font is available. Returns the
-/// redacted image and the count of regions actually redacted (0 means the image had no
-/// detected PII and passes through byte-for-byte re-encoded, not literally unmodified).
+/// Redacts every region in `regions` that [`detect_pii`] flags. This function paints a solid
+/// block over the region's bounding box, padded by [`REDACT_PADDING_PX`] on each side. The
+/// padding stops OCR's occasionally tight box from leaving a sliver of the original glyph
+/// visible at the edge. This function also draws a `«CATEGORY_N»` placeholder label on top,
+/// when a system font is available. Returns the redacted image and the count of regions
+/// actually redacted. A count of 0 means the image had no detected PII. The image still passes
+/// through byte-for-byte re-encoded. It is not literally unmodified.
 pub fn redact_image(image: &DynamicImage, regions: &[TextRegion]) -> (DynamicImage, usize) {
     const REDACT_PADDING_PX: i32 = 2;
     const BLOCK_COLOR: Rgba<u8> = Rgba([20, 20, 20, 255]);
@@ -268,8 +272,8 @@ pub fn redact_image(image: &DynamicImage, regions: &[TextRegion]) -> (DynamicIma
     (DynamicImage::ImageRgba8(canvas), redacted_count)
 }
 
-/// Convenience one-shot: OCR then redact. This is the entry point
-/// [`crate::tinfoil_proxy`]/[`crate::tinfoil_vision`] call before any image bytes leave the
+/// Convenience one-shot function: OCR, then redact. This is the entry point that
+/// [`crate::tinfoil_proxy`] and [`crate::tinfoil_vision`] call before any image bytes leave the
 /// loopback boundary.
 pub fn ocr_and_redact(image: &DynamicImage) -> anyhow::Result<(DynamicImage, usize)> {
     let regions = ocr_text_regions(image)?;
