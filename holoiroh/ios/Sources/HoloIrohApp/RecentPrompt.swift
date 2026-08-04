@@ -1,18 +1,15 @@
 import Foundation
 import SwiftData
 
-/// A prompt the user actually sent to the Mac, kept so the command bar can offer
-/// one-tap re-send of recent instructions. GREENFIELD SwiftData (the local-first
-/// pass deliberately kept the device-confirmed profile store on raw sqlite and
-/// adopts SwiftData only here, where there's no migration risk).
+/// Stores a prompt that the user sent to the daemon.
+/// The command bar uses stored prompts for one-tap resend.
 @Model
 final class RecentPrompt {
-    /// The exact prompt text that was sent.
+    /// Stores the exact prompt text that the user sent.
     @Attribute(.unique) var text: String
-    /// When it was last sent (dedup bumps this rather than inserting a copy).
+    /// Records when the user last sent the prompt.
     var createdAt: Date
-    /// Optional app the prompt referenced (from OrbEffects' app detection), for a
-    /// future grouping/badge affordance. Nil today.
+    /// Identifies an app detected in the prompt, when available.
     var appHint: String?
 
     init(text: String, createdAt: Date = Date(), appHint: String? = nil) {
@@ -22,11 +19,10 @@ final class RecentPrompt {
     }
 }
 
-/// Owns the app-wide SwiftData container for `RecentPrompt`, in its OWN store
-/// file separate from the connection-profile sqlite. Deliberately optional and
-/// failure-isolated: if the container can't be created, `container` is nil, the
-/// recent-prompts feature simply doesn't appear, and NOTHING about pairing or
-/// connection (which never touch SwiftData) is affected.
+/// Owns the app-wide SwiftData container for recent prompts.
+/// The container uses a store separate from connection profiles.
+/// If initialization fails, recent prompts are disabled.
+/// This failure does not affect pairing or connections.
 enum RecentPromptStore {
     static let container: ModelContainer? = {
         do {

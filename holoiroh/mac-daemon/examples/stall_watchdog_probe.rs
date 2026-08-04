@@ -66,7 +66,10 @@ fn main() {
     progressing.mark_nudged(base); // pretend it was nudged once, long ago
     let progress_event = serde_json::json!({"kind": "tool_result"});
     let changed = progressing.observe_working(Some(&progress_event));
-    assert!(changed, "a real tool_result must advance the phase (Plan -> Execute)");
+    assert!(
+        changed,
+        "a real tool_result must advance the phase (Plan -> Execute)"
+    );
     assert!(
         !progressing.should_nudge(progressing.updated_at_ms + 1, WINDOW, COOLDOWN),
         "real progress must reset the stall clock -- no nudge right after"

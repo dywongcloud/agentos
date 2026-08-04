@@ -10,7 +10,10 @@ use holoiroh_daemon::process_awareness;
 fn main() {
     let procs = process_awareness::enumerate();
     println!("enumerated {} running processes", procs.len());
-    assert!(!procs.is_empty(), "ps returned no processes -- enumeration is broken");
+    assert!(
+        !procs.is_empty(),
+        "ps returned no processes -- enumeration is broken"
+    );
 
     let protected: Vec<_> = procs.iter().filter(|p| p.protected).collect();
     println!("protected processes ({}):", protected.len());
@@ -24,13 +27,18 @@ fn main() {
     println!("{block}");
 
     // The hard rules are unconditional -- always present regardless of what's running.
-    assert!(block.contains("Ghostty"), "guard must state the default terminal is Ghostty");
     assert!(
-        block.to_lowercase().contains("never interrupt")
-            || block.contains("NEVER interrupt"),
+        block.contains("Ghostty"),
+        "guard must state the default terminal is Ghostty"
+    );
+    assert!(
+        block.to_lowercase().contains("never interrupt") || block.contains("NEVER interrupt"),
         "guard must forbid interrupting Claude Code"
     );
-    assert!(block.contains("Claude Code"), "guard must name Claude Code explicitly");
+    assert!(
+        block.contains("Claude Code"),
+        "guard must name Claude Code explicitly"
+    );
 
     println!(
         "process_awareness_probe: OK -- real process enumeration + unconditional guard block \

@@ -34,7 +34,7 @@
 
 use holoiroh_daemon::policy::{
     self, ActionClass, ActionVerb, ClickTarget, CommitKind, PauseKind, PolicyDecision,
-    ProposedAction, TypeTarget, SCOPED_CONFIRMATION_TTL_SECS, WIRING,
+    ProposedAction, SCOPED_CONFIRMATION_TTL_SECS, TypeTarget, WIRING,
 };
 use holoiroh_daemon::sensitive_categories::{CategorySetting, SensitiveCategories};
 
@@ -46,64 +46,110 @@ fn main() {
     // Class 0 -- Observe.
     let observe = ProposedAction::new(ActionVerb::Observe, "read the screen");
     let c0 = policy::classify(&observe, &categories);
-    println!("  observe screen                         -> {:?} (ordinal {})", c0, c0.ordinal());
+    println!(
+        "  observe screen                         -> {:?} (ordinal {})",
+        c0,
+        c0.ordinal()
+    );
     assert_eq!(c0, ActionClass::Observe);
     assert_eq!(c0.ordinal(), 0);
 
     // Class 1 -- Navigate (both the Navigate verb and a navigational click).
     let nav_verb = ProposedAction::new(ActionVerb::Navigate, "tab to next field");
     let nav_click = ProposedAction::new(
-        ActionVerb::Click { target: ClickTarget::Navigation },
+        ActionVerb::Click {
+            target: ClickTarget::Navigation,
+        },
         "click a plain link",
     );
     let c1a = policy::classify(&nav_verb, &categories);
     let c1b = policy::classify(&nav_click, &categories);
-    println!("  navigate (keyboard)                    -> {:?} (ordinal {})", c1a, c1a.ordinal());
-    println!("  click navigational control             -> {:?} (ordinal {})", c1b, c1b.ordinal());
+    println!(
+        "  navigate (keyboard)                    -> {:?} (ordinal {})",
+        c1a,
+        c1a.ordinal()
+    );
+    println!(
+        "  click navigational control             -> {:?} (ordinal {})",
+        c1b,
+        c1b.ordinal()
+    );
     assert_eq!(c1a, ActionClass::Navigate);
     assert_eq!(c1b, ActionClass::Navigate);
     assert_eq!(c1a.ordinal(), 1);
 
     // Class 2 -- Draft.
     let draft = ProposedAction::new(
-        ActionVerb::Type { into: TypeTarget::DraftBody },
+        ActionVerb::Type {
+            into: TypeTarget::DraftBody,
+        },
         "type the email body",
     );
     let c2 = policy::classify(&draft, &categories);
-    println!("  type into draft body                   -> {:?} (ordinal {})", c2, c2.ordinal());
+    println!(
+        "  type into draft body                   -> {:?} (ordinal {})",
+        c2,
+        c2.ordinal()
+    );
     assert_eq!(c2, ActionClass::Draft);
     assert_eq!(c2.ordinal(), 2);
 
     // Class 3 -- SensitiveTransition (credential field, and an auth-control click).
     let cred = ProposedAction::new(
-        ActionVerb::Type { into: TypeTarget::CredentialField },
+        ActionVerb::Type {
+            into: TypeTarget::CredentialField,
+        },
         "type into the password field",
     );
     let signin = ProposedAction::new(
-        ActionVerb::Click { target: ClickTarget::AuthControl },
+        ActionVerb::Click {
+            target: ClickTarget::AuthControl,
+        },
         "click Sign in",
     );
     let c3a = policy::classify(&cred, &categories);
     let c3b = policy::classify(&signin, &categories);
-    println!("  type into credential field             -> {:?} (ordinal {})", c3a, c3a.ordinal());
-    println!("  click auth control (sign in)           -> {:?} (ordinal {})", c3b, c3b.ordinal());
+    println!(
+        "  type into credential field             -> {:?} (ordinal {})",
+        c3a,
+        c3a.ordinal()
+    );
+    println!(
+        "  click auth control (sign in)           -> {:?} (ordinal {})",
+        c3b,
+        c3b.ordinal()
+    );
     assert_eq!(c3a, ActionClass::SensitiveTransition);
     assert_eq!(c3b, ActionClass::SensitiveTransition);
     assert_eq!(c3a.ordinal(), 3);
 
     // Class 4 -- ExternalCommitment (a Commit verb, and a commit-button click).
     let send_commit = ProposedAction::new(
-        ActionVerb::Commit { kind: CommitKind::Send },
+        ActionVerb::Commit {
+            kind: CommitKind::Send,
+        },
         "send the email",
     );
     let submit_click = ProposedAction::new(
-        ActionVerb::Click { target: ClickTarget::CommitButton { kind: CommitKind::Submit } },
+        ActionVerb::Click {
+            target: ClickTarget::CommitButton {
+                kind: CommitKind::Submit,
+            },
+        },
         "click Submit",
     );
     let c4a = policy::classify(&send_commit, &categories);
     let c4b = policy::classify(&submit_click, &categories);
-    println!("  commit: send                           -> {:?} (ordinal {})", c4a, c4a.ordinal());
-    println!("  click commit button (submit)           -> {:?} (ordinal {})", c4b, c4b.ordinal());
+    println!(
+        "  commit: send                           -> {:?} (ordinal {})",
+        c4a,
+        c4a.ordinal()
+    );
+    println!(
+        "  click commit button (submit)           -> {:?} (ordinal {})",
+        c4b,
+        c4b.ordinal()
+    );
     assert_eq!(c4a, ActionClass::ExternalCommitment);
     assert_eq!(c4b, ActionClass::ExternalCommitment);
     assert_eq!(c4a.ordinal(), 4);
@@ -111,12 +157,18 @@ fn main() {
     // Class 5 -- SensitiveTarget (a click INTO a sensitive app, reusing the
     // sensitive_categories data model).
     let into_1password = ProposedAction::in_app(
-        ActionVerb::Click { target: ClickTarget::Navigation },
+        ActionVerb::Click {
+            target: ClickTarget::Navigation,
+        },
         "com.1password.1password",
         "click an entry in 1Password",
     );
     let c5 = policy::classify(&into_1password, &categories);
-    println!("  click into 1Password (sensitive app)   -> {:?} (ordinal {})", c5, c5.ordinal());
+    println!(
+        "  click into 1Password (sensitive app)   -> {:?} (ordinal {})",
+        c5,
+        c5.ordinal()
+    );
     assert_eq!(c5, ActionClass::SensitiveTarget);
     assert_eq!(c5.ordinal(), 5);
 
@@ -142,8 +194,16 @@ fn main() {
         "screenshot 1Password's window",
     );
     let c_obs5 = policy::classify(&observe_1password, &categories);
-    println!("  observe 1Password (read-only)          -> {:?} (ordinal {})", c_obs5, c_obs5.ordinal());
-    assert_eq!(c_obs5, ActionClass::Observe, "reading a sensitive app is not a class-5 access");
+    println!(
+        "  observe 1Password (read-only)          -> {:?} (ordinal {})",
+        c_obs5,
+        c_obs5.ordinal()
+    );
+    assert_eq!(
+        c_obs5,
+        ActionClass::Observe,
+        "reading a sensitive app is not a class-5 access"
+    );
 
     println!();
     println!("=== decide: the full PRD §9 decision table ===");
@@ -156,27 +216,44 @@ fn main() {
     ] {
         let d = policy::decide(class, &categories, None);
         println!("  {label:<14} -> {:?}", d);
-        assert_eq!(d, PolicyDecision::Allow, "classes 0-2 are allowed by default");
+        assert_eq!(
+            d,
+            PolicyDecision::Allow,
+            "classes 0-2 are allowed by default"
+        );
         assert!(d.permits_immediate_execution());
     }
 
     // Class 3 -> PauseForInputRequest; NEVER executes.
     let d3 = policy::decide(ActionClass::SensitiveTransition, &categories, None);
     println!("  sensitive_transition (3) -> {:?}", d3);
-    assert_eq!(d3, PolicyDecision::PauseForInputRequest { kind: PauseKind::Credential });
-    assert!(!d3.permits_immediate_execution(), "class 3 must never execute directly");
+    assert_eq!(
+        d3,
+        PolicyDecision::PauseForInputRequest {
+            kind: PauseKind::Credential
+        }
+    );
+    assert!(
+        !d3.permits_immediate_execution(),
+        "class 3 must never execute directly"
+    );
 
     // Class 4 -> RequireScopedConfirmation, 60s, default reject on timeout.
     let d4 = policy::decide(ActionClass::ExternalCommitment, &categories, None);
     println!("  external_commitment (4)  -> {:?}", d4);
     match &d4 {
-        PolicyDecision::RequireScopedConfirmation { expires_in_secs, .. } => {
+        PolicyDecision::RequireScopedConfirmation {
+            expires_in_secs, ..
+        } => {
             assert_eq!(*expires_in_secs, SCOPED_CONFIRMATION_TTL_SECS);
             assert_eq!(*expires_in_secs, 60);
         }
         other => panic!("class 4 must require a scoped confirmation, got {other:?}"),
     }
-    assert!(!d4.permits_immediate_execution(), "class 4 must never execute directly");
+    assert!(
+        !d4.permits_immediate_execution(),
+        "class 4 must never execute directly"
+    );
 
     // Class 5 -> RequireSensitiveApproval by default (AlwaysAsk).
     let d5_ask = policy::decide(
@@ -187,29 +264,52 @@ fn main() {
     println!("  sensitive_target (5), AlwaysAsk  -> {:?}", d5_ask);
     assert_eq!(
         d5_ask,
-        PolicyDecision::RequireSensitiveApproval { category_id: "password_managers".to_string() }
+        PolicyDecision::RequireSensitiveApproval {
+            category_id: "password_managers".to_string()
+        }
     );
     assert!(!d5_ask.permits_immediate_execution());
 
     // Class 5 with AlwaysAllow -> Allow; with HardBlock -> Reject.
     let mut cats_allow = SensitiveCategories::default_categories();
-    cats_allow.find_by_id_mut("password_managers").unwrap().setting = CategorySetting::AlwaysAllow;
-    let d5_allow = policy::decide(ActionClass::SensitiveTarget, &cats_allow, Some("password_managers"));
+    cats_allow
+        .find_by_id_mut("password_managers")
+        .unwrap()
+        .setting = CategorySetting::AlwaysAllow;
+    let d5_allow = policy::decide(
+        ActionClass::SensitiveTarget,
+        &cats_allow,
+        Some("password_managers"),
+    );
     println!("  sensitive_target (5), AlwaysAllow -> {:?}", d5_allow);
     assert_eq!(d5_allow, PolicyDecision::Allow);
     assert!(d5_allow.permits_immediate_execution());
 
     let mut cats_block = SensitiveCategories::default_categories();
-    cats_block.find_by_id_mut("banking_brokerage").unwrap().setting = CategorySetting::HardBlock;
-    let d5_block = policy::decide(ActionClass::SensitiveTarget, &cats_block, Some("banking_brokerage"));
+    cats_block
+        .find_by_id_mut("banking_brokerage")
+        .unwrap()
+        .setting = CategorySetting::HardBlock;
+    let d5_block = policy::decide(
+        ActionClass::SensitiveTarget,
+        &cats_block,
+        Some("banking_brokerage"),
+    );
     println!("  sensitive_target (5), HardBlock   -> {:?}", d5_block);
     assert!(matches!(d5_block, PolicyDecision::Reject { .. }));
     assert!(!d5_block.permits_immediate_execution());
 
     // Fail-closed: a class-5 decision with an unresolvable category id must
     // NOT become Allow -- it defaults to the AlwaysAsk approval gate.
-    let d5_miss = policy::decide(ActionClass::SensitiveTarget, &categories, Some("no_such_category"));
-    println!("  sensitive_target (5), bad cat id  -> {:?} (fails closed to approval)", d5_miss);
+    let d5_miss = policy::decide(
+        ActionClass::SensitiveTarget,
+        &categories,
+        Some("no_such_category"),
+    );
+    println!(
+        "  sensitive_target (5), bad cat id  -> {:?} (fails closed to approval)",
+        d5_miss
+    );
     assert!(
         matches!(d5_miss, PolicyDecision::RequireSensitiveApproval { .. }),
         "a class-5 lookup miss must fail closed, never Allow"
@@ -221,7 +321,11 @@ fn main() {
     // scoped confirmation, without ever changing the decision away from
     // RequireScopedConfirmation.
     let pay = ProposedAction::new(
-        ActionVerb::Click { target: ClickTarget::CommitButton { kind: CommitKind::Payment } },
+        ActionVerb::Click {
+            target: ClickTarget::CommitButton {
+                kind: CommitKind::Payment,
+            },
+        },
         "confirm the $340 payment",
     );
     let d_pay = policy::decide_for(&pay, &categories);
@@ -236,45 +340,79 @@ fn main() {
 
     println!();
     println!("=== PRD ACCEPTANCE TEST (row 16a, adversarial zero-send) ===");
-    println!("A class-4 send action MUST classify class-4 and get RequireScopedConfirmation, never Allow.");
+    println!(
+        "A class-4 send action MUST classify class-4 and get RequireScopedConfirmation, never Allow."
+    );
     // The exact adversarial input: an agent proposing to SEND. Built as a real
     // class-4 action, run through the real classifier and the real decision
     // function -- no mocking.
     let adversarial_send = ProposedAction::new(
-        ActionVerb::Commit { kind: CommitKind::Send },
+        ActionVerb::Commit {
+            kind: CommitKind::Send,
+        },
         "send email to investors@example.com",
     );
     let send_class = policy::classify(&adversarial_send, &categories);
     let send_decision = policy::decide_for(&adversarial_send, &categories);
     println!("  input:    {:?}", adversarial_send);
-    println!("  class:    {:?} (ordinal {})", send_class, send_class.ordinal());
+    println!(
+        "  class:    {:?} (ordinal {})",
+        send_class,
+        send_class.ordinal()
+    );
     println!("  decision: {:?}", send_decision);
 
     // The invariant, asserted three independent ways.
-    assert_eq!(send_class, ActionClass::ExternalCommitment, "a send must be class 4");
+    assert_eq!(
+        send_class,
+        ActionClass::ExternalCommitment,
+        "a send must be class 4"
+    );
     assert_eq!(send_class.ordinal(), 4);
-    assert_ne!(send_decision, PolicyDecision::Allow, "a class-4 send must NEVER be Allow (zero-send)");
+    assert_ne!(
+        send_decision,
+        PolicyDecision::Allow,
+        "a class-4 send must NEVER be Allow (zero-send)"
+    );
     assert!(
         !send_decision.permits_immediate_execution(),
         "a class-4 send must NEVER permit immediate execution (zero-send)"
     );
     match &send_decision {
-        PolicyDecision::RequireScopedConfirmation { commit, expires_in_secs } => {
+        PolicyDecision::RequireScopedConfirmation {
+            commit,
+            expires_in_secs,
+        } => {
             assert_eq!(*commit, CommitKind::Send);
-            assert_eq!(*expires_in_secs, 60, "scoped confirmation expires after 60s, default reject on timeout");
+            assert_eq!(
+                *expires_in_secs, 60,
+                "scoped confirmation expires after 60s, default reject on timeout"
+            );
         }
-        other => panic!("zero-send invariant violated: class-4 send got {other:?}, expected RequireScopedConfirmation"),
+        other => panic!(
+            "zero-send invariant violated: class-4 send got {other:?}, expected RequireScopedConfirmation"
+        ),
     }
-    println!("  ZERO-SEND INVARIANT HELD: class-4 send -> RequireScopedConfirmation (60s), never Allow.");
+    println!(
+        "  ZERO-SEND INVARIANT HELD: class-4 send -> RequireScopedConfirmation (60s), never Allow."
+    );
 
     println!();
     println!("=== documented wiring point (for the follow-up interception row) ===");
     println!("{WIRING}");
-    assert!(WIRING.contains("handle_message"), "wiring note must name the exact dispatch it gates");
-    assert!(WIRING.contains("permits_immediate_execution"), "wiring note must name the go/no-go predicate");
+    assert!(
+        WIRING.contains("handle_message"),
+        "wiring note must name the exact dispatch it gates"
+    );
+    assert!(
+        WIRING.contains("permits_immediate_execution"),
+        "wiring note must name the go/no-go predicate"
+    );
 
     println!();
-    println!("policy_probe: OK -- classifier, decision table, class-5 data-model reuse, and the PRD");
+    println!(
+        "policy_probe: OK -- classifier, decision table, class-5 data-model reuse, and the PRD"
+    );
     println!("row-16a adversarial zero-send invariant all witnessed via real execution.");
     println!();
     println!(

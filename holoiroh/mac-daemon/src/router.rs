@@ -93,15 +93,44 @@ const DOWNGRADE_THRESHOLD: i32 = 1;
 /// module deliberately uses plain-text substring matching, with no external dependency (see
 /// this module's doc on why routing stays dependency-free).
 const KNOWN_APPS: &[&str] = &[
-    "calendar", "contacts", "mail", "email", "messages", "imessage", "text", "notes",
-    "reminders", "system settings", "chrome", "safari", "browser", "discord", "finder",
-    "notion", "slack", "spotify", "music", "photos", "terminal", "preview", "pages",
-    "numbers", "keynote", "xcode",
+    "calendar",
+    "contacts",
+    "mail",
+    "email",
+    "messages",
+    "imessage",
+    "text",
+    "notes",
+    "reminders",
+    "system settings",
+    "chrome",
+    "safari",
+    "browser",
+    "discord",
+    "finder",
+    "notion",
+    "slack",
+    "spotify",
+    "music",
+    "photos",
+    "terminal",
+    "preview",
+    "pages",
+    "numbers",
+    "keynote",
+    "xcode",
 ];
 
 /// These sequencing or connective words signal a multi-step plan when present.
 const SEQUENCING_WORDS: &[&str] = &[
-    "then", "after", "next", "once", "before", "finally", "afterward", "afterwards",
+    "then",
+    "after",
+    "next",
+    "once",
+    "before",
+    "finally",
+    "afterward",
+    "afterwards",
 ];
 
 /// These conditional or branching words stress a smaller model's planning.
@@ -110,9 +139,33 @@ const CONDITIONAL_WORDS: &[&str] = &["if", "unless", "otherwise", "depending", "
 /// These are known imperative action verbs. This module counts these verbs at clause
 /// starts, as a proxy for "how many distinct actions does this prompt actually ask for".
 const ACTION_VERBS: &[&str] = &[
-    "open", "click", "type", "search", "send", "reply", "create", "delete", "move", "copy",
-    "drag", "compose", "book", "schedule", "download", "install", "compare", "summarize",
-    "find", "fill", "upload", "organize", "rename", "close", "switch", "toggle", "scroll",
+    "open",
+    "click",
+    "type",
+    "search",
+    "send",
+    "reply",
+    "create",
+    "delete",
+    "move",
+    "copy",
+    "drag",
+    "compose",
+    "book",
+    "schedule",
+    "download",
+    "install",
+    "compare",
+    "summarize",
+    "find",
+    "fill",
+    "upload",
+    "organize",
+    "rename",
+    "close",
+    "switch",
+    "toggle",
+    "scroll",
 ];
 
 /// Classify a prompt's raw text into a routing tier by an additive, dependency-free heuristic
@@ -193,8 +246,9 @@ fn score(prompt: &str) -> i32 {
     }
 
     // Conjunction density.
-    let conjunction_count =
-        lower.matches(" and ").count() + lower.matches("; ").count() + lower.matches(", then").count();
+    let conjunction_count = lower.matches(" and ").count()
+        + lower.matches("; ").count()
+        + lower.matches(", then").count();
     if conjunction_count >= 4 {
         total += 2;
     } else if conjunction_count >= 2 {
@@ -221,7 +275,10 @@ fn score(prompt: &str) -> i32 {
     }
 
     // Conditionals / branching.
-    if words.iter().any(|w| CONDITIONAL_WORDS.contains(&trim_punct(w))) {
+    if words
+        .iter()
+        .any(|w| CONDITIONAL_WORDS.contains(&trim_punct(w)))
+    {
         total += 2;
     }
 

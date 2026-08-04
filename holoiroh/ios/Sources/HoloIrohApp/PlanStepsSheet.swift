@@ -1,14 +1,14 @@
 import SwiftUI
 
-/// Composes a goal, sends `ClientMessage.planTask`, and shows the resulting step list
-/// (`ServerMessage.planReady`) for the user to review. This proposes a plan; it does not run
-/// it -- running a step (e.g. "Desktop action: ...") is still a separate, explicit
-/// `dispatchPrompt` the user triggers from here, exactly like typing an instruction directly.
+/// Requests a task plan and shows the returned steps.
+/// A plan request does not run its steps.
+/// The user must select Run for each desktop action.
 struct PlanStepsSheet: View {
     let onSend: (ClientMessage) -> Void
-    /// Runs a plan step as a normal desktop-agent prompt (the same path a typed instruction
-    /// takes) -- so any existing safeguards (sensitive-app consent, etc.) apply unchanged.
+    /// Runs the selected step through the standard prompt path.
+    /// Existing safeguards apply to the step.
     let onRunStep: (String) -> Void
+    let autonomousExecutionPermitted: Bool
 
     @Environment(\.dismiss) private var dismiss
 
@@ -38,7 +38,7 @@ struct PlanStepsSheet: View {
                                     .foregroundStyle(.secondary)
                                 Text(step)
                                 Spacer()
-                                if step.hasPrefix("Desktop action:") {
+                                if step.hasPrefix("Desktop action:"), autonomousExecutionPermitted {
                                     Button("Run") {
                                         onRunStep(String(step.dropFirst("Desktop action:".count)).trimmingCharacters(in: .whitespaces))
                                         dismiss()
@@ -57,7 +57,11 @@ struct PlanStepsSheet: View {
                 }
 
                 Section {
-                    Text("Planning is sent to Tinfoil's confidential-computing cloud. Nothing runs on the Mac until you tap Run on a step.")
+                    if !autonomousExecutionPermitted {
+                        Label("Restricted mode — plan steps cannot run autonomously.", systemImage: "hand.raised.fill")
+                            .font(.caption.weight(.semibold))
+                    }
+                    Text("Planning is sent to Tinfoil's confidential-computing cloud. Nothing runs on the Mac until you tap Run on a step. Inspect this connection's cryptographic proof in Diagnostics → Verification Center.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -68,9 +72,19 @@ struct PlanStepsSheet: View {
             #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
+                    Button("Close") {
+                        isPlanning = false
+                        dismiss()
+                    }
                 }
             }
+            .onChange(of: steps) { _, steps in
+                if steps != nil { isPlanning = false }
+            }
+            .onChange(of: planError) { _, error in
+                if error != nil { isPlanning = false }
+            }
+            .onDisappear { isPlanning = false }
         }
     }
 

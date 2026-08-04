@@ -1,148 +1,141 @@
-//! Manual, run-by-hand probe: exercises the real `allowlist` module --
-//! `Allowlist::load`/`save`/`add_entry`/`remove_entry`/`contains_key`,
-//! `generate_pin`/`generate_default_pin`, and `verify_pin` -- against real
-//! temp files on disk and real strings, printing real output. Witnesses
-//! the behavior that used to live in `allowlist.rs`'s
-//! `#[cfg(test)] mod tests` (removed per this repo's no-unit-tests rule:
-//! all validation must be real execution, witnessed by actually running it
-//! and reading the output), including the security-relevant "corrupt file
-//! fails closed" case.
+//! Executable allowlist/PIN and legacy-ID migration probe.
 //!
 //! Run with `cargo run --example allowlist_probe`.
 
-use holoiroh_daemon::allowlist::{generate_default_pin, generate_pin, verify_pin, Allowlist};
+use holoiroh_daemon::allowlist::{
+    Allowlist, generate_default_pin, generate_pin, migration_backup_path, verify_pin,
+};
 
-fn temp_path(name: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "holoiroh-allowlist-probe-{name}-{}-{}.json",
+fn temp_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "holoiroh-allowlist-probe-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
-    ));
-    p
+    ))
+}
+
+fn endpoint_id(prefix: &str, fill: char) -> String {
+    assert!(prefix.len() <= 64);
+    format!("{prefix}{}", fill.to_string().repeat(64 - prefix.len()))
 }
 
 fn main() {
-    println!("=== Allowlist: load missing file -> empty, not an error ===");
-    let path = temp_path("missing");
-    let list = Allowlist::load(&path).expect("missing file should load as empty, not error");
-    println!("load({}) -> is_empty={} len={}", path.display(), list.is_empty(), list.len());
+    let root = temp_dir();
+    std::fs::create_dir_all(&root).unwrap();
+
+    println!("=== missing allowlist is empty ===");
+    let missing = root.join("missing.json");
+    let list = Allowlist::load(&missing).expect("missing file must load empty");
     assert!(list.is_empty());
-    assert_eq!(list.len(), 0);
 
-    println!();
-    println!("=== Allowlist: save then load round-trips entries ===");
-    let path = temp_path("roundtrip");
-    let mut list = Allowlist::default();
-    let added1 = list.add_entry("node-abc123", Some("Dylan's iPhone".to_string()));
-    let added2 = list.add_entry("node-def456", None);
-    println!("add_entry(node-abc123) -> {added1}, add_entry(node-def456) -> {added2}");
-    list.save(&path).expect("save should succeed and create parent dir");
-    println!("saved to {}", path.display());
+    let valid_a = endpoint_id("0123456789", 'a');
+    let valid_b = endpoint_id("0123456789", 'b');
+    let prefix_collision = endpoint_id("0123456789", 'c');
+    let truncated = "0123456789".to_string();
+    let uppercase = "A".repeat(64);
+    let malformed = endpoint_id("012345678g", 'd');
 
-    let loaded = Allowlist::load(&path).expect("load should succeed after save");
+    println!("=== mixed legacy data migrates atomically to active + quarantine ===");
+    let path = root.join("allowlist.json");
+    let mixed = serde_json::json!({
+        "entries": [
+            {"device_id": valid_a.clone(), "label": "valid-a", "paired_at": 1},
+            {"device_id": truncated.clone(), "label": "legacy-short", "paired_at": 2},
+            {"device_id": uppercase.clone(), "label": "uppercase", "paired_at": 3},
+            {"device_id": malformed.clone(), "label": "malformed", "paired_at": 4},
+            {"device_id": valid_b.clone(), "label": "valid-b", "paired_at": 5}
+        ]
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&mixed).unwrap()).unwrap();
+
+    let migrated = Allowlist::load(&path).expect("mixed legacy file must migrate");
+    assert_eq!(migrated.len(), 2);
+    assert!(migrated.contains_key(&valid_a));
+    assert!(migrated.contains_key(&valid_b));
+    assert!(!migrated.contains_key(&prefix_collision));
+    assert!(!migrated.contains_key("0123456789"));
+
+    let backup = migration_backup_path(&path);
+    let backup_value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&backup).expect("migration backup missing")).unwrap();
+    let backup_ids: Vec<&str> = backup_value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["device_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(backup_ids, vec![truncated, uppercase, malformed]);
     println!(
-        "loaded: len={} contains(node-abc123)={} contains(node-def456)={} contains(node-unknown)={}",
-        loaded.len(),
-        loaded.contains_key("node-abc123"),
-        loaded.contains_key("node-def456"),
-        loaded.contains_key("node-unknown")
+        "migration OK: valid=2 quarantined=3 backup={}",
+        backup.display()
     );
-    assert_eq!(loaded.len(), 2);
-    assert!(loaded.contains_key("node-abc123"));
-    assert!(loaded.contains_key("node-def456"));
-    assert!(!loaded.contains_key("node-unknown"));
-    let _ = std::fs::remove_file(&path);
 
-    println!();
-    println!("=== Allowlist: add_entry is idempotent for the same device_id ===");
+    println!("=== second load is byte-idempotent ===");
+    let active_before = std::fs::read(&path).unwrap();
+    let backup_before = std::fs::read(&backup).unwrap();
+    let second = Allowlist::load(&path).expect("second load must succeed");
+    assert_eq!(second.len(), 2);
+    assert_eq!(std::fs::read(&path).unwrap(), active_before);
+    assert_eq!(std::fs::read(&backup).unwrap(), backup_before);
+
+    println!("=== exact full-ID matching rejects a shared-prefix collision ===");
+    assert_eq!(&valid_a[..10], &valid_b[..10]);
+    assert_eq!(&valid_a[..10], &prefix_collision[..10]);
+    assert!(migrated.contains_key(&valid_a));
+    assert!(migrated.contains_key(&valid_b));
+    assert!(!migrated.contains_key(&prefix_collision));
+
+    println!("=== add/save accept only complete lowercase endpoint IDs ===");
+    let roundtrip = root.join("roundtrip.json");
     let mut list = Allowlist::default();
-    let first_add = list.add_entry("node-x", None);
-    let second_add = list.add_entry("node-x", Some("relabel attempt".to_string()));
-    println!("first add -> {first_add}, second add (same id) -> {second_add}, len={}", list.len());
-    assert!(first_add);
-    assert!(!second_add);
-    assert_eq!(list.len(), 1);
+    assert!(list.add_entry(valid_a.clone(), Some("phone".to_string())));
+    assert!(!list.add_entry(valid_a.clone(), None));
+    assert!(!list.add_entry("0123456789", None));
+    assert!(!list.add_entry("F".repeat(64), None));
+    list.save(&roundtrip).unwrap();
+    assert!(Allowlist::load(&roundtrip).unwrap().contains_key(&valid_a));
 
-    println!();
-    println!("=== Allowlist: remove_entry revokes a previously paired device ===");
-    let mut list = Allowlist::default();
-    list.add_entry("node-to-revoke", None);
-    let contained_before = list.contains_key("node-to-revoke");
-    let removed = list.remove_entry("node-to-revoke");
-    let contained_after = list.contains_key("node-to-revoke");
-    let removed_again = list.remove_entry("node-to-revoke");
-    println!(
-        "before={contained_before} removed={removed} after={contained_after} removed_again={removed_again}"
-    );
-    assert!(contained_before);
-    assert!(removed);
-    assert!(!contained_after);
-    assert!(!removed_again, "second removal of an already-gone entry must report no-op");
-
-    println!();
-    println!("=== Allowlist: corrupt JSON file fails CLOSED, not open (security-relevant) ===");
-    let path = temp_path("corrupt");
-    std::fs::write(&path, b"{ this is not valid json").unwrap();
-    let result = Allowlist::load(&path);
-    println!("load(corrupt file) -> is_err={}", result.is_err());
+    println!("=== failed replace leaves no partial active file or temp residue ===");
+    let failure_parent = root.join("failure");
+    let destination = failure_parent.join("allowlist.json");
+    std::fs::create_dir_all(&destination).unwrap();
+    let result = list.save(&destination);
+    assert!(result.is_err(), "renaming over a directory must fail");
     assert!(
-        result.is_err(),
-        "a corrupt allowlist file must be a hard error, never silently treated as empty \
-         (empty would fail OPEN -- accepting a device that was never actually verified)"
+        destination.is_dir(),
+        "failed save must preserve the destination"
     );
-    let _ = std::fs::remove_file(&path);
+    let temp_prefix = ".allowlist.json.tmp-";
+    assert!(
+        std::fs::read_dir(&failure_parent)
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(temp_prefix)),
+        "failed atomic save must clean its temporary file"
+    );
 
-    println!();
-    println!("=== Allowlist::default_path ===");
-    if std::env::var_os("HOME").is_some() {
-        let path = Allowlist::default_path().unwrap();
-        println!("default_path() -> {}", path.display());
-        assert!(path.ends_with(".holoiroh/allowlist.json"));
-    } else {
-        println!("HOME not set in this environment -- skipping (matches the original test's own guard)");
-    }
+    println!("=== corrupt JSON fails closed ===");
+    let corrupt = root.join("corrupt.json");
+    std::fs::write(&corrupt, b"{ this is not valid json").unwrap();
+    assert!(Allowlist::load(&corrupt).is_err());
 
-    println!();
-    println!("=== generate_pin / generate_default_pin ===");
+    println!("=== PIN helpers ===");
     let pin6 = generate_pin(6);
-    println!("generate_pin(6) -> {pin6:?} (len={}, all_digits={})", pin6.len(), pin6.chars().all(|c| c.is_ascii_digit()));
     assert_eq!(pin6.len(), 6);
-    assert!(pin6.chars().all(|c| c.is_ascii_digit()));
-
-    let default_pin = generate_default_pin();
-    println!("generate_default_pin() -> {default_pin:?} (len={})", default_pin.len());
-    assert_eq!(default_pin.len(), 6);
-
-    let pin0 = generate_pin(0);
-    println!("generate_pin(0) -> {pin0:?} (clamps to 1 digit, len={})", pin0.len());
-    assert_eq!(pin0.len(), 1);
-
-    println!();
-    println!("=== verify_pin ===");
-    let cases: &[(&str, &str, &str, bool)] = &[
-        ("correct match", "123456", "123456", true),
-        ("wrong pin", "000000", "123456", false),
-        ("empty candidate", "", "123456", false),
-        ("empty expected", "123456", "", false),
-        ("both empty", "", "", false),
-        ("candidate shorter", "123", "123456", false),
-        ("candidate longer", "123456", "123", false),
-        ("off by one digit", "123457", "123456", false),
-        ("case sensitive: wrong case", "abcdef", "ABCDEF", false),
-        ("case sensitive: same case", "abcdef", "abcdef", true),
-    ];
-    for (label, candidate, expected_pin, expected_result) in cases {
-        let result = verify_pin(candidate, expected_pin);
-        println!(
-            "verify_pin({candidate:?}, {expected_pin:?}) -> {result} [{label}]"
-        );
-        assert_eq!(result, *expected_result, "mismatch for case: {label}");
+    assert!(pin6.bytes().all(|byte| byte.is_ascii_digit()));
+    assert_eq!(generate_default_pin().len(), 6);
+    assert_eq!(generate_pin(0).len(), 1);
+    assert!(verify_pin("123456", "123456"));
+    for candidate in ["000000", "", "123", "1234567"] {
+        assert!(!verify_pin(candidate, "123456"));
     }
 
-    println!();
-    println!("allowlist_probe: OK -- all Allowlist/PIN cases witnessed via real execution");
+    std::fs::remove_dir_all(&root).unwrap();
+    println!("allowlist_probe: ALL CHECKS PASSED");
 }

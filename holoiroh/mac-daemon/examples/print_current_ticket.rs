@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use holoiroh_daemon::control_channel::{
-    write_line, ClientMessage, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+    CONTROL_ALPN, ClientMessage, ServerMessage, TaskEnvelope, write_line,
 };
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_live::ticket::LiveTicket;
@@ -28,20 +28,24 @@ const BROADCAST_NAME: &str = "holoiroh";
 fn derive_ticket() -> anyhow::Result<(LiveTicket, String)> {
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
     let path = format!("{home}/.holoiroh/iroh_secret");
-    let hex = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
+    let hex = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?;
     let secret: SecretKey = hex
         .trim()
         .parse()
         .map_err(|e| anyhow::anyhow!("parsing iroh_secret: {e}"))?;
     let endpoint_id = secret.public();
     let addr = EndpointAddr::from(endpoint_id);
-    Ok((LiveTicket::new(addr, BROADCAST_NAME), endpoint_id.to_string()))
+    Ok((
+        LiveTicket::new(addr, BROADCAST_NAME),
+        endpoint_id.to_string(),
+    ))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let pin = std::env::args().nth(1).unwrap_or_else(|| "394299".to_string());
+    let pin = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "394299".to_string());
 
     let (ticket, endpoint_id) = derive_ticket()?;
     let ticket_str = ticket.to_string();
@@ -49,8 +53,12 @@ async fn main() -> anyhow::Result<()> {
     println!("TICKET={ticket_str}");
 
     // Live witness: dial the derived ticket with a fresh client identity.
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut lines = BufReader::new(recv).lines();
     write_line(&mut send, &ClientMessage::Pin { pin }).await?;
@@ -63,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
             break;
         };
         if let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) {
-            if let ServerMessage::Status { text: Some(t) } = env.payload {
+            if let ServerMessage::Status { text: Some(t), .. } = env.payload {
                 println!("  <- status: {t}");
                 if t.contains("control channel ready") {
                     ready = true;

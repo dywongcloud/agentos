@@ -15,7 +15,7 @@ use std::env;
 use std::time::Duration;
 
 use holoiroh_daemon::control_channel::{
-    write_line, ClientMessage, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+    CONTROL_ALPN, ClientMessage, ServerMessage, TaskEnvelope, write_line,
 };
 use iroh::Endpoint;
 use iroh_live::ticket::LiveTicket;
@@ -35,8 +35,12 @@ async fn main() -> anyhow::Result<()> {
     let pin = args.next().expect("usage: stop_halt_probe <ticket> <pin>");
     let ticket: LiveTicket = ticket_str.parse()?;
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut lines = BufReader::new(recv).lines();
 
@@ -50,7 +54,8 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await
         {
             if let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) {
-                if matches!(&env.payload, ServerMessage::Status { text: Some(t) } if t.contains("control channel ready")) {
+                if matches!(&env.payload, ServerMessage::Status { text: Some(t), .. } if t.contains("control channel ready"))
+                {
                     session_id = Some(env.session_id);
                 }
             }
@@ -66,7 +71,9 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(task_id.clone()),
         seq,
-        ClientMessage::Prompt { text: LONG_TEXT_PROMPT.into() },
+        ClientMessage::Prompt {
+            text: LONG_TEXT_PROMPT.into(),
+        },
     );
     seq += 1;
     write_line(&mut send, &env).await?;
@@ -126,7 +133,9 @@ async fn main() -> anyhow::Result<()> {
         if now >= overall_deadline && terminal_at.is_none() {
             break;
         }
-        let remaining = overall_deadline.saturating_duration_since(now).max(Duration::from_millis(1));
+        let remaining = overall_deadline
+            .saturating_duration_since(now)
+            .max(Duration::from_millis(1));
         let Ok(Ok(Some(line))) = tokio::time::timeout(remaining, lines.next_line()).await else {
             break;
         };
@@ -137,12 +146,17 @@ async fn main() -> anyhow::Result<()> {
             ServerMessage::TaskProgress { .. } => {
                 if terminal_at.is_some() {
                     after_terminal += 1;
-                    println!("  [+{}ms] AFTER-TERMINAL task_progress #{after_terminal} (agent still running!)", stop_at.elapsed().as_millis());
+                    println!(
+                        "  [+{}ms] AFTER-TERMINAL task_progress #{after_terminal} (agent still running!)",
+                        stop_at.elapsed().as_millis()
+                    );
                 } else {
                     buffered_at_stop += 1;
                 }
             }
-            ServerMessage::TaskDone { status, .. } if status == "canceled" && terminal_at.is_none() => {
+            ServerMessage::TaskDone { status, .. }
+                if status == "canceled" && terminal_at.is_none() =>
+            {
                 terminal_at = Some(tokio::time::Instant::now());
                 terminal_ms = Some(stop_at.elapsed().as_millis());
                 println!("  [+{}ms] canceled terminal", stop_at.elapsed().as_millis());
@@ -155,15 +169,22 @@ async fn main() -> anyhow::Result<()> {
     println!("=== RESULT ===");
     println!("progress buffered at stop (pre-terminal, expected): {buffered_at_stop}");
     println!("progress AFTER the canceled terminal (the bug signal): {after_terminal}");
-    println!("canceled terminal seen: {} (at {terminal_ms:?}ms after stop)", terminal_at.is_some());
+    println!(
+        "canceled terminal seen: {} (at {terminal_ms:?}ms after stop)",
+        terminal_at.is_some()
+    );
     if terminal_at.is_none() {
         println!("VERDICT: BROKEN -- no canceled terminal within 15s of stop");
         std::process::exit(1);
     } else if after_terminal > 0 {
-        println!("VERDICT: BROKEN -- {after_terminal} progress events streamed AFTER the terminal; the agent kept running past the stop");
+        println!(
+            "VERDICT: BROKEN -- {after_terminal} progress events streamed AFTER the terminal; the agent kept running past the stop"
+        );
         std::process::exit(1);
     } else {
-        println!("VERDICT: OK -- stop halted the backend (0 progress after the canceled terminal; {buffered_at_stop} pre-terminal buffered events are in-flight SSE, not continuation)");
+        println!(
+            "VERDICT: OK -- stop halted the backend (0 progress after the canceled terminal; {buffered_at_stop} pre-terminal buffered events are in-flight SSE, not continuation)"
+        );
     }
     Ok(())
 }

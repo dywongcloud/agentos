@@ -19,7 +19,7 @@
 //! card probe -> slot swap) needs a live `holo serve`, which needs the installed holo CLI +
 //! its runtime -- exercised on the operator's real Mac, not headlessly here. This probe covers
 //! the guard-ordering LOGIC that made restart impossible, plus spawn's two headless-reachable
-//! failure paths (squatted port, missing binary) including that each failure releases the claim.
+//! failure paths (squatted port, missing launcher) including that neither failure leaks a claim.
 
 use holoiroh_daemon::holo_bridge::process::{GuardClaim, HoloServeProcess};
 
@@ -37,7 +37,9 @@ async fn main() {
         .expect("guard must be re-acquirable after the claim is dropped (released)");
     println!("  drop released the claim; re-acquire OK");
 
-    println!("\n=== (2) restart ordering: disarm-old THEN acquire-new; dropping disarmed old is a no-op ===");
+    println!(
+        "\n=== (2) restart ordering: disarm-old THEN acquire-new; dropping disarmed old is a no-op ==="
+    );
     // `reacquired` plays the dead old process's claim; simulate exactly what
     // `HoloBridge::restart_process` does now:
     drop(reacquired); // disarm_guard(): the old claim is dropped BEFORE the new spawn...
@@ -52,44 +54,60 @@ async fn main() {
     println!("  disarm->respawn ordering acquires OK; disarmed-old cannot clobber new claim OK");
     drop(new_claim);
 
-    println!("\n=== (3) spawn() failure path A: squatted port -> actionable preflight error, claim released ===");
-    // Squat an ephemeral port ourselves, then ask spawn to use it (bogus binary -- the preflight
-    // must fire BEFORE any binary lookup).
+    println!(
+        "\n=== (3) spawn() failure path A: squatted port -> parent bind error, no claim leak ==="
+    );
+    // The long-lived Rust listener is now the authoritative bind, before any child exists.
     let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
     let port = squatter.local_addr().expect("addr").port();
-    let err = match HoloServeProcess::spawn("holoiroh-nonexistent-binary-for-probe", port, None, None).await {
-        Ok(_) => panic!("spawn against a squatted port must fail"),
-        Err(err) => err,
-    };
+    let err =
+        match HoloServeProcess::spawn("holoiroh-nonexistent-binary-for-probe", port, None, None)
+            .await
+        {
+            Ok(_) => panic!("spawn against a squatted port must fail"),
+            Err(err) => err,
+        };
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("already in use") && msg.contains("lsof") && msg.contains(&port.to_string()),
-        "port-conflict error must be actionable (got: {msg})"
+        msg.contains("failed to bind Holo A2A listener")
+            && msg.contains("already in use")
+            && msg.contains(&port.to_string()),
+        "port-conflict error must name the parent bind and address (got: {msg})"
     );
-    println!("  squatted-port spawn failed with actionable message OK: {msg}");
+    println!("  squatted-port parent bind failed with named address OK: {msg}");
     assert!(
         GuardClaim::try_acquire().map(drop).is_some(),
         "failed spawn must have released its guard claim (early-return leak)"
     );
-    println!("  claim released after preflight failure OK");
+    println!("  no guard claim leaked after parent bind failure OK");
     drop(squatter);
 
-    println!("\n=== (4) spawn() failure path B: free port, missing binary -> spawn error, claim released ===");
+    println!(
+        "\n=== (4) spawn() failure path B: free port, missing launcher -> named error, no claim leak ==="
+    );
     let probe_port = {
         // Grab-then-release a free ephemeral port for the missing-binary case.
         let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
         l.local_addr().expect("addr").port()
     };
-    let err = match HoloServeProcess::spawn("holoiroh-nonexistent-binary-for-probe", probe_port, None, None).await {
+    let err = match HoloServeProcess::spawn(
+        "holoiroh-nonexistent-binary-for-probe",
+        probe_port,
+        None,
+        None,
+    )
+    .await
+    {
         Ok(_) => panic!("spawn with a nonexistent binary must fail"),
         Err(err) => err,
     };
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("failed to spawn") && msg.contains("holoiroh-nonexistent-binary-for-probe"),
-        "missing-binary error must name the binary (got: {msg})"
+        msg.contains("could not resolve Holo launcher")
+            && msg.contains("holoiroh-nonexistent-binary-for-probe"),
+        "missing-launcher error must name the launcher (got: {msg})"
     );
-    println!("  missing-binary spawn failed with named-binary error OK");
+    println!("  missing launcher failed with named-launcher error OK");
     assert!(
         GuardClaim::try_acquire().map(drop).is_some(),
         "failed spawn must have released its guard claim"
@@ -100,8 +118,8 @@ async fn main() {
         "\nserve_guard_probe: OK -- GuardClaim ownership (acquire/refuse/release/re-acquire), the \
          restart disarm-old-then-acquire-new ordering (the fix for the live 'failed to respawn \
          holo serve' loop), no-clobber by a disarmed object, and both headless spawn() failure \
-         paths (squatted port with actionable lsof hint; missing binary) each releasing the \
-         claim -- all witnessed against the real static + real spawn(). The full \
+         paths (squatted port rejected by the parent listener; missing launcher named) without a \
+         guard leak -- all witnessed against the real static + real spawn(). The full \
          dead-child->respawn->agent-card->swap path needs a live holo serve on a real Mac."
     );
 }

@@ -1,12 +1,9 @@
 import Foundation
 
-/// Swift mirror of the daemon's `TaskEnvelope<T>` (`control_channel.rs`), the
-/// wrapper every wire message -- both directions -- must carry once a
-/// `session_id` exists (i.e. everything except the pre-session PIN line).
-/// Field set and JSON key names match `control_channel.rs`'s `TaskEnvelope`
-/// exactly: an inbound line missing any non-optional field here is rejected
-/// by the daemon with "malformed envelope: missing field `<name>`" -- this
-/// struct's shape IS the fix for that failure mode, not a convenience.
+/// Encodes the unsigned envelope that Swift passes to the bridge.
+/// Swift supplies framing and typed payload fields, but no signature.
+/// The bridge validates the envelope and signs it with the endpoint identity.
+/// It serializes the signed envelope immediately before the control-channel write.
 private struct OutboundEnvelope: Encodable {
     let protocolVersion: UInt32
     let messageId: String
@@ -32,9 +29,8 @@ private struct OutboundEnvelope: Encodable {
         case signature
     }
 
-    /// Matches `TaskEnvelope::new`'s `protocol_version`/expiry -- see
-    /// `control_channel.rs`'s `PROTOCOL_VERSION` (1) and `DEFAULT_EXPIRY_MS`
-    /// (30_000) constants.
+    /// Uses protocol version 1 and a 30,000-millisecond expiry.
+    /// These values match `TaskEnvelope::new`.
     static let protocolVersion: UInt32 = 1
     static let defaultExpiryMs: UInt64 = 30_000
 
@@ -53,52 +49,30 @@ private struct OutboundEnvelope: Encodable {
     }
 }
 
-/// The seam through which the app sends a `ClientMessage` (`Models/ServerMessage.swift`)
-/// to the Mac daemon over the control channel.
+/// Sends `ClientMessage` values from the app to the daemon over the control channel.
+/// The user interface depends on this protocol instead of a concrete transport.
 ///
-/// This is the single injection point the UI talks to when it needs to *send*
-/// something -- most importantly the remote **kill-switch** `ClientMessage.stop`
-/// wired to the Working/Connecting "Cancel" control (see `MainView.sessionActions`).
-/// Keeping it a protocol means the view layer never references the transport
-/// directly: today it is handed the `LoggingControlChannelSender` stand-in, and
-/// the day the real `iroh` transport exists it is handed a different conforming
-/// type at exactly one place (`MainView`'s initializer default) with no change to
-/// any button, panel, or action closure.
+/// `FFIControlChannelSender` is the live implementation.
+/// It uses the bridge handle that the media subscription uses.
+/// After the handshake, `HoloConnection` injects the sender into `MainView.controlChannel`.
+/// The sender writes envelope-wrapped newline-delimited JavaScript Object Notation (NDJSON).
+/// It uses the bridge's serial foreign function interface (FFI) queue.
 ///
-/// ## The real transport
-///
-/// The real conforming type is `FFIControlChannelSender`
-/// (`HoloConnection.swift`): it holds the opaque bridge handle from
-/// ticket-connect (the same handle the live-video subscription uses) and
-/// writes each message's `encoded(_:)` NDJSON line to the daemon via
-/// `holoiroh_ios_bridge_control_send`, on the connection's serial FFI queue.
-/// It is injected at `MainView.controlChannel` the moment `HoloConnection`
-/// completes the control-ALPN PIN handshake.
-///
-/// `LoggingControlChannelSender` remains as the pre-connect / bridge-less
-/// fallback: it performs the *encode* half for real (so the wire bytes are
-/// exercised and witnessable) and reports the message to the status/log
-/// panel instead of putting it on a socket.
+/// `LoggingControlChannelSender` is the pre-connect and bridge-less fallback.
+/// It encodes the same envelope form and reports it instead of writing to a socket.
 protocol ControlChannelSending {
-    /// Send one `ClientMessage` to the daemon. Implementations must encode it as
-    /// the envelope-wrapped NDJSON wire form; see `ControlChannelSending.encoded(_:sessionState:)`.
+    /// Sends one `ClientMessage` as an envelope-wrapped NDJSON value.
     func send(_ message: ClientMessage)
 }
 
-/// Per-connection outbound envelope state: the `session_id` the daemon minted
-/// for this connection (learned from its envelope-wrapped greeting -- see
-/// `HoloConnection.decodeServerLine`/`sessionId(from:)`) plus a monotonically
-/// increasing `sequence_number`. Mirrors the daemon's own
-/// `OutboundEnvelopeState` (`control_channel.rs`) on the other side of the
-/// wire. A class (not a struct) so `FFIControlChannelSender` and any log
-/// mirror of it share one counter by reference.
+/// Tracks the outbound session identifier and sequence number for one connection.
+/// The daemon provides the session identifier in its verified greeting.
+/// Sequence numbers increase monotonically.
+/// A lock serializes access across user-interface and bridge queues.
+/// The class lets a sender and log mirror share state.
 final class OutboundEnvelopeState {
-    /// `nil` until the daemon's greeting is observed. A send attempted before
-    /// then has no valid envelope to build -- see `encoded(_:sessionState:)`.
-    /// Lock-protected: written from `HoloConnection.decodeServerLine` (on the
-    /// serial FFI queue) and read from `encoded(_:sessionState:)`, which can
-    /// run on whatever thread a UI action calls `send(_:)` from -- see
-    /// `FFIControlChannelSender.send`.
+    /// Remains `nil` until the app receives the daemon greeting.
+    /// The lock protects reads and writes across user-interface and bridge queues.
     private var _sessionId: String?
     private var nextSequenceNumber: UInt64 = 0
     private let lock = NSLock()
@@ -109,12 +83,18 @@ final class OutboundEnvelopeState {
 
     var sessionId: String? {
         get { lock.lock(); defer { lock.unlock() }; return _sessionId }
-        set { lock.lock(); defer { lock.unlock() }; _sessionId = newValue }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            if _sessionId != newValue {
+                nextSequenceNumber = 0
+            }
+            _sessionId = newValue
+        }
     }
 
-    /// Returns this send's sequence number and advances the counter.
-    /// Thread-safe: `FFIControlChannelSender.send` can be called from any
-    /// queue that then hops to the serial FFI queue.
+    /// Returns the current sequence number and increments the counter.
+    /// The method is thread-safe.
     func nextSequence() -> UInt64 {
         lock.lock()
         defer { lock.unlock() }
@@ -125,14 +105,10 @@ final class OutboundEnvelopeState {
 }
 
 extension ControlChannelSending {
-    /// The exact newline-delimited-JSON wire bytes for `message`, wrapped in
-    /// the `TaskEnvelope` shape the daemon's `control_channel.rs` requires
-    /// for every post-greeting inbound line (see `OutboundEnvelope`'s doc for
-    /// exactly why: omitting this wrapper is what produced "malformed
-    /// envelope: missing field `protocol_version`"). `sessionState.sessionId`
-    /// must already be populated from the daemon's greeting -- returns `nil`
-    /// (nothing to send) if it isn't, same as the pre-existing `JSONEncoder`
-    /// failure contract below.
+    /// Encodes the unsigned typed envelope that the bridge accepts.
+    /// The bridge rejects bare payloads and caller-supplied signatures.
+    /// It requires a verified session identifier and attaches the endpoint signature.
+    /// Returns `nil` before the greeting supplies a session or when JSON encoding fails.
     func encoded(_ message: ClientMessage, sessionState: OutboundEnvelopeState) -> String? {
         guard let sessionId = sessionState.sessionId else { return nil }
         let envelope = OutboundEnvelope(
@@ -153,25 +129,14 @@ extension ControlChannelSending {
     }
 }
 
-/// The default `ControlChannelSending` used until a real connection exists
-/// (or the bridge-less/simulator build): it performs the real JSON *encoding*
-/// of every `ClientMessage` (exercising the exact envelope-wrapped wire
-/// bytes) and forwards a human-readable line to a caller-supplied sink (the
-/// status/log panel) instead of writing to a socket.
-///
-/// This is deliberately not a no-op: encoding the kill-switch `ClientMessage.stop`
-/// on every Cancel press means the send path is demonstrably live and the wire
-/// contract is exercised today. It carries its own synthetic `OutboundEnvelopeState`
-/// (a fixed placeholder `session_id`, since no real daemon session exists here) so
-/// the encoded form matches exactly what `FFIControlChannelSender` will later send.
+/// Encodes messages before a real control-channel connection exists.
+/// It reports a human-readable status instead of writing to a socket.
+/// A synthetic session identifier makes the envelope shape match the live sender.
 struct LoggingControlChannelSender: ControlChannelSending {
-    /// Where a sent message is surfaced. `MainView` passes a closure that appends
-    /// a `ServerMessage`-shaped entry to its log panel, so a sent `.stop` shows up
-    /// in the same status list as everything else.
+    /// Receives each message and its encoded envelope for presentation.
     let report: (ClientMessage, _ wire: String) -> Void
 
-    /// Placeholder-session envelope state: this sender never reaches a real
-    /// daemon, so there is no real `session_id` to learn from a greeting.
+    /// Provides a synthetic session identifier because no daemon greeting exists.
     private let sessionState = OutboundEnvelopeState(sessionId: "logging-stand-in")
 
     func send(_ message: ClientMessage) {

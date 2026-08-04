@@ -1,20 +1,33 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
-/// Renders the state-specific panel for the current `SessionState`, hosted by
-/// `MainView` above the shared log panel + prompt bar.
+private extension Color {
+    static var sessionSecondaryBackground: Color {
+        #if canImport(UIKit)
+        Color(uiColor: .secondarySystemBackground)
+        #else
+        Color(nsColor: .controlBackgroundColor)
+        #endif
+    }
+
+    static var sessionTertiaryBackground: Color {
+        #if canImport(UIKit)
+        Color(uiColor: .tertiarySystemBackground)
+        #else
+        Color(nsColor: .underPageBackgroundColor)
+        #endif
+    }
+}
+
+/// Displays the panel for the current `SessionState`.
 ///
-/// Each of the eight PRD 6.1 states (`SessionState`) renders exactly its
-/// specified content and controls -- the `switch` in `body` is the single
-/// place that maps a state to its panel, and every branch surfaces the exact
-/// control set PRD 6.1's states table requires for that state. All the
-/// buttons route through the `SessionActions` closure bundle so this view
-/// stays a pure function of state + callbacks (the owner, `MainView`, decides
-/// what each action *does*, including the local demo transitions).
-///
-/// The live Remote View (`VideoRenderView`) is *not* rendered here -- it lives
-/// in `MainView` and is shown/hidden by `SessionState.showsRemoteView`, so a
-/// single video surface identity persists across state changes (Working and
-/// DraftReady both show it) rather than being torn down/rebuilt per panel.
+/// - Maps each Product Requirements Document (PRD) 6.1 state to its content and controls.
+/// - Routes each control through `SessionActions`.
+/// - Keeps the media stream in `MainView` across state changes.
 struct SessionView: View {
     let state: SessionState
     let macName: String
@@ -45,7 +58,7 @@ struct SessionView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(16)
-        .background(Color(.secondarySystemBackground))
+        .background(Color.sessionSecondaryBackground)
         .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
@@ -241,7 +254,7 @@ struct SessionView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(10)
-            .background(Color(.tertiarySystemBackground))
+            .background(Color.sessionTertiaryBackground)
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
             HStack(spacing: 12) {
@@ -281,8 +294,7 @@ struct SessionView: View {
 
     // MARK: - Shared building blocks
 
-    /// The state name + active inference mode header shown atop every non-
-    /// failure panel (Failed has its own warning-styled header).
+    /// Displays the state name and inference mode for each non-failure panel.
     private var stateHeader: some View {
         HStack {
             Text(state.displayName)
@@ -292,14 +304,13 @@ struct SessionView: View {
                 .font(.caption2.weight(.semibold))
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
-                .background(Color(.tertiarySystemBackground))
+                .background(Color.sessionTertiaryBackground)
                 .clipShape(Capsule())
                 .foregroundStyle(.secondary)
         }
     }
 
-    /// A labelled read-only field row (LABEL over value), the shared shape for
-    /// every PRD-specified content field across the panels.
+    /// Displays a read-only field with its label above its value.
     private func field(_ label: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label.uppercased())
@@ -313,11 +324,9 @@ struct SessionView: View {
     }
 }
 
-/// The full set of PRD 6.1 controls, as closures the owner (`MainView`)
-/// supplies. Bundling them in one struct keeps `SessionView`'s signature flat
-/// and makes the control surface explicit: every button in every panel routes
-/// through exactly one of these. `choose` carries the picked response option
-/// (the P0-14 "Choose" control); the rest are parameterless.
+/// Contains the control callbacks for all PRD 6.1 session panels.
+/// Each panel control calls one closure.
+/// `choose` passes the selected response option.
 struct SessionActions {
     var start: () -> Void = {}
     var edit: () -> Void = {}

@@ -692,6 +692,7 @@ fn translate_control_event(event: ControlEvent) -> Option<ExecutorEvent> {
         ControlEvent::DaemonStatus { .. }
         | ControlEvent::TaskActive { .. }
         | ControlEvent::InputRequested { .. }
+        | ControlEvent::ApprovalRequested { .. }
         | ControlEvent::ClarifyQuestions { .. }
         | ControlEvent::SecureInputState { .. }
         // Tinfoil document/image/audio/planner results: off the desktop-task pipeline, same

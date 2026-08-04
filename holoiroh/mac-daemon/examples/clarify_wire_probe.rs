@@ -15,8 +15,14 @@ fn main() {
     };
     let rj = serde_json::to_string(&request).expect("serialize request");
     println!("clarify_request -> {rj}");
-    assert!(rj.contains("\"type\":\"clarify_request\""), "wrong type tag: {rj}");
-    assert!(rj.contains("\"prompt\":\"send a message to the team\""), "prompt missing: {rj}");
+    assert!(
+        rj.contains("\"type\":\"clarify_request\""),
+        "wrong type tag: {rj}"
+    );
+    assert!(
+        rj.contains("\"prompt\":\"send a message to the team\""),
+        "prompt missing: {rj}"
+    );
     let back: ClientMessage = serde_json::from_str(&rj).expect("deserialize request");
     assert_eq!(back, request);
 
@@ -32,8 +38,14 @@ fn main() {
     ]);
     let qj = serde_json::to_string(&questions).expect("serialize questions");
     println!("clarify_questions -> {qj}");
-    assert!(qj.contains("\"type\":\"clarify_questions\""), "wrong type tag: {qj}");
-    assert!(qj.contains("\"question\":\"Which app?\"") && qj.contains("Slack"), "options missing: {qj}");
+    assert!(
+        qj.contains("\"type\":\"clarify_questions\""),
+        "wrong type tag: {qj}"
+    );
+    assert!(
+        qj.contains("\"question\":\"Which app?\"") && qj.contains("Slack"),
+        "options missing: {qj}"
+    );
     let back_q: ServerMessage = serde_json::from_str(&qj).expect("deserialize questions");
     assert_eq!(back_q, questions);
 
@@ -57,7 +69,10 @@ fn main() {
         let j = serde_json::to_string(&existing).expect("serialize existing");
         let round: ServerMessage = serde_json::from_str(&j).expect("deserialize existing");
         assert_eq!(round, existing);
-        assert!(!j.contains("clarify_questions"), "existing kind polluted: {j}");
+        assert!(
+            !j.contains("clarify_questions"),
+            "existing kind polluted: {j}"
+        );
     }
 
     println!(

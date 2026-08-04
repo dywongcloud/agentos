@@ -29,11 +29,11 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Instant;
 
-use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop};
+use objc2_core_foundation::{CFMachPort, CFRunLoop, kCFRunLoopCommonModes};
 use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType,
@@ -221,5 +221,8 @@ pub fn seconds_since_user_input() -> Option<f64> {
 fn forced_idle_override() -> Option<f64> {
     let path = std::env::var("HOLOIROH_AUTO_YIELD_FORCE_IDLE_FILE").ok()?;
     let raw = std::fs::read_to_string(path).ok()?;
-    raw.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
 }

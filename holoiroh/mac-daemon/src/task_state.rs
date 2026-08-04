@@ -248,15 +248,11 @@ pub fn is_valid_transition(from: TaskState, to: TaskState) -> bool {
             RemoteViewStarting | UserCancelled | PermissionDenied | AgentTimeout | Failed
         ),
 
-        RemoteViewStarting => matches!(
-            to,
-            RemoteViewActive | UserCancelled | AgentTimeout | Failed
-        ),
+        RemoteViewStarting => {
+            matches!(to, RemoteViewActive | UserCancelled | AgentTimeout | Failed)
+        }
 
-        RemoteViewActive => matches!(
-            to,
-            PolicyChecking | UserCancelled | AgentTimeout | Failed
-        ),
+        RemoteViewActive => matches!(to, PolicyChecking | UserCancelled | AgentTimeout | Failed),
 
         PolicyChecking => matches!(
             to,
@@ -276,12 +272,7 @@ pub fn is_valid_transition(from: TaskState, to: TaskState) -> bool {
 
         FindingTarget => matches!(
             to,
-            Navigating
-                | AmbiguousTarget
-                | TargetNotFound
-                | UserCancelled
-                | AgentTimeout
-                | Failed
+            Navigating | AmbiguousTarget | TargetNotFound | UserCancelled | AgentTimeout | Failed
         ),
 
         Navigating => matches!(to, TypingDraft | UserCancelled | AgentTimeout | Failed),
@@ -297,12 +288,12 @@ pub fn is_valid_transition(from: TaskState, to: TaskState) -> bool {
             DraftReady | Navigating | UserCancelled | AgentTimeout | Failed
         ),
 
-        DraftReady => matches!(to, AwaitingConfirmation | UserCancelled | AgentTimeout | Failed),
-
-        AwaitingConfirmation => matches!(
+        DraftReady => matches!(
             to,
-            Committing | UserCancelled | AgentTimeout | Failed
+            AwaitingConfirmation | UserCancelled | AgentTimeout | Failed
         ),
+
+        AwaitingConfirmation => matches!(to, Committing | UserCancelled | AgentTimeout | Failed),
 
         Committing => matches!(to, Completed | UserCancelled | AgentTimeout | Failed),
 
@@ -322,18 +313,11 @@ pub fn is_valid_transition(from: TaskState, to: TaskState) -> bool {
             Connecting | UserCancelled | PermissionDenied | AgentTimeout | Failed
         ),
 
-        NeedsConfirmation => matches!(
-            to,
-            PolicyChecking | UserCancelled | AgentTimeout | Failed
-        ),
+        NeedsConfirmation => matches!(to, PolicyChecking | UserCancelled | AgentTimeout | Failed),
 
         SensitiveAccessRequested => matches!(
             to,
-            PolicyChecking
-                | SensitiveAccessRejected
-                | UserCancelled
-                | AgentTimeout
-                | Failed
+            PolicyChecking | SensitiveAccessRejected | UserCancelled | AgentTimeout | Failed
         ),
 
         // --- Terminal alternatives (real in this alpha build): zero

@@ -128,9 +128,9 @@ async fn check_and_restart_if_needed(
             // and swallowed the actionable root cause beneath it.
             *last_attempt_at = Some(tokio::time::Instant::now());
             tracing::error!("holo_bridge::health: restart failed: {err:#}");
-            bridge
-                .control
-                .emit_daemon_status(format!("Holo bridge (holo serve) restart failed: {err:#}. Will retry."));
+            bridge.control.emit_daemon_status(format!(
+                "Holo bridge (holo serve) restart failed: {err:#}. Will retry."
+            ));
             // Deliberately does not propagate a fatal error or exit the loop -- the daemon
             // (and the iroh P2P session it owns, which this module cannot reach at all -- see
             // module doc) stays up even while holo serve is persistently broken. The next
@@ -138,4 +138,3 @@ async fn check_and_restart_if_needed(
         }
     }
 }
-

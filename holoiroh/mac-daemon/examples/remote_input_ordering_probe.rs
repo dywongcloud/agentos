@@ -69,7 +69,10 @@ fn ordered_variants() -> Vec<(&'static str, ControlMessage)> {
 fn spawnable_variants() -> Vec<(&'static str, ControlMessage)> {
     vec![
         ("take_control", remote(RemoteControlEvent::TakeControl)),
-        ("release_control", remote(RemoteControlEvent::ReleaseControl)),
+        (
+            "release_control",
+            remote(RemoteControlEvent::ReleaseControl),
+        ),
         (
             "prompt",
             ControlMessage::Prompt {
@@ -212,8 +215,7 @@ async fn main() {
     }
 
     assert_eq!(
-        under_load,
-        expected,
+        under_load, expected,
         "the drag lost its order while {CONCURRENT_SPAWNED_TASKS} spawned tasks competed for the \
          same runtime -- which is the only condition that matters, since the read loop always \
          runs both kinds of work together"

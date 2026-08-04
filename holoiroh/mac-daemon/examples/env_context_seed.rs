@@ -35,10 +35,16 @@ async fn main() -> Result<()> {
     ];
 
     for (key, text) in facts {
-        store.remember(key, text).await.with_context(|| format!("remembering {key}"))?;
+        store
+            .remember(key, text)
+            .await
+            .with_context(|| format!("remembering {key}"))?;
         println!("remembered: {key}");
     }
 
-    println!("seeded {} fact(s) into the real ~/.holoiroh/context store", facts.len());
+    println!(
+        "seeded {} fact(s) into the real ~/.holoiroh/context store",
+        facts.len()
+    );
     Ok(())
 }

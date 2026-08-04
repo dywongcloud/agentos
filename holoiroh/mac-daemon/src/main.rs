@@ -16,17 +16,21 @@
 //! ScreenCaptureKit, `--display <index>` selectable) as the broadcast's video source before
 //! publish. System/mic audio capture is not wired up yet.
 
+mod accessibility_tree;
+mod action_executor;
 mod agent_guidance;
+mod agent_loop;
 mod allowlist;
+mod approval;
 mod audit_log;
-mod auto_yield;
-mod clarify;
-mod remote_input;
-mod user_activity;
 mod auth;
+mod auto_yield;
 mod capture;
+mod clarify;
 mod control_channel;
 mod duration;
+mod remote_input;
+mod user_activity;
 // NOTE: `executor` (the ComputerUseExecutor abstraction seam, PRD 7.3) is deliberately declared
 // only in `lib.rs`, not here. It is an available seam consumed by `examples/executor_probe.rs`
 // via the `holoiroh_daemon` lib crate; wiring the live daemon's control path to route through it
@@ -34,29 +38,33 @@ mod duration;
 // is intentionally out of this pass's scope. Declaring `mod executor;` in the binary target too
 // would compile the whole seam as dead code here (25 warnings), since nothing in `main.rs`
 // references it yet -- so it lives in the lib target only until that wiring lands.
+mod env_context;
+mod execution_mode;
 mod frontmost_app;
 mod holo_bridge;
 mod instance_guard;
 mod limits;
+mod local_llama_proxy;
 mod local_model;
-mod router;
-mod env_context;
-mod task_fsm;
-mod tinfoil_proxy;
-mod privacy;
-mod tinfoil_models;
-mod tinfoil_documents;
-mod tinfoil_vision;
-mod tinfoil_audio;
-mod tinfoil_planner;
-mod tmux;
 mod pairing_phrase;
 mod permissions;
 mod policy;
+mod privacy;
 mod process_awareness;
 mod registry;
+mod router;
 mod sensitive_categories;
+mod semantic_ax;
+mod task_fsm;
 mod task_state;
+mod tinfoil_audio;
+mod tinfoil_client;
+mod tinfoil_documents;
+mod tinfoil_models;
+mod tinfoil_planner;
+mod tinfoil_proxy;
+mod tinfoil_vision;
+mod tmux;
 
 use std::sync::Arc;
 
@@ -81,6 +89,7 @@ use holo_bridge::HoloBridge;
 /// broadcasts). A single well-known name is sufficient for one daemon
 /// publishing one stream today.
 const BROADCAST_NAME: &str = "holoiroh";
+const TINFOIL_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// CLI arguments for `holoiroh-daemon`.
 #[derive(Parser, Debug)]
@@ -92,6 +101,10 @@ struct Cli {
     /// use the primary display.
     #[arg(long)]
     display: Option<usize>,
+
+    /// Selects whether autonomous Holo prompts are admitted.
+    #[arg(long, value_enum, default_value_t)]
+    execution_mode: execution_mode::ExecutionMode,
 
     /// Disable the first-connection PIN gate (see `allowlist.rs` and
     /// `holoiroh/PAIRING.md`'s "Auth beyond ticket possession" section). Every connection is
@@ -319,8 +332,7 @@ fn persistent_secret_key() -> anyhow::Result<iroh::SecretKey> {
         .map(std::path::PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("HOME not set; cannot locate ~/.holoiroh/iroh_secret"))?;
     let dir = home.join(".holoiroh");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join("iroh_secret");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let trimmed = existing.trim();
@@ -464,7 +476,13 @@ async fn main() -> anyhow::Result<()> {
     // Refuse to start the broadcast with a black/frozen stream or a
     // daemon that can't actually drive the Mac -- report every missing
     // permission at once and exit before any capture/publish work. ---
-    let preflight = permissions::preflight();
+    let mut preflight = permissions::preflight();
+    if std::env::var("HOLOIROH_INPUT_DRY_RUN").as_deref() == Ok("1") {
+        preflight
+            .missing
+            .retain(|permission| *permission != permissions::MissingPermission::Accessibility);
+        info!("remote input dry-run enabled -- Accessibility grant is not required");
+    }
     if !preflight.is_ok() {
         preflight.report();
         anyhow::bail!(
@@ -529,6 +547,7 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to configure IPv4-only iroh transport")?;
     }
     let endpoint = endpoint_builder.bind().await?;
+    let control_signing_key = Arc::new(endpoint.secret_key().clone());
     let live = Live::builder(endpoint).spawn();
     info!(id = %live.endpoint().id(), "endpoint ready");
 
@@ -559,10 +578,12 @@ async fn main() -> anyhow::Result<()> {
             // best-effort, never load-bearing" daemon, so a temp-dir fallback location is an
             // acceptable degradation, not a silent data-integrity issue.
             let fallback = std::env::temp_dir().join("holoiroh-audit-fallback.log");
-            Arc::new(
-                audit_log::AuditLogger::new(&fallback)
-                    .unwrap_or_else(|_| panic!("audit log fallback path {} must be constructible", fallback.display())),
-            )
+            Arc::new(audit_log::AuditLogger::new(&fallback).unwrap_or_else(|_| {
+                panic!(
+                    "audit log fallback path {} must be constructible",
+                    fallback.display()
+                )
+            }))
         }
     };
 
@@ -583,7 +604,7 @@ async fn main() -> anyhow::Result<()> {
     // channel then surfaces "inference unavailable" rather than the process
     // dying. The local server, when it comes up, is held for the daemon's
     // lifetime and shut down in the cleanup sequence below. ---
-    let local_model_server = if local_model_enabled() {
+    let (local_model_server, local_llama_proxy) = if local_model_enabled() {
         let config = local_model::LocalModelConfig::from_env();
         if config.port == holo_serve_port() {
             warn!(
@@ -592,36 +613,46 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         info!(
-            base_url = %config.base_url(),
+            upstream_base_url = %config.base_url(),
             model = %config.model_hf_repo,
+            max_tokens = config.max_tokens,
             "starting local llama-server (Aro Private mode; loading the model can take minutes)"
         );
         match local_model::LocalModelServer::spawn(config).await {
             Ok(server) => {
-                info!(pid = ?server.pid(), base_url = %server.base_url(), "local llama-server ready");
-                Some(server)
+                info!(pid = ?server.pid(), upstream_base_url = %server.base_url(), "local llama-server ready");
+                match local_llama_proxy::LocalLlamaProxy::spawn_for_config(server.config()).await {
+                    Ok(proxy) => {
+                        info!(proxy_base_url = %proxy.base_url(), "local llama proxy ready");
+                        (Some(server), Some(proxy))
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "local llama proxy failed to start -- disabling the local inference backend");
+                        if let Err(shutdown_err) = server.shutdown().await {
+                            warn!(error = %shutdown_err, "local llama-server cleanup after proxy failure failed");
+                        }
+                        (None, None)
+                    }
+                }
             }
             Err(err) => {
                 warn!(error = %err, "local llama-server failed to start -- holo serve will have no local inference backend");
-                None
+                (None, None)
             }
         }
     } else {
-        info!("HOLOIROH_LOCAL_MODEL disabled -- not starting a local llama-server; holo serve uses its configured backend");
-        None
+        info!(
+            "HOLOIROH_LOCAL_MODEL disabled -- not starting a local llama-server; holo serve uses its configured backend"
+        );
+        (None, None)
     };
-    // The PRIMARY inference backend to hand `holo serve`: the local server's
-    // when it came up, else `None` (holo serve keeps its own configured hosted
-    // backend, which in a correctly-configured local-only alpha means it will
-    // fail to reach a model and the control channel reports that, rather than
-    // silently reaching a cloud endpoint).
-    let primary_target = local_model_server.as_ref().map(|s| holo_bridge::InferenceTarget {
-        base_url: s.base_url(),
-        // llama-server serves whatever model it loaded regardless of the
-        // requested name; no override needed.
-        model: None,
-        label: "local llama-server".to_string(),
-    });
+    let primary_target = local_llama_proxy
+        .as_ref()
+        .map(|proxy| holo_bridge::InferenceTarget {
+            base_url: proxy.base_url(),
+            model: None,
+            label: "local llama-server via constrained loopback proxy".to_string(),
+        });
 
     // --- rate-limit FALLBACK backend (tinfoil kimi-k2-6, a vision model, via
     // a loopback auth-injecting proxy -- see tinfoil_proxy.rs for why a proxy
@@ -636,18 +667,34 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty());
-    // Clarifying-questions inference reuses the same Tinfoil key as a SEPARATE
-    // direct call (independent of the holo-serve rate-limit fallback proxy
-    // below -- so clarification works even in local-model mode). `None` when no
-    // key is set, which disables clarification (the control channel then replies
-    // to a ClarifyRequest with an empty question set).
-    let clarify_config = tinfoil_key.clone().map(clarify::ClarifyConfig::new);
-    // Shared by the document/image/audio/planner control-channel handlers (tinfoil_documents,
-    // tinfoil_vision, tinfoil_audio, tinfoil_planner) -- cloned here, before `tinfoil_key` is
-    // moved into the tinfoil_proxy fallback branch below, so it survives to the ControlChannel
-    // construction further down regardless of which branch that `if`/`else` takes.
-    let tinfoil_key_for_control_channel: Option<Arc<str>> =
-        tinfoil_key.clone().map(|k| Arc::from(k.as_str()));
+    let tinfoil_client = match tinfoil_key {
+        Some(key) => match tokio::time::timeout(
+            TINFOIL_INIT_TIMEOUT,
+            tinfoil_client::TinfoilClient::new(key),
+        )
+        .await
+        {
+            Ok(Ok(client)) => {
+                let client = Arc::new(client);
+                info!(host = %client.base_url(), "Tinfoil enclave attestation verified");
+                Some(client)
+            }
+            Ok(Err(err)) => {
+                warn!(error = %format!("{err:#}"), "Tinfoil attestation failed; all Tinfoil egress disabled and daemon startup continues");
+                None
+            }
+            Err(_) => {
+                warn!(
+                    timeout_seconds = TINFOIL_INIT_TIMEOUT.as_secs(),
+                    "Tinfoil initialization timed out; all Tinfoil egress disabled and daemon startup continues"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let clarify_config = tinfoil_client.clone().map(clarify::ClarifyConfig::new);
+    let tinfoil_client_for_control_channel = tinfoil_client.clone();
     match &clarify_config {
         Some(cfg) => info!(model = %cfg.model(), "clarifying-questions inference enabled"),
         None => info!("clarifying-questions inference disabled (no TINFOIL_API_KEY)"),
@@ -660,7 +707,9 @@ async fn main() -> anyhow::Result<()> {
             ?state,
             "shared terminal session ready for agent CLI work"
         ),
-        Err(err) => warn!(error = %err, "ensuring the shared tmux session panicked; terminal guidance falls back to plain-terminal wording"),
+        Err(err) => {
+            warn!(error = %err, "ensuring the shared tmux session panicked; terminal guidance falls back to plain-terminal wording")
+        }
     }
     // Underscore-named (not bare `_`): the binding must LIVE until main
     // returns -- dropping it aborts the proxy task and every fallback
@@ -668,18 +717,14 @@ async fn main() -> anyhow::Result<()> {
     let (_tinfoil_proxy_handle, fallback_target) = if local_model_server.is_some() {
         info!("local (no-cloud) mode active -- tinfoil rate-limit fallback disabled by design");
         (None, None)
-    } else if let Some(key) = tinfoil_key {
-        let upstream = std::env::var("HOLOIROH_FALLBACK_UPSTREAM")
-            .ok()
-            .map(|s| s.trim().trim_end_matches('/').to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| tinfoil_proxy::DEFAULT_UPSTREAM.to_string());
+    } else if let Some(client) = tinfoil_client.clone() {
+        let upstream = client.base_url();
         let model = std::env::var("HOLOIROH_FALLBACK_MODEL")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "kimi-k2-6".to_string());
-        match tinfoil_proxy::TinfoilProxy::spawn(&upstream, key).await {
+        match tinfoil_proxy::TinfoilProxy::spawn(client).await {
             Ok(proxy) => {
                 let target = holo_bridge::InferenceTarget {
                     // OpenAI-compatible routes live under /v1 upstream; the proxy
@@ -760,10 +805,12 @@ async fn main() -> anyhow::Result<()> {
             // field (an OS security boundary, not a bug) rather than leaving it unexplained.
             // See `holo_bridge::secure_input_watchdog`'s module doc. Same shared shutdown token
             // as the other daemon-lifetime background supervisors above.
-            tokio::spawn(holo_bridge::secure_input_watchdog::run_secure_input_watchdog_loop(
-                bridge.clone(),
-                health_check_shutdown.clone(),
-            ));
+            tokio::spawn(
+                holo_bridge::secure_input_watchdog::run_secure_input_watchdog_loop(
+                    bridge.clone(),
+                    health_check_shutdown.clone(),
+                ),
+            );
             // Cooperative auto-yield: step the agent aside while the user is
             // actively using the Mac, resume when they go idle (see
             // `crate::auto_yield`). Starts its own physical-input CGEventTap;
@@ -823,25 +870,39 @@ async fn main() -> anyhow::Result<()> {
             .to_string()
             .as_str(),
     );
+    let executor_approval_store =
+        Arc::new(std::sync::Mutex::new(approval::ApprovalStore::default()));
+    let typed_action_executor = Arc::new(std::sync::Mutex::new(
+        action_executor::DaemonActionExecutor::new(
+            executor_approval_store.clone(),
+            approval::DEFAULT_APPROVAL_CAPACITY,
+        )
+        .with_audit(audit_logger.clone()),
+    ));
     let router_builder = match bridge.clone() {
         Some(bridge) => {
             let control = match pin.clone() {
                 Some(pin) => ControlChannel::with_auth(
                     bridge,
+                    cli.execution_mode,
+                    control_signing_key.clone(),
                     pin,
                     audit_logger.clone(),
                     daemon_control_ticket.clone(),
                     clarify_config.clone(),
-                    tinfoil_key_for_control_channel.clone(),
+                    tinfoil_client_for_control_channel.clone(),
                 ),
                 None => ControlChannel::new(
                     bridge,
+                    cli.execution_mode,
+                    control_signing_key.clone(),
                     audit_logger.clone(),
                     daemon_control_ticket.clone(),
                     clarify_config.clone(),
-                    tinfoil_key_for_control_channel.clone(),
+                    tinfoil_client_for_control_channel.clone(),
                 ),
-            };
+            }
+            .with_action_executor(typed_action_executor.clone());
             control.register_protocols(router_builder)
         }
         None => {
@@ -890,12 +951,7 @@ async fn main() -> anyhow::Result<()> {
         "selected H.264 video encoder for the iroh/MoQ broadcast (OQ-5: H.264-over-iroh)"
     );
     let broadcast = LocalBroadcast::new();
-    capture::setup_screen_video(
-        &broadcast,
-        cli.display,
-        video_codec,
-        &[VideoPreset::P720],
-    )?;
+    capture::setup_screen_video(&broadcast, cli.display, video_codec, &[VideoPreset::P720])?;
 
     // --- publish, then present the shareable ticket as a scannable QR code
     // AND its raw text (per PAIRING.md's "QR + short-phrase pairing" design).
@@ -1010,6 +1066,12 @@ async fn main() -> anyhow::Result<()> {
                     "holo_bridge still has other Arc references at shutdown; falling back to Drop-based cleanup instead of graceful shutdown()"
                 );
             }
+        }
+    }
+    if let Some(proxy) = local_llama_proxy {
+        info!(proxy_base_url = %proxy.base_url(), "shutting down local llama proxy");
+        if let Err(err) = proxy.shutdown().await {
+            warn!(error = %err, "local llama proxy shutdown error");
         }
     }
     // Stop the local `llama-server` AFTER `holo serve` (which was pointed at it): the inference

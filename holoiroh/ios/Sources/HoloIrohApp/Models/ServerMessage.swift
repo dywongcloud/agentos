@@ -1,9 +1,10 @@
 import Foundation
+#if canImport(HoloIrohMicrophoneCapture)
+import HoloIrohMicrophoneCapture
+#endif
 
-/// One clarifying question the daemon generated for an ambiguous instruction
-/// (see `ServerMessage.clarifyQuestions`). `options` are concrete suggested
-/// answers; the UI renders them as single-select choices and appends its own
-/// "Something else…" free-text entry as the final option.
+/// Contains one daemon-generated clarifying question and its suggested answers.
+/// The app adds a free-text choice after these options.
 struct ClarifyingQuestion: Codable, Equatable, Identifiable {
     let question: String
     let options: [String]
@@ -11,56 +12,340 @@ struct ClarifyingQuestion: Codable, Equatable, Identifiable {
     var id: String { question }
 }
 
-/// Swift mirror of `PROTOCOL.md`'s `ServerMessage` (Mac daemon -> iOS),
-/// a tagged, internally-tagged enum keyed on `type`.
-///
-/// Wire examples (see ../../../PROTOCOL.md):
-/// ```json
-/// { "type": "ack" }
-/// { "type": "status", "text": "connected to holo-desktop-cli" }
-/// { "type": "task_progress", "text": "clicked Safari icon in the Dock" }
-/// { "type": "task_done", "status": "completed", "text": "answer text" }
-/// { "type": "error", "text": "holo-desktop-cli exited unexpectedly (code 1)" }
-/// { "type": "auth_rejected", "text": "incorrect PIN" }
-/// { "type": "input_request", "request_id": "…", "kind": "sensitive_access_consent",
-///   "context": "…", "response_options": ["Allow once", "Stop task"], "expires_at": 0 }
-/// ```
-///
-/// Every daemon frame kind must decode here: `HoloConnection.decodeServerLine`
-/// falls back to an "unrecognized control event" status line for anything this
-/// enum can't decode, which is exactly how `auth_rejected` and `input_request`
-/// frames used to silently degrade before these cases were added.
+enum ApprovalRisk: String, Codable, Equatable {
+    case low
+    case medium
+    case high
+    case critical
+}
+
+struct ApprovalEffect: Codable, Equatable {
+    let app: String
+    let target: String
+    let material: String
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        app = try container.decode(String.self, forKey: .app)
+        target = try container.decode(String.self, forKey: .target)
+        material = try container.decode(String.self, forKey: .material)
+        guard Self.isValidField(app, maximumBytes: 128),
+              Self.isValidField(target, maximumBytes: 512),
+              Self.isValidField(material, maximumBytes: 1_024)
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .app,
+                in: container,
+                debugDescription: "approval effect fields are empty or exceed their byte limits"
+            )
+        }
+    }
+
+    private static func isValidField(_ value: String, maximumBytes: Int) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && value.utf8.count <= maximumBytes
+            && !value.unicodeScalars.contains(where: { $0.value < 0x20 && $0 != "\n" && $0 != "\t" })
+    }
+}
+
+struct ApprovalRequest: Codable, Equatable, Identifiable {
+    let approvalId: String
+    let actionId: String
+    let proposalDigest: String
+    let runId: String
+    let taskId: String
+    let risk: ApprovalRisk
+    let effect: ApprovalEffect
+    let beforeStateDigest: String
+    let expiresAt: UInt64
+
+    var id: String { approvalId }
+
+    private enum CodingKeys: String, CodingKey {
+        case approvalId = "approval_id"
+        case actionId = "action_id"
+        case proposalDigest = "proposal_digest"
+        case runId = "run_id"
+        case taskId = "task_id"
+        case risk
+        case effect
+        case beforeStateDigest = "before_state_digest"
+        case expiresAt = "expires_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        approvalId = try container.decode(String.self, forKey: .approvalId)
+        actionId = try container.decode(String.self, forKey: .actionId)
+        proposalDigest = try container.decode(String.self, forKey: .proposalDigest)
+        runId = try container.decode(String.self, forKey: .runId)
+        taskId = try container.decode(String.self, forKey: .taskId)
+        risk = try container.decode(ApprovalRisk.self, forKey: .risk)
+        effect = try container.decode(ApprovalEffect.self, forKey: .effect)
+        beforeStateDigest = try container.decode(String.self, forKey: .beforeStateDigest)
+        expiresAt = try container.decode(UInt64.self, forKey: .expiresAt)
+        let identifiers = [approvalId, actionId, runId, taskId]
+        guard identifiers.allSatisfy({ Self.isBoundedIdentifier($0) }),
+              Self.isLowercaseSHA256(proposalDigest),
+              Self.isLowercaseSHA256(beforeStateDigest),
+              expiresAt > UInt64(Date().timeIntervalSince1970 * 1_000)
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .approvalId,
+                in: container,
+                debugDescription: "approval bindings, digests, or expiry are invalid"
+            )
+        }
+    }
+
+    private static func isBoundedIdentifier(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 128
+            && value.unicodeScalars.allSatisfy { $0.value >= 0x21 && $0.value <= 0x7e }
+    }
+
+    private static func isLowercaseSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64
+            && value.utf8.allSatisfy { ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102) }
+    }
+}
+
+struct TinfoilMeasurement: Codable, Equatable {
+    let type: String
+    let registers: [String]
+}
+
+struct TinfoilGroundTruth: Codable, Equatable {
+    let digest: String
+    let tlsPublicKey: String?
+    let hpkePublicKey: String?
+    let codeMeasurement: TinfoilMeasurement
+    let enclaveMeasurement: TinfoilMeasurement
+    let codeFingerprint: String
+    let enclaveFingerprint: String
+
+    private enum CodingKeys: String, CodingKey {
+        case digest
+        case tlsPublicKey = "tls_public_key"
+        case hpkePublicKey = "hpke_public_key"
+        case codeMeasurement = "code_measurement"
+        case enclaveMeasurement = "enclave_measurement"
+        case codeFingerprint = "code_fingerprint"
+        case enclaveFingerprint = "enclave_fingerprint"
+    }
+}
+
+struct TinfoilVerification: Codable, Equatable {
+    let host: String
+    let groundTruth: TinfoilGroundTruth
+}
+
+struct TypedPrompt: Codable, Equatable {
+    let goalId: String
+    let instruction: String
+
+    private enum CodingKeys: String, CodingKey {
+        case goalId = "goal_id"
+        case instruction
+    }
+}
+
+struct TypedPlan: Codable, Equatable {
+    let planId: String
+    let goalDigest: String
+    let steps: [PlannedStep]
+
+    private enum CodingKeys: String, CodingKey {
+        case planId = "plan_id"
+        case goalDigest = "goal_digest"
+        case steps
+    }
+}
+
+struct TypedActionProposal: Codable, Equatable {
+    let goalId: String
+    let intentDigest: String
+    let runId: String
+    let taskId: String
+    let actionId: String
+    let observation: TypedObservation
+    let target: TypedTarget
+    let action: TypedDesktopAction
+    let proposalDigest: String
+
+    private enum CodingKeys: String, CodingKey {
+        case goalId = "goal_id"
+        case intentDigest = "intent_digest"
+        case runId = "run_id"
+        case taskId = "task_id"
+        case actionId = "action_id"
+        case observation, target, action
+        case proposalDigest = "proposal_digest"
+    }
+}
+
+struct TypedObservation: Codable, Equatable {
+    let observationId: String
+    let beforeStateDigest: String
+    private enum CodingKeys: String, CodingKey {
+        case observationId = "observation_id"
+        case beforeStateDigest = "before_state_digest"
+    }
+}
+
+struct TypedTarget: Codable, Equatable {
+    let bundleId: String
+    let windowId: String
+    let elementId: String
+    let expectedRole: String
+    let expectedTitleDigest: String
+    let expectedValueDigest: String?
+    let sensitive: Bool
+    let credential: Bool
+    let resolved: Bool
+    private enum CodingKeys: String, CodingKey {
+        case bundleId = "bundle_id"
+        case windowId = "window_id"
+        case elementId = "element_id"
+        case expectedRole = "expected_role"
+        case expectedTitleDigest = "expected_title_digest"
+        case expectedValueDigest = "expected_value_digest"
+        case sensitive, credential, resolved
+    }
+}
+
+enum TypedDesktopAction: Codable, Equatable {
+    case observe
+    case navigate(TypedNavigationAction)
+    case focus
+    case draftText(String)
+    case commit(TypedCommitAction)
+
+    private enum CodingKeys: String, CodingKey { case type, navigation, text, commit }
+    private enum Kind: String, Codable { case observe, navigate, focus, draftText = "draft_text", commit }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .type) {
+        case .observe: self = .observe
+        case .navigate: self = .navigate(try container.decode(TypedNavigationAction.self, forKey: .navigation))
+        case .focus: self = .focus
+        case .draftText: self = .draftText(try container.decode(String.self, forKey: .text))
+        case .commit: self = .commit(try container.decode(TypedCommitAction.self, forKey: .commit))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .observe: try container.encode(Kind.observe, forKey: .type)
+        case .navigate(let navigation):
+            try container.encode(Kind.navigate, forKey: .type)
+            try container.encode(navigation, forKey: .navigation)
+        case .focus: try container.encode(Kind.focus, forKey: .type)
+        case .draftText(let text):
+            try container.encode(Kind.draftText, forKey: .type)
+            try container.encode(text, forKey: .text)
+        case .commit(let commit):
+            try container.encode(Kind.commit, forKey: .type)
+            try container.encode(commit, forKey: .commit)
+        }
+    }
+}
+
+enum TypedNavigationAction: Codable, Equatable {
+    case semanticActivate
+    case coordinateActivate(x: Int32, y: Int32)
+    case scroll(horizontal: Int32, vertical: Int32)
+
+    private enum CodingKeys: String, CodingKey { case type, x, y, horizontal, vertical }
+    private enum Kind: String, Codable { case semanticActivate = "semantic_activate", coordinateActivate = "coordinate_activate", scroll }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .type) {
+        case .semanticActivate: self = .semanticActivate
+        case .coordinateActivate: self = .coordinateActivate(x: try container.decode(Int32.self, forKey: .x), y: try container.decode(Int32.self, forKey: .y))
+        case .scroll: self = .scroll(horizontal: try container.decode(Int32.self, forKey: .horizontal), vertical: try container.decode(Int32.self, forKey: .vertical))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .semanticActivate: try container.encode(Kind.semanticActivate, forKey: .type)
+        case .coordinateActivate(let x, let y):
+            try container.encode(Kind.coordinateActivate, forKey: .type); try container.encode(x, forKey: .x); try container.encode(y, forKey: .y)
+        case .scroll(let horizontal, let vertical):
+            try container.encode(Kind.scroll, forKey: .type); try container.encode(horizontal, forKey: .horizontal); try container.encode(vertical, forKey: .vertical)
+        }
+    }
+}
+
+enum TypedCommitAction: String, Codable, Equatable {
+    case sendMessage = "send_message", submitForm = "submit_form", publish, purchase, transferFunds = "transfer_funds", deleteItem = "delete_item"
+}
+
+enum PlannedStep: Codable, Equatable {
+    case action(TypedActionProposal)
+    case complete
+    private enum CodingKeys: String, CodingKey { case kind, proposal }
+    private enum Kind: String, Codable { case action, complete }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .action: self = .action(try container.decode(TypedActionProposal.self, forKey: .proposal))
+        case .complete: self = .complete
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .action(let proposal): try container.encode(Kind.action, forKey: .kind); try container.encode(proposal, forKey: .proposal)
+        case .complete: try container.encode(Kind.complete, forKey: .kind)
+        }
+    }
+}
+
+enum PlannerRunStatus: String, Codable, Equatable { case planning, ready, executing, completed, failed, canceled }
+
+struct PlannerReceipt: Codable, Equatable {
+    let planId: String
+    let goalDigest: String
+    let actionId: String
+    let proposalDigest: String
+    let status: PlannerRunStatus
+    private enum CodingKeys: String, CodingKey {
+        case planId = "plan_id", goalDigest = "goal_digest", actionId = "action_id", proposalDigest = "proposal_digest", status
+    }
+}
+
+/// Mirrors daemon-to-app messages from `PROTOCOL.md`.
+/// The `type` field selects each wire case.
+/// Decoding fails when the wire type is unknown or required data is absent.
 enum ServerMessage: Codable, Equatable {
     case ack(text: String?)
-    case status(text: String?)
+    case status(text: String?, executionMode: String?, capabilities: [String]?)
     case error(text: String?)
     case taskProgress(text: String?)
-    /// Terminal lifecycle for one task: `status` is `"completed"`,
-    /// `"failed"`, or `"canceled"` (the daemon's `DoneStatus` snake_case).
-    /// This is the signal the task-control UI keys off to know a task ended.
+    /// Reports a terminal task result.
+    /// `status` contains the daemon's snake-case completion status.
     case taskDone(status: String, text: String?)
-    /// Sent right after the greeting on a (re)connect when a task from before
-    /// the connection drop is still live, so the app can restore its Pause/Stop
-    /// task-control pill (in the paused state when `paused`). `queued` is how
-    /// many prompts wait behind it. See PROTOCOL.md `task_active`.
+    /// Reports a task that remained active across reconnection.
+    /// `paused` identifies a parked task.
+    /// `queued` counts waiting prompts.
     case taskActive(paused: Bool, queued: Int)
-    /// The daemon rejected this connection's auth (unknown device / wrong
-    /// PIN) and is about to close it.
+    /// Reports authentication rejection before the daemon closes the connection.
     case authRejected(text: String?)
-    /// The daemon's own current `iroh-live:` ticket, sent right after the
-    /// greeting. Lets the app refresh a stored default whose ticket went stale
-    /// on an identity rotation, over the already-authenticated channel.
+    /// Carries the daemon's current ticket after authentication.
+    /// The app uses it to refresh a stale saved ticket.
     case currentTicket(ticket: String)
-    /// Clarifying questions the daemon generated for a `ClientMessage.clarifyRequest`
-    /// -- EMPTY when the instruction was already clear (the app then sends the
-    /// prompt directly). Each question carries concrete options; the UI appends
-    /// its own "Something else…" free-text option.
+    case tinfoilVerification(TinfoilVerification)
+    /// Carries questions generated for `ClientMessage.clarifyRequest`.
+    /// An empty list means the original instruction needs no clarification.
     case clarifyQuestions(questions: [ClarifyingQuestion])
-    /// The P0-14 structured input request -- today produced by the daemon's
-    /// sensitive-app consent gate. `kind` is the wire snake_case kind string
-    /// (e.g. `"sensitive_access_consent"`); answer via
-    /// `ClientMessage.inputResponse` echoing `requestId` and one of
-    /// `responseOptions`.
+    /// Carries a structured input request from the daemon.
+    /// Reply with `ClientMessage.inputResponse`.
+    /// The reply must echo `requestId` and select one listed option.
     case inputRequest(
         requestId: String,
         kind: String,
@@ -68,34 +353,41 @@ enum ServerMessage: Codable, Equatable {
         responseOptions: [String],
         expiresAt: UInt64
     )
-    /// Whether the Mac's currently-focused field is a secure (password-class) input right
-    /// now -- true whenever the login window's authentication UI, a screen-lock password
-    /// prompt, or a `sudo`/Keychain dialog has focus. Sent whenever this state CHANGES, not
-    /// per-frame. The video's black rectangle over that field is macOS's own
-    /// ScreenCaptureKit security boundary (not a bug); this signal lets the app explain it
-    /// instead of leaving it unexplained. See `mac-daemon/src/holo_bridge/secure_input_watchdog.rs`.
+    case approvalRequest(ApprovalRequest)
+    /// Reports whether the focused Mac field is a secure input.
+    /// The daemon sends this case when the state changes.
+    /// The app uses it to explain ScreenCaptureKit redaction.
     case secureInputState(active: Bool)
-    /// Successful reply to `ClientMessage.processDocument`.
+    /// Returns markdown for `ClientMessage.processDocument`.
     case documentProcessed(requestId: String, markdown: String)
-    /// Failure reply to `ClientMessage.processDocument`.
+    /// Returns a document-processing error.
     case documentProcessFailed(requestId: String, error: String)
-    /// Successful reply to `ClientMessage.analyzeImage`.
+    /// Returns text for `ClientMessage.analyzeImage`.
     case imageAnalyzed(requestId: String, text: String)
-    /// Failure reply to `ClientMessage.analyzeImage`.
+    /// Returns an image-analysis error.
     case imageAnalysisFailed(requestId: String, error: String)
-    /// Successful reply to `ClientMessage.transcribeAudio`.
+    /// Returns text for `ClientMessage.transcribeAudio`.
     case audioTranscribed(requestId: String, text: String)
-    /// Failure reply to `ClientMessage.transcribeAudio`.
+    /// Returns an audio-transcription error.
     case audioTranscriptionFailed(requestId: String, error: String)
-    /// Successful reply to `ClientMessage.requestSpeech`: `audioDataBase64` is WAV bytes.
+    /// Returns WAV data for `ClientMessage.requestSpeech`.
+    /// `audioDataBase64` contains the encoded WAV bytes.
     case speechReady(requestId: String, audioDataBase64: String)
-    /// Failure reply to `ClientMessage.requestSpeech`.
+    /// Returns a speech-synthesis error.
     case speechFailed(requestId: String, error: String)
-    /// Successful reply to `ClientMessage.planTask`: an ordered, human-readable step list to
-    /// show the user before anything runs -- this is a plan, not an execution.
+    case typedPlanReady(requestId: String, plan: TypedPlan)
+    case plannerStatus(requestId: String, status: PlannerRunStatus, text: String?)
+    case plannerReceipt(requestId: String, receipt: PlannerReceipt)
+    /// Returns an ordered step list for `ClientMessage.planTask`.
+    /// The list is a plan and does not execute actions.
     case planReady(requestId: String, steps: [String])
-    /// Failure reply to `ClientMessage.planTask`.
+    /// Returns a task-planning error.
     case planFailed(requestId: String, error: String)
+
+    /// Returns a status without execution metadata.
+    static func status(text: String?) -> Self {
+        .status(text: text, executionMode: nil, capabilities: nil)
+    }
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -109,12 +401,26 @@ enum ServerMessage: Codable, Equatable {
         case paused
         case queued
         case ticket
+        case host
+        case groundTruth = "ground_truth"
         case questions
         case active
         case markdown
         case error
         case audioDataBase64 = "audio_data_base64"
+        case plan
+        case receipt
         case steps
+        case executionMode = "execution_mode"
+        case capabilities
+        case approvalId = "approval_id"
+        case actionId = "action_id"
+        case proposalDigest = "proposal_digest"
+        case runId = "run_id"
+        case taskId = "task_id"
+        case effect
+        case risk
+        case beforeStateDigest = "before_state_digest"
     }
 
     private enum Kind: String, Codable {
@@ -126,8 +432,10 @@ enum ServerMessage: Codable, Equatable {
         case taskActive = "task_active"
         case authRejected = "auth_rejected"
         case currentTicket = "current_ticket"
+        case tinfoilVerification = "tinfoil_verification"
         case clarifyQuestions = "clarify_questions"
         case inputRequest = "input_request"
+        case approvalRequest = "approval_request"
         case secureInputState = "secure_input_state"
         case documentProcessed = "document_processed"
         case documentProcessFailed = "document_process_failed"
@@ -137,6 +445,9 @@ enum ServerMessage: Codable, Equatable {
         case audioTranscriptionFailed = "audio_transcription_failed"
         case speechReady = "speech_ready"
         case speechFailed = "speech_failed"
+        case typedPlanReady = "typed_plan_ready"
+        case plannerStatus = "planner_status"
+        case plannerReceipt = "planner_receipt"
         case planReady = "plan_ready"
         case planFailed = "plan_failed"
     }
@@ -148,7 +459,11 @@ enum ServerMessage: Codable, Equatable {
         case .ack:
             self = .ack(text: try container.decodeIfPresent(String.self, forKey: .text))
         case .status:
-            self = .status(text: try container.decodeIfPresent(String.self, forKey: .text))
+            self = .status(
+                text: try container.decodeIfPresent(String.self, forKey: .text),
+                executionMode: try container.decodeIfPresent(String.self, forKey: .executionMode),
+                capabilities: try container.decodeIfPresent([String].self, forKey: .capabilities)
+            )
         case .error:
             self = .error(text: try container.decodeIfPresent(String.self, forKey: .text))
         case .taskProgress:
@@ -167,6 +482,11 @@ enum ServerMessage: Codable, Equatable {
             self = .authRejected(text: try container.decodeIfPresent(String.self, forKey: .text))
         case .currentTicket:
             self = .currentTicket(ticket: try container.decode(String.self, forKey: .ticket))
+        case .tinfoilVerification:
+            self = .tinfoilVerification(TinfoilVerification(
+                host: try container.decode(String.self, forKey: .host),
+                groundTruth: try container.decode(TinfoilGroundTruth.self, forKey: .groundTruth)
+            ))
         case .clarifyQuestions:
             self = .clarifyQuestions(
                 questions: try container.decodeIfPresent([ClarifyingQuestion].self, forKey: .questions) ?? []
@@ -179,6 +499,8 @@ enum ServerMessage: Codable, Equatable {
                 responseOptions: try container.decode([String].self, forKey: .responseOptions),
                 expiresAt: try container.decode(UInt64.self, forKey: .expiresAt)
             )
+        case .approvalRequest:
+            self = .approvalRequest(try ApprovalRequest(from: decoder))
         case .secureInputState:
             self = .secureInputState(active: try container.decode(Bool.self, forKey: .active))
         case .documentProcessed:
@@ -221,6 +543,22 @@ enum ServerMessage: Codable, Equatable {
                 requestId: try container.decode(String.self, forKey: .requestId),
                 error: try container.decode(String.self, forKey: .error)
             )
+        case .typedPlanReady:
+            self = .typedPlanReady(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                plan: try container.decode(TypedPlan.self, forKey: .plan)
+            )
+        case .plannerStatus:
+            self = .plannerStatus(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                status: try container.decode(PlannerRunStatus.self, forKey: .status),
+                text: try container.decodeIfPresent(String.self, forKey: .text)
+            )
+        case .plannerReceipt:
+            self = .plannerReceipt(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                receipt: try container.decode(PlannerReceipt.self, forKey: .receipt)
+            )
         case .planReady:
             self = .planReady(
                 requestId: try container.decode(String.self, forKey: .requestId),
@@ -240,9 +578,11 @@ enum ServerMessage: Codable, Equatable {
         case .ack(let text):
             try container.encode(Kind.ack, forKey: .type)
             try container.encodeIfPresent(text, forKey: .text)
-        case .status(let text):
+        case .status(let text, let executionMode, let capabilities):
             try container.encode(Kind.status, forKey: .type)
             try container.encodeIfPresent(text, forKey: .text)
+            try container.encodeIfPresent(executionMode, forKey: .executionMode)
+            try container.encodeIfPresent(capabilities, forKey: .capabilities)
         case .error(let text):
             try container.encode(Kind.error, forKey: .type)
             try container.encodeIfPresent(text, forKey: .text)
@@ -263,6 +603,10 @@ enum ServerMessage: Codable, Equatable {
         case .currentTicket(let ticket):
             try container.encode(Kind.currentTicket, forKey: .type)
             try container.encode(ticket, forKey: .ticket)
+        case .tinfoilVerification(let verification):
+            try container.encode(Kind.tinfoilVerification, forKey: .type)
+            try container.encode(verification.host, forKey: .host)
+            try container.encode(verification.groundTruth, forKey: .groundTruth)
         case .clarifyQuestions(let questions):
             try container.encode(Kind.clarifyQuestions, forKey: .type)
             try container.encode(questions, forKey: .questions)
@@ -273,6 +617,17 @@ enum ServerMessage: Codable, Equatable {
             try container.encode(context, forKey: .context)
             try container.encode(responseOptions, forKey: .responseOptions)
             try container.encode(expiresAt, forKey: .expiresAt)
+        case .approvalRequest(let request):
+            try container.encode(Kind.approvalRequest, forKey: .type)
+            try container.encode(request.approvalId, forKey: .approvalId)
+            try container.encode(request.actionId, forKey: .actionId)
+            try container.encode(request.proposalDigest, forKey: .proposalDigest)
+            try container.encode(request.runId, forKey: .runId)
+            try container.encode(request.taskId, forKey: .taskId)
+            try container.encode(request.risk, forKey: .risk)
+            try container.encode(request.effect, forKey: .effect)
+            try container.encode(request.beforeStateDigest, forKey: .beforeStateDigest)
+            try container.encode(request.expiresAt, forKey: .expiresAt)
         case .secureInputState(let active):
             try container.encode(Kind.secureInputState, forKey: .type)
             try container.encode(active, forKey: .active)
@@ -308,6 +663,19 @@ enum ServerMessage: Codable, Equatable {
             try container.encode(Kind.speechFailed, forKey: .type)
             try container.encode(requestId, forKey: .requestId)
             try container.encode(error, forKey: .error)
+        case .typedPlanReady(let requestId, let plan):
+            try container.encode(Kind.typedPlanReady, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(plan, forKey: .plan)
+        case .plannerStatus(let requestId, let status, let text):
+            try container.encode(Kind.plannerStatus, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(status, forKey: .status)
+            try container.encodeIfPresent(text, forKey: .text)
+        case .plannerReceipt(let requestId, let receipt):
+            try container.encode(Kind.plannerReceipt, forKey: .type)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(receipt, forKey: .receipt)
         case .planReady(let requestId, let steps):
             try container.encode(Kind.planReady, forKey: .type)
             try container.encode(requestId, forKey: .requestId)
@@ -319,13 +687,35 @@ enum ServerMessage: Codable, Equatable {
         }
     }
 
-    /// Human-readable text for the status/log panel, falling back to a
-    /// label derived from the discriminant when `text` is absent (e.g.
-    /// bare `{"type":"ack"}`).
+    /// Returns the request identifier for a Tinfoil response.
+    /// Returns `nil` for other messages.
+    var tinfoilRequestId: String? {
+        switch self {
+        case .documentProcessed(let requestId, _),
+             .documentProcessFailed(let requestId, _),
+             .imageAnalyzed(let requestId, _),
+             .imageAnalysisFailed(let requestId, _),
+             .audioTranscribed(let requestId, _),
+             .audioTranscriptionFailed(let requestId, _),
+             .speechReady(let requestId, _),
+             .speechFailed(let requestId, _),
+             .typedPlanReady(let requestId, _),
+             .plannerStatus(let requestId, _, _),
+             .plannerReceipt(let requestId, _),
+             .planReady(let requestId, _),
+             .planFailed(let requestId, _):
+            return requestId
+        default:
+            return nil
+        }
+    }
+
+    /// Returns text for the status panel.
+    /// Cases without text use a label derived from their wire type.
     var displayText: String {
         switch self {
         case .ack(let text): return text ?? "ack"
-        case .status(let text): return text ?? "status"
+        case .status(let text, _, _): return text ?? "status"
         case .error(let text): return text ?? "error"
         case .taskProgress(let text): return text ?? "task in progress"
         case .taskDone(let status, let text):
@@ -336,9 +726,12 @@ enum ServerMessage: Codable, Equatable {
             return queued > 0 ? "\(base) (\(queued) queued)" : base
         case .authRejected(let text): return text ?? "authentication rejected"
         case .currentTicket(let ticket): return "daemon ticket: \(ticket)"
+        case .tinfoilVerification(let verification):
+            return "Tinfoil attestation verified for \(verification.host)"
         case .clarifyQuestions(let questions):
             return questions.isEmpty ? "no clarification needed" : "\(questions.count) clarifying question(s)"
         case .inputRequest(_, _, let context, _, _): return context
+        case .approvalRequest(let request): return request.effect.material
         case .secureInputState(let active):
             return active ? "Mac is at a login/lock screen" : "Mac is signed in"
         case .documentProcessed: return "document processed"
@@ -349,13 +742,15 @@ enum ServerMessage: Codable, Equatable {
         case .audioTranscriptionFailed(_, let error): return error
         case .speechReady: return "speech ready"
         case .speechFailed(_, let error): return error
+        case .typedPlanReady(_, let plan): return "\(plan.steps.count) typed step plan ready"
+        case .plannerStatus(_, let status, let text): return text ?? status.rawValue
+        case .plannerReceipt(_, let receipt): return "\(receipt.status.rawValue): \(receipt.actionId)"
         case .planReady(_, let steps): return "\(steps.count) step plan ready"
         case .planFailed(_, let error): return error
         }
     }
 
-    /// Short label for the discriminant, used as a prefix/badge in the
-    /// log list so the user can distinguish message kinds at a glance.
+    /// Returns the short message-kind label used by the log list.
     var kindLabel: String {
         switch self {
         case .ack: return "ACK"
@@ -366,65 +761,75 @@ enum ServerMessage: Codable, Equatable {
         case .taskActive: return "TASK"
         case .authRejected: return "AUTH"
         case .currentTicket: return "TICKET"
+        case .tinfoilVerification: return "VERIFY"
         case .clarifyQuestions: return "CLARIFY"
         case .inputRequest: return "INPUT"
+        case .approvalRequest: return "APPROVAL"
         case .secureInputState: return "LOCK"
         case .documentProcessed, .documentProcessFailed: return "DOCUMENT"
         case .imageAnalyzed, .imageAnalysisFailed: return "IMAGE"
         case .audioTranscribed, .audioTranscriptionFailed: return "TRANSCRIBE"
         case .speechReady, .speechFailed: return "SPEECH"
+        case .typedPlanReady, .plannerStatus, .plannerReceipt: return "TYPED"
         case .planReady, .planFailed: return "PLAN"
         }
     }
 }
 
-/// Swift mirror of `PROTOCOL.md`'s `ClientMessage` (iOS -> Mac daemon).
+enum ApprovalDecision: String, Codable, Equatable {
+    case approve
+    case deny
+    case cancel
+}
+
+/// Mirrors app-to-daemon messages from `PROTOCOL.md`.
 enum ClientMessage: Codable, Equatable {
+    case typedPrompt(TypedPrompt)
     case prompt(text: String)
     case voiceTranscript(text: String)
-    /// The remote kill-switch. `contextId == nil` is the global form
-    /// (`{"type":"stop"}`, byte-identical to before): the daemon cancels the
-    /// running turn, drains the queue, and engages `holo stop`. A non-nil
-    /// `contextId` scopes the cancel to that one A2A context (no queue
-    /// drain, no global stop) -- no per-turn ids exist on this client today,
-    /// so every Cancel control sends nil.
+    /// Requests task cancellation.
+    /// A nil `contextId` cancels the running turn and drains the queue.
+    /// A nonnil value limits cancellation to one A2A context.
     case stop(contextId: String?)
-    /// Pause the running task (daemon parks it; `resume` continues it on the
-    /// same backend session).
+    /// Parks the running task for a later resume.
     case pause
-    /// Resume the parked task.
+    /// Continues a parked task on the same backend session.
     case resume
-    /// Replace the running/queued work with a new instruction, keeping the
-    /// task's session history.
+    /// Replaces running or queued work while preserving task session history.
     case redirect(text: String)
-    /// Answer to a `ServerMessage.inputRequest` -- echoes its `requestId`
-    /// plus one of its `responseOptions`, verbatim. Never carries free text
-    /// or a credential (see the daemon's wire-schema doc: this is a
-    /// structured selection only).
+    /// Answers a structured input request.
+    /// `requestId` must match the request.
+    /// `selectedOption` must copy one offered option.
+    /// This message never carries free text or credentials.
     case inputResponse(requestId: String, selectedOption: String)
-    /// The user escalated to hands-on control and is driving the Mac directly by
-    /// touching the live-share view; `event` is one normalized touch action.
+    case approvalResponse(
+        approvalId: String,
+        actionId: String,
+        proposalDigest: String,
+        decision: ApprovalDecision
+    )
+    /// Sends one normalized remote-control action from the live video surface.
     case remoteControl(RemoteControlEvent)
-    /// Asks the daemon to generate clarifying questions for a possibly-ambiguous
-    /// instruction before it runs (answered by `ServerMessage.clarifyQuestions`).
+    /// Requests clarifying questions before the daemon runs an instruction.
     case clarifyRequest(prompt: String)
-    /// Asks the daemon to convert an attached document to markdown via Tinfoil
-    /// (answered by `ServerMessage.documentProcessed`/`documentProcessFailed`).
+    /// Requests Tinfoil document conversion.
+    /// The daemon replies with a document success or failure case.
     case processDocument(requestId: String, filename: String, dataBase64: String, mode: String)
-    /// Asks the daemon to analyze an attached image via Tinfoil (redacted on-device before
-    /// upload). Answered by `ServerMessage.imageAnalyzed`/`imageAnalysisFailed`.
+    /// Requests Tinfoil image analysis.
+    /// The app redacts the image before upload.
+    /// The daemon replies with an image success or failure case.
     case analyzeImage(requestId: String, imageDataBase64: String, prompt: String)
-    /// Asks the daemon to transcribe audio via Tinfoil. **Only ever send audio captured from
-    /// this device's own microphone** -- never system/speaker output. Opt-in alternative to
-    /// the default on-device `voiceTranscript` path. Answered by
-    /// `ServerMessage.audioTranscribed`/`audioTranscriptionFailed`.
-    case transcribeAudio(requestId: String, audioDataBase64: String, format: String)
-    /// Asks the daemon to synthesize `text` as speech via Tinfoil. Answered by
-    /// `ServerMessage.speechReady`/`speechFailed`.
+    /// Requests optional Tinfoil audio transcription.
+    ///
+    /// `HoloIrohMicrophoneCapture` creates the opaque capture from this device's microphone.
+    /// The app cannot wrap arbitrary bytes, system audio, or speaker output in this case.
+    /// The default voice transcript path remains on-device.
+    case transcribeAudio(requestId: String, capture: CapturedMicrophoneAudio)
+    /// Requests Tinfoil speech synthesis.
+    /// The daemon replies with a speech success or failure case.
     case requestSpeech(requestId: String, text: String, voice: String)
-    /// Asks the daemon to plan `goal` into an ordered step list via Tinfoil's tool-calling --
-    /// this proposes steps for review, it does not execute them. Answered by
-    /// `ServerMessage.planReady`/`planFailed`.
+    /// Requests a Tinfoil-generated step plan for review.
+    /// This message does not execute the plan.
     case planTask(requestId: String, goal: String)
 
     private enum CodingKeys: String, CodingKey {
@@ -433,6 +838,10 @@ enum ClientMessage: Codable, Equatable {
         case contextId = "context_id"
         case requestId = "request_id"
         case selectedOption = "selected_option"
+        case approvalId = "approval_id"
+        case actionId = "action_id"
+        case proposalDigest = "proposal_digest"
+        case decision
         case event
         case prompt
         case filename
@@ -446,6 +855,7 @@ enum ClientMessage: Codable, Equatable {
     }
 
     private enum Kind: String, Codable {
+        case typedPrompt = "typed_prompt"
         case prompt
         case voiceTranscript = "voice_transcript"
         case stop
@@ -453,6 +863,7 @@ enum ClientMessage: Codable, Equatable {
         case resume
         case redirect
         case inputResponse = "input_response"
+        case approvalResponse = "approval_response"
         case remoteControl = "remote_control"
         case clarifyRequest = "clarify_request"
         case processDocument = "process_document"
@@ -466,6 +877,8 @@ enum ClientMessage: Codable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let kind = try container.decode(Kind.self, forKey: .type)
         switch kind {
+        case .typedPrompt:
+            self = .typedPrompt(try container.decode(TypedPrompt.self, forKey: .prompt))
         case .prompt:
             self = .prompt(text: try container.decode(String.self, forKey: .text))
         case .voiceTranscript:
@@ -482,6 +895,13 @@ enum ClientMessage: Codable, Equatable {
             self = .inputResponse(
                 requestId: try container.decode(String.self, forKey: .requestId),
                 selectedOption: try container.decode(String.self, forKey: .selectedOption)
+            )
+        case .approvalResponse:
+            self = .approvalResponse(
+                approvalId: try container.decode(String.self, forKey: .approvalId),
+                actionId: try container.decode(String.self, forKey: .actionId),
+                proposalDigest: try container.decode(String.self, forKey: .proposalDigest),
+                decision: try container.decode(ApprovalDecision.self, forKey: .decision)
             )
         case .remoteControl:
             self = .remoteControl(try container.decode(RemoteControlEvent.self, forKey: .event))
@@ -501,10 +921,10 @@ enum ClientMessage: Codable, Equatable {
                 prompt: try container.decode(String.self, forKey: .prompt)
             )
         case .transcribeAudio:
-            self = .transcribeAudio(
-                requestId: try container.decode(String.self, forKey: .requestId),
-                audioDataBase64: try container.decode(String.self, forKey: .audioDataBase64),
-                format: try container.decode(String.self, forKey: .format)
+            throw DecodingError.dataCorruptedError(
+                forKey: .type,
+                in: container,
+                debugDescription: "transcribe_audio is outbound-only; construct it from CapturedMicrophoneAudio"
             )
         case .requestSpeech:
             self = .requestSpeech(
@@ -523,6 +943,9 @@ enum ClientMessage: Codable, Equatable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
+        case .typedPrompt(let prompt):
+            try container.encode(Kind.typedPrompt, forKey: .type)
+            try container.encode(prompt, forKey: .prompt)
         case .prompt(let text):
             try container.encode(Kind.prompt, forKey: .type)
             try container.encode(text, forKey: .text)
@@ -543,6 +966,12 @@ enum ClientMessage: Codable, Equatable {
             try container.encode(Kind.inputResponse, forKey: .type)
             try container.encode(requestId, forKey: .requestId)
             try container.encode(selectedOption, forKey: .selectedOption)
+        case .approvalResponse(let approvalId, let actionId, let proposalDigest, let decision):
+            try container.encode(Kind.approvalResponse, forKey: .type)
+            try container.encode(approvalId, forKey: .approvalId)
+            try container.encode(actionId, forKey: .actionId)
+            try container.encode(proposalDigest, forKey: .proposalDigest)
+            try container.encode(decision, forKey: .decision)
         case .remoteControl(let event):
             try container.encode(Kind.remoteControl, forKey: .type)
             try container.encode(event, forKey: .event)
@@ -560,11 +989,11 @@ enum ClientMessage: Codable, Equatable {
             try container.encode(requestId, forKey: .requestId)
             try container.encode(imageDataBase64, forKey: .imageDataBase64)
             try container.encode(prompt, forKey: .prompt)
-        case .transcribeAudio(let requestId, let audioDataBase64, let format):
+        case .transcribeAudio(let requestId, let capture):
             try container.encode(Kind.transcribeAudio, forKey: .type)
             try container.encode(requestId, forKey: .requestId)
-            try container.encode(audioDataBase64, forKey: .audioDataBase64)
-            try container.encode(format, forKey: .format)
+            try container.encode(capture.audioDataBase64, forKey: .audioDataBase64)
+            try container.encode(capture.format, forKey: .format)
         case .requestSpeech(let requestId, let text, let voice):
             try container.encode(Kind.requestSpeech, forKey: .type)
             try container.encode(requestId, forKey: .requestId)
@@ -577,11 +1006,21 @@ enum ClientMessage: Codable, Equatable {
         }
     }
 
-    /// Short label for the message's wire `type` discriminant, for the
-    /// status/log panel. Mirrors the daemon's `ClientMessage::type_tag`
-    /// snake_case discriminants exactly.
+    var requiresAutonomousHolo: Bool {
+        switch self {
+        case .typedPrompt:
+            return false
+        case .prompt, .voiceTranscript, .redirect:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Returns the exact snake-case wire type label.
     var wireKindLabel: String {
         switch self {
+        case .typedPrompt: return "typed_prompt"
         case .prompt: return "prompt"
         case .voiceTranscript: return "voice_transcript"
         case .stop: return "stop"
@@ -589,6 +1028,7 @@ enum ClientMessage: Codable, Equatable {
         case .resume: return "resume"
         case .redirect: return "redirect"
         case .inputResponse: return "input_response"
+        case .approvalResponse: return "approval_response"
         case .remoteControl: return "remote_control"
         case .clarifyRequest: return "clarify_request"
         case .processDocument: return "process_document"
@@ -600,9 +1040,8 @@ enum ClientMessage: Codable, Equatable {
     }
 }
 
-/// One entry in the status/log panel. Wraps a `ServerMessage` with a
-/// stable identity and timestamp so it can drive a SwiftUI `List`/
-/// `ForEach` and be displayed in chronological order.
+/// Adds a stable identifier and timestamp to a server message.
+/// The log uses these values for identity and chronological display.
 struct LogEntry: Identifiable, Equatable {
     let id: UUID
     let timestamp: Date
@@ -614,15 +1053,12 @@ struct LogEntry: Identifiable, Equatable {
         self.message = message
     }
 
-    /// Formatted `HH:mm:ss` timestamp for compact display in the log row.
+    /// Returns the timestamp in `HH:mm:ss` format.
     var formattedTime: String {
         Self.timeFormatter.string(from: timestamp)
     }
 
-    /// Shared formatter. `DateFormatter()` construction is genuinely expensive
-    /// (it builds ICU state), and this is called once per visible log row on
-    /// every re-render of the status list, so allocating a fresh one per row
-    /// was pure waste in a hot path.
+    /// Shares one date formatter across all log entries.
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"

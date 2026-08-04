@@ -23,11 +23,7 @@ fn check(label: &str, contents: &str, expected: Option<&str>) {
 fn main() {
     println!("=== extract_api_key parsing (real function, real inputs) ===");
     check("basic", "HAI_API_KEY=hk-abc123\n", Some("hk-abc123"));
-    check(
-        "quoted",
-        "HAI_API_KEY=\"hk-abc123\"\n",
-        Some("hk-abc123"),
-    );
+    check("quoted", "HAI_API_KEY=\"hk-abc123\"\n", Some("hk-abc123"));
     check(
         "single-quoted",
         "HAI_API_KEY='hk-abc123'\n",
@@ -53,14 +49,15 @@ fn main() {
     std::fs::create_dir_all(&missing_dir).expect("create missing_dir");
     let result = check_holo_token_in(&missing_dir);
     println!("missing token file -> {result:?}");
-    assert!(result.is_err(), "expected an error for a missing token file");
+    assert!(
+        result.is_err(),
+        "expected an error for a missing token file"
+    );
     let _ = std::fs::remove_dir_all(&missing_dir);
 
     // Happy path: real file, real key.
-    let happy_dir = std::env::temp_dir().join(format!(
-        "holoiroh-auth-probe-happy-{}",
-        std::process::id()
-    ));
+    let happy_dir =
+        std::env::temp_dir().join(format!("holoiroh-auth-probe-happy-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&happy_dir);
     let holo_dir = happy_dir.join(".holo");
     std::fs::create_dir_all(&holo_dir).expect("create .holo dir");
@@ -75,10 +72,8 @@ fn main() {
     let _ = std::fs::remove_dir_all(&happy_dir);
 
     // Empty file -> missing key.
-    let empty_dir = std::env::temp_dir().join(format!(
-        "holoiroh-auth-probe-empty-{}",
-        std::process::id()
-    ));
+    let empty_dir =
+        std::env::temp_dir().join(format!("holoiroh-auth-probe-empty-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&empty_dir);
     let holo_dir = empty_dir.join(".holo");
     std::fs::create_dir_all(&holo_dir).expect("create .holo dir");

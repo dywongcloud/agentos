@@ -1,98 +1,122 @@
 import Combine
 import Foundation
 
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
+
 #if canImport(HoloirohIosBridge)
 import HoloirohIosBridge
 #endif
 
-/// Owns the ONE `holoiroh-ios-bridge` handle a connected session runs on, and
-/// both planes that share it:
+/// Owns one bridge handle for a connected session.
 ///
-/// - **Video plane**: after `ticket_connect`, the bridge is handed to a
-///   shared-bridge `IrohLiveFrameSource` (`init(bridge:)`), which subscribes
-///   to the `iroh-live` video track and polls frames on its own serial queue.
-/// - **Control plane**: `control_connect(pin)` performs the PROTOCOL.md
-///   pre-session PIN handshake on the control-ALPN stream. Outbound
-///   `ClientMessage`s then go through `FFIControlChannelSender` (below), and
-///   inbound `ServerMessage` NDJSON lines are drained by a repeating pump on
-///   the same serial FFI queue and delivered -- decoded -- to
-///   `onServerMessage` on the main thread.
+/// - The media stream uses `IrohLiveFrameSource`.
+/// - The control channel authenticates with a personal identification number (PIN).
+/// - The control channel uses `FFIControlChannelSender`.
+/// - `ffiQueue` serializes control-channel bridge calls.
+/// - `shutdown()` stops the media subscription before it frees the bridge.
 ///
-/// ## Threading / ownership
-/// Every control-plane FFI call (`new`, `ticket_connect`, `control_connect`,
-/// `control_send`, `poll_control_event`, `free`) happens on the private
-/// serial `ffiQueue`, so the bridge's control plane has a single owning
-/// thread. The frame source owns the *subscription* handle on its own queue
-/// (`poll_next_frame`/`subscription_free` take the subscription, not the
-/// bridge); the only bridge call it makes is the one-shot `subscribe` at
-/// start, which the bridge (a Tokio-runtime wrapper) must tolerate alongside
-/// control traffic -- that concurrency is part of the shared-bridge FFI
-/// contract this type codes against.
-///
-/// Teardown order is enforced: `shutdown()` stops the frame source first and
-/// frees the bridge only from that stop's completion (subscription before
-/// bridge -- the subscription's decoder is driven by the bridge's runtime).
-///
-/// ## Bridge-less builds
-/// Under `#if !canImport(HoloirohIosBridge)` (the headless simulator/CI
-/// `swift build`), `connect` immediately reports `.failed` with an
-/// explanatory reason and the UI keeps its synthetic-video +
-/// logging-sender fallbacks -- the same compile-honest stub pattern as
-/// `IrohLiveFrameSource`.
+/// Bridge-less builds report a failed connection and keep the app fallbacks available.
 final class HoloConnection: ObservableObject {
 
-    /// Coarse connection lifecycle, published so the dashboard can react.
+    /// Defines the published connection lifecycle.
     enum Phase: Equatable {
-        /// Not yet connected (initial state, and after `shutdown`).
+        /// Indicates that no connection is active. `shutdown()` also returns the phase to this value.
         case idle
-        /// `connect` is running (bridge create / ticket connect / PIN handshake).
+        /// Indicates that bridge creation, ticket connection, or PIN authentication is in progress.
         case connecting
-        /// Both planes are up: live frames + real control channel available.
+        /// Indicates that the media stream and control channel are available.
         case connected
-        /// The connection could not be established (or the bridge is not
-        /// linked in this build). The associated value is the reason.
+        /// Indicates a connection failure. The associated string describes the cause.
         case failed(String)
     }
 
     @Published private(set) var phase: Phase = .idle
 
-    /// The shared-bridge live video source. Non-nil from the moment `phase`
-    /// becomes `.connected` -- both are set in the same main-thread turn, so
-    /// a `phase` observer can read this immediately.
+    /// Provides the media-stream source after `phase` becomes `.connected`.
+    /// The source and phase change during the same main-thread turn.
     private(set) var liveFrameSource: VideoFrameSource?
 
-    /// The real outbound control channel, non-nil once `.connected`. `nil`
-    /// before then (callers fall back to the logging stand-in).
+    /// Provides the outbound control channel after connection. Callers use a logging fallback while this value is `nil`.
     private(set) var controlSender: ControlChannelSending?
 
-    /// Decoded daemon events (and wire-level send confirmations/errors in the
-    /// same `ServerMessage` shape), delivered on the main thread. Assign
-    /// before calling `connect`.
+    /// Receives decoded daemon messages and send results on the main thread.
+    /// Assign this closure before you call `connect`.
     var onServerMessage: ((ServerMessage) -> Void)?
 
-    /// Serial queue owning every control-plane FFI call on the bridge.
+    /// Serializes all control-channel Foreign Function Interface (FFI) calls on the bridge.
     private let ffiQueue = DispatchQueue(label: "com.holoiroh.connection.control")
 
-    /// Set once `shutdown()` has run (main thread only). Late completions
-    /// hopping back from `ffiQueue` check it so a torn-down connection never
-    /// resurrects published state.
+    /// Prevents state publication after permanent shutdown.
+    /// Late `ffiQueue` completions check this main-thread value.
     private var isShutdown = false
+
+    private let secretKey: Data?
+    private let identityErrorDescription: String?
+
+    init(identityStore: IrohIdentityStore = IrohIdentityStore()) {
+        do {
+            self.secretKey = try identityStore.loadOrCreateSeed()
+            self.identityErrorDescription = nil
+        } catch {
+            self.secretKey = nil
+            self.identityErrorDescription = error.localizedDescription
+        }
+    }
 
     #if canImport(HoloirohIosBridge)
 
-    /// Guards `_bridge`: it is written on `ffiQueue` (establish) and claimed
-    /// on the main thread (`shutdown`) or in `deinit`, so access is locked
-    /// and freeing goes through the claim-once `takeBridge()`.
+    /// Protects `_bridge` across `ffiQueue`, the main thread, and `deinit`.
+    /// All ownership claims use `takeBridge()`.
     private let bridgeLock = NSLock()
     private var _bridge: OpaquePointer?
+
+    private let generationLock = NSLock()
+    private var connectionGeneration: UInt64 = 0
+    private let endpointLeaseLock = NSLock()
+    private var endpointLeaseHeld = false
+
+    private func acquireEndpointLease() {
+        IrohEndpointCoordinator.shared.acquire()
+        endpointLeaseLock.lock()
+        endpointLeaseHeld = true
+        endpointLeaseLock.unlock()
+    }
+
+    private func takeEndpointLease() -> Bool {
+        endpointLeaseLock.lock()
+        defer { endpointLeaseLock.unlock() }
+        let held = endpointLeaseHeld
+        endpointLeaseHeld = false
+        return held
+    }
+
+    private func releaseEndpointLease() {
+        if takeEndpointLease() {
+            IrohEndpointCoordinator.shared.release()
+        }
+    }
+
+    private func advanceConnectionGeneration() -> UInt64 {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+        connectionGeneration &+= 1
+        return connectionGeneration
+    }
+
+    private func isCurrentConnectionGeneration(_ generation: UInt64) -> Bool {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+        return connectionGeneration == generation
+    }
 
     private var bridge: OpaquePointer? {
         get { bridgeLock.lock(); defer { bridgeLock.unlock() }; return _bridge }
         set { bridgeLock.lock(); defer { bridgeLock.unlock() }; _bridge = newValue }
     }
 
-    /// Atomically takes ownership of the bridge pointer (exactly one caller
-    /// can win), so shutdown racing a failed establish can never double-free.
+    /// Claims the bridge pointer once. This prevents a double free during concurrent shutdown and connection failure.
     private func takeBridge() -> OpaquePointer? {
         bridgeLock.lock(); defer { bridgeLock.unlock() }
         let claimed = _bridge
@@ -100,35 +124,39 @@ final class HoloConnection: ObservableObject {
         return claimed
     }
 
-    /// Repeating drain of `poll_control_event`, on `ffiQueue`. Timer-driven
-    /// rather than a tight loop so `control_send` calls interleave on the
-    /// same serial queue.
+    /// Drains `poll_control_event` repeatedly on `ffiQueue`.
+    /// The timer lets `control_send` calls run between drain operations.
     private var eventPump: DispatchSourceTimer?
 
-    /// This connection's outbound envelope state (`session_id` + sequence
-    /// counter -- see `OutboundEnvelopeState`'s doc). `session_id` starts
-    /// `nil` and is populated the moment the daemon's envelope-wrapped
-    /// greeting is observed in `decodeServerLine`; `FFIControlChannelSender`
-    /// shares this exact instance, so every outbound send after the greeting
-    /// carries the daemon-assigned `session_id`. Fresh per `establish()` call
-    /// (a reconnect gets a new daemon-minted session, so the old id/sequence
-    /// must not carry over).
+    /// Tracks the verified session identifier and outbound sequence.
+    /// The bridge verifies daemon envelopes and signs each outbound Swift envelope.
     private var sessionState = OutboundEnvelopeState()
 
     #endif
 
     // MARK: - Lifecycle
 
-    /// Opens the real connection: bridge create → `ticket_connect(ticket)`
-    /// (video plane) → `control_connect(pin)` (control-ALPN PIN handshake).
-    /// Runs off-main; publishes `.connected`/`.failed` on main. Idempotent
-    /// once past `.idle`.
+    /// Creates the bridge, connects the ticket, and authenticates the control channel with the PIN.
+    /// Work runs off the main thread.
+    /// Phase updates run on the main thread.
+    /// Repeated calls do nothing after the idle phase.
     func connect(ticket: String, pin: String) {
         guard !isShutdown, phase == .idle else { return }
         phase = .connecting
         #if canImport(HoloirohIosBridge)
-        ffiQueue.async { [weak self] in
-            self?.establish(ticket: ticket, pin: pin)
+        let generation = advanceConnectionGeneration()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            self.acquireEndpointLease()
+            self.ffiQueue.async {
+                guard !self.isShutdown,
+                      self.isCurrentConnectionGeneration(generation)
+                else {
+                    self.releaseEndpointLease()
+                    return
+                }
+                self.establish(ticket: ticket, pin: pin, generation: generation)
+            }
         }
         #else
         phase = .failed(
@@ -137,21 +165,9 @@ final class HoloConnection: ObservableObject {
         #endif
     }
 
-    /// Tears the current session down but leaves this object REUSABLE: back
-    /// to `.idle`, ready for another `connect(ticket:pin:)`. This is the
-    /// auto-reconnect primitive (see `MainView`'s foreground/failure
-    /// recovery): when the QUIC session dies while the app is backgrounded
-    /// (iOS suspends the process; the daemon side times the connection out),
-    /// the ONLY way back to live video is a fresh bridge + ticket connect +
-    /// PIN handshake -- restarting the frame source alone re-subscribes on a
-    /// dead bridge, which is exactly the live-witnessed "black screen and
-    /// errors out after switching apps" bug.
-    ///
-    /// Refused while `.connecting`: `establish` is mid-flight on `ffiQueue`
-    /// and its main-thread completions only check `isShutdown` -- resetting
-    /// under it could interleave a stale publication with the new session's.
-    /// Every real call site (failure recovery, foreground recovery) runs
-    /// from `.failed`/`.connected`, where `establish` has already finished.
+    /// Resets the session to `.idle` and permits a later connection.
+    /// Stops the media source before it frees the bridge.
+    /// Does nothing while a connection attempt is in progress.
     func reset() {
         guard !isShutdown, phase != .connecting else { return }
         controlSender = nil
@@ -159,6 +175,7 @@ final class HoloConnection: ObservableObject {
         liveFrameSource = nil
         phase = .idle
         #if canImport(HoloirohIosBridge)
+        _ = advanceConnectionGeneration()
         eventPump?.cancel()
         eventPump = nil
         freeBridgeAfterStopping(source)
@@ -167,9 +184,9 @@ final class HoloConnection: ObservableObject {
         #endif
     }
 
-    /// Tears the session down PERMANENTLY: like `reset()`, but this object
-    /// refuses all further use (`isShutdown`). Idempotent; call on
-    /// Disconnect / screen teardown.
+    /// Permanently closes the session and returns the phase to `.idle`.
+    /// Later connection attempts do nothing.
+    /// Repeated calls are safe.
     func shutdown() {
         guard !isShutdown else { return }
         controlSender = nil
@@ -178,6 +195,7 @@ final class HoloConnection: ObservableObject {
         phase = .idle
         isShutdown = true
         #if canImport(HoloirohIosBridge)
+        _ = advanceConnectionGeneration()
         eventPump?.cancel()
         eventPump = nil
         freeBridgeAfterStopping(source)
@@ -202,16 +220,30 @@ final class HoloConnection: ObservableObject {
 
     #if canImport(HoloirohIosBridge)
 
-    /// Runs on `ffiQueue`. Creates the one bridge, ticket-connects it (video
-    /// plane), then performs the control-ALPN PIN handshake (control plane).
-    private func establish(ticket: String, pin: String) {
+    /// Creates and authenticates the bridge on `ffiQueue` for one connection generation.
+    private func establish(ticket: String, pin: String, generation: UInt64) {
         // Fresh per connection attempt: a reconnect gets a new daemon-minted
         // `session_id` and its own sequence numbering from zero (see
         // `sessionState`'s doc).
         sessionState = OutboundEnvelopeState()
 
-        guard let created = holoiroh_ios_bridge_new() else {
-            reportFailure("holoiroh_ios_bridge_new returned null")
+        guard let secretKey else {
+            releaseEndpointLease()
+            reportFailure(
+                "Iroh identity unavailable: \(identityErrorDescription ?? "unknown Keychain error")",
+                generation: generation
+            )
+            return
+        }
+        let created = secretKey.withUnsafeBytes { keyBytes in
+            holoiroh_ios_bridge_new_with_secret_key(
+                keyBytes.bindMemory(to: UInt8.self).baseAddress,
+                UInt(keyBytes.count)
+            )
+        }
+        guard let created else {
+            releaseEndpointLease()
+            reportFailure("holoiroh_ios_bridge_new_with_secret_key returned null", generation: generation)
             return
         }
         bridge = created
@@ -221,8 +253,14 @@ final class HoloConnection: ObservableObject {
             holoiroh_ios_bridge_ticket_connect(created, cstr, &err)
         }
         guard ticketStatus == HOLOIROH_OK else {
-            if let claimed = takeBridge() { holoiroh_ios_bridge_free(claimed) }
-            reportFailure(describeFFIFailure("ticket_connect", status: ticketStatus, err: &err))
+            if let claimed = takeBridge() {
+                holoiroh_ios_bridge_free(claimed)
+            }
+            releaseEndpointLease()
+            reportFailure(
+                describeFFIFailure("ticket_connect", status: ticketStatus, err: &err),
+                generation: generation
+            )
             return
         }
 
@@ -230,8 +268,14 @@ final class HoloConnection: ObservableObject {
             holoiroh_ios_bridge_control_connect(created, cstr, &err)
         }
         guard controlStatus == HOLOIROH_OK else {
-            if let claimed = takeBridge() { holoiroh_ios_bridge_free(claimed) }
-            reportFailure(describeFFIFailure("control_connect", status: controlStatus, err: &err))
+            if let claimed = takeBridge() {
+                holoiroh_ios_bridge_free(claimed)
+            }
+            releaseEndpointLease()
+            reportFailure(
+                describeFFIFailure("control_connect", status: controlStatus, err: &err),
+                generation: generation
+            )
             return
         }
 
@@ -244,6 +288,7 @@ final class HoloConnection: ObservableObject {
             queue: ffiQueue,
             sessionState: sessionState,
             report: { [weak self] message, wire in
+                guard let self, self.isCurrentConnectionGeneration(generation) else { return }
                 // Runs on main (the sender hops there): surface the confirmed
                 // wire send in the same log stream as daemon events.
                 //
@@ -257,42 +302,44 @@ final class HoloConnection: ObservableObject {
                 // of envelopes nobody reads. Their effect is already visible to
                 // the user directly: the Mac's cursor moves.
                 if case .remoteControl = message { return }
-                let trimmed = wire.trimmingCharacters(in: .whitespacesAndNewlines)
-                self?.onServerMessage?(.status(text: "→ sent \(message.wireKindLabel): \(trimmed)"))
+                let summary = safeOutboundWireSummary(message: message, wire: wire)
+                self.onServerMessage?(.status(text: summary))
             },
             reportError: { [weak self] detail in
-                self?.onServerMessage?(.error(text: detail))
+                guard let self, self.isCurrentConnectionGeneration(generation) else { return }
+                self.onServerMessage?(.error(text: detail))
             }
         )
 
         DispatchQueue.main.async { [weak self] in
-            guard let self, !self.isShutdown else { return }
-            // Order matters: the frame source and sender must be readable the
+            guard let self,
+                  !self.isShutdown,
+                  self.isCurrentConnectionGeneration(generation)
+            else { return }
             // instant a `phase` observer fires.
             self.liveFrameSource = source
             self.controlSender = sender
-            self.startEventPump()
+            self.startEventPump(generation: generation)
             self.phase = .connected
         }
     }
 
-    /// Starts the control-event pump: a repeating timer on `ffiQueue` that
-    /// drains every pending `poll_control_event` line and delivers the
-    /// decoded `ServerMessage`s on the main thread.
-    private func startEventPump() {
+    /// Starts a timer on `ffiQueue` that drains pending control events.
+    /// Delivers decoded messages on the main thread.
+    private func startEventPump(generation: UInt64) {
         let timer = DispatchSource.makeTimerSource(queue: ffiQueue)
         timer.schedule(deadline: .now(), repeating: .milliseconds(150), leeway: .milliseconds(50))
         timer.setEventHandler { [weak self] in
-            self?.drainControlEvents()
+            self?.drainControlEvents(generation: generation)
         }
         timer.resume()
         eventPump = timer
     }
 
-    /// Runs on `ffiQueue`. Drains all pending control events (the daemon can
-    /// emit bursts), stopping when the bridge reports none pending.
-    private func drainControlEvents() {
-        guard let bridge = bridge else { return }
+    /// Drains pending control events on `ffiQueue`.
+    /// Stops when the bridge reports no event or returns an error.
+    private func drainControlEvents(generation: UInt64) {
+        guard isCurrentConnectionGeneration(generation), let bridge = bridge else { return }
         while true {
             var outJSON: UnsafeMutablePointer<CChar>?
             var outErr: UnsafeMutablePointer<CChar>?
@@ -305,7 +352,10 @@ final class HoloConnection: ObservableObject {
                 }
                 // Surface a broken control stream once, not every tick.
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, !self.isShutdown else { return }
+                    guard let self,
+                          !self.isShutdown,
+                          self.isCurrentConnectionGeneration(generation)
+                    else { return }
                     self.eventPump?.cancel()
                     self.eventPump = nil
                     self.onServerMessage?(.error(text: detail))
@@ -326,16 +376,12 @@ final class HoloConnection: ObservableObject {
             }
             let line = String(cString: json)
             holoiroh_ios_bridge_free_error_string(json)
-            deliver(decodeServerLine(line))
+            deliver(decodeServerLine(line), generation: generation)
         }
     }
 
-    /// A `TaskEnvelope`d server line: `{ "session_id": ..., "payload": { "type": ... }, ... }`.
-    /// The bridge is expected to hand up bare `ServerMessage` lines only for
-    /// the pre-session PIN handshake reply; every message from the greeting
-    /// onward is envelope-wrapped and carries the daemon-minted `session_id`
-    /// this connection must echo on every outbound send (see
-    /// `OutboundEnvelopeState`).
+    /// Decodes the envelope shape used after the PIN handshake.
+    /// Each envelope contains the daemon session identifier and a `ServerMessage` payload.
     private struct EnvelopedServerMessage: Decodable {
         let sessionId: String
         let payload: ServerMessage
@@ -346,12 +392,9 @@ final class HoloConnection: ObservableObject {
         }
     }
 
-    /// Decodes one NDJSON line from `poll_control_event` into a
-    /// `ServerMessage` (directly, or via a `TaskEnvelope` payload -- in which
-    /// case this connection's `sessionId` is captured/refreshed from it, so
-    /// outbound sends can be envelope-wrapped correctly; see
-    /// `ControlChannelSender.swift`'s `OutboundEnvelope`). Undecodable lines
-    /// are surfaced as status entries instead of vanishing.
+    /// Decodes one verified server envelope.
+    /// Captures its session identifier for outbound messages.
+    /// Reports bounded metadata for unrecognized data.
     private func decodeServerLine(_ line: String) -> ServerMessage {
         let data = Data(line.utf8)
         let decoder = JSONDecoder()
@@ -359,22 +402,21 @@ final class HoloConnection: ObservableObject {
             sessionState.sessionId = enveloped.sessionId
             return enveloped.payload
         }
-        if let direct = try? decoder.decode(ServerMessage.self, from: data) {
-            return direct
-        }
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        return .status(text: "unrecognized control event: \(trimmed)")
+        return .status(text: safeInboundWireSummary(data))
     }
 
-    /// Hands one message to `onServerMessage` on the main thread.
-    private func deliver(_ message: ServerMessage) {
+    /// Delivers one server message on the main thread for the current connection generation.
+    private func deliver(_ message: ServerMessage, generation: UInt64) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, !self.isShutdown else { return }
+            guard let self,
+                  !self.isShutdown,
+                  self.isCurrentConnectionGeneration(generation)
+            else { return }
             self.onServerMessage?(message)
         }
     }
 
-    /// Formats an FFI failure, consuming (and freeing) the out_error string.
+    /// Formats an FFI failure and frees the returned error string.
     private func describeFFIFailure(
         _ what: String,
         status: Int32,
@@ -389,26 +431,32 @@ final class HoloConnection: ObservableObject {
         return "\(what) failed (\(status))"
     }
 
-    /// Publishes `.failed` on the main thread (unless already shut down).
-    private func reportFailure(_ detail: String) {
+    /// Publishes `.failed` on the main thread for the current connection generation.
+    private func reportFailure(_ detail: String, generation: UInt64) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, !self.isShutdown else { return }
+            guard let self,
+                  !self.isShutdown,
+                  self.isCurrentConnectionGeneration(generation)
+            else { return }
             self.phase = .failed(detail)
         }
     }
 
-    /// Stops `source` (a shared-bridge frame source frees its subscription on
-    /// its own queue first) and then frees the bridge on `ffiQueue` -- free
-    /// order is subscription first, bridge second, because the subscription's
-    /// decoder is driven by the bridge's runtime. Captures the claimed bridge
-    /// pointer by value so this also works from `deinit`.
+    /// Stops the media source before it frees the bridge on `ffiQueue`.
+    /// This order keeps the subscription decoder on a valid bridge runtime.
+    /// The method also releases the endpoint lease.
     private func freeBridgeAfterStopping(_ source: VideoFrameSource?) {
         let queue = ffiQueue
         let bridgeToFree = takeBridge()
+        let releasesEndpointLease = takeEndpointLease()
         let freeBridge: () -> Void = {
-            guard let bridgeToFree else { return }
             queue.async {
-                holoiroh_ios_bridge_free(bridgeToFree)
+                if let bridgeToFree {
+                    holoiroh_ios_bridge_free(bridgeToFree)
+                }
+                if releasesEndpointLease {
+                    IrohEndpointCoordinator.shared.release()
+                }
             }
         }
         if let live = source as? IrohLiveFrameSource {
@@ -424,26 +472,52 @@ final class HoloConnection: ObservableObject {
 
 #if canImport(HoloirohIosBridge)
 
-/// The real `ControlChannelSending`: writes each `ClientMessage`'s NDJSON
-/// wire line (the shared `encoded(_:sessionState:)` helper -- byte-identical to what the
-/// `LoggingControlChannelSender` stand-in produced) to the daemon over the
-/// bridge's control-ALPN stream via `holoiroh_ios_bridge_control_send`.
-/// Sends hop to the owning `HoloConnection`'s serial FFI queue so the
-/// bridge's control plane is only ever touched from one thread; results are
-/// reported back on the main thread through the two closures. Valid only
-/// while the owning `HoloConnection` is connected (it is discarded on
-/// `shutdown`, and pre-shutdown sends drain on the serial queue before the
-/// bridge is freed).
+private func safeInboundWireSummary(_ data: Data) -> String {
+    #if canImport(CryptoKit)
+    let digest = SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
+    #else
+    let digest = "unavailable"
+    #endif
+    return "unrecognized control event bytes=\(data.count) sha256=\(digest)"
+}
+
+private struct SafeOutboundEnvelopeMetadata: Decodable {
+    let messageId: String
+
+    private enum CodingKeys: String, CodingKey {
+        case messageId = "message_id"
+    }
+}
+
+private func safeOutboundWireSummary(message: ClientMessage, wire: String) -> String {
+    let data = Data(wire.utf8)
+    let decodedId = try? JSONDecoder().decode(SafeOutboundEnvelopeMetadata.self, from: data).messageId
+    let messageId = decodedId.map { String($0.prefix(64)) } ?? "unknown"
+    #if canImport(CryptoKit)
+    let digest = SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
+    #else
+    let digest = "unavailable"
+    #endif
+    return "→ sent kind=\(message.wireKindLabel) message_id=\(messageId) bytes=\(data.count) sha256=\(digest)"
+}
+
+/// Sends typed control-channel messages through the Rust bridge.
+///
+/// - The bridge accepts unsigned typed envelopes only.
+/// - The bridge validates the session and message type.
+/// - The bridge signs envelopes with its endpoint identity.
+/// - The serial FFI queue owns bridge access.
+/// - Result closures run on the main thread.
+///
+/// The sender is valid only while its `HoloConnection` is connected.
 final class FFIControlChannelSender: ControlChannelSending {
     private let bridge: OpaquePointer
     private let queue: DispatchQueue
-    /// This connection's shared outbound envelope state (`session_id` +
-    /// sequence counter) -- the same instance `HoloConnection` populates from
-    /// the daemon's greeting in `decodeServerLine`. See `OutboundEnvelopeState`.
+    /// Shares the session identifier and sequence counter with the owning connection.
     private let sessionState: OutboundEnvelopeState
-    /// Called on the main thread after a successful send (message + wire line).
+    /// Reports a successful send on the main thread.
     private let report: (ClientMessage, String) -> Void
-    /// Called on the main thread when a send fails (human-readable detail).
+    /// Reports a send failure on the main thread.
     private let reportError: (String) -> Void
 
     init(
@@ -460,8 +534,7 @@ final class FFIControlChannelSender: ControlChannelSending {
         self.reportError = reportError
     }
 
-    /// The newest cursor move not yet handed to the bridge, staged from the touch thread so a
-    /// move arriving while `queue` is blocked in a write can overwrite its predecessor.
+    /// Stores the newest cursor move until the FFI queue can write it. New moves replace older staged moves.
     private let moves = MoveCoalescer<ClientMessage>()
 
     func send(_ message: ClientMessage) {
@@ -472,13 +545,10 @@ final class FFIControlChannelSender: ControlChannelSending {
         coalesceMove(message)
     }
 
-    /// Sends the newest move rather than every move -- see `MoveCoalescer` for why that is
-    /// lossless. One flush is enqueued per move, so this self-clocks: on a nearby LAN each flush
-    /// finds its own move and nothing is dropped at all, and only a link too slow to keep up with
-    /// the finger sees any collapsing.
-    ///
-    /// Retries are deliberately not used here: a move held back waiting for a session greeting is
-    /// stale by the time it would fire, and a newer one is already on its way.
+    /// Sends the newest staged cursor move.
+    /// Each move schedules one flush on the serial queue.
+    /// A slow link can coalesce moves that it cannot transmit in time.
+    /// This path does not retry moves because delayed cursor positions are stale.
     private func coalesceMove(_ message: ClientMessage) {
         moves.stage(message)
         queue.async {
@@ -487,14 +557,10 @@ final class FFIControlChannelSender: ControlChannelSending {
         }
     }
 
-    /// The greeting that carries the daemon-minted `session_id` races any
-    /// send fired the instant the connection reports `.connected` (the event
-    /// pump only polls every 150ms) -- live-witnessed: the auto-pair prompt
-    /// silently dropped with "no session_id yet" because the one send
-    /// attempt happened a few ms before the greeting was decoded. A send
-    /// that arrives before the greeting therefore RETRIES briefly (100ms *
-    /// 20 = up to 2s) instead of dropping; a genuinely missing greeting
-    /// still surfaces the error after the window.
+    /// Retries a send while the daemon session identifier is unavailable.
+    /// The event pump can receive the identifier after the connection phase changes.
+    /// Retries occur every 100 milliseconds for up to 2 seconds.
+    /// After 2 seconds, the sender reports an error.
     private func sendWithRetry(_ message: ClientMessage, retriesLeft: Int) {
         let reportError = reportError
         // Encoding happens on `queue` too (not the caller's thread): the
@@ -519,12 +585,11 @@ final class FFIControlChannelSender: ControlChannelSending {
     enum BridgeWriteOutcome {
         case sent
         case refused
-        /// The daemon greeting carrying `session_id` has not arrived yet -- the one outcome a
-        /// caller can usefully wait out.
+        /// Indicates that the daemon session identifier is not available yet.
         case noSessionYet
     }
 
-    /// Encodes `message` and hands it to the bridge. Must run on `queue`.
+    /// Encodes one message and writes it to the bridge. Call this method only on `queue`.
     @discardableResult
     private func writeToBridge(_ message: ClientMessage, reportSuccess: Bool) -> BridgeWriteOutcome {
         guard let wire = encoded(message, sessionState: sessionState) else { return .noSessionYet }

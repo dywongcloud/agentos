@@ -20,7 +20,10 @@ fn main() {
     let msg = ServerMessage::current_ticket(ticket);
     let j = rt(&msg);
     println!("current_ticket -> {j}");
-    assert!(j.contains("\"type\":\"current_ticket\""), "wrong type tag: {j}");
+    assert!(
+        j.contains("\"type\":\"current_ticket\""),
+        "wrong type tag: {j}"
+    );
     assert!(j.contains(ticket), "ticket missing from wire: {j}");
 
     let decoded: ServerMessage =
@@ -35,10 +38,16 @@ fn main() {
         ServerMessage::task_progress("clicking"),
         ServerMessage::task_done("completed", None),
         ServerMessage::auth_rejected("bad pin"),
-        ServerMessage::TaskActive { paused: true, queued: 2 },
+        ServerMessage::TaskActive {
+            paused: true,
+            queued: 2,
+        },
     ] {
         let j = rt(&existing);
-        assert!(!j.contains("current_ticket"), "existing kind polluted by new variant: {j}");
+        assert!(
+            !j.contains("current_ticket"),
+            "existing kind polluted by new variant: {j}"
+        );
     }
 
     println!(

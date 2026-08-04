@@ -92,7 +92,10 @@ fn expect_snake_case(state: TaskState, expected: &str) {
 }
 
 fn main() {
-    println!("=== TaskState serde snake_case round-trips (all {} variants) ===", ALL_STATES.len());
+    println!(
+        "=== TaskState serde snake_case round-trips (all {} variants) ===",
+        ALL_STATES.len()
+    );
     expect_snake_case(TaskState::Created, "created");
     expect_snake_case(TaskState::Queued, "queued");
     expect_snake_case(TaskState::Connecting, "connecting");
@@ -112,12 +115,18 @@ fn main() {
     expect_snake_case(TaskState::NeedsLogin, "needs_login");
     expect_snake_case(TaskState::NeedsMfa, "needs_mfa");
     expect_snake_case(TaskState::NeedsConfirmation, "needs_confirmation");
-    expect_snake_case(TaskState::SensitiveAccessRequested, "sensitive_access_requested");
+    expect_snake_case(
+        TaskState::SensitiveAccessRequested,
+        "sensitive_access_requested",
+    );
     expect_snake_case(TaskState::UserCancelled, "user_cancelled");
     expect_snake_case(TaskState::PermissionDenied, "permission_denied");
     expect_snake_case(TaskState::AmbiguousTarget, "ambiguous_target");
     expect_snake_case(TaskState::TargetNotFound, "target_not_found");
-    expect_snake_case(TaskState::SensitiveAccessRejected, "sensitive_access_rejected");
+    expect_snake_case(
+        TaskState::SensitiveAccessRejected,
+        "sensitive_access_rejected",
+    );
     expect_snake_case(TaskState::AgentTimeout, "agent_timeout");
     expect_snake_case(TaskState::Failed, "failed");
     expect_snake_case(
@@ -132,7 +141,11 @@ fn main() {
         TaskState::ConfidentialModelUnavailable,
         "confidential_model_unavailable",
     );
-    assert_eq!(ALL_STATES.len(), 30, "expected exactly 30 TaskState variants");
+    assert_eq!(
+        ALL_STATES.len(),
+        30,
+        "expected exactly 30 TaskState variants"
+    );
 
     println!();
     println!("=== happy-path adjacent edges are all valid ===");
@@ -156,7 +169,10 @@ fn main() {
     for (from, to) in skip_cases {
         let valid = is_valid_transition(from, to);
         println!("{from:?} -> {to:?} : valid={valid}");
-        assert!(!valid, "{from:?} -> {to:?} skips states and must be rejected");
+        assert!(
+            !valid,
+            "{from:?} -> {to:?} skips states and must be rejected"
+        );
     }
 
     println!();
@@ -171,22 +187,37 @@ fn main() {
         assert!(out, "{wait:?} must be able to resume back into Connecting");
     }
     // NeedsConfirmation / SensitiveAccessRequested interrupt PolicyChecking and resume into it.
-    for wait in [TaskState::NeedsConfirmation, TaskState::SensitiveAccessRequested] {
+    for wait in [
+        TaskState::NeedsConfirmation,
+        TaskState::SensitiveAccessRequested,
+    ] {
         let into = is_valid_transition(TaskState::PolicyChecking, wait);
         let out = is_valid_transition(wait, TaskState::PolicyChecking);
         println!("PolicyChecking -> {wait:?} : valid={into}");
         println!("{wait:?} -> PolicyChecking : valid={out}");
-        assert!(into, "PolicyChecking must be able to interrupt into {wait:?}");
-        assert!(out, "{wait:?} must be able to resume back into PolicyChecking");
+        assert!(
+            into,
+            "PolicyChecking must be able to interrupt into {wait:?}"
+        );
+        assert!(
+            out,
+            "{wait:?} must be able to resume back into PolicyChecking"
+        );
     }
     // A waiting state must not resume into some unrelated flow state (no bypass).
     let bogus_resume = is_valid_transition(TaskState::NeedsLogin, TaskState::Committing);
     println!("NeedsLogin -> Committing (bogus resume) : valid={bogus_resume}");
-    assert!(!bogus_resume, "a waiting state must only resume into the flow state it interrupted");
+    assert!(
+        !bogus_resume,
+        "a waiting state must only resume into the flow state it interrupted"
+    );
 
     println!();
     println!("=== SensitiveAccessRequested can be explicitly rejected ===");
-    let rejected = is_valid_transition(TaskState::SensitiveAccessRequested, TaskState::SensitiveAccessRejected);
+    let rejected = is_valid_transition(
+        TaskState::SensitiveAccessRequested,
+        TaskState::SensitiveAccessRejected,
+    );
     println!("SensitiveAccessRequested -> SensitiveAccessRejected : valid={rejected}");
     assert!(rejected);
 
@@ -198,9 +229,15 @@ fn main() {
     for &terminal in TERMINAL_STATES {
         for &to in ALL_STATES {
             let valid = is_valid_transition(terminal, to);
-            assert!(!valid, "terminal state {terminal:?} must have no valid edge to {to:?}, got valid={valid}");
+            assert!(
+                !valid,
+                "terminal state {terminal:?} must have no valid edge to {to:?}, got valid={valid}"
+            );
         }
-        println!("{terminal:?} -> * : all {} candidates rejected, OK", ALL_STATES.len());
+        println!(
+            "{terminal:?} -> * : all {} candidates rejected, OK",
+            ALL_STATES.len()
+        );
     }
 
     println!();
@@ -208,13 +245,22 @@ fn main() {
     for &deferred in TINFOIL_DEFERRED {
         for &from in ALL_STATES {
             let into = is_valid_transition(from, deferred);
-            assert!(!into, "{from:?} -> {deferred:?} must be rejected (Tinfoil deferred to beta)");
+            assert!(
+                !into,
+                "{from:?} -> {deferred:?} must be rejected (Tinfoil deferred to beta)"
+            );
         }
         for &to in ALL_STATES {
             let out = is_valid_transition(deferred, to);
-            assert!(!out, "{deferred:?} -> {to:?} must be rejected (Tinfoil deferred to beta)");
+            assert!(
+                !out,
+                "{deferred:?} -> {to:?} must be rejected (Tinfoil deferred to beta)"
+            );
         }
-        println!("{deferred:?} : confirmed unreachable inbound and outbound across all {} states", ALL_STATES.len());
+        println!(
+            "{deferred:?} : confirmed unreachable inbound and outbound across all {} states",
+            ALL_STATES.len()
+        );
     }
 
     println!();
@@ -223,11 +269,19 @@ fn main() {
     let self_loop = is_valid_transition(TaskState::Verifying, TaskState::Verifying);
     println!("Verifying -> Navigating (retry) : valid={retry}");
     println!("Verifying -> Verifying (self-loop) : valid={self_loop}");
-    assert!(retry, "a failed verification must be able to route back to Navigating for a retry");
-    assert!(!self_loop, "Verifying has no direct self-loop in this lifecycle diagram");
+    assert!(
+        retry,
+        "a failed verification must be able to route back to Navigating for a retry"
+    );
+    assert!(
+        !self_loop,
+        "Verifying has no direct self-loop in this lifecycle diagram"
+    );
 
     println!();
-    println!("=== UserCancelled and AgentTimeout are reachable broadly, but never chainable further ===");
+    println!(
+        "=== UserCancelled and AgentTimeout are reachable broadly, but never chainable further ==="
+    );
     for &from in HAPPY_PATH.iter().filter(|s| **s != TaskState::Completed) {
         let cancel = is_valid_transition(from, TaskState::UserCancelled);
         println!("{from:?} -> UserCancelled : valid={cancel}");
@@ -235,5 +289,7 @@ fn main() {
     }
 
     println!();
-    println!("task_state_probe: OK -- TaskState enum, serde snake_case wire form, and is_valid_transition's full lifecycle diagram witnessed via real execution");
+    println!(
+        "task_state_probe: OK -- TaskState enum, serde snake_case wire form, and is_valid_transition's full lifecycle diagram witnessed via real execution"
+    );
 }

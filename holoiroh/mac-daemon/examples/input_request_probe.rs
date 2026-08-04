@@ -29,7 +29,9 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use holoiroh_daemon::control_channel::{ClientMessage, InputRequestKind, PendingInputRequest, ServerMessage, wait_for_expiry};
+use holoiroh_daemon::control_channel::{
+    ClientMessage, InputRequestKind, PendingInputRequest, ServerMessage, wait_for_expiry,
+};
 
 fn epoch_millis_now() -> u64 {
     SystemTime::now()
@@ -152,12 +154,26 @@ async fn main() {
         "InputRequest JSON must never contain a credential value -- the constructor has no parameter that could carry one"
     );
     match &msg {
-        ServerMessage::InputRequest { kind, response_options, expires_at, .. } => {
+        ServerMessage::InputRequest {
+            kind,
+            response_options,
+            expires_at,
+            ..
+        } => {
             assert_eq!(*kind, InputRequestKind::Credential);
-            assert!(response_options.is_empty(), "credential kind carries no discrete choices");
+            assert!(
+                response_options.is_empty(),
+                "credential kind carries no discrete choices"
+            );
             let now = epoch_millis_now();
-            assert!(*expires_at > now, "expires_at must be in the future for a fresh 300s-TTL request");
-            assert!(*expires_at <= now + 301_000, "expires_at should be ~300s out, not wildly off");
+            assert!(
+                *expires_at > now,
+                "expires_at must be in the future for a fresh 300s-TTL request"
+            );
+            assert!(
+                *expires_at <= now + 301_000,
+                "expires_at should be ~300s out, not wildly off"
+            );
             println!(
                 "expires_at={expires_at}, now={now}, delta_ms={}",
                 expires_at.saturating_sub(now)
@@ -193,35 +209,63 @@ async fn main() {
     let safe_pause_json = serde_json::to_string(&safe_pause_msg).unwrap();
     println!("safe-pause status message: {safe_pause_json}");
     match &safe_pause_msg {
-        ServerMessage::Status { text } => {
+        ServerMessage::Status { text, .. } => {
             let text = text.as_deref().unwrap_or_default();
-            assert!(text.contains("safely paused"), "expiry status text must say 'safely paused': {text}");
-            assert!(!text.to_lowercase().contains("fail"), "expiry status text must NOT say failed: {text}");
+            assert!(
+                text.contains("safely paused"),
+                "expiry status text must say 'safely paused': {text}"
+            );
+            assert!(
+                !text.to_lowercase().contains("fail"),
+                "expiry status text must NOT say failed: {text}"
+            );
         }
-        other => panic!("expiry must produce a Status message (safe pause, not a failure), got {other:?}"),
+        other => panic!(
+            "expiry must produce a Status message (safe pause, not a failure), got {other:?}"
+        ),
     }
     println!("OK -- expiry emits ServerMessage::Status (safe pause), never ServerMessage::Error");
 
     println!();
-    println!("=== degenerate case: expires_at already in the past resolves immediately, no hang ===");
+    println!(
+        "=== degenerate case: expires_at already in the past resolves immediately, no hang ==="
+    );
     let already_expired = epoch_millis_now().saturating_sub(10_000); // 10s in the past
-    let pending_past = Some(PendingInputRequest::for_probing("req-already-expired", already_expired));
+    let pending_past = Some(PendingInputRequest::for_probing(
+        "req-already-expired",
+        already_expired,
+    ));
     let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(Duration::from_secs(2), wait_for_expiry(&pending_past)).await;
     let elapsed = started.elapsed();
     println!("already-past-deadline wait_for_expiry resolved after {elapsed:?}");
-    assert!(result.is_ok(), "an already-expired deadline must resolve immediately, not hang until the 2s timeout");
-    assert!(elapsed < Duration::from_millis(500), "already-expired deadline took too long to resolve: {elapsed:?}");
+    assert!(
+        result.is_ok(),
+        "an already-expired deadline must resolve immediately, not hang until the 2s timeout"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "already-expired deadline took too long to resolve: {elapsed:?}"
+    );
     println!("OK -- already-expired deadline fires immediately, no panic, no hang");
 
     println!();
     println!("=== None pending: wait_for_expiry never resolves (no spurious firing) ===");
     let none_pending: Option<PendingInputRequest> = None;
-    let result = tokio::time::timeout(Duration::from_millis(300), wait_for_expiry(&none_pending)).await;
-    println!("wait_for_expiry(&None) within a 300ms window -> timed_out={}", result.is_err());
-    assert!(result.is_err(), "wait_for_expiry on None pending must never resolve on its own");
+    let result =
+        tokio::time::timeout(Duration::from_millis(300), wait_for_expiry(&none_pending)).await;
+    println!(
+        "wait_for_expiry(&None) within a 300ms window -> timed_out={}",
+        result.is_err()
+    );
+    assert!(
+        result.is_err(),
+        "wait_for_expiry on None pending must never resolve on its own"
+    );
     println!("OK -- no pending request never spuriously fires the expiry arm");
 
     println!();
-    println!("input_request_probe: OK -- all input_request/input_response wire-schema and real-timed expiry cases witnessed via real execution");
+    println!(
+        "input_request_probe: OK -- all input_request/input_response wire-schema and real-timed expiry cases witnessed via real execution"
+    );
 }

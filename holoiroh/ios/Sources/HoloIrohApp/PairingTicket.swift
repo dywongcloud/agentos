@@ -1,48 +1,23 @@
 import Foundation
 
-/// Extracts and lightly validates the iroh ticket string out of a decoded
-/// QR payload (or a pasted value).
-///
-/// ## What the QR actually contains
-///
-/// The Mac daemon renders **exactly the ticket string** into the QR — no
-/// URL wrapper, no JSON, no extra fields. `mac-daemon/src/main.rs`'s
-/// `print_ticket_qr(&ticket.to_string())` calls `QrCode::new(ticket.as_bytes())`,
-/// where `ticket` is a `LiveTicket` whose `to_string()` looks like:
-///
-/// ```
-/// iroh-live:TleiXllmGyIDcEOXtF-AIExJQnPFPlZuzkXmR6OVWNwDAQD…/holoiroh
-/// ```
-///
-/// So in the normal case the decoded QR string *is* the ticket and this
-/// type just trims surrounding whitespace. The extra tolerance below exists
-/// only to be forgiving of a future QR that wraps the ticket (e.g. some
-/// `holoiroh://pair?ticket=…` scheme) or a paste that picked up stray
-/// surrounding text — it never *invents* a ticket, it only locates an
-/// already-present `iroh-live:` token.
+/// Extracts a plausible iroh ticket from a Quick Response (QR) payload or pasted value.
+/// The daemon normally encodes only the ticket string.
+/// Extraction also accepts surrounding text that contains an `iroh-live:` token.
+/// It trims surrounding whitespace but does not alter the ticket body.
 enum PairingTicket {
-    /// The scheme prefix every iroh-live ticket carries.
+    /// Identifies the prefix for every iroh-live ticket.
     static let scheme = "iroh-live:"
 
-    /// Returns the canonical ticket string if `raw` contains a plausible
-    /// iroh-live ticket, else `nil`.
+    /// Returns the first plausible iroh ticket in `raw`.
     ///
-    /// Rules, in order:
-    /// 1. Trim surrounding whitespace/newlines.
-    /// 2. Find the first occurrence of the scheme anywhere in the value
-    ///    (covers both the common QR case — the whole payload *is* the
-    ///    ticket — and a wrapped/prefixed payload).
-    /// 3. Take from the scheme to the end of that **whitespace-delimited
-    ///    token**. A real iroh ticket (base32 body + `/holoiroh`) contains
-    ///    no whitespace, so stopping at the first whitespace strips any
-    ///    trailing text that a paste or wrapper picked up, in both the
-    ///    prefix case and the mid-string case.
-    /// 4. Reject anything without the scheme, or with no ticket body after
-    ///    the scheme.
+    /// Processing order:
+    /// 1. Trim surrounding whitespace and newlines.
+    /// 2. Find the first scheme occurrence.
+    /// 3. Take the whitespace-delimited token that starts at the scheme.
+    /// 4. Reject an empty value, missing scheme, or missing ticket body.
     ///
-    /// This never mutates the ticket body — the extracted substring is
-    /// hashed as-is for the verification phrase, so it must match the
-    /// daemon's own `ticket.to_string()` byte-for-byte.
+    /// The method does not change the extracted body.
+    /// This preserves byte equality for verification-phrase hashing.
     static func extract(from raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -61,7 +36,7 @@ enum PairingTicket {
         return candidate
     }
 
-    /// Convenience predicate: does `raw` contain a usable ticket?
+    /// Returns `true` when `raw` contains a usable ticket.
     static func isValid(_ raw: String) -> Bool {
         extract(from: raw) != nil
     }

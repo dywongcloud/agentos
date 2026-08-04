@@ -57,8 +57,16 @@ impl InstanceGuard {
                 let holder = holder.trim();
                 anyhow::bail!(
                     "another holoiroh-daemon instance is already running{}; only one instance may run at a time (it owns `holo serve`'s port and the iroh control channel -- a second instance would publish a QR code that silently cannot accept control connections). Stop the other instance first (`kill {}` or close its terminal), then retry.",
-                    if holder.is_empty() { String::new() } else { format!(" (pid {holder})") },
-                    if holder.is_empty() { "<pid>".to_string() } else { holder.to_string() }
+                    if holder.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (pid {holder})")
+                    },
+                    if holder.is_empty() {
+                        "<pid>".to_string()
+                    } else {
+                        holder.to_string()
+                    }
                 );
             }
             return Err(anyhow::anyhow!("failed to lock {}: {err}", path.display()));

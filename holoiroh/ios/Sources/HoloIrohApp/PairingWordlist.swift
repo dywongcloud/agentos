@@ -1,45 +1,26 @@
 import Foundation
 
-/// The fixed 256-word list used to render a pairing verification phrase
-/// (a short-authentication-string / SAS) from a hash of the iroh ticket.
+/// Defines the fixed word list for the ticket verification phrase.
 ///
-/// ## This list is a shared-secret *contract* with the Mac daemon
+/// The app and daemon use the same list and index rule.
 ///
-/// The whole point of the verification phrase (Project Aro PRD P0-2 / 7.1)
-/// is that the *same* phrase appears on both the Mac and the iPhone, so a
-/// man-in-the-middle who substituted the QR/ticket is caught when the two
-/// phrases fail to match. That only works if **both ends derive the phrase
-/// from the identical wordlist, in the identical order, with the identical
-/// indexing rule** (see `PairingPhrase.swift` for the derivation).
+/// This list has these constraints:
 ///
-/// Therefore:
-/// - The list has **exactly 256 entries** (`2^8`), so a single digest byte
-///   (`0...255`) maps to exactly one word with no modulo bias and no
-///   bit-slicing ambiguity: `word = wordlist[digestByte]`.
-/// - The **order is load-bearing**. Index `i` must map to the same word on
-///   the daemon side. Reordering, inserting, or removing any word is a
-///   **breaking change** to the pairing contract and must be accompanied by
-///   a bump of `PairingPhrase.algorithmVersion` (and a matching bump on the
-///   daemon).
-/// - Words are chosen to be short, lowercase, ASCII, distinct, and
-///   low-homophone so they are unambiguous when one person reads the phrase
-///   aloud and the other confirms it. (Classic SAS-wordlist properties; a
-///   compact hand-curated list rather than the full 2048-word BIP-39 list,
-///   because 4 words out of 256 already gives 2^32 ≈ 4.3 billion possible
-///   phrases, far beyond what an interactive attacker can grind against a
-///   single live pairing attempt.)
+/// - It contains exactly 256 entries.
+/// - Each digest byte maps directly to one list index.
+/// - Each word uses lowercase American Standard Code for Information Interchange (ASCII) characters.
+/// - Each word is distinct and has few homophones.
 ///
-/// The daemon must embed a byte-for-byte identical list. `PAIRING_PHRASE.md`
-/// (in `holoiroh/ios/`) is the authoritative spec the daemon side follows,
-/// and includes a known-answer test vector so agreement can be proven.
+/// The word order is part of the pairing contract.
+/// Reordering, adding, or removing a word is a breaking change.
+/// Update both implementations and their algorithm versions together.
+/// See `PAIRING_PHRASE.md` for the contract and known-answer vectors.
 enum PairingWordlist {
-    /// Version of *this specific list's contents+ordering*. Bumped together
-    /// with `PairingPhrase.algorithmVersion` whenever the list changes, so a
-    /// mismatched daemon/app pair can detect that they disagree rather than
-    /// silently show phrases that never match.
+    /// Identifies this exact list and word order.
+    /// Update this value with `PairingPhrase.algorithmVersion` when the list changes.
     static let version = 1
 
-    /// Exactly 256 words. Index == digest byte value.
+    /// Contains 256 words indexed by digest byte value.
     static let words: [String] = [
         // 0x00 - 0x0F
         "acid", "alarm", "album", "anchor", "apple", "april", "arena", "atlas",

@@ -1,181 +1,150 @@
-//! `extern "C"` FFI bridge from `iroh-live` to the iOS Swift client.
+//! Provides an `extern "C"` foreign function interface (FFI) between `iroh-live` and the iOS Swift app.
 //!
-//! # Why this crate exists
+//! # Purpose
 //!
-//! Neither `iroh` nor `iroh-live` ships official Swift/UniFFI bindings for
-//! `iroh-live`'s media API (base `iroh` *does* have official Swift bindings,
-//! via the separate `n0-computer/iroh-ffi` repo -- but that wraps raw
-//! `Endpoint`/`Connection`, not `iroh-live`'s `LocalBroadcast`/`subscribe`/
-//! frame-pull surface, which is what this project actually needs). Full
-//! research trail, sources, and the exact decision rationale live in
-//! `../ios/IROH_FFI.md` -- read that first if you're wondering "why not just
-//! use iroh-ffi directly."
+//! Neither `iroh` nor `iroh-live` provides official Swift bindings for the `iroh-live` media API.
+//! The separate `n0-computer/iroh-ffi` repository provides official Swift bindings for base `iroh`.
+//! Those bindings wrap `Endpoint` and `Connection`.
+//! They do not wrap `LocalBroadcast`, `subscribe`, or frame polling.
+//! See `../ios/IROH_FFI.md` for sources and the decision rationale.
 //!
-//! This crate is the fallback plan: a minimal hand-written bridge, following
-//! the same shape `iroh-live`'s own `moq-media-android` crate uses for
-//! Kotlin/JNI (a hand-rolled bridge crate, not a code-generated one) --
-//! that's an established precedent in the upstream project, not an unusual
-//! choice made here.
+//! This crate provides a minimal hand-written bridge.
+//! The upstream `moq-media-android` crate uses the same hand-written bridge pattern for Kotlin and Java Native Interface (JNI).
 //!
-//! # Status: real subscribe implementation (as-built)
+//! # Observable behavior
 //!
-//! Every `extern "C"` function below has a real body wired to the actual
-//! `iroh-live` subscribe API, verified against the vendored crate source at
-//! commit `5f95758` (the same commit `Cargo.toml` pins):
+//! The implementation uses the `iroh-live` subscribe API from commit `5f95758`.
+//! `Cargo.toml` pins that commit.
 //!
-//! - Connect: [`iroh::Endpoint::builder`]`(presets::N0).bind()` ->
-//!   [`iroh_live::Live::builder`]`(ep).with_router().spawn()`.
-//! - Ticket: [`iroh_live::ticket::LiveTicket::from_str`] -> a struct with a
-//!   public `endpoint: EndpointAddr` and `broadcast_name: String`.
-//! - Subscribe: [`iroh_live::Live::subscribe`]`(ticket.endpoint,
-//!   &ticket.broadcast_name)` -> [`iroh_live::Subscription`].
-//! - Video track: `subscription.broadcast().video_ready()` ->
-//!   `moq_media::subscribe::VideoTrack` (waits for the catalog to advertise a
-//!   video rendition, then subscribes to the best quality, decoding via the
-//!   platform's default decoder -- VideoToolbox on Apple targets).
-//! - Frames: `VideoTrack::try_recv()` (non-blocking) ->
-//!   `Option<moq_media::format::VideoFrame>`; `frame.rgba_image().as_raw()`
-//!   normalizes any backing pixel format (packed RGBA/BGRA, GPU, NV12) into a
-//!   tightly-packed `width * height * 4` RGBA8 byte buffer that maps directly
-//!   onto a `kCVPixelFormatType_32RGBA` `CVPixelBuffer` on the Swift side.
+//! - Connect: [`iroh::Endpoint::builder`]`(presets::N0).bind()` then [`iroh_live::Live::builder`]`(ep).with_router().spawn()`.
+//! - Ticket: [`iroh_live::ticket::LiveTicket::from_str`] returns public `endpoint: EndpointAddr` and `broadcast_name: String` fields.
+//! - Subscribe: [`iroh_live::Live::subscribe`]`(ticket.endpoint, &ticket.broadcast_name)` returns [`iroh_live::Subscription`].
+//! - Video: `subscription.broadcast().video_ready()` waits for a catalog video rendition.
+//!   It subscribes to the best-quality rendition.
+//!   Apple targets use VideoToolbox as the default decoder.
+//! - Frames: `VideoTrack::try_recv()` returns `Option<moq_media::format::VideoFrame>` without blocking.
+//!   `frame.rgba_image().as_raw()` normalizes packed RGBA, packed BGRA, GPU, or NV12 input.
+//!   The bridge converts this data to tightly packed BGRA8 output.
+//!   Each row contains `width * 4` bytes.
+//!   The complete buffer contains `width * height * 4` bytes.
+//!   Swift maps this output to a `kCVPixelFormatType_32BGRA` `CVPixelBuffer`.
 //!
-//! The control-channel functions (`holoiroh_ios_bridge_control_connect` /
-//! `_control_send` / `_poll_control_event`) ride a **separate** iroh ALPN
-//! (`holoiroh/control/1`, byte-identical to
-//! `mac-daemon/src/control_channel.rs`'s `CONTROL_ALPN`), not the media
-//! subscribe path: `_control_connect` dials the same peer the ticket named
-//! (via `live.endpoint().connect(peer, CONTROL_ALPN)`), opens one
-//! bidirectional stream, performs the bare-line PIN handshake the daemon's
-//! auth gate expects, then hands the recv half to a reader task feeding an
-//! NDJSON event queue -- see each function's doc comment for the exact wire
-//! contract.
+//! The control channel uses the separate `holoiroh/control/1` application-layer protocol negotiation (ALPN) identifier.
+//! Both sides share [`holoiroh_wire::CONTROL_ALPN`].
+//! The control connection dials the ticket peer with `live.endpoint().connect(peer, CONTROL_ALPN)`.
+//! It opens one bidirectional stream and performs the daemon's bare-line personal identification number (PIN) handshake.
+//! A reader task then sends received newline-delimited JSON (NDJSON) lines to an event queue.
+//! Each control function documents its wire contract.
 //!
-//! # FFI design notes
+//! # FFI invariants
 //!
-//! - **Opaque handles, not exposed structs.** Every stateful object
-//!   (`Bridge`, `Subscription`) crosses the boundary as an opaque pointer
-//!   (typed here as a pointer to a zero-sized marker struct, so C/Swift can't
-//!   accidentally dereference it) obtained from a `_new`/`_subscribe`
-//!   function and released by a matching `_free` function. This is the same
-//!   pattern `iroh-ffi` uses internally before uniffi's codegen wraps it in a
-//!   Swift class -- we're doing by hand what uniffi would otherwise generate.
-//! - **No `async fn` across the FFI boundary.** `async`/`.await` doesn't have
-//!   a C ABI. Every `extern "C"` function here is synchronous from the
-//!   caller's point of view; internally, `BridgeInner` owns a Tokio
-//!   multi-thread runtime and blocks the calling thread on
-//!   `runtime.block_on(...)` for connect/subscribe calls, or returns
-//!   immediately for polling calls (`poll_next_frame`) which do a
-//!   non-blocking `try_recv` on the decoded-frame channel. Swift is expected
-//!   to call the connect/subscribe functions and the polling loop from a
-//!   background `DispatchQueue`/`Task`, not the main thread.
-//! - **No panic may unwind across the boundary.** `extern "C"` functions must
-//!   never unwind across the FFI boundary (undefined behavior in Rust; a hard
-//!   crash in practice). Every fallible function is wrapped in
-//!   [`std::panic::catch_unwind`] and returns a sentinel (null pointer /
-//!   negative int) on failure, writing a heap-allocated, null-terminated
-//!   error string to an optional `*mut *mut c_char` out-param, freed by the
-//!   caller via [`holoiroh_ios_bridge_free_error_string`]. This mirrors what
-//!   uniffi generates automatically (`Result<T, IrohError>` -> Swift
-//!   `throws`); we do it by hand here.
-//! - **Frames are caller-allocated-and-filled, not Rust-allocated-and-
-//!   returned**, to avoid an allocation per frame on a hot path (screen
-//!   capture at 30-60fps): [`holoiroh_ios_bridge_poll_next_frame`] takes a
-//!   caller-owned buffer + capacity and, if the frame doesn't fit, returns
-//!   [`HOLOIROH_ERR_BUFFER_TOO_SMALL`] after writing the frame's real
-//!   dimensions into `out_frame` (so the caller can size a buffer as
-//!   `width * height * 4` and retry), rather than returning an owned
-//!   allocation the caller would have to free per-frame.
+//! - Stateful objects cross the boundary as opaque pointers to zero-sized marker types.
+//!   A `_new` or `_subscribe` function creates each handle.
+//!   The matching `_free` function releases it.
+//!   Distinct marker types prevent callers from exchanging bridge and subscription handles.
+//! - C application binary interfaces (ABIs) do not support `async fn`.
+//!   Each `extern "C"` function is synchronous for its caller.
+//!   `BridgeInner` owns a multithreaded Tokio runtime.
+//!   Connect and subscribe calls use `runtime.block_on(...)`.
+//!   Polling calls return immediately after a non-blocking `try_recv`.
+//!   Swift must run connection, subscription, and polling work outside the main thread.
+//! - A panic must not unwind across the FFI boundary.
+//!   Rust defines such unwinding as undefined behavior.
+//!   Each fallible function uses [`std::panic::catch_unwind`].
+//!   Failure returns a null pointer or negative integer.
+//!   An optional `out_error: *mut *mut c_char` points to a writable `*mut c_char` slot.
+//!   On failure, the function can store a heap-allocated, null-terminated string in that slot.
+//!   The caller must use [`holoiroh_ios_bridge_free_error_string`] to free that string.
+//! - [`holoiroh_ios_bridge_poll_next_frame`] writes frames into caller-owned buffers.
+//!   This design avoids one Rust allocation for each frame at 30-60 frames per second.
+//!   If capacity is insufficient, the function returns [`HOLOIROH_ERR_BUFFER_TOO_SMALL`].
+//!   It writes the actual dimensions to `out_frame`.
+//!   The caller can allocate `width * height * 4` bytes before polling again.
 //!
-//! # Packaging this crate into an iOS `.xcframework`
+//! # iOS `.xcframework` packaging
 //!
-//! See `../ios/IROH_FFI.md`'s "As-built: xcframework packaging" section for
-//! the full, witnessed command sequence. In brief:
+//! See the witnessed commands in `../ios/IROH_FFI.md` under "As-built: xcframework packaging."
 //!
-//! 1. `rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-//!    x86_64-apple-ios-sim`
-//! 2. `cargo build -p holoiroh-ios-bridge --target <triple> --release`
-//!    per target -> `target/<triple>/release/libholoiroh_ios_bridge.a`
-//! 3. `lipo -create` the two simulator slices into one fat `.a`.
-//! 4. Generate `include/HoloirohIosBridge.h` (committed) + the
-//!    `module.modulemap` beside it.
-//! 5. `xcodebuild -create-xcframework` combining the device slice + fused
-//!    simulator slice, each paired with `-headers include/`.
-//! 6. Add the `.xcframework` to the Xcode/SwiftPM target;
-//!    `import HoloirohIosBridge` from Swift. `IrohLiveFrameSource`
-//!    (`../ios/Sources/HoloIrohApp/Video/IrohLiveFrameSource.swift`) wraps
-//!    the C functions into a `VideoFrameSource`.
+//! 1. Run `rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios-sim`.
+//! 2. Run `cargo build -p holoiroh-ios-bridge --target <triple> --release` for each target.
+//!    Each archive is `target/<triple>/release/libholoiroh_ios_bridge.a`.
+//! 3. Use `lipo -create` to combine both simulator slices into one fat `.a` archive.
+//! 4. Generate the committed `include/HoloirohIosBridge.h` and adjacent `module.modulemap` files.
+//! 5. Use `xcodebuild -create-xcframework` with the device slice and combined simulator slice.
+//!    Pair each slice with `-headers include/`.
+//! 6. Add the `.xcframework` to the Xcode or Swift Package Manager target.
+//!    Use `import HoloirohIosBridge` from Swift.
+//!    `../ios/Sources/HoloIrohApp/Video/IrohLiveFrameSource.swift` wraps the C functions as a `VideoFrameSource`.
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use holoiroh_wire::{
+    ClientMessage, EnvelopeDirection, InboundEnvelopeState, PROTOCOL_VERSION, ServerMessage,
+    TaskEnvelope, decode_ed25519_signature, encode_ed25519_signature,
+};
 use iroh::endpoint::{Connection, SendStream, presets};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey, Signature};
 use iroh_live::Live;
 use iroh_live::media::subscribe::VideoTrack;
 use iroh_live::ticket::LiveTicket;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::runtime::Runtime;
 
-/// Opaque handle to a running bridge instance: owns the Tokio runtime, the
-/// `iroh_live::Live` session, and (once connected) the current subscription.
-/// Obtained via [`holoiroh_ios_bridge_new`], released via
-/// [`holoiroh_ios_bridge_free`].
+/// Stores an opaque bridge handle.
+/// [`holoiroh_ios_bridge_new`] creates the handle.
+/// [`holoiroh_ios_bridge_free`] releases it.
 ///
-/// Zero-sized and never constructed on the Rust side as a real value -- only
-/// ever handed out as `Box::into_raw(Box::new(BridgeInner {..}))` cast to
-/// this opaque type, so C/Swift can hold and pass the pointer around without
-/// any ability to read its layout (the real state lives in the private,
-/// non-`#[repr(C)]` [`BridgeInner`] behind it). (Deliberately not a bare
-/// `*mut c_void`: giving `HoloirohBridge` and `HoloirohSubscription` distinct
-/// named types means Swift/C callers get a type error if they pass the wrong
-/// handle to the wrong function, which `c_void` erasure would silently
-/// allow.)
+/// Rust never constructs this zero-sized marker as bridge state.
+/// The implementation casts a boxed [`BridgeInner`] pointer to this type.
+/// C and Swift can hold the pointer but cannot access the private Rust layout.
+/// Distinct bridge and subscription marker types prevent callers from exchanging their handles.
 #[repr(C)]
 pub struct HoloirohBridge {
     _private: [u8; 0],
 }
 
-/// Opaque handle to an active video subscription (post-`subscribe`), distinct
-/// from [`HoloirohBridge`] so a bridge holds zero or one active video
-/// subscriptions independently of its connection lifecycle. Obtained via
-/// [`holoiroh_ios_bridge_subscribe`], released via
-/// [`holoiroh_ios_bridge_subscription_free`].
+/// Stores an opaque active-video-subscription handle.
+/// A bridge can maintain zero or one active subscription independently of its connection lifecycle.
+/// [`holoiroh_ios_bridge_subscribe`] creates this handle.
+/// [`holoiroh_ios_bridge_subscription_free`] releases it.
 #[repr(C)]
 pub struct HoloirohSubscription {
     _private: [u8; 0],
 }
 
-/// One decoded media frame's metadata handed back across the FFI boundary by
-/// [`holoiroh_ios_bridge_poll_next_frame`]. The frame *bytes* are written into
-/// a caller-allocated buffer (see module doc, "Frames are
-/// caller-allocated-and-filled"); this struct carries the metadata the Swift
-/// side needs to hand those bytes to `CVPixelBuffer` /
-/// `AVSampleBufferDisplayLayer` correctly.
+/// Contains metadata for one decoded media frame.
+/// [`holoiroh_ios_bridge_poll_next_frame`] fills this structure.
+/// That function writes frame bytes to a separate caller-owned buffer.
+/// Swift uses this metadata to configure `CVPixelBuffer` or `AVSampleBufferDisplayLayer`.
 #[repr(C)]
 pub struct HoloirohFrame {
     pub width: u32,
     pub height: u32,
-    /// Presentation timestamp, microseconds since the subscription started
-    /// (the decoded frame's own `timestamp`, which is `Duration::ZERO` before
-    /// the pipeline assigns a PTS).
+    /// Presentation timestamp in microseconds since the subscription started.
+    /// This value comes from the decoded frame's `timestamp`.
+    /// It is `Duration::ZERO` before the pipeline assigns a presentation timestamp (PTS).
     pub timestamp_us: u64,
-    /// Pixel format of the bytes written into the caller's buffer. Always
-    /// [`HOLOIROH_PIXFMT_RGBA8`] in this build: the frame is normalized to
-    /// tightly-packed 8-bit RGBA via `VideoFrame::rgba_image()`, so
-    /// `bytes_per_row == width * 4` and total length `== width * height * 4`.
-    /// Kept as a field (rather than assumed) so the Swift side can pick the
-    /// matching `kCVPixelFormatType_*` without guessing, and so a future
-    /// zero-copy path can report a different format without an ABI change.
+    /// Identifies the pixel format in the caller's buffer.
+    /// This build always writes [`HOLOIROH_PIXFMT_BGRA8`].
+    /// `VideoFrame::rgba_image()` first produces tightly packed 8-bit RGBA data.
+    /// The bridge swaps the red and blue bytes during copy-out.
+    /// Each row contains `width * 4` bytes.
+    /// The complete buffer contains `width * height * 4` bytes.
+    /// Swift uses this field to select the matching `kCVPixelFormatType_*`.
+    /// A future zero-copy path can report another format without an application binary interface change.
     pub pixel_format: u32,
-    /// 0 = video, 1 = audio. Kept as a plain tag rather than a Rust `enum`
-    /// crossing FFI, since `#[repr(C)]` enums are still awkward to bind safely
-    /// from Swift compared to a plain integer + doc comment. Always `0`
-    /// (video) in this build -- audio is not yet pulled across this bridge.
+    /// `0` identifies video.
+    /// `1` identifies audio.
+    /// A plain integer tag crosses the foreign function interface (FFI) safely.
+    /// A `#[repr(C)]` Rust `enum` is more difficult to bind from Swift.
+    /// This build always writes `0`.
+    /// This bridge does not currently provide audio.
     pub kind: u8,
 }
 
@@ -193,16 +162,16 @@ pub const HOLOIROH_ERR_BUFFER_TOO_SMALL: HoloirohStatus = -5;
 /// The subscription's video track has ended (producer dropped): no further
 /// frames will ever arrive. Distinct from "no frame yet" (`0`).
 pub const HOLOIROH_ERR_ENDED: HoloirohStatus = -6;
-/// The requested operation is not supported by this build. No function
-/// currently returns this (the control-channel functions, which used to,
-/// are implemented as of this build) -- the constant is kept so the C ABI's
-/// error-code numbering stays stable.
+/// This build does not support the requested operation.
+/// No function currently returns this status.
+/// Earlier control-channel functions returned it before their implementation.
+/// The constant preserves the C application binary interface (ABI) error-code numbering.
 pub const HOLOIROH_ERR_UNSUPPORTED: HoloirohStatus = -7;
 /// A required pointer argument was null.
 pub const HOLOIROH_ERR_NULL_ARG: HoloirohStatus = -8;
-/// A Rust panic was caught at the FFI boundary (should never happen; the
-/// boundary catches it and returns this rather than unwinding into C, which
-/// would be undefined behavior).
+/// The bridge caught a Rust panic at the foreign function interface (FFI) boundary.
+/// The boundary returns this status instead of unwinding into C.
+/// Unwinding into C causes undefined behavior.
 pub const HOLOIROH_ERR_PANIC: HoloirohStatus = -9;
 
 /// Pixel-format tag for [`HoloirohFrame::pixel_format`]: tightly-packed 8-bit
@@ -210,59 +179,87 @@ pub const HOLOIROH_ERR_PANIC: HoloirohStatus = -9;
 /// longer emitted by this build -- see [`HOLOIROH_PIXFMT_BGRA8`].
 pub const HOLOIROH_PIXFMT_RGBA8: u32 = 0;
 
-/// Pixel-format tag for [`HoloirohFrame::pixel_format`]: tightly-packed 8-bit
-/// BGRA (B,G,R,A byte order) -- what [`holoiroh_ios_bridge_poll_next_frame`]
-/// actually emits. Maps to Swift's `kCVPixelFormatType_32BGRA`.
+/// Tags tightly packed 8-bit BGRA data in [`HoloirohFrame::pixel_format`].
+/// Byte order is B, G, R, A.
+/// Each row contains `width * 4` bytes.
+/// [`holoiroh_ios_bridge_poll_next_frame`] emits this format.
+/// Swift maps it to `kCVPixelFormatType_32BGRA`.
 ///
-/// Why BGRA, not RGBA: `kCVPixelFormatType_32RGBA` is NOT a supported
-/// CoreVideo pool/IOSurface format on iOS (it is on macOS), so the Swift
-/// side's `CVPixelBufferPoolCreate` silently returned nil and dropped EVERY
-/// frame -- live-witnessed as a permanent black screen while the on-device
-/// decode pipeline was verifiably delivering 20-40fps the whole session
-/// (device console: `vdec stats fps=20..40`, zero errors anywhere). 32BGRA
-/// is the universally-supported iOS display format, so the bridge swizzles
-/// R<->B during copy-out and tags frames with this constant.
+/// iOS does not support `kCVPixelFormatType_32RGBA` for Core Video pools or IOSurface.
+/// A live device probe showed that `CVPixelBufferPoolCreate` returned nil for that format.
+/// The display therefore dropped every frame while decoding continued at 20-40 frames per second.
+/// The device console showed `vdec stats fps=20..40` and no errors.
+/// The bridge swaps red and blue bytes during copy-out because iOS supports 32BGRA.
 pub const HOLOIROH_PIXFMT_BGRA8: u32 = 1;
 
-/// ALPN identifying the control-channel protocol on the daemon's `iroh`
-/// `Endpoint`. Re-exported here from [`holoiroh_wire::CONTROL_ALPN`] rather
-/// than a local duplicate byte string -- this crate and
-/// `mac-daemon/src/control_channel.rs` both import the one definition in
-/// the `holoiroh-wire` crate now, instead of each hand-maintaining a copy
-/// that had to stay byte-for-byte identical by convention alone. See
-/// `holoiroh-wire/src/lib.rs`'s module doc for the wire schema this ALPN
-/// carries and why that crate exists. Re-exported (`pub use`, not a plain
-/// `use`) so existing call sites in this crate referencing the bare
-/// `CONTROL_ALPN` name (no module qualifier) keep resolving unchanged.
+/// Re-exports the control channel application-layer protocol negotiation (ALPN) identifier.
+/// Both the bridge and daemon import [`holoiroh_wire::CONTROL_ALPN`].
+/// This shared definition prevents byte-string drift.
+/// See `holoiroh-wire/src/lib.rs` for the wire schema.
+/// The public re-export preserves existing unqualified `CONTROL_ALPN` references.
 pub use holoiroh_wire::CONTROL_ALPN;
 
-/// How long playout waits for an incomplete group before skipping it.
+/// Limits how long playout waits for an incomplete group before skipping it.
 ///
-/// This is a head-of-line TOLERANCE, not a fixed delay: zero cost on a clean link, but on every
-/// loss or reordering event it is how long the picture is allowed to stall before playout gives
-/// up and moves on. The library default is 150ms, chosen for recorded media where a stall beats a
-/// gap. This product wants the opposite trade, and the codebase had already said so once -- the
-/// `Sync` jitter buffer beside it was deliberately set to 20ms with a comment naming "the
-/// touch-to-cursor feedback loop of hands-on remote control" -- while this was left 7.5x larger
-/// at the library default.
+/// This value controls head-of-line tolerance, not a fixed delay.
+/// A clean link adds no delay.
+/// Loss or reordering can stall playout for at most 60 milliseconds.
+/// The library default is 150 milliseconds for recorded media.
+/// The adjacent `Sync` jitter buffer uses 20 milliseconds for the remote-control feedback loop.
 ///
-/// The number is derived rather than guessed. Skipping a group costs whatever it takes to resume
-/// at the next group boundary, which `video_latency_probe` measures at 66-172ms with an 80ms
-/// median. Tolerating a stall LONGER than that is strictly worse than skipping, so the budget
-/// belongs below it. 60ms sits under the 80ms median while still covering roughly two frames at
-/// the ~28fps the pipeline delivers, so ordinary reordering does not trigger a skip.
+/// `video_latency_probe` measured 66-172 milliseconds to resume at the next group boundary.
+/// Its median result was 80 milliseconds.
+/// The 60-millisecond limit remains below that median.
+/// It also covers approximately two frames at the measured rate of approximately 28 frames per second.
 ///
-/// This also settles the concern that lowering it against the encoder's 1-second GOP could
-/// produce LONGER freezes: that assumed a skip costs a full wait for the next IDR, and the
-/// measurement says it does not, because a group begins with its own keyframe.
+/// The encoder uses a one-second group of pictures (GOP).
+/// Skipping does not require waiting for the next independent decoder refresh (IDR) frame.
+/// The probe showed that each group starts with a keyframe.
 const PLAYOUT_MAX_LATENCY: std::time::Duration = std::time::Duration::from_millis(60);
 
-/// How long [`holoiroh_ios_bridge_control_connect`] waits for the daemon's
-/// first reply line (a bare `auth_rejected`, or the envelope-wrapped ready
-/// greeting) after writing the PIN line. Generous enough for a relay-path
-/// round trip plus the daemon's allowlist-save on first pairing; the QUIC
-/// connect itself has already succeeded by the time this timer starts.
+/// Waits for the daemon's first reply after writing the personal identification number (PIN) line.
+/// The reply is either bare `auth_rejected` or an envelope-wrapped ready greeting.
+/// The 30-second limit permits a relay round trip and the daemon's first-pairing allowlist save.
+/// The QUIC connection has already succeeded when this timer starts.
 const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONTROL_FRAME_BYTES: usize = 96 * 1024 * 1024;
+
+async fn read_bounded_control_line<R>(reader: &mut R) -> Result<Option<String>, String>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(MAX_CONTROL_FRAME_BYTES.min(8 * 1024));
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|error| format!("control-channel read failed: {error}"))?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        if content_len > MAX_CONTROL_FRAME_BYTES.saturating_sub(bytes.len()) {
+            return Err(format!(
+                "control frame exceeds {MAX_CONTROL_FRAME_BYTES}-byte limit"
+            ));
+        }
+        bytes.extend_from_slice(&available[..content_len]);
+        reader.consume(newline.map_or(content_len, |index| index + 1));
+        if newline.is_some() {
+            break;
+        }
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| "control frame is not valid UTF-8".to_string())
+}
 
 // ---------------------------------------------------------------------
 // Private Rust state behind the opaque handles
@@ -271,9 +268,9 @@ const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The real state behind a [`HoloirohBridge`] opaque pointer. Never
 /// `#[repr(C)]`; only ever reached via `&*(ptr as *const BridgeInner)`.
 struct BridgeInner {
-    /// Multi-thread Tokio runtime owned by this bridge. Drives every async
-    /// `iroh-live` call via `block_on`. Declared last so it drops last (after
-    /// `subscription` and `live`), letting shutdown await on it.
+    /// This bridge owns a multithreaded Tokio runtime.
+    /// All asynchronous `iroh-live` calls use `block_on` on this runtime.
+    /// Rust drops bridge fields in declaration order.
     runtime: Runtime,
     /// The `iroh-live` session (owns the iroh `Endpoint` + MoQ transport).
     live: Live,
@@ -286,11 +283,11 @@ struct BridgeInner {
     /// -- the address [`holoiroh_ios_bridge_control_connect`] dials on
     /// [`CONTROL_ALPN`]. `None` until a ticket has been parsed.
     control_peer: Mutex<Option<EndpointAddr>>,
-    /// The live control-channel connection + send stream, once
-    /// [`holoiroh_ios_bridge_control_connect`] has succeeded. One lock serves
-    /// both idempotency (connect holds it across the whole dial, so
-    /// concurrent connect calls serialize instead of double-dialing) and
-    /// writes ([`holoiroh_ios_bridge_control_send`] serializes on it).
+    /// Stores the active control channel after [`holoiroh_ios_bridge_control_connect`] succeeds.
+    /// One lock provides connection idempotency and serialized writes.
+    /// The connection call holds the lock throughout dialing.
+    /// Concurrent connection calls therefore serialize instead of dialing twice.
+    /// [`holoiroh_ios_bridge_control_send`] also serializes writes through this lock.
     control: Mutex<Option<ControlState>>,
     /// NDJSON lines read off the control stream by the reader task spawned
     /// in [`holoiroh_ios_bridge_control_connect`], drained one line per
@@ -298,6 +295,12 @@ struct BridgeInner {
     /// reader task (spawned on `runtime`, hence `'static`) shares it with
     /// the FFI side.
     control_events: Arc<Mutex<VecDeque<String>>>,
+    /// Bounded fatal reader error reported by the polling ABI before any
+    /// queued event can be delivered.
+    control_error: Arc<Mutex<Option<String>>>,
+    /// Monotonic reconnect generation. Reader tasks may mutate shared state
+    /// only while this still equals the generation they were spawned with.
+    control_generation: Arc<AtomicU64>,
     /// Set by the reader task on stream end (EOF or read error) and by a
     /// failed [`holoiroh_ios_bridge_control_send`]. Once the event queue is
     /// also drained, [`holoiroh_ios_bridge_poll_control_event`] reports
@@ -305,22 +308,23 @@ struct BridgeInner {
     control_ended: Arc<AtomicBool>,
 }
 
-/// The live control-channel transport stored in [`BridgeInner`]'s `control`
-/// slot once [`holoiroh_ios_bridge_control_connect`] succeeds. Keeps the
-/// [`Connection`] handle alive alongside the send half (an iroh/QUIC
-/// connection closes once every handle to it is dropped; the recv half lives
-/// inside the reader task, so `connection` here pins it from the FFI side
-/// too and gives [`holoiroh_ios_bridge_free`] something to `close()`
-/// explicitly).
+/// Stores the active control-channel transport in [`BridgeInner::control`].
+/// The stored [`Connection`] keeps the iroh QUIC connection active with its send half.
+/// The receive half remains in the reader task.
+/// Iroh closes the connection after every handle is dropped.
+/// [`holoiroh_ios_bridge_free`] uses this stored handle to close the connection explicitly.
 struct ControlState {
     connection: Connection,
     send: SendStream,
+    session_id: String,
+    daemon_public: PublicKey,
+    next_outbound_sequence: u64,
 }
 
-/// The real state behind a [`HoloirohSubscription`] opaque pointer: the
-/// decoded video track. `try_recv`/`next_frame` need `&mut self`, and the
-/// poll may be called from a background Swift thread, so the track lives
-/// behind a `Mutex`.
+/// Stores the decoded video track behind a [`HoloirohSubscription`] handle.
+/// `try_recv` and `next_frame` require mutable access.
+/// A background Swift thread can call the poll function.
+/// The `Mutex` therefore protects the track.
 struct SubscriptionInner {
     track: Mutex<VideoTrack>,
 }
@@ -360,71 +364,142 @@ unsafe fn bridge_ref<'a>(bridge: *mut HoloirohBridge) -> Option<&'a BridgeInner>
     Some(unsafe { &*(bridge as *const BridgeInner) })
 }
 
+const MAX_CONTROL_ERROR_BYTES: usize = 256;
+
+fn bounded_control_error(message: impl AsRef<str>) -> String {
+    let message = message.as_ref();
+    if message.len() <= MAX_CONTROL_ERROR_BYTES {
+        return message.to_string();
+    }
+    let mut end = MAX_CONTROL_ERROR_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message[..end].to_string()
+}
+
+fn verify_daemon_envelope(
+    envelope: &TaskEnvelope<serde_json::Value>,
+    signer: &PublicKey,
+    recipient: &PublicKey,
+) -> Result<(), String> {
+    let encoded = envelope
+        .signature
+        .as_deref()
+        .ok_or_else(|| "daemon envelope signature is required".to_string())?;
+    let bytes = decode_ed25519_signature(encoded)
+        .map_err(|error| format!("invalid daemon signature encoding: {error}"))?;
+    let signature = Signature::from_bytes(&bytes);
+    let payload = envelope
+        .signing_payload(
+            EnvelopeDirection::DaemonToClient,
+            signer.as_bytes(),
+            recipient.as_bytes(),
+        )
+        .map_err(|error| format!("invalid daemon signing payload: {error}"))?;
+    signer
+        .verify(&payload, &signature)
+        .map_err(|_| "daemon envelope signature verification failed".to_string())
+}
+
+fn sign_client_envelope(
+    envelope: &mut TaskEnvelope<ClientMessage>,
+    signer: &SecretKey,
+    recipient: &PublicKey,
+) -> Result<(), String> {
+    let signer_public = signer.public();
+    let payload = envelope
+        .signing_payload(
+            EnvelopeDirection::ClientToDaemon,
+            signer_public.as_bytes(),
+            recipient.as_bytes(),
+        )
+        .map_err(|error| format!("invalid client signing payload: {error}"))?;
+    let signature = signer.sign(&payload);
+    envelope.signature = Some(encode_ed25519_signature(&signature.to_bytes()));
+    Ok(())
+}
+
+fn validate_server_line(
+    line: &str,
+    daemon_public: &PublicKey,
+    local_public: &PublicKey,
+    inbound: &mut InboundEnvelopeState,
+) -> Result<TaskEnvelope<ServerMessage>, String> {
+    let envelope: TaskEnvelope<serde_json::Value> =
+        serde_json::from_str(line).map_err(|error| format!("invalid daemon envelope: {error}"))?;
+    if envelope.protocol_version != PROTOCOL_VERSION {
+        return Err("unsupported daemon envelope protocol_version".to_string());
+    }
+    verify_daemon_envelope(&envelope, daemon_public, local_public)?;
+    let payload: ServerMessage = serde_json::from_value(envelope.payload.clone())
+        .map_err(|error| format!("invalid daemon payload: {error}"))?;
+    if envelope.message_type != payload.type_tag() {
+        return Err("daemon envelope message_type mismatch".to_string());
+    }
+    inbound
+        .validate_inbound(&envelope)
+        .map_err(|error| format!("daemon envelope state rejected: {error}"))?;
+    Ok(TaskEnvelope {
+        protocol_version: envelope.protocol_version,
+        message_id: envelope.message_id,
+        session_id: envelope.session_id,
+        task_id: envelope.task_id,
+        message_type: envelope.message_type,
+        sent_at: envelope.sent_at,
+        expires_at: envelope.expires_at,
+        sequence_number: envelope.sequence_number,
+        payload,
+        signature: envelope.signature,
+    })
+}
+
 // ---------------------------------------------------------------------
 // Lifecycle: bridge construction / teardown
 // ---------------------------------------------------------------------
 
-/// Creates a new bridge instance: spins up an internal Tokio multi-thread
-/// runtime and an `iroh-live` [`Live`] session (binding an iroh
-/// [`Endpoint`] with n0's default relay/discovery preset), but does **not**
-/// connect to any peer yet (see [`holoiroh_ios_bridge_ticket_connect`]).
-/// Returns null on failure (runtime or endpoint construction failed).
-///
-/// # Safety
-/// The returned pointer, if non-null, must eventually be passed to exactly
-/// one call of [`holoiroh_ios_bridge_free`]. It must not be dereferenced
-/// directly by the caller (opaque type) and must not be used after being
-/// freed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn holoiroh_ios_bridge_new() -> *mut HoloirohBridge {
-    // On-device pipeline visibility (Once-guarded, idempotent across
-    // repeated bridge_new calls): without this, every media-pipeline
-    // tracing event -- decoder selection, per-packet decode errors,
-    // pipeline start/stop -- is silently dropped on iOS (no subscriber
-    // installed anywhere in the app), which is exactly how the
-    // permanent-black-screen bug stayed invisible on-device while the
-    // identical code path was fully debuggable on macOS probes. stderr
-    // reaches the device console when the app is launched with
-    // `devicectl ... launch --console`. `try_init` (not `init`): losing to
-    // a race with some other subscriber must never panic across FFI.
-    {
-        static TRACING_INIT: std::sync::Once = std::sync::Once::new();
-        TRACING_INIT.call_once(|| {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::new(
-                    "warn,moq_media=debug,rusty_codecs=debug,moq_net=info,iroh_moq=info",
-                ))
-                .with_writer(std::io::stderr)
-                .try_init();
-        });
-    }
+const IROH_SECRET_KEY_LEN: usize = 32;
 
+unsafe fn secret_key_from_raw(key_ptr: *const u8, key_len: usize) -> Option<SecretKey> {
+    if key_ptr.is_null() || key_len != IROH_SECRET_KEY_LEN {
+        return None;
+    }
+    let mut key_bytes = [0u8; IROH_SECRET_KEY_LEN];
+    unsafe {
+        std::ptr::copy_nonoverlapping(key_ptr, key_bytes.as_mut_ptr(), IROH_SECRET_KEY_LEN);
+    }
+    Some(SecretKey::from_bytes(&key_bytes))
+}
+
+fn initialize_tracing() {
+    static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+    TRACING_INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "warn,moq_media=debug,rusty_codecs=debug,moq_net=info,iroh_moq=info",
+            ))
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}
+
+fn create_bridge(secret_key: Option<SecretKey>) -> *mut HoloirohBridge {
+    initialize_tracing();
     let result = catch_unwind(|| {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .ok()?;
-
-        // Bind an iroh endpoint with n0's default relay/discovery preset, then
-        // build a Live session with an internal router (so incoming MoQ
-        // sessions -- the publisher's catalog/tracks -- are accepted). This is
-        // exactly the pattern iroh-live's own subscribe_test.rs / frame_dump.rs
-        // examples use.
-        // mDNS address lookup is ADDED to the preset, not substituted for it: away from the Mac's
-        // network the phone still reaches it through the relay exactly as before. On the same
-        // network it stops the session beginning with every packet routed through a datacentre --
-        // see main.rs's matching comment and mac-daemon/examples/lan_discovery_probe.rs for the
-        // measurement. Requires `NSBonjourServices` in the app's Info.plist; without that entry
-        // iOS silently refuses the multicast queries and this quietly degrades to relay-first.
         let live = runtime.block_on(async {
-            let endpoint = Endpoint::builder(presets::N0)
-                .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
-                .bind()
-                .await
-                .ok()?;
+            let builder = Endpoint::builder(presets::N0)
+                .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder());
+            let builder = match secret_key {
+                Some(secret_key) => builder.secret_key(secret_key),
+                None => builder,
+            };
+            let endpoint = builder.bind().await.ok()?;
             Some(Live::builder(endpoint).with_router().spawn())
         })?;
-
         let inner = Box::new(BridgeInner {
             runtime,
             live,
@@ -432,29 +507,64 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_new() -> *mut HoloirohBridge {
             control_peer: Mutex::new(None),
             control: Mutex::new(None),
             control_events: Arc::new(Mutex::new(VecDeque::new())),
+            control_error: Arc::new(Mutex::new(None)),
+            control_generation: Arc::new(AtomicU64::new(0)),
             control_ended: Arc::new(AtomicBool::new(false)),
         });
         Some(Box::into_raw(inner) as *mut HoloirohBridge)
     });
-
     match result {
         Ok(Some(ptr)) => ptr,
-        // Construction failure or a caught panic -> null (never unwind into C).
         Ok(None) | Err(_) => std::ptr::null_mut(),
     }
 }
 
-/// Releases a bridge instance created by [`holoiroh_ios_bridge_new`], tearing
-/// down any active subscription, its `iroh_live::Live` session (via
-/// `live.shutdown().await`), and its Tokio runtime. Passing null is a no-op
-/// (matches `free(NULL)` C convention).
+/// Creates a bridge with a generated, process-lifetime iroh identity.
+///
+/// This constructor remains available for ABI compatibility. Persistent clients
+/// must use [`holoiroh_ios_bridge_new_with_secret_key`].
 ///
 /// # Safety
-/// `bridge` must either be null or a pointer previously returned by
-/// [`holoiroh_ios_bridge_new`] and not already freed. The caller must not use
-/// `bridge` again after this call. Any [`HoloirohSubscription`] obtained from
-/// this bridge must be freed *before* this call (the subscription's video
-/// track is driven by the bridge's runtime).
+/// The returned pointer, if non-null, must be released exactly once with
+/// [`holoiroh_ios_bridge_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn holoiroh_ios_bridge_new() -> *mut HoloirohBridge {
+    create_bridge(None)
+}
+
+/// Creates a bridge with an endpoint identity derived from a 32-byte secret-key seed.
+/// `key_ptr` must be non-null.
+/// `key_len` must equal `32`.
+/// Invalid input or runtime construction failure returns null.
+/// Endpoint construction failure also returns null.
+///
+/// # Safety
+///
+/// `key_ptr` must be readable for exactly `key_len` bytes.
+/// The caller must release a non-null result exactly once with [`holoiroh_ios_bridge_free`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn holoiroh_ios_bridge_new_with_secret_key(
+    key_ptr: *const u8,
+    key_len: usize,
+) -> *mut HoloirohBridge {
+    let Some(secret_key) = (unsafe { secret_key_from_raw(key_ptr, key_len) }) else {
+        return std::ptr::null_mut();
+    };
+    create_bridge(Some(secret_key))
+}
+
+/// Releases a bridge and shuts down its active resources.
+/// This function drops any active subscription.
+/// It calls `live.shutdown().await` for the `iroh_live::Live` session.
+/// It then drops bridge fields in declaration order.
+/// A null pointer has no effect, consistent with `free(NULL)`.
+///
+/// # Safety
+///
+/// `bridge` must be null or an unfreed pointer returned by a bridge constructor.
+/// The caller must not use `bridge` after this call.
+/// The caller must first free every [`HoloirohSubscription`] obtained from this bridge.
+/// The bridge runtime drives each subscription's video track.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_free(bridge: *mut HoloirohBridge) {
     if bridge.is_null() {
@@ -469,16 +579,14 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_free(bridge: *mut HoloirohBridge) {
         // runtime. The Box's own drop then releases `live` and finally the
         // `runtime` (declared last in BridgeInner).
         {
-            let mut sub = inner
-                .subscription
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut sub = inner.subscription.lock().unwrap_or_else(|e| e.into_inner());
             *sub = None;
         }
         // Close the control channel (if connected) before shutting the Live
         // session down; the reader task ends on its own when the closed
         // stream EOFs, and is torn down with the runtime regardless.
         {
+            inner.control_generation.fetch_add(1, Ordering::AcqRel);
             let mut control = inner.control.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(state) = control.take() {
                 state.connection.close(0u32.into(), b"bridge freed");
@@ -495,23 +603,62 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_free(bridge: *mut HoloirohBridge) {
 // Reachability probe
 // ---------------------------------------------------------------------
 
-/// ADDITIVE, fully self-contained daemon-reachability probe. Touches NONE of the
-/// existing bridge/connection state: it binds a THROWAWAY iroh endpoint (its own
-/// identity, so it never fights the daemon's pkarr record), dials the ticket's
-/// node on [`CONTROL_ALPN`], and reports whether a control bi-stream opens within
-/// `timeout_ms`.
+unsafe fn probe_reachable(
+    ticket_cstr: *const c_char,
+    timeout_ms: u64,
+    secret_key: Option<SecretKey>,
+) -> bool {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if ticket_cstr.is_null() {
+            return false;
+        }
+        let ticket_str = match unsafe { CStr::from_ptr(ticket_cstr) }.to_str() {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let ticket = match LiveTicket::from_str(ticket_str) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        runtime.block_on(async move {
+            let builder = Endpoint::builder(presets::N0)
+                .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder());
+            let builder = match secret_key {
+                Some(secret_key) => builder.secret_key(secret_key),
+                None => builder,
+            };
+            let endpoint = match builder.bind().await {
+                Ok(endpoint) => endpoint,
+                Err(_) => return false,
+            };
+            let peer = ticket.endpoint.clone();
+            let dial = async {
+                let connection = endpoint.connect(peer, CONTROL_ALPN).await.map_err(|_| ())?;
+                connection.open_bi().await.map_err(|_| ())?;
+                Ok::<(), ()>(())
+            };
+            let reachable = matches!(
+                tokio::time::timeout(Duration::from_millis(timeout_ms.max(500)), dial).await,
+                Ok(Ok(()))
+            );
+            endpoint.close().await;
+            reachable
+        })
+    }));
+    result.unwrap_or(false)
+}
+
+/// Probes daemon reachability with a temporary generated endpoint identity.
 ///
-/// A successful dial + `open_bi` means the daemon is up and accepting control
-/// connections -- exactly what the pairing screen's "reachable / unreachable"
-/// indicator and the launch auto-connect want to know BEFORE a real connect.
-/// (The PIN handshake happens later on a real connect; it is not needed just to
-/// learn that the daemon is reachable, and the daemon accepts the connection +
-/// stream before the PIN line anyway.)
-///
-/// Returns `true` if reachable, `false` otherwise (null/invalid ticket, no
-/// runtime, endpoint bind failure, dial timeout, or daemon down). Blocks the
-/// calling thread for at most ~`timeout_ms` plus a brief endpoint bind, so call
-/// it off the main thread. Never panics across the FFI boundary.
+/// This function remains available for ABI compatibility. Persistent clients
+/// must use [`holoiroh_ios_bridge_probe_reachable_with_secret_key`].
 ///
 /// # Safety
 /// `ticket_cstr` must be a valid null-terminated C string, or null.
@@ -520,84 +667,53 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_probe_reachable(
     ticket_cstr: *const c_char,
     timeout_ms: u64,
 ) -> bool {
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if ticket_cstr.is_null() {
-            return false;
-        }
-        let ticket_str = match unsafe { CStr::from_ptr(ticket_cstr) }.to_str() {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let ticket = match LiveTicket::from_str(ticket_str) {
-            Ok(t) => t,
-            Err(_) => return false,
-        };
-        // A short-lived, single-thread runtime, isolated to this probe.
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-        runtime.block_on(async move {
-            // Same address lookup as the real connect path above. This probe exists to PREDICT
-            // whether that path will work, so discovering strictly less than it does means
-            // reporting a Mac as unreachable that the app would in fact have reached -- a
-            // node-id-only ticket resolves through pkarr/DNS to a relay, and a peer reachable
-            // only on the local network would be invisible here while being fine there.
-            let endpoint = match Endpoint::builder(presets::N0)
-                .address_lookup(iroh_mdns_address_lookup::MdnsAddressLookup::builder())
-                .bind()
-                .await
-            {
-                Ok(e) => e,
-                Err(_) => return false,
-            };
-            let peer = ticket.endpoint.clone();
-            let dial = async {
-                let connection = endpoint
-                    .connect(peer, CONTROL_ALPN)
-                    .await
-                    .map_err(|_| ())?;
-                connection.open_bi().await.map_err(|_| ())?;
-                Ok::<(), ()>(())
-            };
-            matches!(
-                tokio::time::timeout(Duration::from_millis(timeout_ms.max(500)), dial).await,
-                Ok(Ok(()))
-            )
-        })
-    }));
-    result.unwrap_or(false)
+    unsafe { probe_reachable(ticket_cstr, timeout_ms, None) }
+}
+
+/// Probes daemon reachability from an endpoint derived from one 32-byte secret
+/// key seed. Returns false unless the ticket is valid, `key_ptr` is non-null,
+/// and `key_len` is exactly 32. The temporary endpoint is explicitly closed
+/// before this function returns.
+///
+/// # Safety
+/// `ticket_cstr` must be a valid null-terminated C string, or null. `key_ptr`
+/// must be readable for exactly `key_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn holoiroh_ios_bridge_probe_reachable_with_secret_key(
+    ticket_cstr: *const c_char,
+    timeout_ms: u64,
+    key_ptr: *const u8,
+    key_len: usize,
+) -> bool {
+    let Some(secret_key) = (unsafe { secret_key_from_raw(key_ptr, key_len) }) else {
+        return false;
+    };
+    unsafe { probe_reachable(ticket_cstr, timeout_ms, Some(secret_key)) }
 }
 
 // ---------------------------------------------------------------------
 // Ticket-connect
 // ---------------------------------------------------------------------
 
-/// Parses an `iroh-live:` ticket string (the format
-/// [`LiveTicket`](iroh_live::ticket::LiveTicket) serializes to -- see
-/// `../ios/IROH_FFI.md`'s Finding (b)) and connects the bridge's
-/// `iroh_live::Live` session to the peer it describes, subscribing to the
-/// named broadcast. Blocks the calling thread until the connection attempt
-/// resolves (success or failure) -- call from a background queue, not the main
-/// thread.
+/// Connects the `iroh_live::Live` session to the peer in an `iroh-live:` ticket.
+/// See Finding (b) in `../ios/IROH_FFI.md` for the serialized [`LiveTicket`](iroh_live::ticket::LiveTicket) format.
+/// The function subscribes to the ticket's named broadcast.
+/// It blocks until the connection succeeds or fails.
+/// Call it from a background queue.
 ///
-/// `ticket_cstr` must be a null-terminated UTF-8 C string, e.g. as produced by
-/// Swift's `String.withCString`. `out_error` may be null if the caller doesn't
-/// want a human-readable error message on failure (the [`HoloirohStatus`]
-/// return value alone still distinguishes failure modes).
-///
-/// Returns [`HOLOIROH_OK`] on success, or a negative [`HoloirohStatus`] (see
-/// constants above) on failure.
+/// `ticket_cstr` must contain null-terminated UTF-8, such as output from Swift's `String.withCString`.
+/// `out_error` can be null when the caller does not need an error message.
+/// The [`HoloirohStatus`] result still identifies the failure class.
+/// Success returns [`HOLOIROH_OK`].
+/// Failure returns a negative [`HoloirohStatus`].
 ///
 /// # Safety
-/// `bridge` must be a live pointer from [`holoiroh_ios_bridge_new`].
-/// `ticket_cstr` must be a valid null-terminated C string for the duration of
-/// this call. If non-null, `out_error` must be a valid, writable
-/// `*mut c_char` slot; any string written there must later be freed via
-/// [`holoiroh_ios_bridge_free_error_string`].
+///
+/// `bridge` must be a live pointer returned by a bridge constructor.
+/// `ticket_cstr` must remain a valid, null-terminated C string during this call.
+/// If non-null, `out_error` must point to a writable `*mut c_char` slot.
+/// Therefore, `out_error` has type `*mut *mut c_char`.
+/// The caller must free any stored string with [`holoiroh_ios_bridge_free_error_string`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_ticket_connect(
     bridge: *mut HoloirohBridge,
@@ -638,10 +754,7 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_ticket_connect(
         // subscribe success) so a media-side failure -- e.g. the Mac isn't
         // broadcasting yet -- doesn't also block the control channel.
         {
-            let mut peer = inner
-                .control_peer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut peer = inner.control_peer.lock().unwrap_or_else(|e| e.into_inner());
             *peer = Some(ticket.endpoint.clone());
         }
 
@@ -662,10 +775,7 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_ticket_connect(
 
         match subscribe_result {
             Ok(subscription) => {
-                let mut slot = inner
-                    .subscription
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut slot = inner.subscription.lock().unwrap_or_else(|e| e.into_inner());
                 *slot = Some(subscription);
                 HOLOIROH_OK
             }
@@ -689,26 +799,22 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_ticket_connect(
 // Subscribe (video track)
 // ---------------------------------------------------------------------
 
-/// Begins consuming the video track of the broadcast on an already-connected
-/// bridge (see [`holoiroh_ios_bridge_ticket_connect`]), returning an opaque
-/// subscription handle that [`holoiroh_ios_bridge_poll_next_frame`] reads
-/// from. Internally calls `subscription.broadcast().video_ready().await`,
-/// which blocks until the publisher's catalog advertises at least one video
-/// rendition, then subscribes to the best-quality rendition and starts the
-/// decoder pipeline (VideoToolbox on Apple targets).
-///
-/// Blocks the calling thread until a video rendition is available -- call from
-/// a background queue. Returns null on failure (bridge not connected yet, or
-/// the broadcast never advertised a video track); check `out_error` if
-/// non-null.
+/// Starts the connected broadcast's video decoder pipeline.
+/// The function calls `subscription.broadcast().video_ready().await`.
+/// It waits until the catalog advertises at least one video rendition.
+/// It then subscribes to the best-quality rendition.
+/// Apple targets use VideoToolbox for decoding.
+/// The function blocks while waiting for a rendition.
+/// Call it from a background queue.
+/// A disconnected bridge or unavailable video track returns null.
+/// If `out_error` is non-null, the function stores an error string through it.
 ///
 /// # Safety
-/// `bridge` must be a live, connected pointer (post successful
-/// [`holoiroh_ios_bridge_ticket_connect`]). `out_error` follows the same
-/// contract as in [`holoiroh_ios_bridge_ticket_connect`]. The returned
-/// pointer, if non-null, must eventually be passed to exactly one call of
-/// [`holoiroh_ios_bridge_subscription_free`], and *before* the parent bridge
-/// is freed.
+///
+/// `bridge` must be a live, connected pointer after [`holoiroh_ios_bridge_ticket_connect`] succeeds.
+/// `out_error` uses the exact `*mut *mut c_char` contract documented by that function.
+/// The caller must pass each non-null result to [`holoiroh_ios_bridge_subscription_free`] exactly once.
+/// The caller must free the subscription before freeing its bridge.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_subscribe(
     bridge: *mut HoloirohBridge,
@@ -723,10 +829,7 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_subscribe(
         // Hold the subscription lock only long enough to run video_ready() on
         // the runtime.
         let track_result = {
-            let slot = inner
-                .subscription
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let slot = inner.subscription.lock().unwrap_or_else(|e| e.into_inner());
             let Some(subscription) = slot.as_ref() else {
                 unsafe {
                     set_error(
@@ -789,37 +892,30 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_subscription_free(
 // Poll next frame
 // ---------------------------------------------------------------------
 
-/// Non-blocking poll for the latest decoded video frame on an active
-/// subscription. Fills `out_frame` (metadata) and copies the frame's RGBA8
-/// bytes into caller-owned `buf`, returning the number of bytes actually
-/// written into `buf` on success.
+/// Polls without blocking for the latest decoded video frame.
+/// On success, this function fills `out_frame` and writes BGRA8 bytes to caller-owned `buf`.
+/// It returns the number of bytes written.
 ///
-/// Semantics (all non-negative returns are byte counts; negative returns are
-/// [`HoloirohStatus`] errors):
-/// - **No frame available yet** -> returns `0`, `out_frame` left untouched.
-///   Not an error; poll again shortly (e.g. on a timer-driven loop on a
-///   background queue). Internally this is `VideoTrack::try_recv()` returning
-///   `None`, which also drains older buffered frames so you always get the
-///   most recent decoded frame (the low-latency "latest frame wins" behavior a
-///   live mirror wants).
-/// - **A frame is available and fits** -> copies `width * height * 4` RGBA8
-///   bytes into `buf`, fills `out_frame`, returns that byte count.
-/// - **A frame is available but `buf_capacity` is too small** -> returns
-///   [`HOLOIROH_ERR_BUFFER_TOO_SMALL`] and writes the frame's real
-///   `width`/`height`/`pixel_format` into `out_frame` so the caller can size a
-///   `width * height * 4` buffer and poll again. (The frame itself is
-///   consumed; the caller re-polls for the next one -- acceptable for a live
-///   mirror where a single dropped frame is invisible, and the caller should
-///   size its buffer to the largest expected resolution up front to avoid this
-///   path entirely.)
-/// - **The track has ended** (publisher dropped it) -> returns
-///   [`HOLOIROH_ERR_ENDED`]; no further frames will arrive.
+/// Return behavior:
+///
+/// - If no frame is available, it returns `0` and does not modify `out_frame`.
+///   Poll again after a short interval on a background queue.
+///   `VideoTrack::try_recv()` drains older buffered frames and returns the latest frame.
+/// - If a frame fits, it writes `width * height * 4` BGRA8 bytes.
+///   It fills `out_frame` and returns that byte count.
+/// - If `buf_capacity` is insufficient, it returns [`HOLOIROH_ERR_BUFFER_TOO_SMALL`].
+///   It writes the actual `width`, `height`, and `pixel_format` to `out_frame`.
+///   The function consumes that frame.
+///   Allocate for the largest expected resolution to prevent this result.
+/// - If the publisher ends the track, it returns [`HOLOIROH_ERR_ENDED`].
+///   No more frames will arrive.
 ///
 /// # Safety
-/// `subscription` must be a live pointer from
-/// [`holoiroh_ios_bridge_subscribe`]. `buf` must be valid and writable for
-/// `buf_capacity` bytes (or null iff `buf_capacity` is 0). `out_frame` must be
-/// a valid, writable `*mut HoloirohFrame`.
+///
+/// `subscription` must be a live pointer from [`holoiroh_ios_bridge_subscribe`].
+/// `buf` must be writable for `buf_capacity` bytes.
+/// `buf` can be null only when `buf_capacity` is `0`.
+/// `out_frame` must be a valid, writable `*mut HoloirohFrame`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_poll_next_frame(
     subscription: *mut HoloirohSubscription,
@@ -901,57 +997,47 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_poll_next_frame(
 // Control channel (PROTOCOL.md ClientMessage / ServerMessage)
 // ---------------------------------------------------------------------
 
-/// Establishes the control channel to the Mac daemon the bridge is
-/// ticket-connected to: dials the peer stored by
-/// [`holoiroh_ios_bridge_ticket_connect`] on [`CONTROL_ALPN`], opens one
-/// bidirectional QUIC stream, performs the PIN handshake, and waits (up to
-/// [`CONTROL_HANDSHAKE_TIMEOUT`]) for the daemon's first reply line.
+/// Establishes the control channel to the ticket peer.
+/// The function dials [`CONTROL_ALPN`] and opens one bidirectional QUIC stream.
+/// It performs the personal identification number (PIN) handshake.
+/// It waits at most [`CONTROL_HANDSHAKE_TIMEOUT`] for the first daemon reply.
 ///
-/// Wire contract (mirror of `mac-daemon/src/control_channel.rs`):
-/// - The PIN goes out as a **bare** (non-envelope) NDJSON line
-///   `{"type":"pin","pin":"..."}` -- exactly what the daemon's
-///   `ControlChannel::authenticate` gate requires as the very first line
-///   from an unrecognized device. (The gate would reject an envelope-
-///   wrapped PIN, so this one line is deliberately not enveloped.)
-/// - On success the daemon's first line is its envelope-wrapped greeting
-///   (`payload` = `{"type":"status","text":"control channel ready"}`) ->
-///   returns [`HOLOIROH_OK`], stores the send stream on the bridge, and
-///   spawns a reader task queueing every subsequent NDJSON line for
-///   [`holoiroh_ios_bridge_poll_control_event`].
-/// - On auth failure the daemon's first (and only) line is a **bare**
-///   `{"type":"auth_rejected","text":...}` -> returns
-///   [`HOLOIROH_ERR_CONNECT_FAILED`] with the daemon's reason in
-///   `*out_error`. Timeout / early close also map to
-///   [`HOLOIROH_ERR_CONNECT_FAILED`].
+/// # Wire contract
 ///
-/// Everything *after* the handshake is envelope-framed both directions
-/// (`TaskEnvelope<ClientMessage>` / `TaskEnvelope<ServerMessage>`, see
-/// `PROTOCOL.md`): [`holoiroh_ios_bridge_control_send`] passes caller-built
-/// envelope lines through verbatim, and the lines handed back by
-/// [`holoiroh_ios_bridge_poll_control_event`] are envelope JSON for the
-/// Swift side to decode.
+/// - The app sends `{"type":"pin","pin":"..."}` as a bare newline-delimited JSON (NDJSON) line.
+///   An unrecognized device must send this as its first line.
+///   The daemon rejects an envelope-wrapped PIN.
+/// - On success, the daemon sends an envelope containing `{"type":"status","text":"control channel ready"}`.
+///   The function returns [`HOLOIROH_OK`] and stores the send stream.
+///   It starts a reader task for later NDJSON lines.
+/// - On authentication failure, the daemon sends a bare `{"type":"auth_rejected","text":...}` line.
+///   The function returns [`HOLOIROH_ERR_CONNECT_FAILED`].
+///   It stores the daemon's reason through `out_error`.
+///   Timeout and early closure return the same status.
 ///
-/// Idempotent: returns [`HOLOIROH_OK`] immediately if already connected
-/// (checked and connected under one lock, so concurrent callers serialize
-/// rather than double-dial). Requires a prior successful
-/// [`holoiroh_ios_bridge_ticket_connect`] (which stores the peer address)
-/// -- returns [`HOLOIROH_ERR_NOT_CONNECTED`] otherwise. Blocks the calling
-/// thread; call from a background queue.
+/// After authentication, both directions use signed envelope JSON from `PROTOCOL.md`.
+/// [`holoiroh_ios_bridge_control_send`] accepts an unsigned `TaskEnvelope<ClientMessage>`.
+/// It validates the session and sequence before signing with the bridge endpoint identity.
+/// The reader verifies each daemon envelope against the authenticated transport peer.
+/// It queues verified JSON for [`holoiroh_ios_bridge_poll_control_event`].
 ///
-/// Note: for a device the daemon has *already allowlisted*, the daemon's
-/// auth gate never consumes the PIN line; it instead falls through to the
-/// daemon's main envelope loop, which replies with one harmless
-/// `{"type":"error","text":"malformed envelope: ..."}` envelope that will
-/// surface once via [`holoiroh_ios_bridge_poll_control_event`]. This is
-/// cosmetic: the ready greeting is written before that loop reads anything,
-/// so it still arrives first and this function still returns
-/// [`HOLOIROH_OK`].
+/// An existing connection makes this function return [`HOLOIROH_OK`] immediately.
+/// One lock serializes concurrent connection attempts.
+/// A prior [`holoiroh_ios_bridge_ticket_connect`] call must have stored the peer address.
+/// Otherwise, this function returns [`HOLOIROH_ERR_NOT_CONNECTED`].
+/// The function blocks the calling thread.
+/// Call it from a background queue.
+///
+/// For an allowlisted device, the daemon does not consume the bare PIN during authentication.
+/// Its envelope loop later returns one `{"type":"error","text":"malformed envelope: ..."}` envelope.
+/// [`holoiroh_ios_bridge_poll_control_event`] reports that harmless envelope once.
+/// The ready greeting arrives first, so this function still returns [`HOLOIROH_OK`].
 ///
 /// # Safety
-/// `bridge` must be a live pointer from [`holoiroh_ios_bridge_new`].
-/// `pin_cstr` must be a valid null-terminated C string for the duration of
-/// this call. `out_error` follows the same contract as in
-/// [`holoiroh_ios_bridge_ticket_connect`].
+///
+/// `bridge` must be a live pointer returned by a bridge constructor.
+/// `pin_cstr` must remain a valid, null-terminated C string during this call.
+/// `out_error` uses the exact `*mut *mut c_char` contract from [`holoiroh_ios_bridge_ticket_connect`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
     bridge: *mut HoloirohBridge,
@@ -982,9 +1068,23 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
         // Runtime::block_on polls the future on *this* thread (it has no
         // `Send` bound), and nothing inside the future takes this lock.
         let mut control = inner.control.lock().unwrap_or_else(|e| e.into_inner());
-        if control.is_some() {
+        if control.is_some() && !inner.control_ended.load(Ordering::Acquire) {
             return HOLOIROH_OK;
         }
+        if let Some(previous) = control.take() {
+            previous.connection.close(0u32.into(), b"control reconnect");
+        }
+        let generation = inner.control_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        inner.control_ended.store(false, Ordering::Release);
+        inner
+            .control_events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        *inner
+            .control_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
 
         let Some(peer) = inner
             .control_peer
@@ -1025,6 +1125,7 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
             .as_ref()
             .map(|s| s.session().conn().clone());
 
+        let local_public = inner.live.endpoint().secret_key().public();
         let connect_result = inner.runtime.block_on(async {
             // Wait (bounded, 1.5s) for the media connection's path set to
             // settle: either a direct (IP) path exists, or a relay path has
@@ -1123,10 +1224,10 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
 
             // First reply line: bare auth_rejected, or the envelope-wrapped
             // ready greeting.
-            let mut lines = BufReader::new(recv).lines();
+            let mut lines = BufReader::new(recv);
             let greeting = tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, async {
                 loop {
-                    match lines.next_line().await {
+                    match read_bounded_control_line(&mut lines).await {
                         Ok(Some(line)) if line.trim().is_empty() => continue,
                         Ok(Some(line)) => break Ok(line),
                         Ok(None) => {
@@ -1136,11 +1237,7 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
                                     .to_string(),
                             );
                         }
-                        Err(err) => {
-                            break Err(format!(
-                                "read error awaiting control-channel greeting: {err}"
-                            ));
-                        }
+                        Err(error) => break Err(error),
                     }
                 }
             })
@@ -1161,24 +1258,45 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
                     .unwrap_or("(no reason given)");
                 return Err(format!("auth rejected: {reason}"));
             }
-            // Anything else this early is the daemon's post-auth greeting
-            // envelope (its accept loop writes `status: "control channel
-            // ready"` immediately after the auth gate passes, before reading
-            // anything) -- matched structurally rather than on the greeting
-            // text, so a daemon-side wording tweak can't break pairing.
-            // `greeting` itself is threaded out here (not dropped) so the
-            // caller can queue it for `poll_control_event` -- see the
-            // `events.push_back(greeting)` call below for why.
-            Ok::<_, String>((connection, send, lines, greeting))
+
+            let shell: TaskEnvelope<serde_json::Value> = serde_json::from_value(value)
+                .map_err(|error| format!("invalid signed control-channel greeting: {error}"))?;
+            if shell.session_id.is_empty() {
+                return Err("control-channel greeting has an empty session_id".to_string());
+            }
+            if shell.sequence_number != 0 {
+                return Err("control-channel greeting must have sequence_number 0".to_string());
+            }
+            let session_id = shell.session_id.clone();
+            let daemon_public = connection.remote_id();
+            let mut inbound = InboundEnvelopeState::for_session(session_id.clone());
+            let greeting_envelope =
+                validate_server_line(&greeting, &daemon_public, &local_public, &mut inbound)?;
+            match greeting_envelope.payload {
+                ServerMessage::Status { text, .. }
+                    if text.as_deref() == Some("control channel ready") => {}
+                _ => return Err("daemon did not send the required ready greeting".to_string()),
+            }
+
+            Ok::<_, String>((
+                connection,
+                send,
+                lines,
+                greeting,
+                inbound,
+                daemon_public,
+                session_id,
+            ))
         });
 
-        let (connection, send, lines, greeting) = match connect_result {
-            Ok(parts) => parts,
-            Err(msg) => {
-                unsafe { set_error(out_error, &msg) };
-                return HOLOIROH_ERR_CONNECT_FAILED;
-            }
-        };
+        let (connection, send, lines, greeting, mut inbound, daemon_public, session_id) =
+            match connect_result {
+                Ok(parts) => parts,
+                Err(msg) => {
+                    unsafe { set_error(out_error, &msg) };
+                    return HOLOIROH_ERR_CONNECT_FAILED;
+                }
+            };
 
         // Reader task: every subsequent NDJSON line goes into the shared
         // queue for poll_control_event; EOF or a read error marks the
@@ -1205,28 +1323,67 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
             .unwrap_or_else(|e| e.into_inner())
             .push_back(greeting);
         let ended = inner.control_ended.clone();
+        let errors = inner.control_error.clone();
+        let generations = inner.control_generation.clone();
+        let reader_connection = connection.clone();
+        let reader_daemon_public = daemon_public.clone();
         inner.runtime.spawn(async move {
             let mut lines = lines;
             loop {
-                match lines.next_line().await {
+                match read_bounded_control_line(&mut lines).await {
+                    Ok(Some(line)) if line.trim().is_empty() => continue,
                     Ok(Some(line)) => {
-                        if line.trim().is_empty() {
-                            continue;
+                        let validation = validate_server_line(
+                            &line,
+                            &reader_daemon_public,
+                            &local_public,
+                            &mut inbound,
+                        );
+                        if let Err(error) = validation {
+                            if generations.load(Ordering::Acquire) == generation {
+                                events.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                                *errors.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(bounded_control_error(error));
+                                ended.store(true, Ordering::Release);
+                                reader_connection.close(0u32.into(), b"invalid signed envelope");
+                            }
+                            break;
+                        }
+                        if generations.load(Ordering::Acquire) != generation {
+                            break;
                         }
                         events
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .push_back(line);
                     }
-                    Ok(None) | Err(_) => {
-                        ended.store(true, Ordering::Release);
+                    Ok(None) => {
+                        if generations.load(Ordering::Acquire) == generation {
+                            ended.store(true, Ordering::Release);
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        if generations.load(Ordering::Acquire) == generation {
+                            events.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                            *errors.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(bounded_control_error(error));
+                            ended.store(true, Ordering::Release);
+                            reader_connection.close(0u32.into(), b"invalid control frame");
+                        }
                         break;
                     }
                 }
             }
         });
 
-        *control = Some(ControlState { connection, send });
+        *control = Some(ControlState {
+            connection,
+            send,
+            session_id,
+            daemon_public,
+            next_outbound_sequence: 0,
+        });
         HOLOIROH_OK
     }));
 
@@ -1239,24 +1396,23 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_connect(
     }
 }
 
-/// Sends one NDJSON line (per `../PROTOCOL.md`: a `TaskEnvelope<
-/// ClientMessage>` the Swift side has already serialized -- this function is
-/// transport-only and does not inspect or re-frame the JSON) over the
-/// control channel to the connected Mac daemon, appending the terminating
-/// `\n` if the caller didn't include one. Blocks until the bytes are
-/// accepted by the QUIC stream; call from a background queue.
+/// Sends one unsigned `TaskEnvelope<ClientMessage>` JSON value from Swift.
+/// The bridge rejects caller-supplied signatures and invalid envelope metadata.
+/// It binds the envelope to the verified session and next outbound sequence.
+/// It signs the envelope with the bridge endpoint's Ed25519 identity.
+/// It writes the signed envelope as one newline-delimited JSON (NDJSON) line.
+/// The function blocks until the QUIC stream accepts the bytes.
+/// Call it from a background queue.
 ///
-/// Returns [`HOLOIROH_ERR_NOT_CONNECTED`] until
-/// [`holoiroh_ios_bridge_control_connect`] has succeeded. On a write
-/// failure (peer gone, connection lost) returns
-/// [`HOLOIROH_ERR_CONNECT_FAILED`] and drops the stored stream so a later
-/// `control_connect` call can re-dial.
+/// Before [`holoiroh_ios_bridge_control_connect`] succeeds, it returns [`HOLOIROH_ERR_NOT_CONNECTED`].
+/// A write failure returns [`HOLOIROH_ERR_CONNECT_FAILED`].
+/// It then drops the stored stream so a later connection call can dial again.
 ///
 /// # Safety
-/// `bridge` must be a live pointer from [`holoiroh_ios_bridge_new`].
-/// `json_cstr` must be a valid null-terminated C string for the duration of
-/// this call. `out_error` follows the same contract as elsewhere in this
-/// module.
+///
+/// `bridge` must be a live pointer returned by a bridge constructor.
+/// `json_cstr` must remain a valid, null-terminated C string during this call.
+/// `out_error` must follow the documented `*mut *mut c_char` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_control_send(
     bridge: *mut HoloirohBridge,
@@ -1280,9 +1436,33 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_send(
             }
         };
 
-        // NDJSON framing: exactly one trailing newline.
-        let mut line = json.trim_end_matches(['\r', '\n']).to_owned();
-        line.push('\n');
+        let unsigned_json = json.trim_end_matches(['\r', '\n']);
+        let mut envelope: TaskEnvelope<ClientMessage> = match serde_json::from_str(unsigned_json) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                unsafe {
+                    set_error(
+                        out_error,
+                        &format!(
+                            "control_send requires an unsigned TaskEnvelope<ClientMessage>: {error}"
+                        ),
+                    )
+                };
+                return HOLOIROH_ERR_UNKNOWN;
+            }
+        };
+        if envelope.signature.is_some() {
+            unsafe { set_error(out_error, "caller-supplied signatures are not accepted") };
+            return HOLOIROH_ERR_UNKNOWN;
+        }
+        if envelope.protocol_version != PROTOCOL_VERSION {
+            unsafe { set_error(out_error, "unsupported control envelope protocol_version") };
+            return HOLOIROH_ERR_UNKNOWN;
+        }
+        if envelope.message_type != envelope.payload.type_tag() {
+            unsafe { set_error(out_error, "control envelope message_type mismatch") };
+            return HOLOIROH_ERR_UNKNOWN;
+        }
 
         let mut control = inner.control.lock().unwrap_or_else(|e| e.into_inner());
         let Some(state) = control.as_mut() else {
@@ -1296,6 +1476,54 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_send(
             return HOLOIROH_ERR_NOT_CONNECTED;
         };
 
+        if envelope.session_id != state.session_id {
+            unsafe {
+                set_error(
+                    out_error,
+                    "control envelope session_id is not the verified session",
+                )
+            };
+            return HOLOIROH_ERR_UNKNOWN;
+        }
+        if envelope.sequence_number != state.next_outbound_sequence {
+            unsafe {
+                set_error(
+                    out_error,
+                    "control envelope sequence_number is not the next value",
+                )
+            };
+            return HOLOIROH_ERR_UNKNOWN;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        if envelope.is_expired_at(now_ms) {
+            unsafe { set_error(out_error, "control envelope is expired") };
+            return HOLOIROH_ERR_UNKNOWN;
+        }
+        if let Err(error) = sign_client_envelope(
+            &mut envelope,
+            inner.live.endpoint().secret_key(),
+            &state.daemon_public,
+        ) {
+            unsafe { set_error(out_error, &bounded_control_error(error)) };
+            return HOLOIROH_ERR_UNKNOWN;
+        }
+        let mut line = match serde_json::to_string(&envelope) {
+            Ok(line) => line,
+            Err(error) => {
+                unsafe {
+                    set_error(
+                        out_error,
+                        &format!("serializing signed control envelope: {error}"),
+                    )
+                };
+                return HOLOIROH_ERR_UNKNOWN;
+            }
+        };
+        line.push('\n');
+
         let write_result = inner.runtime.block_on(async {
             state.send.write_all(line.as_bytes()).await?;
             state.send.flush().await?;
@@ -1303,16 +1531,18 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_send(
         });
 
         match write_result {
-            Ok(()) => HOLOIROH_OK,
+            Ok(()) => {
+                state.next_outbound_sequence += 1;
+                HOLOIROH_OK
+            }
             Err(err) => {
                 // The stream is dead: drop the stored state so a later
                 // control_connect can re-dial, and mark the channel ended so
                 // poll_control_event reports ENDED once the queue drains.
                 *control = None;
+                inner.control_generation.fetch_add(1, Ordering::AcqRel);
                 inner.control_ended.store(true, Ordering::Release);
-                unsafe {
-                    set_error(out_error, &format!("control-channel write failed: {err}"))
-                };
+                unsafe { set_error(out_error, &format!("control-channel write failed: {err}")) };
                 HOLOIROH_ERR_CONNECT_FAILED
             }
         }
@@ -1327,27 +1557,26 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_control_send(
     }
 }
 
-/// Non-blocking poll for the next NDJSON line (per `../PROTOCOL.md`: a
-/// `TaskEnvelope<ServerMessage>` -- or, rarely, a bare `ServerMessage` if
-/// the daemon replied outside a session) received on the control channel.
+/// Polls without blocking for the next verified `TaskEnvelope<ServerMessage>` NDJSON line.
+/// The reader rejects malformed, unsigned, incorrectly signed, expired, replayed, or out-of-sequence envelopes.
 ///
-/// Semantics:
-/// - **A line is queued** -> writes a freshly-allocated null-terminated
-///   copy to `*out_json` (caller frees via
-///   [`holoiroh_ios_bridge_free_error_string`]) and returns [`HOLOIROH_OK`].
-/// - **Queue empty, stream alive** -> sets `*out_json` to null and returns
-///   [`HOLOIROH_OK`]; poll again shortly.
-/// - **Queue empty, stream ended** (daemon closed it, or a prior
-///   `control_send` failed) -> sets `*out_json` to null and returns
-///   [`HOLOIROH_ERR_ENDED`]; a fresh
-///   [`holoiroh_ios_bridge_control_connect`] may re-establish the channel.
+/// Return behavior:
+///
+/// - If a line is queued, the function allocates a null-terminated copy through `out_json`.
+///   It returns [`HOLOIROH_OK`].
+///   The caller must free the string with [`holoiroh_ios_bridge_free_error_string`].
+/// - If the queue is empty and the stream is active, it stores null through `out_json`.
+///   It returns [`HOLOIROH_OK`].
+/// - If the queue is empty and the stream ended, it stores null through `out_json`.
+///   It returns [`HOLOIROH_ERR_ENDED`].
+///   [`holoiroh_ios_bridge_control_connect`] can establish a new channel.
 ///
 /// # Safety
-/// `bridge` must be a live pointer from [`holoiroh_ios_bridge_new`].
-/// `out_json` must be a valid writable `*mut *mut c_char`; the string
-/// written there (if any) must later be freed via
-/// [`holoiroh_ios_bridge_free_error_string`]. `out_error` follows the same
-/// contract as elsewhere in this module.
+///
+/// `bridge` must be a live pointer returned by a bridge constructor.
+/// `out_json` must be a valid, writable `*mut *mut c_char`.
+/// The caller must free any stored string with [`holoiroh_ios_bridge_free_error_string`].
+/// `out_error` must follow the same `*mut *mut c_char` contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_poll_control_event(
     bridge: *mut HoloirohBridge,
@@ -1366,6 +1595,21 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_poll_control_event(
             unsafe { set_error(out_error, "bridge pointer is null") };
             return HOLOIROH_ERR_NULL_ARG;
         };
+
+        if let Some(error) = inner
+            .control_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            inner
+                .control_events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            unsafe { set_error(out_error, &error) };
+            return HOLOIROH_ERR_CONNECT_FAILED;
+        }
 
         // Same NOT_CONNECTED contract as `control_send`: an empty queue is ambiguous between
         // "never connected" and "connected, nothing new yet" unless this is checked explicitly.
@@ -1430,19 +1674,18 @@ pub unsafe extern "C" fn holoiroh_ios_bridge_poll_control_event(
 // Shared teardown helper
 // ---------------------------------------------------------------------
 
-/// Frees a C string previously allocated by this crate and handed back through
-/// an `out_error`/`out_json` out-parameter (e.g. from
-/// [`holoiroh_ios_bridge_ticket_connect`]). Passing null is a no-op.
+/// Frees a C string that this crate allocated through an `out_error` or `out_json` parameter.
+/// [`holoiroh_ios_bridge_ticket_connect`] is one function that can return such a string.
+/// A null pointer has no effect.
 ///
-/// Every Rust-allocated string crossing this FFI boundary **must** be freed
-/// via this function, never via Swift's own memory management or libc `free`
-/// directly -- the allocator that created it (Rust's global allocator, via
-/// `CString::into_raw`) must also be the one that deallocates it.
+/// Use this function for every Rust-allocated string that crosses this foreign function interface (FFI) boundary.
+/// Do not use Swift memory management or call libc `free` directly.
+/// `CString::into_raw` used Rust's global allocator to create the string.
+/// The corresponding Rust allocator must deallocate it.
 ///
 /// # Safety
-/// `s` must either be null or a pointer previously returned in an
-/// `out_error`/`out_json` parameter by a function in this crate, and must not
-/// have been freed already.
+///
+/// `s` must be null or an unfreed pointer returned through this crate's `out_error` or `out_json` parameter.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn holoiroh_ios_bridge_free_error_string(s: *mut c_char) {
     if s.is_null() {

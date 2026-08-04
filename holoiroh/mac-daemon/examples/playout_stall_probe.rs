@@ -20,7 +20,7 @@
 
 use std::time::{Duration, Instant};
 
-use moq_mux::container::{loc, Consumer, Container, Frame};
+use moq_mux::container::{Consumer, Container, Frame, loc};
 use tokio_util::bytes::Bytes;
 
 /// How far apart the synthetic frames are in media time, matching the ~28fps the real pipeline

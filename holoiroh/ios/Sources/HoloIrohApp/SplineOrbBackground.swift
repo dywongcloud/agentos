@@ -6,21 +6,15 @@ import SplineRuntime
 import WebKit
 #endif
 
-/// Full-screen animated background: the blue blob orb Spline scene
-/// (`prod.spline.design/EEXJWT2Sfje1M4iS`).
+/// Renders the full-screen animated Spline orb background.
+/// The web backend loads `https://prod.spline.design/EEXJWT2Sfje1M4iS`.
 ///
-/// Rendering backends, best-first:
-/// 1. **Native SplineRuntime** (Metal; the official splinetool iOS SPM
-///    package) loading the exact public `scene.splinecode` URL -- matches
-///    the reference render (deep black field, glowing blue blob) that the
-///    earlier web-runtime approach visibly degraded on device.
-/// 2. **Web runtime in a WKWebView** where SplineRuntime can't be imported
-///    (kept as the middle fallback so non-SPM build contexts still show
-///    the real scene).
-/// 3. **Deep blue-black gradient** while either loads, or offline.
+/// The renderer uses the first available backend:
+/// 1. Native `SplineRuntime`.
+/// 2. A web runtime in `WKWebView`.
+/// 3. A black fallback while the scene loads or the device is offline.
 ///
-/// Non-interactive: all touches pass through to the app's real controls
-/// layered above it.
+/// The view disables hit testing so touches reach the app controls.
 struct SplineOrbBackground: View {
     var body: some View {
         ZStack(alignment: .top) {
@@ -46,8 +40,10 @@ struct SplineOrbBackground: View {
                 Group {
                     #if canImport(SplineRuntime)
                     NativeSplineOrb()
-                    #elseif canImport(WebKit)
+                    #elseif canImport(WebKit) && canImport(UIKit)
                     SplineWebView()
+                    #else
+                    Color.clear
                     #endif
                 }
                 .frame(width: side, height: side)
@@ -60,29 +56,12 @@ struct SplineOrbBackground: View {
 }
 
 #if canImport(SplineRuntime)
-/// The native-runtime orb, using the REAL SplineView API: the init is
-/// NON-throwing (`init(sceneFileURL: URL?, ...)` -- the old
-/// `try SplineView(...)` tutorial pattern is a no-op on 0.2.x), and every
-/// load failure is delivered to the phase closure as
-/// `.failure(SplineViewError)`. The DEFAULT closure renders failures as a
-/// blank view with zero diagnostics -- exactly how "the orb doesn't
-/// render, just black" stayed undiagnosable. This explicit closure logs
-/// the concrete error case (fileUnknownFormat / fileOldFormat /
-/// fileNewFormat / fileUnreachable / deviceUnsupported) to the device
-/// console instead.
-///
-/// File preference order:
-/// 1. Bundled `orb.splineswift` -- the iOS runtime's REAL input format
-///    (only produced by the Spline editor's Export -> Mobile Platform ->
-///    Apple panel; not yet exported for this scene).
-/// 2. Bundled `orb.splinecode` -- the WEB runtime format; the iOS runtime
-///    accepts the URL but fails format validation (research-verified:
-///    docs + binary-strings audit of SplineRuntime 0.2.53). Kept only as
-///    a candidate in case a future runtime accepts it.
-/// 3. Remote scene.splinecode URL, same caveat.
+/// Renders the orb with native `SplineRuntime`.
+/// The view prefers bundled `orb.splineswift`.
+/// If the bundle has no scene, the view loads the remote Apple-platform scene.
+/// The phase closure logs load failures to the device console.
 private struct NativeSplineOrb: View {
-    /// The user's real Apple-platform export of this scene (Export ->
-    /// Mobile Platform -> Apple), NOT the web `.splinecode` URL.
+    /// Identifies the remote Apple-platform scene export.
     private static let remoteURL = URL(string: "https://build.spline.design/FxpXnkTaazJVlLqe096P/scene.splineswift")!
 
     private var sceneURL: URL {
@@ -104,13 +83,15 @@ private struct NativeSplineOrb: View {
                 Color.clear.onAppear {
                     NSLog("SplineOrbBackground: SplineView FAILED for \(url.lastPathComponent): \(error) -- if fileUnknownFormat/fileNewFormat, the scene needs a .splineswift export from the Spline editor (Export -> Mobile Platform -> Apple)")
                 }
+            @unknown default:
+                Color.clear
             }
         }
     }
 }
 #endif
 
-#if canImport(WebKit)
+#if canImport(WebKit) && canImport(UIKit)
 private struct SplineWebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()

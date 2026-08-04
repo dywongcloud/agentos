@@ -20,19 +20,31 @@ const BROADCAST_NAME: &str = "holoiroh";
 fn derive_ticket() -> anyhow::Result<LiveTicket> {
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
     let hex = std::fs::read_to_string(format!("{home}/.holoiroh/iroh_secret"))?;
-    let secret: SecretKey = hex.trim().parse().map_err(|e| anyhow::anyhow!("parsing secret: {e}"))?;
-    Ok(LiveTicket::new(EndpointAddr::from(secret.public()), BROADCAST_NAME))
+    let secret: SecretKey = hex
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parsing secret: {e}"))?;
+    Ok(LiveTicket::new(
+        EndpointAddr::from(secret.public()),
+        BROADCAST_NAME,
+    ))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let pin = std::env::args().nth(1).unwrap_or_else(|| "394299".to_string());
+    let pin = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "394299".to_string());
     let ticket = derive_ticket()?;
     let expected = ticket.to_string();
     println!("EXPECTED_TICKET={expected}");
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut lines = BufReader::new(recv).lines();
     write_line(&mut send, &ClientMessage::Pin { pin }).await?;
@@ -54,7 +66,9 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .or_else(|| serde_json::from_str::<ServerMessage>(&line).ok());
         match msg {
-            Some(ServerMessage::Status { text }) if text.as_deref() == Some("control channel ready") => {
+            Some(ServerMessage::Status { text, .. })
+                if text.as_deref() == Some("control channel ready") =>
+            {
                 got_greeting = true;
                 println!("greeting: control channel ready");
             }
@@ -67,9 +81,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let received = got_ticket.ok_or_else(|| anyhow::anyhow!("no current_ticket received within 20s"))?;
+    let received =
+        got_ticket.ok_or_else(|| anyhow::anyhow!("no current_ticket received within 20s"))?;
     assert!(got_greeting, "greeting must arrive before current_ticket");
-    assert_eq!(received, expected, "current_ticket must equal the daemon's node-id ticket");
+    assert_eq!(
+        received, expected,
+        "current_ticket must equal the daemon's node-id ticket"
+    );
     println!("current_ticket_live_probe: OK -- daemon broadcast CurrentTicket = {received}");
     Ok(())
 }

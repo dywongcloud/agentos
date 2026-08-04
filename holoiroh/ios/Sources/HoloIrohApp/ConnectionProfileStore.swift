@@ -1,10 +1,8 @@
 import Foundation
 import SQLite3
 
-/// A saved way to reach a daemon: the iroh ticket plus the pairing PIN.
-/// The verification phrase is NOT stored -- it is always derived from the
-/// ticket via `PairingPhrase`, so a stored profile can never show a phrase
-/// that disagrees with the ticket it would actually connect to.
+/// Stores the ticket and pairing personal identification number (PIN) for a daemon connection.
+/// The verification phrase is derived from the ticket and is not stored.
 struct ConnectionProfile: Identifiable, Equatable {
     let id: Int64
     var name: String
@@ -15,36 +13,25 @@ struct ConnectionProfile: Identifiable, Equatable {
     var phrase: String { PairingPhrase.phrase(for: ticket) }
 }
 
-/// SQLite-backed store for connection profiles, using the system `SQLite3`
-/// C module directly (no third-party dependency; profiles are one small
-/// table). The database lives in Application Support so it survives app
-/// updates but is excluded from the user's visible Documents.
-///
-/// All sqlite access happens on the main actor -- the table is tiny and
-/// every call site is UI-driven, so a serial background queue would add
-/// complexity without a measurable win.
-/// SQLite-backed, local-first implementation of `ConnectionProfileRepository`
-/// (see that protocol for how this maps to the article's local-first
-/// principles). The "Dev Mac" default is synthesized in-memory so it is always
-/// present with zero latency and no network -- offline-primary by construction.
+/// Stores connection profiles in SQLite.
+/// The primary database is in Application Support.
+/// If that path fails, the store tries its app Documents directory.
+/// The main actor serializes all database access.
+/// The in-memory default remains available without a database.
 @MainActor
 final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepository {
     @Published private(set) var profiles: [ConnectionProfile] = []
 
     private var db: OpaquePointer?
 
-    /// The resolved on-disk path of the last-attempted sqlite database (for the
-    /// on-device diagnostics screen). Empty until `init` runs.
+    /// Contains the path from the most recent database-open attempt.
+    /// The value is empty before initialization.
     private(set) var databasePath: String = ""
 
-    /// Whether the backing sqlite database is currently open. When false, the
-    /// store is running purely on the in-memory synthesized default -- the exact
-    /// state the diagnostics screen exists to surface.
+    /// Indicates whether a SQLite database is open.
     var isOpen: Bool { db != nil }
 
-    /// SQLITE_TRANSIENT: tells sqlite to copy bound text immediately.
-    /// Swift's temporary C strings from `withCString`/`-1` binds die before
-    /// sqlite3_step without this; the classic silent-garbage bug.
+    /// Makes SQLite copy bound text before Swift releases the temporary C string.
     private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     init(databaseURL: URL? = nil) {
@@ -74,8 +61,8 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         NSLog("ConnectionProfileStore: opened=\(db != nil) profiles=\(profiles.count) devMac=\(dev != nil) pin=\(dev?.pin ?? "-")")
     }
 
-    /// Opens `url` into `db`; returns whether it succeeded (and logs the
-    /// concrete sqlite error on failure).
+    /// Opens the database at `url` and stores its handle.
+    /// Returns `false` and logs the SQLite error if opening fails.
     @discardableResult
     private func openDatabase(_ url: URL) -> Bool {
         databasePath = url.path
@@ -101,9 +88,7 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         return support.appendingPathComponent("profiles.sqlite")
     }
 
-    /// Last-resort DB location if Application Support can't be opened: the
-    /// Documents dir (always present + writable in the app sandbox). Keeping
-    /// the default profile seeded matters more than the exact file location.
+    /// Returns the fallback database location in the app Documents directory.
     private static func fallbackDatabaseURL() -> URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("HoloIroh", isDirectory: true)
@@ -130,8 +115,7 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_ticket ON profiles(ticket);")
     }
 
-    /// The built-in ticket/PIN for the dev Mac's daemon -- the constant that
-    /// `reload()` synthesizes as the always-present "Dev Mac" default profile.
+    /// Contains the built-in ticket for the synthesized "Dev Mac" profile.
     // A NODE-ID-ONLY ticket, on purpose: the daemon's identity key is stable
     // (~/.holoiroh/iroh_secret), and both the daemon and this app's iroh endpoint
     // use n0's default relay+discovery preset (presets::N0) -- so the phone
@@ -147,15 +131,11 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwA/holoiroh"
     private static let currentDevPin = "394299"
 
-    /// UserDefaults key holding a ticket the daemon reported over the
-    /// authenticated control channel (or a manual QR rescan) after its identity
-    /// rotated -- see `refreshDefaultTicket`. Absent until a real rotation, so a
-    /// fresh install always starts on the drift-proof `currentDevTicket`.
+    /// Identifies the `UserDefaults` entry for a refreshed daemon ticket.
+    /// The app writes it after an authenticated control-channel update or manual ticket scan.
     private static let refreshedTicketDefaultsKey = "refreshedDevTicket"
 
-    /// A stored refreshed ticket, but only if it still parses as an
-    /// `iroh-live:` ticket -- a malformed value is ignored so a bad write can
-    /// never leave the default pointing at garbage (the constant wins).
+    /// Returns a stored refreshed ticket only when it has the `iroh-live:` scheme.
     private static var storedRefreshedTicket: String? {
         guard let t = UserDefaults.standard.string(forKey: refreshedTicketDefaultsKey),
               t.hasPrefix("iroh-live:")
@@ -163,40 +143,28 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         return t
     }
 
-    /// The ticket the synthesized default actually uses: a refreshed ticket if
-    /// the daemon's identity rotated, otherwise the drift-proof constant. Never
-    /// empty by construction, so the always-present-default invariant holds.
+    /// Returns the refreshed ticket when available.
+    /// Otherwise, it returns the built-in ticket.
     static var effectiveDefaultTicket: String {
         storedRefreshedTicket ?? currentDevTicket
     }
 
     // MARK: - CRUD
 
-    /// Sentinel id for the in-memory synthesized default (never a real sqlite
-    /// row id, which start at 1). `delete()` on it is a harmless no-op DELETE,
-    /// and the next reload re-synthesizes it -- so the default can't be
-    /// permanently removed (only the daemon changing its identity replaces it).
+    /// Identifies synthesized profiles that do not exist in SQLite.
+    /// Deleting this identifier does not remove the synthesized default.
     static let syntheticDefaultID: Int64 = -1
 
-    /// The always-present synthesized "Dev Mac" default -- the current daemon's
-    /// ticket + PIN. Non-nil in every real state (reload() always prepends it),
-    /// so the reachability monitor and launch auto-connect can read the ticket
-    /// to probe/dial without reaching into the private constants.
+    /// Returns the synthesized "Dev Mac" profile.
     var defaultProfile: ConnectionProfile? {
         profiles.first { $0.id == Self.syntheticDefaultID }
     }
 
-    /// UserDefaults key holding the ticket of whatever profile the user last successfully
-    /// connected to -- see `autoConnectProfile`/`markConnected`.
+    /// Identifies the `UserDefaults` entry for the most recently connected profile ticket.
     private static let lastConnectedTicketDefaultsKey = "lastConnectedTicket"
 
-    /// The profile launch auto-connect should use: whichever one the user actually last
-    /// connected to (by hand, or by tapping a saved-profile card), falling back to the
-    /// synthesized "Dev Mac" default only if nothing has ever been connected to, or if the
-    /// last-connected ticket no longer matches a saved profile (e.g. it was deleted). Without
-    /// this, auto-connect always dialed the hardcoded Dev Mac ticket regardless of what the
-    /// user actually paired with -- "ensure the active connection is saved as a default
-    /// connection profile" wasn't actually true.
+    /// Returns the most recently connected saved profile for launch auto-connect.
+    /// If that profile is unavailable, it returns the synthesized default.
     var autoConnectProfile: ConnectionProfile? {
         if let lastTicket = UserDefaults.standard.string(forKey: Self.lastConnectedTicketDefaultsKey),
            let match = profiles.first(where: { $0.ticket == lastTicket }) {
@@ -205,11 +173,7 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         return defaultProfile
     }
 
-    /// Records `ticket` as the most recently connected-to profile, so the NEXT launch's
-    /// auto-connect (see `autoConnectProfile`) reconnects to it instead of always falling back
-    /// to the synthesized Dev Mac default. Call this from wherever a connection is actually
-    /// established (manual pairing or tapping a saved profile) -- never from `reload()` or any
-    /// passive read path.
+    /// Stores `ticket` as the most recently connected profile for launch auto-connect.
     func markConnected(ticket: String) {
         UserDefaults.standard.set(ticket, forKey: Self.lastConnectedTicketDefaultsKey)
     }
@@ -259,14 +223,10 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         profiles = result
     }
 
-    /// Refreshes the "Dev Mac" default's ticket after the daemon's identity
-    /// rotated -- called with the ticket the daemon reported over the
-    /// authenticated control channel (`ServerMessage.currentTicket`) or from a
-    /// manual QR rescan. Persists the new ticket as the override the synthesized
-    /// default then uses, so future launches reach the rotated daemon without a
-    /// re-scan. No-op (returns false) unless the ticket parses AND differs from
-    /// the current default -- it never downgrades a working default to a bad or
-    /// identical ticket.
+    /// Replaces the synthesized default ticket after a daemon identity change.
+    /// The method accepts only a different ticket with the `iroh-live:` scheme.
+    /// It persists an accepted ticket and reloads profiles.
+    /// Returns `true` when the update succeeds.
     @discardableResult
     func refreshDefaultTicket(_ ticket: String) -> Bool {
         let trimmed = ticket.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -278,10 +238,9 @@ final class ConnectionProfileStore: ObservableObject, ConnectionProfileRepositor
         return true
     }
 
-    /// Inserts (or, if a profile with the same ticket already exists,
-    /// updates) a profile. Keying dedup on the ticket rather than the name
-    /// means re-saving the same daemon under a new label renames it instead
-    /// of quietly accumulating duplicates that all dial the same machine.
+    /// Inserts a profile or updates the profile with the same ticket.
+    /// Saving the same ticket under a new name renames the existing profile.
+    /// Returns `false` when the database is unavailable, the name or ticket is empty, or SQLite fails.
     @discardableResult
     func save(name: String, ticket: String, pin: String) -> Bool {
         guard let db else { return false }

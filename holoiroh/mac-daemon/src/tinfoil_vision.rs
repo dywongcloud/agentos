@@ -1,17 +1,28 @@
-//! Image analysis via Tinfoil's chat/completions endpoint with an image-input-capable model.
-//! docs.tinfoil.sh/guides/image-processing names `qwen3-vl-30b` and `gemma-4-31b`, but a live
-//! `GET /v1/models` call (`tinfoil_live_probe.rs`, 2026-07-28) proved `qwen3-vl-30b` does not
-//! exist (404) -- the docs page was wrong. The real catalog's two `multimodal: true` chat
-//! models are `gemma4-31b` (no dash) and `kimi-k2-6`, confirmed live against the real endpoint.
+//! Analyzes images through Tinfoil's image-capable chat completions endpoint.
 //!
-//! Direct-reqwest-with-bearer style, same posture as [`crate::clarify`]/
-//! [`crate::tinfoil_documents`] -- not routed through [`crate::tinfoil_proxy`]'s loopback
-//! proxy, which exists only to solve `holo serve`'s header limitation.
+//! ## Model source
 //!
-//! **Every image is redacted on-device via [`crate::privacy::ocr_and_redact`] before it is
-//! base64-encoded into the request body.** This is load-bearing, not optional: it is the same
-//! privacy control `privacy-wire-into-tinfoil-proxy` (PRD) wires into the existing screenshot
-//! fallback path, applied consistently to this new outbound path too.
+//! `docs.tinfoil.sh/guides/image-processing` names `qwen3-vl-30b` and `gemma-4-31b`.
+//! A live probe showed that `qwen3-vl-30b` does not exist.
+//! A request for that model returns Hypertext Transfer Protocol (HTTP) status 404.
+//! The probe used `GET /v1/models` in `tinfoil_live_probe.rs` on 2026-07-28.
+//! The live catalog contained two chat models with `multimodal: true`.
+//! They were `gemma4-31b` without a dash and `kimi-k2-6`.
+//! The probe confirmed both models against the real endpoint.
+//!
+//! ## Privacy invariant
+//!
+//! Every image passes through [`crate::privacy::ocr_and_redact`] on the device before Base64 encoding.
+//! This redaction is mandatory.
+//! The `privacy-wire-into-tinfoil-proxy` product requirements document (PRD) defines the same privacy control.
+//! The existing screenshot fallback path also applies that control.
+//!
+//! ## Transport
+//!
+//! This module uses direct `reqwest` requests with bearer authentication.
+//! This approach matches [`crate::clarify`] and [`crate::tinfoil_documents`].
+//! Requests do not use the [`crate::tinfoil_proxy`] loopback proxy.
+//! That proxy exists only because `holo serve` cannot set the required header.
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -19,21 +30,28 @@ use image::DynamicImage;
 use serde::Deserialize;
 use std::time::Duration;
 
-use crate::tinfoil_models::{GEMMA_4_31B, KIMI_K2_6, TINFOIL_BASE_URL};
+use crate::tinfoil_client::{JSON_SUCCESS_BODY_LIMIT_BYTES, collect_tinfoil_response};
+use crate::tinfoil_models::{GEMMA_4_31B, KIMI_K2_6};
 
 const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
-/// Tinfoil's documented max image dimension (docs.tinfoil.sh/guides/image-processing:
-/// "resizing images to a maximum of 4096x4096 pixels for optimal performance"). Enforced as a
-/// downscale (never an error) so a caller never has to pre-resize -- oversized inputs are the
-/// common case for a raw phone/screenshot capture, not an exceptional one.
+/// Tinfoil documents an inclusive maximum of 4,096 pixels for each image dimension.
+///
+/// Source: `docs.tinfoil.sh/guides/image-processing`.
+/// The source recommends "resizing images to a maximum of 4096x4096 pixels for optimal performance".
+/// This module downscales larger inputs instead of returning an error.
+/// Raw images from the app and screenshots commonly exceed the limit.
+/// Therefore, callers do not have to resize those inputs.
 const MAX_DIMENSION_PX: u32 = 4096;
 
-/// Which of Tinfoil's two real (`GET /v1/models`-confirmed) image-capable chat models to
-/// request. `Gemma431b` is the default (see [`Default`] impl below): it needs no special
-/// request tuning, unlike `kimi-k2-6` which requires [`crate::tinfoil_proxy`]'s
-/// `apply_kimi_tuning` for its reasoning-token/`guided_json` quirks -- tuning this module does
-/// not replicate, so `Kimi` here sends the plain untuned request and may be slower/costlier.
+/// Selects one of the two image-capable chat models confirmed by live `GET /v1/models`.
+///
+/// [`VisionModel::Gemma431b`] is the default. See the [`Default`] implementation.
+/// It requires no special request tuning.
+/// `kimi-k2-6` requires [`crate::tinfoil_proxy`]'s `apply_kimi_tuning` for reasoning-token and `guided_json` behavior.
+/// This module does not replicate that tuning.
+/// Therefore, [`VisionModel::Kimi`] sends a plain request without tuning.
+/// That request may be slower or costlier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisionModel {
     Gemma431b,
@@ -71,20 +89,48 @@ struct ChatMessage {
     content: String,
 }
 
-/// Redacts, downscales-if-needed, base64-encodes, and asks `model` about `image` per `prompt`.
-/// Returns the model's text answer. Unlike [`crate::clarify::generate_clarifying_questions`],
-/// errors are surfaced (`Result`) rather than swallowed -- this is a caller-requested action on
-/// the critical path of an explicit user request, not an off-path best-effort enrichment.
+pub fn parse_image_analysis_response(raw: &[u8]) -> Result<String> {
+    let parsed: ChatCompletionResponse =
+        serde_json::from_slice(raw).context("failed to parse tinfoil chat/completions response")?;
+    let content = parsed
+        .choices
+        .into_iter()
+        .next()
+        .map(|choice| choice.message.content)
+        .unwrap_or_default();
+    if content.is_empty() {
+        bail!("tinfoil chat/completions returned an empty choices/content");
+    }
+    Ok(content)
+}
+
+/// Sends a privacy-filtered image to `model` for analysis with `prompt`.
+///
+/// Before sending the request, this function performs these steps:
+///
+/// 1. The function redacts the image.
+/// 2. It downscales the image when necessary.
+/// 3. It Base64-encodes the image.
+///
+/// The function returns the model's text answer.
+/// It returns errors to the caller through [`Result`].
+/// In contrast, [`crate::clarify::generate_clarifying_questions`] suppresses errors.
+/// Image analysis is on the critical path of an explicit user request.
+/// It is not an off-path, best-effort enrichment.
 pub async fn analyze_image(
-    api_key: &str,
+    transport: &crate::tinfoil_client::TinfoilClient,
     image: &DynamicImage,
     prompt: &str,
     model: VisionModel,
 ) -> Result<String> {
-    let (redacted, redacted_count) = crate::privacy::ocr_and_redact(image)
-        .context("on-device PII redaction failed; refusing to send an unredacted image to Tinfoil")?;
+    let (redacted, redacted_count) = crate::privacy::ocr_and_redact(image).context(
+        "on-device PII redaction failed; refusing to send an unredacted image to Tinfoil",
+    )?;
     if redacted_count > 0 {
-        tracing::info!(redacted_count, "tinfoil_vision: redacted PII regions before upload");
+        tracing::info!(
+            redacted_count,
+            "tinfoil_vision: redacted PII regions before upload"
+        );
     }
 
     let resized = downscale_if_needed(&redacted, MAX_DIMENSION_PX);
@@ -112,44 +158,37 @@ pub async fn analyze_image(
         }],
     });
 
-    let client = reqwest::Client::new();
-    let response = tokio::time::timeout(
-        Duration::from_secs(60),
-        client
-            .post(format!("{TINFOIL_BASE_URL}{CHAT_COMPLETIONS_PATH}"))
-            .header("authorization", format!("Bearer {api_key}"))
+    let client = transport
+        .client()
+        .http_client()
+        .context("Tinfoil verified HTTP client unavailable")?;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let response = client
+            .post(format!("{}{CHAT_COMPLETIONS_PATH}", transport.base_url()))
+            .header("authorization", transport.bearer())
             .header("content-type", "application/json")
             .json(&body)
-            .send(),
-    )
+            .send()
+            .await
+            .context("tinfoil image analysis request failed")?;
+
+        let raw = collect_tinfoil_response(
+            response,
+            JSON_SUCCESS_BODY_LIMIT_BYTES,
+            "tinfoil /v1/chat/completions image analysis",
+        )
+        .await?;
+        parse_image_analysis_response(&raw)
+    })
     .await
     .context("tinfoil image analysis timed out")?
-    .context("tinfoil image analysis request failed")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        bail!("tinfoil {CHAT_COMPLETIONS_PATH} returned {status}: {text}");
-    }
-
-    let parsed: ChatCompletionResponse = response
-        .json()
-        .await
-        .context("failed to parse tinfoil chat/completions response")?;
-    let content = parsed
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .unwrap_or_default();
-    if content.is_empty() {
-        bail!("tinfoil chat/completions returned an empty choices/content");
-    }
-    Ok(content)
 }
 
-/// Downscales `image` so neither dimension exceeds `max_dim`, preserving aspect ratio. A no-op
-/// (returns a clone via `to_owned`-equivalent) when the image already fits.
+/// Downscales `image` while preserving its aspect ratio.
+///
+/// The result's width and height do not exceed `max_dim`.
+/// A dimension equal to `max_dim` is permitted.
+/// If both dimensions fit, the function returns a clone equivalent to `to_owned`.
 fn downscale_if_needed(image: &DynamicImage, max_dim: u32) -> DynamicImage {
     let (w, h) = (image.width(), image.height());
     if w <= max_dim && h <= max_dim {

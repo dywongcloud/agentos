@@ -32,7 +32,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
-use holoiroh_wire::{ClarifyingQuestion, InputRequestKind, MouseButton, RemoteControlEvent};
+use holoiroh_wire::{
+    ActionApprovalRequest, ClarifyingQuestion, InputRequestKind, MouseButton, RemoteControlEvent,
+};
 
 use crate::holo_bridge::a2a_client::{A2aClient, TaskUpdate, TerminalState};
 use crate::limits::ActionCounter;
@@ -145,9 +147,12 @@ fn inject_remote_input(event: RemoteControlEvent) {
         RemoteControlEvent::Button { x, y, button, down } => {
             crate::remote_input::button(x, y, matches!(button, MouseButton::Right), down)
         }
-        RemoteControlEvent::Click { x, y, button, count } => {
-            crate::remote_input::click(x, y, matches!(button, MouseButton::Right), count)
-        }
+        RemoteControlEvent::Click {
+            x,
+            y,
+            button,
+            count,
+        } => crate::remote_input::click(x, y, matches!(button, MouseButton::Right), count),
         RemoteControlEvent::Scroll { x, y, dx, dy } => crate::remote_input::scroll(x, y, dx, dy),
         RemoteControlEvent::Text { text } => crate::remote_input::text(&text),
         RemoteControlEvent::Key { key, down } => crate::remote_input::key(&key, down),
@@ -245,10 +250,18 @@ pub enum ControlEvent {
     /// `control_channel::from_control_event` maps it straight to the wire
     /// `ServerMessage::SecureInputState`.
     SecureInputState { active: bool },
+    /// Requests approval for one exact typed action without passing approval text through inference.
+    ApprovalRequested {
+        request_id: String,
+        request: ActionApprovalRequest,
+    },
     /// Successful `ClientMessage::ProcessDocument` result. Off the
     /// desktop-task pipeline, with the same posture as
     /// `ClarifyQuestions`. A spawned `tinfoil_documents` call emits this.
-    DocumentProcessed { request_id: String, markdown: String },
+    DocumentProcessed {
+        request_id: String,
+        markdown: String,
+    },
     /// Failure of a `ClientMessage::ProcessDocument` request.
     DocumentProcessFailed { request_id: String, error: String },
     /// Successful `ClientMessage::AnalyzeImage` result.
@@ -260,11 +273,17 @@ pub enum ControlEvent {
     /// Failure of a `ClientMessage::TranscribeAudio` request.
     AudioTranscriptionFailed { request_id: String, error: String },
     /// Successful `ClientMessage::RequestSpeech` result; `audio_data_base64` is WAV bytes.
-    SpeechReady { request_id: String, audio_data_base64: String },
+    SpeechReady {
+        request_id: String,
+        audio_data_base64: String,
+    },
     /// Failure of a `ClientMessage::RequestSpeech` request.
     SpeechFailed { request_id: String, error: String },
     /// Successful `ClientMessage::PlanTask` result: an ordered human-readable step list.
-    PlanReady { request_id: String, steps: Vec<String> },
+    PlanReady {
+        request_id: String,
+        steps: Vec<String>,
+    },
     /// Failure of a `ClientMessage::PlanTask` request.
     PlanFailed { request_id: String, error: String },
 }
@@ -655,7 +674,10 @@ impl HoloControlBridge {
                     let seed_store = store.clone();
                     tokio::spawn(async move {
                         match seed_store.seed_defaults().await {
-                            Ok(n) => tracing::info!(facts = n, "env_context: seeded default environment facts"),
+                            Ok(n) => tracing::info!(
+                                facts = n,
+                                "env_context: seeded default environment facts"
+                            ),
                             Err(err) => tracing::warn!(
                                 error = %format!("{err:#}"),
                                 "env_context: seeding default facts failed (the hard process-awareness guard still carries the same rules)"
@@ -675,24 +697,22 @@ impl HoloControlBridge {
             current_turn: Mutex::new(None),
             paused: Mutex::new(None),
             remote_control_active: AtomicBool::new(false),
-            sensitive_categories: Mutex::new(
-                match SensitiveCategories::load_or_init_default() {
-                    Ok(cats) => {
-                        tracing::info!(
-                            categories = cats.categories.len(),
-                            "sensitive-app categories loaded (privacy layer live)"
-                        );
-                        cats
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %format!("{err:#}"),
-                            "failed to load sensitive-app categories config; using built-in defaults for this run"
-                        );
-                        SensitiveCategories::default_categories()
-                    }
-                },
-            ),
+            sensitive_categories: Mutex::new(match SensitiveCategories::load_or_init_default() {
+                Ok(cats) => {
+                    tracing::info!(
+                        categories = cats.categories.len(),
+                        "sensitive-app categories loaded (privacy layer live)"
+                    );
+                    cats
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %format!("{err:#}"),
+                        "failed to load sensitive-app categories config; using built-in defaults for this run"
+                    );
+                    SensitiveCategories::default_categories()
+                }
+            }),
             turn_allowances: Mutex::new(HashSet::new()),
             pending_consent: Mutex::new(None),
             turns_this_daemon_canceled_itself: TurnsCanceledByUs::default(),
@@ -825,7 +845,10 @@ impl HoloControlBridge {
         });
         self.cancel_current_turn("auto-yield").await;
         let queued = self.queue.lock().expect("queue lock poisoned").len();
-        self.emit(ControlEvent::TaskActive { paused: true, queued });
+        self.emit(ControlEvent::TaskActive {
+            paused: true,
+            queued,
+        });
         self.emit_daemon_status(
             "stepping aside while you use the Mac -- I'll resume when you're idle",
         );
@@ -847,7 +870,10 @@ impl HoloControlBridge {
         };
         let Some(parked) = parked else { return };
         let queued = self.queue.lock().expect("queue lock poisoned").len();
-        self.emit(ControlEvent::TaskActive { paused: false, queued });
+        self.emit(ControlEvent::TaskActive {
+            paused: false,
+            queued,
+        });
         self.emit_daemon_status("you're idle again -- resuming the task");
         let request_id = uuid::Uuid::new_v4().to_string();
         self.redispatch_parked(
@@ -974,7 +1000,10 @@ impl HoloControlBridge {
                 }
                 if self.paused.lock().expect("paused lock poisoned").is_some() {
                     let queued = self.queue.lock().expect("queue lock poisoned").len();
-                    self.emit(ControlEvent::TaskActive { paused: true, queued });
+                    self.emit(ControlEvent::TaskActive {
+                        paused: true,
+                        queued,
+                    });
                 }
                 self.emit_daemon_status("you took control -- the agent is paused while you drive");
             }
@@ -989,7 +1018,10 @@ impl HoloControlBridge {
                 let parked = self.paused.lock().expect("paused lock poisoned").take();
                 if let Some(parked) = parked {
                     let queued = self.queue.lock().expect("queue lock poisoned").len();
-                    self.emit(ControlEvent::TaskActive { paused: false, queued });
+                    self.emit(ControlEvent::TaskActive {
+                        paused: false,
+                        queued,
+                    });
                     self.emit_daemon_status("you released control -- resuming the agent");
                     let request_id = uuid::Uuid::new_v4().to_string();
                     self.redispatch_parked(
@@ -1141,7 +1173,10 @@ impl HoloControlBridge {
         // here is still the ORIGINAL instruction (env-context augmentation happens below), so
         // a pause stash replays what the user actually asked for. Per-turn consent allowances
         // reset with the turn they were granted for.
-        *self.current_turn.lock().expect("current_turn lock poisoned") = Some(CurrentTurn {
+        *self
+            .current_turn
+            .lock()
+            .expect("current_turn lock poisoned") = Some(CurrentTurn {
             request_id: request_id.clone(),
             text: text.clone(),
             context_id: context_id.map(str::to_owned),
@@ -1250,10 +1285,64 @@ impl HoloControlBridge {
         // user's own earlier "hi" messages on Slack) is NOT task completion. Injected
         // unconditionally every turn, like the guard block.
         let task_framing = crate::agent_guidance::task_framing_block();
+        let accessibility_snapshot_json = match tokio::time::timeout(
+            holoiroh_daemon::accessibility_tree::BRIDGE_SNAPSHOT_TIMEOUT,
+            tokio::task::spawn_blocking(
+                holoiroh_daemon::accessibility_tree::snapshot_frontmost_application,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(holoiroh_daemon::accessibility_tree::SnapshotAttempt::Captured {
+                snapshot,
+                elapsed,
+            })) => {
+                tracing::debug!(
+                    request_id,
+                    elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+                    nodes = snapshot.node_count,
+                    bytes = snapshot.byte_count,
+                    truncated = snapshot.truncated,
+                    "captured bounded start-of-turn Accessibility snapshot"
+                );
+                Some(snapshot.json)
+            }
+            Ok(Ok(holoiroh_daemon::accessibility_tree::SnapshotAttempt::Omitted {
+                reason,
+                elapsed,
+            })) => {
+                tracing::debug!(
+                    request_id,
+                    elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+                    reason = %reason,
+                    "Accessibility snapshot unavailable; preserving screenshot-only grounding"
+                );
+                None
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    request_id,
+                    error = %err,
+                    "Accessibility snapshot worker failed; preserving screenshot-only grounding"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::debug!(
+                    request_id,
+                    timeout_ms =
+                        holoiroh_daemon::accessibility_tree::BRIDGE_SNAPSHOT_TIMEOUT.as_millis(),
+                    "Accessibility snapshot bridge deadline elapsed; preserving screenshot-only grounding"
+                );
+                None
+            }
+        };
 
         // Order: hard guard first (highest authority), then task-execution framing,
-        // then durable env facts, then the user's instruction. `run_prompt_once`
-        // sends this whole string to the backend.
+        // then durable env facts, then the optional untrusted Accessibility observation,
+        // and finally the user's instruction as a JSON string under an explicit authority
+        // marker. JSON encoding prevents user or AX text from breaking the boundary with a
+        // forged closing delimiter. `run_prompt_once` sends this whole string to the backend.
         let augmented_text = {
             let mut s = guard_block;
             s.push('\n');
@@ -1262,9 +1351,11 @@ impl HoloControlBridge {
                 s.push('\n');
                 s.push_str(&block);
             }
-            s.push('\n');
-            s.push_str(&text);
-            s
+            crate::agent_guidance::finish_task_prompt(
+                s,
+                accessibility_snapshot_json.as_deref(),
+                &text,
+            )
         };
 
         // At most ONE failover retry per turn: attempt 0 may suppress a backend failure and
@@ -1311,9 +1402,8 @@ impl HoloControlBridge {
                                     .current_turn
                                     .lock()
                                     .expect("current_turn lock poisoned");
-                                if let Some(turn) = current
-                                    .as_mut()
-                                    .filter(|t| t.request_id == request_id)
+                                if let Some(turn) =
+                                    current.as_mut().filter(|t| t.request_id == request_id)
                                 {
                                     turn.context_id = None;
                                     turn.a2a_task_id = None;
@@ -1321,8 +1411,10 @@ impl HoloControlBridge {
                             }
                             attempt += 1;
                         }
-                        Ok(super::FallbackActivation::AlreadyActive
-                        | super::FallbackActivation::Unavailable) => {
+                        Ok(
+                            super::FallbackActivation::AlreadyActive
+                            | super::FallbackActivation::Unavailable,
+                        ) => {
                             for event in original {
                                 self.emit(event);
                             }
@@ -1544,16 +1636,13 @@ impl HoloControlBridge {
 
         match result {
             Ok(resolved_context_id) => {
-                let held = std::mem::take(
-                    &mut *suppressed.lock().expect("suppressed lock poisoned"),
-                );
+                let held =
+                    std::mem::take(&mut *suppressed.lock().expect("suppressed lock poisoned"));
                 // Held events only count as a backend failure when a TERMINAL is among
                 // them (an empty Answer alone followed by a real Failed took shape 1's
                 // path; an empty Answer with no terminal at all means the stream ended
                 // oddly -- emit what was held and let the transport error path speak).
-                let has_terminal = held
-                    .iter()
-                    .any(|e| matches!(e, ControlEvent::Done { .. }));
+                let has_terminal = held.iter().any(|e| matches!(e, ControlEvent::Done { .. }));
                 if has_terminal {
                     return TurnOutcome::BackendFailure { original: held };
                 }
@@ -1676,7 +1765,10 @@ impl HoloControlBridge {
             // the current holo serve (context-id-only cancels return JSON-RPC -32603 there;
             // see a2a_client::cancel's doc).
             let (matches_current, a2a_task_id) = {
-                let current = self.current_turn.lock().expect("current_turn lock poisoned");
+                let current = self
+                    .current_turn
+                    .lock()
+                    .expect("current_turn lock poisoned");
                 match current.as_ref() {
                     Some(t) if t.context_id.as_deref() == Some(ctx) => {
                         (true, t.a2a_task_id.clone())
@@ -1708,7 +1800,6 @@ impl HoloControlBridge {
             });
             return;
         }
-
 
         // The request_id of the turn actually running when this Stop arrived -- captured now
         // so the force-escalation below can tell "the turn we asked to stop is STILL running"
@@ -1793,7 +1884,9 @@ impl HoloControlBridge {
         // still-running turn -- the only way to witness the escalation path end-to-end without
         // a real runaway desktop agent. Never set in production.
         if skip_graceful {
-            tracing::warn!("HOLOIROH_DEBUG_STOP_SKIP_GRACEFUL set -- skipping scoped cancel + graceful holo stop to exercise force escalation");
+            tracing::warn!(
+                "HOLOIROH_DEBUG_STOP_SKIP_GRACEFUL set -- skipping scoped cancel + graceful holo stop to exercise force escalation"
+            );
         }
 
         // Global `holo stop` kill switch: always issued when no context_id was given (the
@@ -1845,7 +1938,8 @@ impl HoloControlBridge {
                             "stop: turn still running 3s after graceful holo stop; escalating to `holo stop --force`"
                         );
                         if let Err(err) =
-                            crate::holo_bridge::stop::holo_stop(&bridge.control.holo_bin, true).await
+                            crate::holo_bridge::stop::holo_stop(&bridge.control.holo_bin, true)
+                                .await
                         {
                             tracing::warn!(error = %err, "forced holo stop failed");
                         } else {
@@ -1890,16 +1984,22 @@ impl HoloControlBridge {
                 let client = self.client.read().expect("client lock poisoned").clone();
                 if let Err(err) = client.cancel(ctx, turn.a2a_task_id.as_deref()).await {
                     tracing::warn!(request_id = turn.request_id, context_id = ctx, error = %err, why, "scoped cancel failed; falling back to global holo stop");
-                    if let Err(err) = crate::holo_bridge::stop::holo_stop(&self.holo_bin, false).await {
+                    if let Err(err) =
+                        crate::holo_bridge::stop::holo_stop(&self.holo_bin, false).await
+                    {
                         tracing::warn!(error = %err, why, "global holo stop also failed");
-                        self.emit_daemon_status(format!("{why}: could not stop the running turn: {err}"));
+                        self.emit_daemon_status(format!(
+                            "{why}: could not stop the running turn: {err}"
+                        ));
                     }
                 }
             }
             None => {
                 if let Err(err) = crate::holo_bridge::stop::holo_stop(&self.holo_bin, false).await {
                     tracing::warn!(error = %err, why, "holo stop failed");
-                    self.emit_daemon_status(format!("{why}: could not stop the running turn: {err}"));
+                    self.emit_daemon_status(format!(
+                        "{why}: could not stop the running turn: {err}"
+                    ));
                 }
             }
         }
@@ -1916,7 +2016,9 @@ impl HoloControlBridge {
         });
 
         if self.paused.lock().expect("paused lock poisoned").is_some() {
-            self.emit_daemon_status("already paused -- send resume to continue, or redirect/stop to replace it");
+            self.emit_daemon_status(
+                "already paused -- send resume to continue, or redirect/stop to replace it",
+            );
             return;
         }
         let current = self
@@ -2048,7 +2150,10 @@ impl HoloControlBridge {
                 "redirect: active turn's backend session was replaced (crash-restart or backend switch) mid-task; failing it cleanly instead of inheriting a dead context"
             );
             self.tasks.with_task(&stale.request_id, |fsm| fsm.fail());
-            *self.current_turn.lock().expect("current_turn lock poisoned") = None;
+            *self
+                .current_turn
+                .lock()
+                .expect("current_turn lock poisoned") = None;
             self.emit(ControlEvent::Error {
                 request_id: stale.request_id.clone(),
                 message: "the agent backend restarted mid-task (it may have crashed) -- \
@@ -2140,7 +2245,10 @@ impl HoloControlBridge {
                 "stall watchdog: turn's backend session was replaced (crash-restart or backend switch) mid-task; failing cleanly instead of nudging a dead context"
             );
             self.tasks.with_task(&request_id, |fsm| fsm.fail());
-            *self.current_turn.lock().expect("current_turn lock poisoned") = None;
+            *self
+                .current_turn
+                .lock()
+                .expect("current_turn lock poisoned") = None;
             self.emit(ControlEvent::Error {
                 request_id,
                 message: "the agent backend restarted mid-task (it may have crashed) -- \
@@ -2151,7 +2259,10 @@ impl HoloControlBridge {
             return;
         }
 
-        tracing::info!(request_id, "stall watchdog: nudging a stalled turn to self-correct");
+        tracing::info!(
+            request_id,
+            "stall watchdog: nudging a stalled turn to self-correct"
+        );
         self.emit_daemon_status(format!(
             "{STALL_WATCHDOG_STATUS_MARKER} no progress detected -- asking the agent to verify and fix its last step"
         ));

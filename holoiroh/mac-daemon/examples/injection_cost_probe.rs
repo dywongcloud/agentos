@@ -82,10 +82,7 @@ fn main() {
         "scroll",
         measure(|| remote_input::scroll(0.5, 0.5, 0.0, 1.0)),
     ));
-    worst_build = worst_build.max(report(
-        "key",
-        measure(|| remote_input::key("return", true)),
-    ));
+    worst_build = worst_build.max(report("key", measure(|| remote_input::key("return", true))));
 
     for length in [1usize, 100, 1_000, 10_000] {
         let payload = "a".repeat(length);

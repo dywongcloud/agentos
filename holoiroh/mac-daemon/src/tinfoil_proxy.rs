@@ -38,15 +38,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-/// Default upstream. Override this value via `HOLOIROH_FALLBACK_UPSTREAM`: scheme and host,
-/// with no trailing slash. The request path, for example `/v1/chat/completions`, is appended
-/// verbatim.
-pub const DEFAULT_UPSTREAM: &str = "https://inference.tinfoil.sh";
-
 struct ProxyState {
     upstream: String,
-    bearer: String,
-    client: reqwest::Client,
+    client: Arc<crate::tinfoil_client::TinfoilClient>,
 }
 
 /// The running proxy. Dropping it aborts the serve task. The daemon holds one proxy for its
@@ -60,13 +54,9 @@ impl TinfoilProxy {
     /// Binds `127.0.0.1:0`, an ephemeral port, and starts forwarding. `api_key` is the Tinfoil
     /// bearer key, from `TINFOIL_API_KEY` in the gitignored `.env`. It lives only inside this
     /// process. This function never places it in any child's env or argv.
-    pub async fn spawn(upstream: impl Into<String>, api_key: impl Into<String>) -> Result<Self> {
-        let upstream = upstream.into().trim_end_matches('/').to_string();
-        let state = Arc::new(ProxyState {
-            upstream,
-            bearer: format!("Bearer {}", api_key.into()),
-            client: reqwest::Client::new(),
-        });
+    pub async fn spawn(client: Arc<crate::tinfoil_client::TinfoilClient>) -> Result<Self> {
+        let upstream = client.base_url();
+        let state = Arc::new(ProxyState { upstream, client });
 
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -117,7 +107,14 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Reque
         Ok(m) => m,
         Err(_) => return status_response(StatusCode::METHOD_NOT_ALLOWED, "unsupported method"),
     };
-    let mut upstream_req = state.client.request(reqwest_method, &url);
+    let verified_client = match state.client.client().http_client() {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(error = %err, "tinfoil proxy verified client unavailable");
+            return status_response(StatusCode::BAD_GATEWAY, "verified upstream unavailable");
+        }
+    };
+    let mut upstream_req = verified_client.request(reqwest_method, &url);
 
     for (name, value) in req.headers() {
         let lower = name.as_str().to_ascii_lowercase();
@@ -134,7 +131,7 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Reque
             upstream_req = upstream_req.header(name.as_str(), v);
         }
     }
-    upstream_req = upstream_req.header("authorization", &state.bearer);
+    upstream_req = upstream_req.header("authorization", state.client.bearer());
 
     // Chat-completion bodies get buffered and REWRITTEN, not streamed: the runtime's requests
     // carry a hardcoded `logit_bias` token id from HOLO's tokenizer (witnessed: 248069), which
@@ -142,8 +139,8 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Reque
     // whole request with 400 `logit_bias contain out-of-vocab token ids`. The bias only nudges
     // a Holo-specific token, so dropping it is the correct translation for a foreign model.
     // Everything else (guided_json, streaming responses, other routes) passes through untouched.
-    let is_chat_completion = req.method() == axum::http::Method::POST
-        && req.uri().path().ends_with("/chat/completions");
+    let is_chat_completion =
+        req.method() == axum::http::Method::POST && req.uri().path().ends_with("/chat/completions");
     if is_chat_completion {
         // 64 MiB cap: screenshots ride as base64 (hundreds of KB each, up to a few per
         // request); anything past this cap is not a legitimate inference request.
@@ -158,15 +155,32 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Reque
             Ok(mut json) => {
                 if let Some(obj) = json.as_object_mut() {
                     if obj.remove("logit_bias").is_some() {
-                        tracing::debug!("tinfoil proxy stripped logit_bias (holo-tokenizer-specific) from request");
+                        tracing::debug!(
+                            "tinfoil proxy stripped logit_bias (holo-tokenizer-specific) from request"
+                        );
                     }
                     let is_kimi = obj.get("model").and_then(|m| m.as_str()) == Some("kimi-k2-6");
                     if is_kimi {
                         apply_kimi_tuning(obj);
                     }
-                    redact_image_urls_in_messages(obj);
+                    if let Err(err) = redact_image_urls_in_messages(obj) {
+                        tracing::warn!(error = %err, "tinfoil proxy rejected request because image redaction failed");
+                        return status_response(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "image redaction failed; request was not forwarded",
+                        );
+                    }
                 }
-                serde_json::to_vec(&json).unwrap_or_else(|_| bytes.to_vec())
+                match serde_json::to_vec(&json) {
+                    Ok(body) => body,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "tinfoil proxy failed to serialize redacted request");
+                        return status_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "redacted request serialization failed",
+                        );
+                    }
+                }
             }
             // Not JSON? Forward verbatim; the upstream owns rejecting it.
             Err(_) => bytes.to_vec(),
@@ -242,8 +256,12 @@ async fn forward(State(state): State<Arc<ProxyState>>, req: axum::extract::Reque
 fn apply_kimi_tuning(obj: &mut serde_json::Map<String, serde_json::Value>) {
     obj.entry("chat_template_kwargs".to_string())
         .or_insert_with(|| serde_json::json!({}));
-    if let Some(ctk) = obj.get_mut("chat_template_kwargs").and_then(|v| v.as_object_mut()) {
-        ctk.entry("thinking".to_string()).or_insert(serde_json::Value::Bool(false));
+    if let Some(ctk) = obj
+        .get_mut("chat_template_kwargs")
+        .and_then(|v| v.as_object_mut())
+    {
+        ctk.entry("thinking".to_string())
+            .or_insert(serde_json::Value::Bool(false));
     }
 
     if let Some(guided_json) = obj.remove("guided_json") {
@@ -258,7 +276,9 @@ fn apply_kimi_tuning(obj: &mut serde_json::Map<String, serde_json::Value>) {
                 }
             }),
         );
-        tracing::debug!("tinfoil proxy: translated guided_json -> response_format json_schema for kimi-k2-6");
+        tracing::debug!(
+            "tinfoil proxy: translated guided_json -> response_format json_schema for kimi-k2-6"
+        );
     }
 
     // The runtime sends `max_completion_tokens` (confirmed in captured logs: the shipped
@@ -281,22 +301,20 @@ fn apply_kimi_tuning(obj: &mut serde_json::Map<String, serde_json::Value>) {
             return;
         }
     }
-    obj.insert("max_completion_tokens".to_string(), serde_json::json!(MIN_MAX_TOKENS));
+    obj.insert(
+        "max_completion_tokens".to_string(),
+        serde_json::json!(MIN_MAX_TOKENS),
+    );
 }
 
-/// Walks every `messages[].content[]` entry of shape `{"type":"image_url","image_url":{"url":
-/// "data:image/...;base64,<data>"}}`. This function replaces the base64 payload with an
-/// on-device PII-redacted version (see [`crate::privacy::ocr_and_redact`]), before the request
-/// leaves the loopback boundary. This is the load-bearing fix for the gap
-/// `privacy-wire-into-tinfoil-proxy` (PRD) named. `Cargo.toml`'s dependency comments described
-/// this exact redaction step as already wired here, since before this function existed. It was
-/// not wired: screenshots forwarded completely unredacted. This function is best-effort per
-/// image: a decode/OCR/re-encode failure on one image leaves that image's URL untouched
-/// (logged), rather than dropping the whole request. A redaction bug must never silently turn
-/// into "the agent stopped seeing the screen."
-fn redact_image_urls_in_messages(obj: &mut serde_json::Map<String, serde_json::Value>) {
+/// Walks each image URL in chat messages. It redacts local data images before egress.
+/// A malformed or unredactable data image rejects the complete request. External URLs are not
+/// local image payloads and pass through unchanged.
+fn redact_image_urls_in_messages(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<()> {
     let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) else {
-        return;
+        return Ok(());
     };
     let mut redacted_images = 0usize;
     for message in messages.iter_mut() {
@@ -316,40 +334,42 @@ fn redact_image_urls_in_messages(obj: &mut serde_json::Map<String, serde_json::V
             else {
                 continue;
             };
-            match redact_data_url(&url) {
-                Ok(Some(redacted_url)) => {
-                    if let Some(iu) = part.get_mut("image_url") {
-                        iu["url"] = serde_json::Value::String(redacted_url);
-                        redacted_images += 1;
-                    }
-                }
-                Ok(None) => {
-                    // Not a data: URL (e.g. an https:// image reference) -- nothing local to
-                    // redact; the upstream fetches it directly and never touches this proxy's
-                    // memory at all.
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "tinfoil proxy: image redaction failed, forwarding this image unredacted");
+            if let Some(redacted_url) = redact_data_url(&url)? {
+                if let Some(iu) = part.get_mut("image_url") {
+                    iu["url"] = serde_json::Value::String(redacted_url);
+                    redacted_images += 1;
                 }
             }
         }
     }
     if redacted_images > 0 {
-        tracing::info!(redacted_images, "tinfoil proxy: redacted PII in outbound image(s)");
+        tracing::info!(
+            redacted_images,
+            "tinfoil proxy: redacted PII in outbound image(s)"
+        );
     }
+    Ok(())
 }
 
-/// Decodes a `data:image/<fmt>;base64,<data>` URL. Runs [`crate::privacy::ocr_and_redact`].
-/// Re-encodes the result as a PNG data URL. Returns `Ok(None)` for a non-`data:` URL, since
-/// there is nothing to do locally. Returns `Err` for a malformed or undecodable URL. The caller
-/// then logs the error and leaves the original untouched.
+/// Redacts one data image and returns `None` only for a non-data URL.
 fn redact_data_url(url: &str) -> anyhow::Result<Option<String>> {
-    let Some(comma_idx) = url.find(',') else {
+    let prefix = b"data:image/";
+    let is_data_image = url
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix));
+    if !is_data_image {
         return Ok(None);
-    };
+    }
+    let comma_idx = url
+        .find(',')
+        .ok_or_else(|| anyhow::anyhow!("data image URL has no payload separator"))?;
     let header = &url[..comma_idx];
-    if !header.starts_with("data:image/") || !header.ends_with(";base64") {
-        return Ok(None);
+    let is_base64 = header
+        .rsplit_once(';')
+        .is_some_and(|(_, encoding)| encoding.eq_ignore_ascii_case("base64"));
+    if !is_base64 {
+        anyhow::bail!("data image URL is not base64 encoded");
     }
     let b64_data = &url[comma_idx + 1..];
     let raw_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_data)

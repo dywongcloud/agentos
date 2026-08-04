@@ -63,16 +63,18 @@ fn main() -> Result<()> {
     let switch_decisive = should_switch(Tier::Simple, decisive_complex);
     println!(
         "[{}] should_switch(Simple, decisive complex prompt) = {switch_decisive:?} (expected Some(Complex))",
-        if switch_decisive == Some(Tier::Complex) { "OK" } else { "FAIL" }
+        if switch_decisive == Some(Tier::Complex) {
+            "OK"
+        } else {
+            "FAIL"
+        }
     );
     if switch_decisive != Some(Tier::Complex) {
         failures.push("hysteresis-decisive-upgrade");
     }
 
     let stay_complex = should_switch(Tier::Complex, "open calendar");
-    println!(
-        "[INFO] should_switch(Complex, 'open calendar') = {stay_complex:?}"
-    );
+    println!("[INFO] should_switch(Complex, 'open calendar') = {stay_complex:?}");
 
     if !failures.is_empty() {
         bail!("router classifier probe FAILED: {failures:?}");
@@ -106,12 +108,8 @@ fn live_respawn_witness() -> Result<()> {
             }
         });
 
-        // Distinct ports per spawn (not just distinct runtime ports): a bare re-spawn on the
-        // SAME A2A port right after `shutdown()` hit a real macOS TIME_WAIT window here that
-        // outlived the daemon's own retry budget (8 attempts x 1.2s backoff) -- witnessed
-        // live, not assumed. `holo serve`'s own within-daemon restart path never hits this
-        // because it holds the port for the daemon's whole lifetime; only a probe spawning
-        // twice in quick succession needs the workaround, so it lives here, not in process.rs.
+        // Use distinct A2A and runtime ports so each model witness is isolated. Production
+        // backend switches instead keep one bridge-owned A2A listener across child replacement.
         for (i, model) in [Tier::Simple.model_id(), Tier::Complex.model_id()].into_iter().enumerate() {
             let a2a_port = PROBE_A2A_PORT + i as u16;
             let runtime_port = (PROBE_RUNTIME_PORT.parse::<u16>().expect("valid port literal") + i as u16).to_string();

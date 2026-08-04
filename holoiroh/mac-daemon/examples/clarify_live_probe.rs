@@ -20,17 +20,29 @@ const BROADCAST_NAME: &str = "holoiroh";
 fn derive_ticket() -> anyhow::Result<LiveTicket> {
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
     let hex = std::fs::read_to_string(format!("{home}/.holoiroh/iroh_secret"))?;
-    let secret: SecretKey = hex.trim().parse().map_err(|e| anyhow::anyhow!("parsing secret: {e}"))?;
-    Ok(LiveTicket::new(EndpointAddr::from(secret.public()), BROADCAST_NAME))
+    let secret: SecretKey = hex
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parsing secret: {e}"))?;
+    Ok(LiveTicket::new(
+        EndpointAddr::from(secret.public()),
+        BROADCAST_NAME,
+    ))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let pin = std::env::args().nth(1).unwrap_or_else(|| "394299".to_string());
+    let pin = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "394299".to_string());
     let ticket = derive_ticket()?;
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut lines = BufReader::new(recv).lines();
     write_line(&mut send, &ClientMessage::Pin { pin }).await?;
@@ -81,7 +93,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let qs = questions.ok_or_else(|| anyhow::anyhow!("no ClarifyQuestions received within 30s"))?;
-    assert!(!qs.is_empty(), "ambiguous prompt must yield questions from the live handler");
-    println!("clarify_live_probe: OK -- live daemon answered ClarifyRequest with {} clarifying question(s)", qs.len());
+    assert!(
+        !qs.is_empty(),
+        "ambiguous prompt must yield questions from the live handler"
+    );
+    println!(
+        "clarify_live_probe: OK -- live daemon answered ClarifyRequest with {} clarifying question(s)",
+        qs.len()
+    );
     Ok(())
 }

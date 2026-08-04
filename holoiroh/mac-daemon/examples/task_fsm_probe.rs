@@ -23,38 +23,73 @@ fn main() -> Result<()> {
     assert_eq!(fsm.phase, Phase::Plan, "starts at Plan");
 
     let changed = fsm.observe_working(Some(&json!({"kind": "observation_event"})));
-    println!("[{}] observation_event -> {:?} (changed={changed}, expected Plan/false: already Plan)",
-        if fsm.phase == Phase::Plan && !changed { "OK" } else { "FAIL" }, fsm.phase);
+    println!(
+        "[{}] observation_event -> {:?} (changed={changed}, expected Plan/false: already Plan)",
+        if fsm.phase == Phase::Plan && !changed {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        fsm.phase
+    );
     if !(fsm.phase == Phase::Plan && !changed) {
         bail!("unit case 1 failed");
     }
 
     let changed = fsm.observe_working(Some(&json!({"kind": "tool_result"})));
-    println!("[{}] tool_result -> {:?} (changed={changed}, actions={})",
-        if fsm.phase == Phase::Execute && changed && fsm.actions_taken == 1 { "OK" } else { "FAIL" },
-        fsm.phase, fsm.actions_taken);
+    println!(
+        "[{}] tool_result -> {:?} (changed={changed}, actions={})",
+        if fsm.phase == Phase::Execute && changed && fsm.actions_taken == 1 {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        fsm.phase,
+        fsm.actions_taken
+    );
     if !(fsm.phase == Phase::Execute && changed && fsm.actions_taken == 1) {
         bail!("unit case 2 failed");
     }
 
     // Sticky Execute: a later policy_event must NOT regress the phase.
     let changed = fsm.observe_working(Some(&json!({"kind": "policy_event"})));
-    println!("[{}] policy_event mid-Execute -> {:?} (changed={changed}, expected Execute/false)",
-        if fsm.phase == Phase::Execute && !changed { "OK" } else { "FAIL" }, fsm.phase);
+    println!(
+        "[{}] policy_event mid-Execute -> {:?} (changed={changed}, expected Execute/false)",
+        if fsm.phase == Phase::Execute && !changed {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        fsm.phase
+    );
     if !(fsm.phase == Phase::Execute && !changed) {
         bail!("unit case 3 (sticky Execute) failed");
     }
 
     let changed = fsm.observe_answer("the answer");
-    println!("[{}] answer_event -> {:?} (changed={changed})",
-        if fsm.phase == Phase::Verify && changed { "OK" } else { "FAIL" }, fsm.phase);
+    println!(
+        "[{}] answer_event -> {:?} (changed={changed})",
+        if fsm.phase == Phase::Verify && changed {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        fsm.phase
+    );
     if !(fsm.phase == Phase::Verify && changed) {
         bail!("unit case 4 failed");
     }
 
     fsm.advance_terminal(holoiroh_daemon::holo_bridge::a2a_client::TerminalState::Completed);
-    println!("[{}] real Completed terminal -> {:?} (expected Done)",
-        if fsm.phase == Phase::Done { "OK" } else { "FAIL" }, fsm.phase);
+    println!(
+        "[{}] real Completed terminal -> {:?} (expected Done)",
+        if fsm.phase == Phase::Done {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        fsm.phase
+    );
     if fsm.phase != Phase::Done {
         bail!("unit case 5 failed");
     }
@@ -64,8 +99,15 @@ fn main() -> Result<()> {
     // as a backend failure, now checked at the FSM layer too).
     let mut empty_fsm = TaskFsm::new("probe-unit-empty");
     empty_fsm.advance_terminal(holoiroh_daemon::holo_bridge::a2a_client::TerminalState::Completed);
-    println!("[{}] Completed with zero actions/no answer -> {:?} (expected Failed)",
-        if empty_fsm.phase == Phase::Failed { "OK" } else { "FAIL" }, empty_fsm.phase);
+    println!(
+        "[{}] Completed with zero actions/no answer -> {:?} (expected Failed)",
+        if empty_fsm.phase == Phase::Failed {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        empty_fsm.phase
+    );
     if empty_fsm.phase != Phase::Failed {
         bail!("unit case 6 (empty-completion downgrade) failed");
     }
@@ -74,8 +116,16 @@ fn main() -> Result<()> {
     let mut qa_fsm = TaskFsm::new("probe-unit-qa");
     qa_fsm.observe_answer("42");
     qa_fsm.advance_terminal(holoiroh_daemon::holo_bridge::a2a_client::TerminalState::Completed);
-    println!("[{}] pure Q&A (answer, no tool calls) -> {:?} (expected Done, actions={})",
-        if qa_fsm.phase == Phase::Done { "OK" } else { "FAIL" }, qa_fsm.phase, qa_fsm.actions_taken);
+    println!(
+        "[{}] pure Q&A (answer, no tool calls) -> {:?} (expected Done, actions={})",
+        if qa_fsm.phase == Phase::Done {
+            "OK"
+        } else {
+            "FAIL"
+        },
+        qa_fsm.phase,
+        qa_fsm.actions_taken
+    );
     if qa_fsm.phase != Phase::Done {
         bail!("unit case 7 (Plan-skip-to-Done) failed");
     }
@@ -130,7 +180,10 @@ async fn live_witness() -> Result<()> {
         println!("event: {event:?}");
         match event {
             ControlEvent::DaemonStatus { text } => {
-                if text.contains("planning") || text.contains("acting on your Mac") || text.contains("reviewing") {
+                if text.contains("planning")
+                    || text.contains("acting on your Mac")
+                    || text.contains("reviewing")
+                {
                     saw_phase_status = true;
                 }
             }
@@ -144,7 +197,9 @@ async fn live_witness() -> Result<()> {
     // once the turn fully finishes, so its ABSENCE here is itself the witness that the full
     // begin -> observe -> terminal -> conclude lifecycle ran to completion without leaking
     // state. Confirm that directly.
-    let persisted_path = dirs_home()?.join(".holoiroh/tasks").join(format!("{request_id}.json"));
+    let persisted_path = dirs_home()?
+        .join(".holoiroh/tasks")
+        .join(format!("{request_id}.json"));
     let leaked = persisted_path.exists();
 
     if let Ok(owned) = Arc::try_unwrap(bridge) {
@@ -157,7 +212,9 @@ async fn live_witness() -> Result<()> {
     if !saw_phase_status || !saw_answer || !saw_done_status || leaked {
         bail!("LIVE WITNESS FAILED");
     }
-    println!("TASK_FSM LIVE WITNESS: OK (phase status emitted, answer + done seen, no leaked state file)");
+    println!(
+        "TASK_FSM LIVE WITNESS: OK (phase status emitted, answer + done seen, no leaked state file)"
+    );
     Ok(())
 }
 

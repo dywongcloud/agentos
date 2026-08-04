@@ -15,7 +15,7 @@ use std::env;
 use std::time::Duration;
 
 use holoiroh_daemon::control_channel::{
-    write_line, ClientMessage, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+    CONTROL_ALPN, ClientMessage, ServerMessage, TaskEnvelope, write_line,
 };
 use iroh::Endpoint;
 use iroh_live::ticket::LiveTicket;
@@ -37,10 +37,18 @@ async fn connect_and_pin(
     tokio::io::Lines<BufReader<iroh::endpoint::RecvStream>>,
     String,
 )> {
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut lines = BufReader::new(recv).lines();
-    write_line(&mut send, &ClientMessage::Pin { pin: pin.to_string() }).await?;
+    write_line(
+        &mut send,
+        &ClientMessage::Pin {
+            pin: pin.to_string(),
+        },
+    )
+    .await?;
 
     let mut session_id: Option<String> = None;
     let start = tokio::time::Instant::now();
@@ -49,7 +57,8 @@ async fn connect_and_pin(
             tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await
         {
             if let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) {
-                if matches!(&env.payload, ServerMessage::Status { text: Some(t) } if t.contains("control channel ready")) {
+                if matches!(&env.payload, ServerMessage::Status { text: Some(t), .. } if t.contains("control channel ready"))
+                {
                     session_id = Some(env.session_id);
                 }
             }
@@ -66,11 +75,17 @@ async fn connect_and_pin(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let mut args = env::args().skip(1);
-    let ticket_str = args.next().expect("usage: reconnect_task_active_probe <ticket> <pin>");
-    let pin = args.next().expect("usage: reconnect_task_active_probe <ticket> <pin>");
+    let ticket_str = args
+        .next()
+        .expect("usage: reconnect_task_active_probe <ticket> <pin>");
+    let pin = args
+        .next()
+        .expect("usage: reconnect_task_active_probe <ticket> <pin>");
     let ticket: LiveTicket = ticket_str.parse()?;
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
 
     // --- Connection 1: start a long text-only turn and let it stream. ---
     let (mut send, mut lines, session_id) = connect_and_pin(&endpoint, &ticket, &pin).await?;
@@ -81,7 +96,9 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(task_id.clone()),
         0,
-        ClientMessage::Prompt { text: LONG_TEXT_PROMPT.into() },
+        ClientMessage::Prompt {
+            text: LONG_TEXT_PROMPT.into(),
+        },
     );
     write_line(&mut send, &env).await?;
     println!("-> long text prompt ({task_id})");
@@ -132,9 +149,13 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!("=== RESULT ===");
     if saw_task_active {
-        println!("VERDICT: OK -- daemon emitted task_active on reconnect; the app can restore the Pause/Stop pill.");
+        println!(
+            "VERDICT: OK -- daemon emitted task_active on reconnect; the app can restore the Pause/Stop pill."
+        );
     } else {
-        println!("VERDICT: BROKEN -- no task_active within 20s of reconnect; the pill would stay hidden.");
+        println!(
+            "VERDICT: BROKEN -- no task_active within 20s of reconnect; the pill would stay hidden."
+        );
         std::process::exit(1);
     }
     Ok(())

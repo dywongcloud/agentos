@@ -1,75 +1,49 @@
-//! Class-5 sensitive-app category data model and config file I/O.
+//! Stores class-5 sensitive-app categories and their policy settings.
 //!
-//! Project Aro PRD §9 ("Safety, Consent, and Sensitive Apps") defines a
-//! five-class action policy; class 5 ("sensitive target") covers apps like
-//! password managers, banking, health, and system settings, where the
-//! default behavior is **approval-gated, not blocked**: the executor is
-//! supposed to pause before any input into a sensitive surface, show the
-//! user a sensitive-access request, and respect a per-category setting of
-//! always-ask (default) / always-allow / hard-block.
+//! Project Aro product requirements document (PRD) §9 defines six action classes numbered 0 through 5.
+//! Class 5 covers sensitive targets such as password managers, banking, health, and system settings.
+//! The default setting requires approval instead of blocking access.
+//! Each category supports `always_ask`, `always_allow`, or `hard_block`.
 //!
-//! This module implements the **data model and config-file persistence**
-//! for that per-category setting: the default category list (with
-//! illustrative macOS bundle IDs), the three-way setting enum, and
-//! load/save against a user-editable file at `~/.holoiroh/sensitive_categories.toml`
-//! (or `.json` -- see [`ConfigFormat`]).
+//! This module provides the category model, default macOS bundle identifiers, and configuration persistence.
+//! The daemon loads or initializes `~/.holoiroh/sensitive_categories.toml` when it constructs `HoloControlBridge`.
+//! If loading fails, the daemon logs a warning and uses built-in defaults for that run.
+//! Callers can also use JavaScript Object Notation (JSON) through [`ConfigFormat`].
+//! The default format is Tom's Obvious, Minimal Language (TOML).
 //!
-//! ## Live wiring status (updated 2026-07-21)
+//! ## Live enforcement
 //!
-//! This module is now consulted from a REAL interception point: the
-//! per-turn sensitive-app watchdog in `crate::holo_bridge::control`
-//! (`sensitive_watchdog`) polls the frontmost application via
-//! `crate::frontmost_app` while a turn runs, classifies its bundle id
-//! through [`SensitiveCategories::classify`], and enforces the per-category
-//! setting live -- `always_ask` pauses the turn and raises a
-//! `sensitive_access_consent` P0-14 `input_request` over the control
-//! channel (answered by the iOS app), `hard_block` cancels the turn
-//! outright, `always_allow` proceeds. All three arms are witnessed live by
-//! `examples/consent_probe.rs` (`CONSENT_PROBE_EXPECT`/`CONSENT_PROBE_ANSWER`
-//! variants) against a running daemon.
+//! `crate::holo_bridge::control::sensitive_watchdog` polls the frontmost app once each second during a turn.
+//! It obtains the bundle identifier from `crate::frontmost_app`.
+//! It then calls [`SensitiveCategories::classify`] and enforces the matched category setting.
 //!
-//! What remains heuristic: the classifier input is the FRONTMOST APP's
-//! bundle id (the closest real proxy for "the surface the agent is about
-//! to act on" -- the agent drives the frontmost app), not a per-window or
-//! per-URL classifier; see "Why bundle-ID matching is a heuristic" below.
+//! - `always_ask` pauses the turn and sends a P0-14 `sensitive_access_consent` `input_request` over the control channel.
+//! - `hard_block` cancels the turn.
+//! - `always_allow` lets the turn continue.
 //!
-//! ## Why bundle-ID matching is a heuristic, not a classifier
+//! The app answers the consent request.
+//! `examples/consent_probe.rs` exercises `always_ask` and `hard_block` against a running daemon.
+//! The probe selects behavior through `CONSENT_PROBE_EXPECT` and `CONSENT_PROBE_ANSWER`.
+//! The live watchdog contains an `always_allow` branch, but this probe does not select it.
 //!
-//! There is no real app-classification pipeline in this alpha. The default
-//! lists below are a best-effort, illustrative starting point (common macOS
-//! apps for each PRD-listed category), not an exhaustive or authoritative
-//! registry:
+//! ## Classification limits
 //!
-//! - A bundle ID identifies *an application*, not a *screen inside it* --
-//!   e.g. matching `com.apple.systempreferences` catches System Settings
-//!   entirely, but can't distinguish "the user is looking at Wi-Fi status"
-//!   from "the user is looking at FileVault recovery keys". PRD §9's class
-//!   5 is defined at the level of "sensitive target" surfaces, which in
-//!   general is finer-grained than one bundle ID.
-//! - Browser-based instances of these categories (a banking website open
-//!   in Safari/Chrome, a cloud admin console in a browser tab) are entirely
-//!   unaddressed -- the browser's bundle ID (e.g. `com.apple.Safari`) gives
-//!   no visibility into which site/tab is active. A real implementation
-//!   would need URL/tab-level classification, which is out of scope here.
-//! - The lists are US/English-market-biased and inevitably incomplete --
-//!   this is exactly why the config file is user-editable rather than a
-//!   hardcoded constant with no override path.
+//! The watchdog uses the frontmost app as a proxy for the surface that the agent will use.
+//! The classifier does not inspect windows, screens, browser tabs, or Uniform Resource Locators (URLs).
 //!
-//! Treat [`SensitiveCategories::default_categories`] as a seed a real
-//! deployment is expected to edit, not a finished registry.
+//! - A bundle identifier names an app, not a screen within that app.
+//! - `com.apple.systempreferences` cannot distinguish Wi-Fi status from FileVault recovery keys.
+//! - A browser bundle identifier cannot identify a banking site or cloud admin console in a tab.
+//! - URL-level and tab-level classification are outside this module.
+//! - The default lists favor the United States English market and are incomplete.
 //!
-//! ## Why `#![allow(dead_code)]`
+//! [`SensitiveCategories::default_categories`] provides an editable seed, not an authoritative registry.
 //!
-//! Nothing in `main.rs` calls into this module yet (see "What this module
-//! is not" above) -- this pass only adds the module and registers it via
-//! `mod sensitive_categories;` so it's compiled and reachable for a future
-//! policy-interception row to call, and so `examples/sensitive_categories_probe.rs`
-//! can exercise it for real. Every item here is real, working, documented
-//! public API (same status `allowlist.rs`'s own not-yet-called methods
-//! carry, each with its own `#[allow(dead_code)]`) -- this blanket module-
-//! level attribute just avoids repeating that same annotation on every
-//! single method below, since *none* of them have a call site in the
-//! binary yet.
+//! ## Dead-code allowance
+//!
+//! The daemon uses configuration loading and classification during live turns.
+//! Other public helpers remain available to probes and future settings interfaces.
+//! The module-level allowance avoids separate `#[allow(dead_code)]` attributes on those helpers.
 
 #![allow(dead_code)]
 
@@ -79,31 +53,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Per-category policy setting, per PRD §9 point 5 ("Per-category settings:
-/// always-ask (default), always-allow, or hard-block -- the user's
-/// configuration wins").
+/// Selects the class-5 policy for one category.
+/// PRD §9 point 5 defines these settings.
 ///
-/// Note what this enum does *not* cover: PRD §9 point 4 says "credential
-/// surfaces inside the app still pause per class 3 regardless of approval
-/// -- the credential boundary is not user-configurable". That class-3
-/// credential pause is a separate, non-configurable behavior this enum has
-/// no variant for and must never be used to bypass -- even a category set
-/// to [`CategorySetting::AlwaysAllow`] does not touch class-3 credential
-/// handling, because nothing in this module is wired to class 3 at all
-/// (see the module doc's "What this module is not").
+/// Users cannot configure separate class-3 credential handling here.
+/// [`CategorySetting::AlwaysAllow`] bypasses only this class-5 watchdog gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CategorySetting {
-    /// Default. Every class-5 entry into this category should trigger the
-    /// approval-request round trip (not yet built -- see module doc).
+    /// Requests consent unless the current turn already has an allowance for this category.
+    /// This is the default.
     AlwaysAsk,
-    /// User has pre-approved this category; a real policy layer would skip
-    /// the interactive approval round trip (still subject to the
-    /// non-configurable class-3 credential pause, which this setting
-    /// cannot affect).
+    /// Lets this watchdog continue without requesting consent.
+    /// This setting cannot alter separate class-3 policy behavior.
     AlwaysAllow,
-    /// User has pre-rejected this category; a real policy layer would
-    /// refuse entry outright rather than asking.
+    /// Cancels the turn when this category becomes the frontmost app.
     HardBlock,
 }
 
@@ -113,48 +77,34 @@ impl Default for CategorySetting {
     }
 }
 
-/// One class-5 sensitive category: a human-readable name, the PRD-quoted
-/// description of what it covers, a best-effort list of known macOS bundle
-/// IDs (see module doc for how heuristic this is), and the per-category
-/// [`CategorySetting`].
+/// Defines one class-5 category and its current policy setting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SensitiveCategory {
-    /// Short machine-stable identifier (snake_case), used for lookups and
-    /// as the TOML table key on disk. Not shown to the end user directly --
-    /// [`Self::display_name`] is for that.
+    /// Identifies the category with a stable snake_case TOML table key.
     pub id: String,
-    /// Human-readable name shown to the user (e.g. in a future approval
-    /// prompt or a settings UI).
+    /// User-visible category name.
     pub display_name: String,
-    /// One-line description of what belongs in this category, matching
-    /// PRD §9's own category list wording where applicable.
+    /// Describes the category in one line using PRD §9 terminology.
     pub description: String,
-    /// Best-effort, illustrative macOS bundle IDs known to fall in this
-    /// category. Not exhaustive -- see module doc's "Why bundle-ID
-    /// matching is a heuristic" section. User-editable via the config
-    /// file; additions/removals here are exactly the PRD's "user-
-    /// configured additions/removals" for this category.
+    /// Editable bundle identifiers that this category matches exactly.
+    /// The list is illustrative and not exhaustive.
     pub bundle_ids: Vec<String>,
-    /// This category's current policy setting. Defaults to
-    /// [`CategorySetting::AlwaysAsk`] per PRD §9 point 5.
+    /// Current policy setting.
+    /// Serde defaults this field to [`CategorySetting::AlwaysAsk`].
     #[serde(default)]
     pub setting: CategorySetting,
 }
 
-/// The full set of sensitive categories, as loaded from (or defaulted for)
-/// the user-editable config file.
+/// Contains the configured sensitive categories.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SensitiveCategories {
     pub categories: Vec<SensitiveCategory>,
 }
 
-/// Which on-disk format to read/write. Both are supported per the task's
-/// ask ("TOML/JSON config file"); TOML is the default (see
-/// [`SensitiveCategories::default_path`]) because it's the friendlier
-/// format for a human to hand-edit (comments, less punctuation), but JSON
-/// is offered as an equally-real alternative for callers/tooling that
-/// prefer it (e.g. something that already speaks JSON elsewhere in this
-/// crate, like `allowlist.json`).
+/// Selects an on-disk configuration format.
+///
+/// [`SensitiveCategories::default_path`] uses TOML for convenient manual editing.
+/// JSON remains available for callers and tools that prefer it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFormat {
     Toml,
@@ -162,10 +112,8 @@ pub enum ConfigFormat {
 }
 
 impl ConfigFormat {
-    /// Infers the format from a path's extension. Defaults to
-    /// [`ConfigFormat::Toml`] for any extension other than a recognized
-    /// `.json` (including no extension at all), matching this module's
-    /// TOML-first default path.
+    /// Returns JSON for a `.json` extension, ignoring case.
+    /// Returns TOML for every other extension and for no extension.
     pub fn from_path(path: &Path) -> Self {
         match path.extension().and_then(|ext| ext.to_str()) {
             Some(ext) if ext.eq_ignore_ascii_case("json") => ConfigFormat::Json,
@@ -175,10 +123,9 @@ impl ConfigFormat {
 }
 
 impl SensitiveCategories {
-    /// Default config file location: `~/.holoiroh/sensitive_categories.toml`.
-    /// Resolved via `$HOME` (same approach as [`crate::allowlist::Allowlist::default_path`]
-    /// -- this daemon is macOS-only, where `$HOME` is always set for an
-    /// interactive login session).
+    /// Returns `~/.holoiroh/sensitive_categories.toml` under `$HOME`.
+    ///
+    /// Returns an error when `$HOME` is not set.
     pub fn default_path() -> Result<PathBuf> {
         let home = std::env::var_os("HOME")
             .context("HOME environment variable is not set (required to locate ~/.holoiroh/)")?;
@@ -187,9 +134,9 @@ impl SensitiveCategories {
             .join("sensitive_categories.toml"))
     }
 
-    /// The alternate JSON config file location, for callers that prefer
-    /// `.json` over the default `.toml` (see [`ConfigFormat`]):
-    /// `~/.holoiroh/sensitive_categories.json`.
+    /// Returns `~/.holoiroh/sensitive_categories.json` under `$HOME`.
+    ///
+    /// Returns an error when `$HOME` is not set.
     pub fn default_json_path() -> Result<PathBuf> {
         let home = std::env::var_os("HOME")
             .context("HOME environment variable is not set (required to locate ~/.holoiroh/)")?;
@@ -198,19 +145,12 @@ impl SensitiveCategories {
             .join("sensitive_categories.json"))
     }
 
-    /// The built-in default category list: password managers, banking/
-    /// brokerage, payroll/tax/legal, health, system/security settings,
-    /// identity/admin consoles, device management, production
-    /// infrastructure/admin dashboards -- exactly the PRD §9 list, in the
-    /// order given there. Every category starts at
-    /// [`CategorySetting::AlwaysAsk`], the PRD-specified default.
+    /// Builds the eight PRD §9 categories in PRD order.
+    /// Every category starts with [`CategorySetting::AlwaysAsk`].
     ///
-    /// Bundle IDs are best-effort/illustrative (see module doc) -- verified
-    /// against each vendor's own publicly documented bundle identifier
-    /// where the vendor publishes one, not exhaustively audited against a
-    /// live Mac's `/Applications`. Treat this as a starting seed, not a
-    /// finished registry: a real deployment is expected to edit the config
-    /// file this seeds.
+    /// The bundle identifiers are illustrative vendor identifiers.
+    /// We did not exhaustively audit them against `/Applications` on a live Mac.
+    /// Edit the generated configuration for each deployment.
     pub fn default_categories() -> Self {
         let cat = |id: &str, display_name: &str, description: &str, bundle_ids: &[&str]| {
             SensitiveCategory {
@@ -332,17 +272,14 @@ impl SensitiveCategories {
         }
     }
 
-    /// Loads the config from `path`, in the format inferred by
-    /// [`ConfigFormat::from_path`]. A missing file is **not** an error --
-    /// it's the expected state on first run, and this returns
-    /// [`Self::default_categories`] in that case (the caller is
-    /// responsible for calling [`Self::save`] afterwards if it wants that
-    /// default actually persisted to disk; [`Self::load_or_init`] does
-    /// that for you). Any other I/O error, or a parse failure, is a real
-    /// error -- a corrupt config silently treated as "just use defaults"
-    /// would silently discard a user's hard-block/allow customizations,
-    /// which is exactly the kind of silent policy change this file exists
-    /// to prevent.
+    /// Loads configuration in the format that [`ConfigFormat::from_path`] selects.
+    ///
+    /// Returns [`Self::default_categories`] when the file does not exist.
+    /// This function does not save those defaults.
+    /// Use [`Self::load_or_init`] to create a missing file.
+    ///
+    /// Returns an error for other input/output failures, invalid 8-bit Unicode Transformation Format (UTF-8), or parse failures.
+    /// This behavior prevents a corrupt file from silently replacing user policy settings.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let bytes = match std::fs::read(path) {
@@ -351,126 +288,120 @@ impl SensitiveCategories {
                 return Ok(Self::default_categories());
             }
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("reading sensitive-categories file at {}", path.display()));
+                return Err(err).with_context(|| {
+                    format!("reading sensitive-categories file at {}", path.display())
+                });
             }
         };
 
         match ConfigFormat::from_path(path) {
             ConfigFormat::Toml => {
                 let text = String::from_utf8(bytes).with_context(|| {
-                    format!("sensitive-categories file at {} is not valid UTF-8", path.display())
+                    format!(
+                        "sensitive-categories file at {} is not valid UTF-8",
+                        path.display()
+                    )
                 })?;
-                toml::from_str(&text)
-                    .with_context(|| format!("parsing sensitive-categories TOML at {}", path.display()))
+                toml::from_str(&text).with_context(|| {
+                    format!("parsing sensitive-categories TOML at {}", path.display())
+                })
             }
-            ConfigFormat::Json => serde_json::from_slice(&bytes)
-                .with_context(|| format!("parsing sensitive-categories JSON at {}", path.display())),
+            ConfigFormat::Json => serde_json::from_slice(&bytes).with_context(|| {
+                format!("parsing sensitive-categories JSON at {}", path.display())
+            }),
         }
     }
 
-    /// Convenience wrapper around [`Self::load`] using [`Self::default_path`].
+    /// Loads configuration from [`Self::default_path`].
     pub fn load_default() -> Result<Self> {
         Self::load(Self::default_path()?)
     }
 
-    /// Loads from `path` if it exists; otherwise builds
-    /// [`Self::default_categories`] **and persists it** to `path` so the
-    /// file exists (with sensible defaults, per the task's ask) after the
-    /// first run, ready for the user to hand-edit. Returns the loaded or
-    /// newly-defaulted-and-saved value either way.
+    /// Loads an existing file or saves [`Self::default_categories`] to a missing file.
+    ///
+    /// Returns the loaded or newly saved value.
+    /// Returns an error when loading or initialization fails.
     pub fn load_or_init(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if path.exists() {
             return Self::load(path);
         }
         let defaults = Self::default_categories();
-        defaults
-            .save(path)
-            .with_context(|| format!("writing default sensitive-categories file at {}", path.display()))?;
+        defaults.save(path).with_context(|| {
+            format!(
+                "writing default sensitive-categories file at {}",
+                path.display()
+            )
+        })?;
         Ok(defaults)
     }
 
-    /// Convenience wrapper around [`Self::load_or_init`] using
-    /// [`Self::default_path`] (i.e. `~/.holoiroh/sensitive_categories.toml`).
+    /// Loads or initializes `~/.holoiroh/sensitive_categories.toml`.
     pub fn load_or_init_default() -> Result<Self> {
         Self::load_or_init(Self::default_path()?)
     }
 
-    /// Writes `self` to `path`, in the format inferred by
-    /// [`ConfigFormat::from_path`], creating the parent directory
-    /// (`~/.holoiroh/`) if it doesn't exist yet. Overwrites the whole file,
-    /// same one-writer-at-a-time posture as
-    /// [`crate::allowlist::Allowlist::save`] (this daemon supports exactly
-    /// one concurrent control-channel connection today, so concurrent
-    /// writers to this file are not a real scenario yet either).
+    /// Serializes the full configuration in the format that [`ConfigFormat::from_path`] selects.
+    /// Creates the parent directory when necessary.
+    /// Overwrites an existing file.
+    ///
+    /// Callers must serialize concurrent writes.
+    /// The daemon currently supports one concurrent control-channel connection.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating sensitive-categories directory {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "creating sensitive-categories directory {}",
+                    parent.display()
+                )
+            })?;
         }
 
         match ConfigFormat::from_path(path) {
             ConfigFormat::Toml => {
-                let text = toml::to_string_pretty(self).context("serializing sensitive categories to TOML")?;
+                let text = toml::to_string_pretty(self)
+                    .context("serializing sensitive categories to TOML")?;
                 std::fs::write(path, text)
             }
             ConfigFormat::Json => {
-                let json =
-                    serde_json::to_vec_pretty(self).context("serializing sensitive categories to JSON")?;
+                let json = serde_json::to_vec_pretty(self)
+                    .context("serializing sensitive categories to JSON")?;
                 std::fs::write(path, json)
             }
         }
         .with_context(|| format!("writing sensitive-categories file at {}", path.display()))
     }
 
-    /// Convenience wrapper around [`Self::save`] using [`Self::default_path`].
+    /// Saves configuration to [`Self::default_path`].
     pub fn save_default(&self) -> Result<()> {
         self.save(Self::default_path()?)
     }
 
-    /// Looks up which category (if any) a macOS bundle ID falls into,
-    /// returning the matching [`SensitiveCategory`] by reference.
+    /// Returns the first category whose bundle-identifier list contains `bundle_id`.
     ///
-    /// This is a **bundle-ID membership check, not an app classifier** --
-    /// see the module doc's "Why bundle-ID matching is a heuristic"
-    /// section for exactly what this can and can't distinguish. Matching
-    /// is case-sensitive and exact (macOS bundle IDs are conventionally
-    /// lowercase reverse-DNS and this does not attempt fuzzy matching,
-    /// which would risk false positives on an unrelated app that happens
-    /// to share a prefix).
-    ///
-    /// Returns the first matching category if (implausibly, given the
-    /// disjoint default lists) a bundle ID were listed in more than one
-    /// user-edited category -- this is a config authoring choice this
-    /// function does not attempt to prevent or resolve; a real policy
-    /// layer consuming this would need its own conflict-resolution
-    /// decision (e.g. "most restrictive wins") if that mattered, which is
-    /// out of scope for the data-model row this module implements.
+    /// Matching is exact and case-sensitive.
+    /// The function does not inspect app content, windows, browser tabs, or URLs.
+    /// If multiple categories contain the identifier, list order determines the result.
     pub fn classify(&self, bundle_id: &str) -> Option<&SensitiveCategory> {
         self.categories
             .iter()
             .find(|c| c.bundle_ids.iter().any(|b| b == bundle_id))
     }
 
-    /// Looks up a category by its stable [`SensitiveCategory::id`].
+    /// Returns the category with the specified stable identifier.
     pub fn find_by_id(&self, id: &str) -> Option<&SensitiveCategory> {
         self.categories.iter().find(|c| c.id == id)
     }
 
-    /// Mutable version of [`Self::find_by_id`], for updating a category's
-    /// [`CategorySetting`] (e.g. from a future settings UI) before calling
-    /// [`Self::save`].
+    /// Returns mutable access to the category with the specified stable identifier.
+    /// Call [`Self::save`] to persist a changed setting.
     pub fn find_by_id_mut(&mut self, id: &str) -> Option<&mut SensitiveCategory> {
         self.categories.iter_mut().find(|c| c.id == id)
     }
 
-    /// All bundle IDs across all categories, deduplicated. Diagnostic
-    /// convenience -- not currently called from any live policy path (see
-    /// module doc), useful for a future `--list-sensitive-bundle-ids`
-    /// command or for sanity-checking a hand-edited config file for
-    /// accidental cross-category duplicates.
+    /// Returns all configured bundle identifiers as a deduplicated set.
+    /// This diagnostic helper can reveal cross-category duplicates in edited configuration.
     pub fn all_bundle_ids(&self) -> HashSet<&str> {
         self.categories
             .iter()

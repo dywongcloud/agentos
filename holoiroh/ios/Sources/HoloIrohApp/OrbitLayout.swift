@@ -1,34 +1,30 @@
 import SwiftUI
 
-/// Pure 3D-orbit placement math for the app badges circling the orb, split out
-/// of `OrbEffects` (which is UIKit-bound via `AppBadge`) so the geometry is
-/// deterministic and headlessly renderable: given a badge's index, the ring
-/// phase, and the ring dimensions, it returns where / how big / how visible
-/// that badge is.
-///
-/// It is a HORIZONTAL ring seen slightly from the front -- badges sweep from the
-/// BACK of the orb (small, dim, high on screen, occluded by the blob) around to
-/// the FRONT (large, bright, low on screen, drawn over everything), i.e. a real
-/// 3D orbit rather than a flat top/bottom 2D ellipse.
+/// Contains the rendered placement of one badge in a horizontal three-dimensional orbit.
+/// Front badges appear lower, larger, sharper, and above back badges.
+/// Back badges fade behind the orb near its center.
 struct OrbitBadgePlacement: Equatable {
-    /// Screen offset from the orb center.
+    /// Specifies the offset from the orb center.
     var offset: CGSize
-    /// Size multiplier (front badges larger).
+    /// Specifies the size multiplier.
     var scale: CGFloat
-    /// 0...1 visibility (back-center badges fade behind the orb).
+    /// Specifies visibility from `0` through `1`.
     var opacity: Double
-    /// Gaussian softening for far/back badges.
+    /// Specifies Gaussian blur for back badges.
     var blur: CGFloat
-    /// Painter's-order key: higher = nearer the viewer, drawn on top.
+    /// Specifies drawing order.
+    /// Higher values are nearer the viewer.
     var z: Double
-    /// Signed depth, 1 = dead front, -1 = dead back (handy for witnesses).
+    /// Specifies signed depth from `-1` at the back to `1` at the front.
     var depth: Double
 }
 
-/// Place badge `index` of `count` on the ring at `phase` radians.
-/// - `radiusX`: horizontal half-width of the ring (its wide axis).
-/// - `tiltY`: vertical half-height (small -> a shallow, 3D-looking ring).
-/// - `blobRadius`: the orb's on-screen radius, for back-of-ring occlusion.
+/// Calculates one badge placement on the orbit.
+/// Values of `count` below `1` use `1`.
+/// - Parameters:
+///   - radiusX: The horizontal ring radius.
+///   - tiltY: The vertical ring radius.
+///   - blobRadius: The on-screen orb radius used for occlusion.
 func orbitBadgePlacement(
     index: Int,
     count: Int,

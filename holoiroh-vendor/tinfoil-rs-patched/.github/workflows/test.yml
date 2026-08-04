@@ -1,0 +1,109 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      # Don't bail the whole matrix on a single OS failing — we want to
+      # see Windows-only or macOS-only regressions even if Linux is red.
+      fail-fast: false
+      matrix:
+        # ubuntu-latest = x86_64-unknown-linux-gnu
+        # macos-latest = aarch64-apple-darwin (Apple Silicon)
+        # windows-latest = x86_64-pc-windows-msvc — the platform that
+        # caught the aws-lc-rs / __builtin_bswap link regression
+        # downstream (see #21). Without this matrix entry the bug
+        # reaches consumers before any tinfoil-rs test ever notices.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup update stable && rustup default stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Run unit tests
+        run: cargo test --locked --lib --verbose
+
+      - name: Run integration tests
+        run: cargo test --locked --test '*' --verbose
+
+      - name: Check if API key is available
+        # Bash only — Windows runner uses pwsh by default, but bash is
+        # available there too. Force it explicitly so the heredoc syntax
+        # works on every OS in the matrix.
+        id: gate
+        shell: bash
+        env:
+          TINFOIL_API_KEY: ${{ secrets.TINFOIL_API_KEY }}
+        run: |
+          if [ -z "$TINFOIL_API_KEY" ]; then
+            echo "run=false" >> $GITHUB_OUTPUT
+          else
+            echo "run=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run API integration tests
+        if: steps.gate.outputs.run == 'true'
+        env:
+          TINFOIL_API_KEY: ${{ secrets.TINFOIL_API_KEY }}
+        run: cargo test --locked --test '*' --verbose -- --ignored
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88 toolchain
+        run: rustup toolchain install 1.88 --profile minimal && rustup default 1.88
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-msrv-
+
+      - name: Build on MSRV
+        run: cargo build --locked --verbose
+
+      - name: Unit tests on MSRV
+        run: cargo test --locked --lib --verbose

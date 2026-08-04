@@ -23,7 +23,7 @@ use std::env;
 use std::time::Duration;
 
 use holoiroh_daemon::control_channel::{
-    write_line, ClientMessage, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+    CONTROL_ALPN, ClientMessage, ServerMessage, TaskEnvelope, write_line,
 };
 use iroh::Endpoint;
 use iroh_live::ticket::LiveTicket;
@@ -98,7 +98,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin> Wire<R> {
 }
 
 fn status_contains(env: &TaskEnvelope<ServerMessage>, needle: &str) -> bool {
-    matches!(&env.payload, ServerMessage::Status { text: Some(t) } if t.contains(needle))
+    matches!(&env.payload, ServerMessage::Status { text: Some(t), .. } if t.contains(needle))
 }
 
 fn is_progress(env: &TaskEnvelope<ServerMessage>) -> bool {
@@ -109,16 +109,26 @@ fn is_progress(env: &TaskEnvelope<ServerMessage>) -> bool {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let mut args = env::args().skip(1);
-    let ticket_str = args.next().expect("usage: live_task_control_probe <ticket> <pin>");
-    let pin = args.next().expect("usage: live_task_control_probe <ticket> <pin>");
+    let ticket_str = args
+        .next()
+        .expect("usage: live_task_control_probe <ticket> <pin>");
+    let pin = args
+        .next()
+        .expect("usage: live_task_control_probe <ticket> <pin>");
     let ticket: LiveTicket = ticket_str.parse()?;
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     println!("connected: remote={}", conn.remote_id().fmt_short());
 
     let (mut send, recv) = conn.open_bi().await?;
-    let mut wire = Wire { lines: BufReader::new(recv).lines() };
+    let mut wire = Wire {
+        lines: BufReader::new(recv).lines(),
+    };
 
     // PIN handshake (bare) -- harmless if this device is already allowlisted:
     // the daemon acks a redundant Pin instead of erroring.
@@ -129,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
     // simply ignore in the event flow.)
     let greeting = wire
         .wait_for(Duration::from_secs(30), |env| {
-            matches!(&env.payload, ServerMessage::Status { text: Some(t) } if t.contains("control channel ready"))
+            matches!(&env.payload, ServerMessage::Status { text: Some(t), .. } if t.contains("control channel ready"))
         })
         .await
         .expect("no greeting within 30s");
@@ -148,7 +158,9 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(task_a.clone()),
         next_seq(),
-        ClientMessage::Prompt { text: PLANNING_ONLY_A.into() },
+        ClientMessage::Prompt {
+            text: PLANNING_ONLY_A.into(),
+        },
     );
     write_line(&mut send, &env).await?;
     println!("-> prompt A ({task_a})");
@@ -174,7 +186,8 @@ async fn main() -> anyhow::Result<()> {
     // finished, so this ack could not arrive while the turn was alive.
     let ack = wire
         .wait_for(Duration::from_secs(20), |env| {
-            matches!(env.payload, ServerMessage::Ack { .. }) && env.task_id.as_deref() == Some(stop_id.as_str())
+            matches!(env.payload, ServerMessage::Ack { .. })
+                && env.task_id.as_deref() == Some(stop_id.as_str())
         })
         .await
         .expect("phase A: stop was not acked within 20s of sending -- read loop still parked?");
@@ -197,7 +210,9 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(task_b.clone()),
         next_seq(),
-        ClientMessage::Prompt { text: PLANNING_ONLY_B.into() },
+        ClientMessage::Prompt {
+            text: PLANNING_ONLY_B.into(),
+        },
     );
     write_line(&mut send, &env).await?;
     println!("-> prompt B ({task_b})");
@@ -217,9 +232,11 @@ async fn main() -> anyhow::Result<()> {
     write_line(&mut send, &env).await?;
     println!("-> pause (mid-turn)");
 
-    wire.wait_for(Duration::from_secs(60), |env| status_contains(env, "task paused"))
-        .await
-        .expect("phase B: no 'task paused' status within 60s");
+    wire.wait_for(Duration::from_secs(60), |env| {
+        status_contains(env, "task paused")
+    })
+    .await
+    .expect("phase B: no 'task paused' status within 60s");
     println!("phase B PASS(pause): daemon confirmed the pause");
 
     let resume_id = uuid::Uuid::new_v4().to_string();
@@ -232,13 +249,17 @@ async fn main() -> anyhow::Result<()> {
     write_line(&mut send, &env).await?;
     println!("-> resume");
 
-    wire.wait_for(Duration::from_secs(30), |env| status_contains(env, "resuming"))
-        .await
-        .expect("phase B: no 'resuming' status within 30s");
+    wire.wait_for(Duration::from_secs(30), |env| {
+        status_contains(env, "resuming")
+    })
+    .await
+    .expect("phase B: no 'resuming' status within 30s");
     wire.wait_for(Duration::from_secs(300), is_progress)
         .await
         .expect("phase B: no post-resume task_progress within 300s");
-    println!("phase B PASS: resumed turn is streaming (contextId continuity witnessed in the daemon log)");
+    println!(
+        "phase B PASS: resumed turn is streaming (contextId continuity witnessed in the daemon log)"
+    );
 
     // ---------- Phase C: redirect ----------
     let redirect_id = uuid::Uuid::new_v4().to_string();
@@ -246,14 +267,18 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(redirect_id.clone()),
         next_seq(),
-        ClientMessage::Redirect { text: REDIRECT_TEXT.into() },
+        ClientMessage::Redirect {
+            text: REDIRECT_TEXT.into(),
+        },
     );
     write_line(&mut send, &env).await?;
     println!("-> redirect (mid-turn)");
 
-    wire.wait_for(Duration::from_secs(60), |env| status_contains(env, "redirecting"))
-        .await
-        .expect("phase C: no 'redirecting' status within 60s");
+    wire.wait_for(Duration::from_secs(60), |env| {
+        status_contains(env, "redirecting")
+    })
+    .await
+    .expect("phase C: no 'redirecting' status within 60s");
     wire.wait_for(Duration::from_secs(300), |env| {
         is_progress(env) && env.task_id.as_deref() == Some(redirect_id.as_str())
     })

@@ -1,71 +1,92 @@
-//! Shells out to the `holo` CLI's own `stop` subcommand for the global kill-switch path.
+//! Runs the `holo` command-line interface (CLI) `stop` subcommand for the global kill-switch path.
 //!
 //! ## Source grounding
 //!
-//! Confirmed directly from `hcompai/holo-desktop-cli` source
-//! (`src/holo_desktop/cli/stop.py` and `src/holo_desktop/killswitch/channel.py`, read via the
-//! GitHub API on 2026-07-17):
+//! The behavior comes directly from `hcompai/holo-desktop-cli` source.
+//! The source files are `src/holo_desktop/cli/stop.py` and `src/holo_desktop/killswitch/channel.py`.
+//! They were read through the GitHub application programming interface (API) on 2026-07-17.
 //!
-//! - `holo stop` is **not an HTTP call** -- it writes the current wall-clock time
-//!   (`time.time()`, plain decimal text) to `~/.holo/stop`
-//!   (`killswitch/channel.py::request_stop`). There is no port, no auth, nothing scoped to a
-//!   particular `holo serve` instance or A2A `contextId`: it is a single, host-wide file that
-//!   *any* in-flight Holo turn on the machine polls.
-//! - Every in-flight turn (regardless of surface -- CLI `run`, `serve` A2A, `acp`, `mcp`, all
-//!   go through the same `session_runner.run_turn`) runs a `StopWatcher` that polls this file
-//!   every 250ms (`STOP_POLL_S`) via `StopSentinel.stop_requested()`, which only returns true
-//!   for requests filed **after** that turn's own start time -- so `holo stop` cannot
-//!   retroactively "miss" a request filed just before a turn starts, but also cannot target
-//!   one specific turn among several concurrent ones; it stops all of them.
-//! - On seeing a stop, `run_turn` does pause-then-cancel against the backend session
-//!   (`_pause_then_cancel`: `client.pause(session_id)` then `client.cancel(session_id)`,
-//!   each best-effort) and marks the turn's outcome `TrajectoryStatus.INTERRUPTED`, which
-//!   `serve.py`'s `_TERMINAL_TO_A2A` maps to `TASK_STATE_CANCELED` -- i.e. a `holo stop`
-//!   surfaces to an A2A client (this daemon) as an ordinary terminal `TaskUpdate::Terminal`
-//!   with `TerminalState::Canceled`, indistinguishable on the wire from an A2A-native
-//!   `tasks/cancel`. The daemon does not need to special-case this.
-//! - `holo stop --force` additionally reads `~/.holo/agent-pid-<port>`
-//!   (`launcher.py::pid_file_path`, `discover_runtime_pids`) and sends `SIGKILL` to that
-//!   process group. This targets the **`hai-agent-runtime` binary**, not `holo serve` itself
-//!   -- `holo serve` (the A2A HTTP server this daemon spawned) is unaffected and keeps
-//!   running, but its backend runtime dies out from under it, so the next prompt sent to it
-//!   will fail (the executor's `AgentApiClient` calls will error) until `holo serve` is
-//!   restarted or reattaches. This module does not restart `holo serve` automatically after a
-//!   forced stop -- that's the caller's (the daemon's top-level supervisor's) decision, since
-//!   auto-restarting immediately after an operator explicitly force-killed the runtime could
-//!   fight the operator's intent.
-//! - Keyboard alternative (double-`Esc`) is CLI/interactive-only and has no bearing on this
-//!   daemon, which has no keyboard focus of its own.
+//! ## Graceful stop behavior
 //!
-//! ## Why shell out instead of writing `~/.holo/stop` directly
+//! - `holo stop` does not make a Hypertext Transfer Protocol (HTTP) request.
+//! - It writes the current wall-clock time to `~/.holo/stop`.
+//! - The value is `time.time()` as plain decimal text.
+//! - `killswitch/channel.py::request_stop` performs the write.
+//! - The stop channel has no port or authentication.
+//! - It is not scoped to a `holo serve` instance.
+//! - It is not scoped to an Agent-to-Agent (A2A) `contextId`.
+//! - The file is host-wide.
+//! - Every in-flight Holo turn on the machine polls it.
 //!
-//! Writing the file directly (mirroring `request_stop`'s three lines of Python) would work
-//! and would save a process spawn, but the task explicitly asks for either "shell out to the
-//! holo CLI's stop command, or call the A2A cancel equivalent" -- and shelling out to the
-//! real `holo stop` binary is the more robust choice long-term: if a future CLI version
-//! changes the stop-channel format (path, encoding, or replaces the file with something
-//! else), a daemon that shells out to `holo stop` tracks that change automatically, whereas
-//! one that reimplements `request_stop`'s file-write would silently break. The A2A
-//! `tasks/cancel`-equivalent path (scoped, lower blast radius) is implemented separately in
-//! `control.rs` / `a2a_client.rs` and is preferred whenever a `context_id` is available; this
-//! module is the fallback/global path for when the caller wants "stop everything" or when
-//! `--force` is requested.
+//! Every in-flight turn uses the same `session_runner.run_turn` path.
+//! These turns include CLI `run`, `serve` A2A, `acp`, and `mcp` surfaces.
+//! Each turn runs a `StopWatcher` at a 250-millisecond polling interval.
+//! `STOP_POLL_S` defines that interval.
+//! `StopSentinel.stop_requested()` accepts only requests filed after the turn's start time.
+//! A request filed before a later turn starts does not stop that turn retroactively.
+//! A request stops all turns that were already in flight.
+//! It cannot target one turn among several concurrent turns.
+//!
+//! After a turn detects a stop, `run_turn` pauses and then cancels the backend session.
+//! `_pause_then_cancel` calls `client.pause(session_id)` before `client.cancel(session_id)`.
+//! Both calls are best-effort.
+//! The turn records `TrajectoryStatus.INTERRUPTED`.
+//! In `serve.py`, `_TERMINAL_TO_A2A` maps that outcome to `TASK_STATE_CANCELED`.
+//! The daemon receives a normal terminal `TaskUpdate::Terminal` with `TerminalState::Canceled`.
+//! On the wire, this result is indistinguishable from an A2A-native `tasks/cancel` result.
+//! Therefore, the daemon requires no special handling.
+//!
+//! ## Forced stop behavior
+//!
+//! `holo stop --force` also reads `~/.holo/agent-pid-<port>`.
+//! `launcher.py::pid_file_path` and `discover_runtime_pids` implement that lookup.
+//! The command sends the non-catchable kill signal (`SIGKILL`) to the discovered process group.
+//! This signal targets the `hai-agent-runtime` executable, not `holo serve`.
+//! The `holo serve` A2A HTTP server remains running.
+//! However, its backend runtime is no longer available.
+//! The next prompt fails when the executor's `AgentApiClient` calls return errors.
+//! Prompts continue to fail until `holo serve` restarts or reattaches.
+//! This module does not restart `holo serve` automatically after a forced stop.
+//! The daemon's top-level supervisor makes that decision.
+//! An immediate automatic restart could conflict with the operator's explicit force-kill intent.
+//!
+//! The double-`Esc` keyboard alternative applies only to CLI and interactive use.
+//! It does not apply to the daemon because the daemon has no keyboard focus.
+//!
+//! ## Why this module runs the CLI
+//!
+//! Writing `~/.holo/stop` directly would reproduce the three Python lines in `request_stop`.
+//! That approach would work and avoid a process spawn.
+//! However, the task explicitly requested one of two approaches:
+//!
+//! 1. Run the `holo` CLI `stop` command.
+//! 2. Call the equivalent A2A cancellation operation.
+//!
+//! Running the real `holo stop` command follows future stop-channel format changes.
+//! Those changes can include the path, encoding, or replacement of the file mechanism.
+//! Reimplementing `request_stop` could silently fail after such a change.
+//!
+//! `control.rs` and `a2a_client.rs` implement the A2A `tasks/cancel` equivalent separately.
+//! That path has a smaller blast radius because it targets one context.
+//! Prefer that path when a `context_id` is available.
+//! This module provides the fallback global path for `stop everything` and `--force` requests.
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
-/// The exact argument vector `holo_stop` passes to the `holo` CLI for a given
-/// `force` flag: `["stop"]` for a graceful pause-then-cancel, or
-/// `["stop", "--force"]` to additionally SIGKILL the `hai-agent-runtime`
-/// process (see this module's doc and `holo stop --help`).
+/// Provides the exact argument vector for the `holo` CLI.
 ///
-/// Factored out of [`holo_stop`] as a pure function so the kill-switch's
-/// command construction is witnessable in isolation -- `examples/holo_stop_probe.rs`
-/// asserts on this directly for both `force` values without having to actually
-/// SIGKILL a runtime (which `holo stop --force` would do to any live
-/// `hai-agent-runtime`). `holo_stop` itself builds its `Command` from exactly
-/// this vector, so the probe is asserting on the real invocation shape, not a
-/// parallel copy that could drift.
+/// When `force` is `false`, the result is `["stop"]` for graceful pause-then-cancel behavior.
+/// When `force` is `true`, the result is `["stop", "--force"]`.
+/// Passing the forced form to `holo` also sends `SIGKILL` to the `hai-agent-runtime` process.
+/// See this module's documentation and `holo stop --help`.
+///
+/// This pure function makes kill-switch command construction independently witnessable.
+/// `examples/holo_stop_probe.rs` verifies both `force` values directly.
+/// The probe does not send `SIGKILL` to a running `hai-agent-runtime`.
+/// [`holo_stop`] builds its `Command` from this exact vector.
+/// The probe therefore verifies the real invocation.
+/// It does not verify a parallel copy that could drift.
 pub fn build_stop_args(force: bool) -> Vec<&'static str> {
     if force {
         vec!["stop", "--force"]
@@ -74,10 +95,14 @@ pub fn build_stop_args(force: bool) -> Vec<&'static str> {
     }
 }
 
-/// Run `holo stop` (optionally `--force`) as a child process and wait for it to exit.
+/// Starts `holo stop` as a child process and waits for it to exit.
 ///
-/// `holo_bin` is the same executable path/name used to spawn `holo serve` (see
-/// `process.rs`) -- `stop` is a subcommand of the same CLI, not a separate binary.
+/// When `force` is `true`, the command includes `--force`.
+/// `holo_bin` is the executable path or name that starts `holo serve` in `process.rs`.
+/// The `stop` operation is a subcommand of that CLI.
+/// It is not a separate executable.
+/// The function returns an error when spawning fails.
+/// It also returns an error when the child exits unsuccessfully.
 pub async fn holo_stop(holo_bin: &str, force: bool) -> Result<()> {
     let mut cmd = Command::new(holo_bin);
     cmd.args(build_stop_args(force));

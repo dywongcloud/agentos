@@ -1,56 +1,26 @@
 import SwiftUI
 import AVFoundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
-/// Live QR-code scanner: a SwiftUI wrapper around a UIKit view whose
-/// backing layer is an `AVCaptureVideoPreviewLayer`, driven by an
-/// `AVCaptureSession` with an `AVCaptureMetadataOutput` restricted to
-/// `.qr`. When a QR is decoded, its string payload is delivered once via
-/// `onCode`.
+/// Scans Quick Response (QR) codes with AVFoundation.
+/// The scanner delivers the first decoded text payload through `onCode`.
+/// It delivers callbacks on the main thread.
+/// It restricts metadata output to QR codes.
+/// It starts and stops the capture session on a serial background queue.
 ///
-/// This is the *scan* half of pairing (Project Aro PRD P0-2): it turns the
-/// QR the Mac daemon prints (`mac-daemon/src/main.rs print_ticket_qr`, which
-/// encodes the raw `iroh-live:…` ticket string) into that same string on the
-/// phone, so `PairingView` can auto-fill the ticket field instead of the
-/// user retyping a 100+-character token. It knows nothing about iroh or the
-/// ticket format — it only decodes QR text and hands it up; `PairingTicket`
-/// does the extraction and `PairingPhrase` the verification.
-///
-/// ## Structure mirrors `VideoRenderView`
-/// Same `UIViewRepresentable` + `Coordinator` shape as the video render
-/// surface: a dedicated `UIView` subclass whose `layerClass` is the capture
-/// preview layer, a `Coordinator` holding the strong references the value-
-/// type `View` cannot, `dismantleUIView` for deterministic teardown, and a
-/// serial queue so the `AVCaptureSession` is never started/stopped on the
-/// main thread (Apple documents `startRunning()` as blocking).
-///
-/// ## Camera permission (`NSCameraUsageDescription` required)
-/// Starting the session triggers the camera-permission prompt the first
-/// time. iOS **terminates the process** if `NSCameraUsageDescription` is
-/// missing from the app's `Info.plist` when that happens — this cannot be
-/// fixed in library code (a bare SwiftPM package has no `Info.plist`), so
-/// the requirement is documented in
-/// `Sources/HoloIrohApp/REQUIRED_INFO_PLIST_KEYS.md` for whoever wraps this
-/// package in an Xcode app target. This view handles the *authorization
-/// state* correctly-by-construction: it requests access when undetermined,
-/// reports denied/restricted up via `onAuthorizationDenied` (so the caller
-/// can show guidance instead of a black frame), and only starts the session
-/// once authorized.
-///
-/// ## Headless-build honesty
-/// The camera capture path cannot be exercised in a headless/simulator
-/// build (there is no camera, and permission prompts need a real app host),
-/// so this view's *runtime* behavior is not witnessed by the build. What
-/// the build proves is that it compiles against the real iOS 17 SDK
-/// (AVFoundation types, `sampleBufferRenderer`-style availability gating,
-/// the delegate conformance). The decode → ticket-extraction → phrase
-/// pipeline that *can* be witnessed lives in `PairingTicket` /
-/// `PairingPhrase`, which are pure and are verified directly.
+/// The app must define `NSCameraUsageDescription` in its `Info.plist`.
+/// iOS terminates the app if this key is absent when camera access starts.
+/// The scanner requests access when authorization is undetermined.
+/// It calls `onAuthorizationDenied` for denied, restricted, or unavailable access.
+#if canImport(UIKit)
 struct QRScannerView: UIViewRepresentable {
-    /// Called (once) with the decoded QR string payload on the main thread.
+    /// Receives the first decoded QR text on the main thread.
     let onCode: (String) -> Void
 
-    /// Called on the main thread if the camera is denied or restricted, so
-    /// the caller can show guidance rather than a permanently black preview.
+    /// Reports camera denial, restriction, or unavailable capture hardware.
+    /// The scanner calls this closure on the main thread.
     var onAuthorizationDenied: () -> Void = {}
 
     func makeCoordinator() -> Coordinator {
@@ -70,27 +40,25 @@ struct QRScannerView: UIViewRepresentable {
         // owned by the coordinator and sized by the view's `layoutSubviews`.
     }
 
-    /// Stop the session and drop references so nothing keeps capturing into
-    /// a torn-down view.
+    /// Stops capture before SwiftUI removes the preview.
     static func dismantleUIView(_ uiView: CameraPreviewView, coordinator: Coordinator) {
         coordinator.stop()
     }
 
-    /// Owns the `AVCaptureSession` and the metadata delegate. Holds the
-    /// strong references the value-type `View` cannot.
+    /// Owns the capture session and metadata delegate.
+    /// The coordinator keeps references that the value-type view cannot store.
     final class Coordinator: NSObject, AVCaptureMetadataOutputObjectsDelegate {
         private let onCode: (String) -> Void
         private let onAuthorizationDenied: () -> Void
 
         private let session = AVCaptureSession()
-        /// Serial queue for session start/stop and metadata delivery — never
-        /// the main thread (Apple: `startRunning()` blocks).
+        /// Serializes session changes and metadata delivery.
+        /// Session operations do not run on the main thread.
         private let sessionQueue = DispatchQueue(label: "com.holoiroh.qrscanner.session")
         private weak var view: CameraPreviewView?
 
-        /// Guards against delivering more than one decode. Only touched on
-        /// `sessionQueue` (metadata delegate is dispatched there), so a plain
-        /// `Bool` is safe without extra locking.
+        /// Prevents more than one decoded payload.
+        /// Only `sessionQueue` accesses this value.
         private var hasDelivered = false
         private var isConfigured = false
 
@@ -105,7 +73,8 @@ struct QRScannerView: UIViewRepresentable {
             view.previewLayer.videoGravity = .resizeAspectFill
         }
 
-        /// Resolve camera authorization, then start the session if allowed.
+        /// Resolves camera authorization.
+        /// It starts capture only when access is authorized.
         func startWhenAuthorized() {
             switch AVCaptureDevice.authorizationStatus(for: .video) {
             case .authorized:
@@ -126,9 +95,9 @@ struct QRScannerView: UIViewRepresentable {
             }
         }
 
-        /// Build the capture graph (once) and start running, off the main
-        /// thread. Any missing hardware/permission failure degrades to a
-        /// black preview + denied callback rather than a crash.
+        /// Configures the capture graph once and starts the session.
+        /// Work runs on `sessionQueue`.
+        /// Configuration failure calls `onAuthorizationDenied`.
         private func configureAndStart() {
             sessionQueue.async { [weak self] in
                 guard let self else { return }
@@ -145,10 +114,8 @@ struct QRScannerView: UIViewRepresentable {
             }
         }
 
-        /// Wire camera input + a `.qr` metadata output. Returns `false` if
-        /// the device/input/output can't be built (e.g. no camera in the
-        /// simulator), so the caller can surface that instead of showing a
-        /// dead preview.
+        /// Adds the camera input and QR metadata output.
+        /// It returns `false` when the input or output is unavailable.
         private func configureSession() -> Bool {
             session.beginConfiguration()
             defer { session.commitConfiguration() }
@@ -218,10 +185,8 @@ struct QRScannerView: UIViewRepresentable {
     }
 }
 
-/// A `UIView` whose backing layer *is* an `AVCaptureVideoPreviewLayer`,
-/// via the `layerClass` override (the standard way to back a view with a
-/// specific `CALayer` subclass so the layer is auto-sized to the view).
-/// Same pattern `SampleBufferView` uses for the video render surface.
+/// Uses an `AVCaptureVideoPreviewLayer` as its backing layer.
+/// The `layerClass` override keeps the preview layer sized with the view.
 final class CameraPreviewView: UIView {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
 
@@ -235,3 +200,13 @@ final class CameraPreviewView: UIView {
         return layer
     }
 }
+#else
+struct QRScannerView: View {
+    let onCode: (String) -> Void
+    var onAuthorizationDenied: () -> Void = {}
+
+    var body: some View {
+        Color.black
+    }
+}
+#endif

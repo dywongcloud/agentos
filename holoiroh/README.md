@@ -1,291 +1,60 @@
 # Aro
 
-**Aro** (codebase name: `holoiroh`) gives a user remote view and control of
-a Mac over a direct P2P connection.
-[H Company's Holo3](https://github.com/H-Company-AI) computer-use agent
-(`holo-desktop-cli`) drives the Mac.
+**Aro** is the product name. The codebase name is `holoiroh`.
 
-This is a standalone subproject living at `holoiroh/` in this repo. It is
-**unrelated** to the rest of the repository (the Next.js/Vercel app). It
-does not share code, dependencies, or deployment with it.
+Aro gives users remote viewing and control of a Mac through a direct peer-to-peer (P2P) connection.
+[H Company's Holo3](https://github.com/H-Company-AI) computer-use agent, `holo-desktop-cli`, drives the Mac.
+
+This standalone subproject is at `holoiroh/` in this repository.
+It is unrelated to the Next.js/Vercel app elsewhere in the repository.
+The projects do not share code, dependencies, or deployment.
 
 ## Status
 
-### Alpha completeness, and the two things needed to run it live
+Aro is an alpha. This repository has a configured `origin`. The current work has been pushed to it.
 
-Nearly every alpha component is built and individually witnessed. Each
-component is witnessed via a real `cargo run --example *_probe` run, a real
-`swift build` run, or both, per this repo's no-unit-tests rule. The
-witnessed components are:
+### Implemented
 
-**Rust daemon:**
-- `iroh-live` publish + ticket
-- ScreenCaptureKit capture
-- hardware-VideoToolbox H.264
-- control channel with signed/expiring/replay-checked `TaskEnvelope`s
-- PIN + device-allowlist auth
-- metadata-only audit log with a proven no-content-leak guarantee
-- session/rate limits
-- a `holo serve` health-restart supervisor
-- the local-`llama.cpp` no-cloud inference path
-- the `ComputerUseExecutor` seam + the 6-class policy wrapper
-- the app registry + deterministic launch
-- the remote kill-switch
+- The daemon publishes ScreenCaptureKit video through the `iroh-live` media stream.
+- The daemon uses hardware H.264 when VideoToolbox is available.
+- The control channel uses the same iroh endpoint.
+- The control channel requires a PIN and an exact full-ID device allowlist match.
+- Each post-authentication envelope has a directional signature from the authenticated iroh endpoint identity.
+- Both network boundaries validate signatures, message type, session, expiry, replay, and sequence before dispatch or state mutation.
+- `control_channel.rs` creates metadata-only `audit_log` entries on the live task path.
+- It also records Tinfoil cloud-egress metadata.
+- `holo_bridge/control.rs` uses `sensitive_categories` on the live path.
+- Its watchdog can allow access, request consent, or block access before the agent continues.
+- The control channel and executor use `task_state` for task lifecycle state.
+- The daemon prints the ticket as a terminal Quick Response (QR) code.
+- The daemon prints a verification phrase beside the QR code.
+- The app derives and displays the same verification phrase before connection.
+- The `--rotate-every` option prints the current pairing block again at the selected interval.
+- The app implements the control channel, iroh bridge, video path, QR scanner, and speech transcription.
+- The app requests on-device transcription when the device and locale support it.
+- Tinfoil supports fallback inference, clarification, documents, images, audio, speech, and planning.
+- The Tinfoil client verifies enclave attestation before it permits requests.
+- The daemon sends the verified ground truth to the app.
+- The app displays this evidence in the Verification Center.
 
-**iOS app:**
-- pairing with QR scan + a SHA-256 short-phrase mutual verification that
-  byte-matches the daemon
-- the full 8-state PRD-6.1 session dashboard
-- on-device voice transcription
-- the video render surface
-- the real iroh-live subscribe FFI (`ios-bridge` cross-compiles cleanly to
-  `aarch64-apple-ios`)
+### Known gaps
 
-See `BENCHMARKS.md` for the local-model latency work (KV-cache reuse brings a
-warm step to ~2.3 s, under the < 5 s NFR).
+- `capture.rs` captures screen video only.
+- It does not capture system audio or microphone audio.
+- A launchd service cannot obtain macOS Transparency, Consent, and Control (TCC) permissions.
+- Grant Screen Recording and Accessibility in System Settings.
+- Some final checks require a physical Mac or iPhone.
+- Simulator and headless checks do not replace device-specific verification.
 
-**This build genuinely cannot do two things for itself. It needs a human to
-do them before it runs end-to-end:**
-
-1. **Grant the daemon macOS permissions. Run it on a real Mac.** The
-   daemon correctly refuses to start without Screen Recording and
-   Accessibility permissions (PRD P0-13). This rule stops the daemon from
-   streaming a black frame or from driving a Mac it cannot control.
-   macOS provides **no CLI to grant these permissions**. `tccutil` only
-   resets permissions. The `TCC.db` file is SIP-protected. An interactive
-   click in **System Settings → Privacy & Security** is required. After
-   granting the permissions, re-run the daemon:
-   1. Run `cargo build --release` in `mac-daemon/`.
-   2. Run `target/release/holoiroh-daemon`.
-
-   The daemon then prints a ticket QR, a verification phrase, and a PIN.
-   This step unblocks every live-run row: end-to-end video, the
-   leak/reconnect/latency measurements, and live policy gating.
-2. **Deploy the iOS app to a real iPhone** (Xcode device-deploy, linking the
-   `ios-bridge` staticlib as an xcframework). This step exercises camera QR
-   scanning, real voice capture, and the live remote view. None of these can
-   run headlessly.
-
-Separately, `git push` has no effect until a remote is configured
-(`git remote add origin <url>`). All work to date is committed locally.
-
-`mac-daemon` publishes an `iroh-live` broadcast and ticket. It attaches a
-macOS ScreenCaptureKit video source to the broadcast (`capture.rs`,
-screen/display capture only -- no audio yet). A `--display <index>` CLI
-flag selects the display; it defaults to the primary display.
-`mac-daemon` also runs a working bidirectional control channel
-(`control_channel.rs`, ALPN `holoiroh/control/1`) bridged to `holo serve`
-(`holo_bridge/`). See [`PROTOCOL.md`](./PROTOCOL.md) for the control
-channel's wire schema. The control channel's accept path now enforces a
-PIN + persisted device-allowlist auth gate on unrecognized devices (real,
-tested; see [`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md)). A QR
-rendering of the ticket and a ticket-rotation flag are designed in that
-same doc. Neither is implemented yet. Startup now also does two real,
-wired preflight checks before any capture/publish work begins:
-
-- a Holo auth-token check (`auth.rs`): it refuses to start, with a clear
-  instruction, if the user never ran `holo login`.
-- a macOS Screen Recording + Accessibility TCC permission preflight
-  (`permissions.rs`): it uses the same refuse-with-instructions behavior,
-  rather than starting into a black/frozen stream.
-
-`holo_bridge/` now also runs an ongoing health-check loop
-(`holo_bridge/health.rs`). This loop polls the supervised `holo serve`
-subprocess. It restarts the subprocess on crash. This check runs
-independently of the one-time startup health check that `process.rs`
-already did. System/mic audio capture is still not wired up. `ios/` is now
-a real multi-screen SwiftUI app skeleton that builds for iOS 17.
-`ContentView` hosts a `NavigationStack`. The stack moves from
-`PairingView` (paste an iroh ticket, plus a placeholder "Scan QR" button)
-to `MainView` on "connect". `MainView` has a real video render surface, a
-prompt text field with a Send button, a placeholder microphone button,
-and a scrolling status/log list of `ServerMessage`-equivalent entries.
-
-The **video render path is now real**. `MainView`'s preview is a
-`VideoRenderView` (`ios/Sources/HoloIrohApp/Video/`), a SwiftUI
-`UIViewRepresentable` backed by an `AVSampleBufferDisplayLayer`. It has
-public `enqueue(CVPixelBuffer:pts:)` and `enqueue(CMSampleBuffer)` entry
-points, with thread-safe, display-immediately low-latency scheduling and
-`.failed`-status flush-and-resume recovery. These entry points receive the
-H.264/HEVC frames that the Mac daemon's VideoToolbox-encoded `iroh-live`
-stream will decode to. The view binds to a small `VideoFrameSource`
-protocol so the concrete frame producer is swappable. The **network frame
-source now exists too**. The `ios-bridge` `extern "C"` FFI has a real
-`iroh-live` subscribe implementation: ticket-connect -> `Live::subscribe`
--> `video_ready` -> non-blocking frame poll, returning RGBA8 bytes across
-the C boundary. This implementation is verified against the vendored crate
-source (see `ios/IROH_FFI.md`'s "As-built" section). A Swift
-`IrohLiveFrameSource` (conforming to `VideoFrameSource`) wraps that FFI
-into pooled `CVPixelBuffer`s. It pushes them through the same `onFrame`
-seam. A `SyntheticVideoFrameSource` also generates animated
-`CVPixelBuffer`s on device, to prove the render path works end-to-end
-without a network source. The generator produces a scrolling gradient and
-a sweeping bar, driven by a `CADisplayLink`. It pushes the frames through
-the exact same `onFrame`/`enqueue` seam, so the preview animates today.
-`IrohLiveFrameSource` drops into `MainView`'s single binding site, once
-the xcframework is linked, without touching the view. **Read this
-honestly.** The render half and the Rust subscribe FFI + Swift wrapper are
-implemented and witnessed: host and `aarch64-apple-ios` builds succeed, an
-FFI probe exercises the C-ABI/error/teardown paths, and the Swift source
-compiles against the iOS SDK. **What still needs a real device, network,
-and Xcode-link is an actual frame arriving on screen.** The headless dial
-cannot complete, because no iroh relay is reachable in this sandbox. Also,
-no full Xcode app target links the `.xcframework` here. This is **not**
-"video streaming works". It is "the subscribe FFI is real and compiles for
-iOS; the last mile needs a device."
-
-The rest is still not wired to a real transport. There is no iroh/FFI
-networking, no actual QR scanning, and no on-device transcription. The log
-list is driven by locally-synthesized entries, so the UI is demonstrably
-live rather than static mock data. The Swift side of the control channel
-remains unimplemented. This scope covers sending and receiving
-`PROTOCOL.md`'s JSON over a real connection, including the
-`pin`/`auth_rejected` messages.
-
-The control channel's wire schema now wraps every message in a
-`TaskEnvelope`, except the bare pre-session PIN handshake. The
-`TaskEnvelope` fields are:
-
-- `protocol_version`
-- `message_id`
-- `session_id`
-- `task_id`
-- `sent_at`/`expires_at`
-- `sequence_number`
-- `payload`
-- `signature`
-
-These fields match the Project Aro PRD's authoritative envelope shape.
-This is **real, wired code**, not a paper schema. `control_channel.rs`
-actually rejects inbound envelopes in this order, before the payload is
-even parsed:
-
-1. envelopes that are expired
-2. envelopes that replay a seen `message_id`
-3. envelopes that send a non-increasing `sequence_number`
-
-See [`PROTOCOL.md`](./PROTOCOL.md)'s "Envelope" and "Rejection rules"
-sections. `signature` rides on the wire per the PRD schema. It is **not
-cryptographically verified**. This codebase has no signing-keypair
-infrastructure yet. So the field is always `null` on envelopes this daemon
-constructs. The field is unchecked on the way in. A new message pair,
-`input_request` (server → client) and `input_response` (client → server),
-lets the daemon pause a running turn. The daemon uses this pause to ask
-the user a structured question: credential needed, MFA needed, ambiguous
-choice, missing info, or sensitive-access consent. This message pair is
-also real and wired, including a real timed expiry-to-safe-pause path. An
-unanswered request emits a `status`, never an `error`, and clears itself
-rather than hanging. Credentials and MFA codes themselves never travel on
-this channel, by construction. See [`PROTOCOL.md`](./PROTOCOL.md)'s
-"Credentials never travel on this channel" section for why. That section
-also explains why the real secret-entry path (a separate `manual_input`
-channel) remains unbuilt.
-
-Two new modules add PRD-tracked functionality that is real, working, and
-independently witnessed. This functionality is **not yet wired to a live
-policy or event source**. Both modules say so explicitly in their own doc
-comments. This README repeats that fact honestly, rather than rounding up
-to "implemented":
-
-- **`sensitive_categories.rs`** (PRD §9, class-5 "sensitive target" apps
-  like password managers, banking, health, and system settings) is a real
-  data model and config file (`~/.holoiroh/sensitive_categories.toml` or
-  `.json`). It stores a per-category always-ask/always-allow/hard-block
-  setting, with real bundle-ID classification. Its own module doc is
-  explicit: *"This is a config-file row, not a policy-enforcement row...
-  nothing in this codebase currently calls into this module from a live
-  interception point."* This Rust daemon has no
-  `ComputerUseExecutor`/policy-wrapper equivalent yet. `holo_bridge` still
-  forwards every prompt straight through to `holo serve`, with no
-  pause-before-sensitive-surface check.
-- **`limits.rs`** (PRD §10.4 session/rate limits). See the dedicated
-  "Session & rate limits" section below for the exact per-limit
-  real-vs-constant-only breakdown. The short version follows the same
-  pattern: most limits are typed, independently-tested constants/helpers,
-  with no live call site wiring them into an actual session or turn yet.
-  Two limits (max active tasks per Mac, agent action cap) **are** really
-  enforced today.
-
-Two more new modules are real and independently witnessed with a different
-shape of gap each:
-
-- **`audit_log.rs`** (PRD row P0-12, local metadata-only audit log) writes
-  a real, append-only JSON-Lines file (default `~/.holoiroh/audit.log`),
-  via a real `AuditLogger` type. `AuditEntry` has exactly the ten
-  PRD-named fields. It deliberately has no catch-all string/JSON field. So
-  it is structurally impossible for a call site to log a dictated
-  transcript, prompt text, or recipient name. `examples/audit_log_probe.rs`'s
-  acceptance test proves this: it writes a real audit entry, then greps
-  the literal on-disk bytes for a marker string, and confirms the marker
-  is absent. **This module is not yet called from
-  `main.rs`/`control_channel.rs`/`holo_bridge`.** Nothing in the live
-  request path constructs an `AuditEntry` today. So no audit log is
-  actually produced by running the daemon. Two of its ten fields
-  (`app_category`, `remote_view_state`) are also honestly modeled as
-  single-variant enums for now. This daemon has no per-app attribution. It
-  also has no way to detach the broadcast independently of the control
-  channel yet (see the module's own "Real vs. honestly-approximated
-  fields" doc). The `inference_mode` field's `Local` variant is now the
-  accurate value for this build's actual inference path (see
-  `local_model.rs` below and the "Inference: local, on-device only"
-  section). But `audit_log` has no live call site at all yet. So no
-  `AuditEntry` is constructed anywhere to carry this value, and nothing
-  sets it either. The wiring gap is the missing call site, not the enum.
-- **`task_state.rs`** (PRD task lifecycle: 16 flow states, 4
-  interactive-waiting states, and 10 terminal states) is a real,
-  fully-modeled Rust enum. It has a real, exhaustively-tested
-  `is_valid_transition` state machine, including the three
-  Confidential-Cloud/Tinfoil states. These three states are present for
-  schema completeness, but they are provably unreachable in this alpha
-  build. `task_state.rs` is **deliberately independent of any live event
-  source**. `holo_bridge::control::ControlEvent`/`DoneStatus` are the only
-  task-progress types actually wired to the real `holo serve` A2A stream
-  today. They report three coarse outcomes, plus free-text progress
-  strings, with no concept of which of `task_state.rs`'s finer states a
-  task is in. Promoting live events to carry a real `TaskState` needs
-  `holo-desktop-cli` itself to expose that granularity. `holo-desktop-cli`
-  does not expose that granularity today.
-
-`mac-daemon` has **no `#[cfg(test)]` unit tests** as of this writing. This
-repo deliberately removed them, per its no-unit-tests rule: validation
-must be real, witnessed execution, not assertions run later.
-`cargo test -p holoiroh-daemon` now runs **0 tests**. This repo
-re-witnessed their coverage instead, as `cargo run --example <name>_probe`
-binaries:
-
-- `allowlist_probe`
-- `auth_probe`
-- `auth_gate_probe`
-- `control_channel_probe`
-- `envelope_probe`
-- `input_request_probe`
-- `task_state_probe`
-- `audit_log_probe`
-- `sensitive_categories_probe`
-- `limits_probe`
-- `holo_bridge_queue_probe`
-- `permissions_probe`
-- `local_model_probe` (builds the exact `llama-server` + `holo serve`
-  subprocess commands and verifies the local-inference env wiring
-  **without spawning the 21 GB model**)
-
-The pre-existing `control_probe` (a real external `iroh` dial against a
-live daemon) also covers this path. See "Build status" below for exact,
-witnessed build and probe results.
-
-The daemon's actual inference path is the **on-device `llama-server`
-local model** (see "Inference: local, on-device only" below). A real
-end-to-end latency benchmark of that path (8.3 s/step @ 720p on this Mac)
-was run separately. A live model-serving run loads ~21 GB and takes
-minutes. So this benchmark is documented in
-[`BENCHMARKS.md`](./BENCHMARKS.md), rather than re-run by the build/probe
-path above.
+See [`SECURITY.md`](./SECURITY.md) for instruction-channel, confirmation, and egress boundaries.
+See [`BUILD.md`](./BUILD.md) for native, iOS, and WebAssembly System Interface (WASI) commands.
 
 ## Components
 
 ```
 holoiroh/
-├── Cargo.toml                     # Rust workspace manifest (members = ["mac-daemon", "ios-bridge"])
+├── Cargo.toml                     # Rust workspace manifest
+├── BUILD.md                       # native, iOS, and wasm32-wasip1 build commands
 ├── PROTOCOL.md                    # control-channel wire schema (ClientMessage/ServerMessage)
 ├── mac-daemon/                    # Rust binary + lib crate: the Mac-side daemon
 │   ├── Cargo.toml
@@ -299,12 +68,13 @@ holoiroh/
 │   │   ├── auth.rs                # startup check for an existing Holo login token (~/.holo/.env)
 │   │   ├── permissions.rs         # macOS Screen Recording + Accessibility TCC preflight
 │   │   ├── limits.rs               # PRD 10.4 session/rate-limit constants + helpers (partly enforced -- see "Session & rate limits" below)
-│   │   ├── sensitive_categories.rs # PRD §9 class-5 sensitive-app config data model + file I/O (not wired to a live policy point yet)
-│   │   ├── audit_log.rs            # PRD P0-12 metadata-only local audit log (real AuditLogger; not yet called from the live request path)
-│   │   ├── task_state.rs          # PRD task lifecycle state machine (16 flow + 4 interactive + 10 terminal states; not wired to a live event source yet)
-│   │   ├── local_model.rs         # PRD P0-11 Aro Private mode: manages a local llama.cpp `llama-server` subprocess (Holo3.1 Q4 GGUF, 127.0.0.1 only); holo serve is pointed at it via --base-url / HAI_AGENT_RUNTIME_BASE_URL
-│   │   ├── executor.rs            # PRD 7.3 ComputerUseExecutor trait + HoloDesktopExecutor abstraction seam (lib-only; live daemon path not yet routed through it)
-│   │   ├── policy.rs              # PRD 7.3/9/P0-7 Aro policy wrapper: 6-class action taxonomy + decision table (real interception logic; not yet wired to a live tool-call boundary)
+│   │   ├── sensitive_categories.rs # PRD §9 class-5 sensitive-app config, used by the live Holo bridge watchdog
+│   │   ├── audit_log.rs            # PRD P0-12 metadata-only audit log, written by the live control channel
+│   │   ├── task_state.rs          # PRD task lifecycle state machine, used by control-channel and executor paths
+│   │   ├── local_model.rs         # manages the loopback llama.cpp subprocess and bounded token configuration
+│   │   ├── local_llama_proxy.rs   # constrained loopback OpenAI proxy: hard output cap, cache flag, body/deadline bounds, SSE pass-through
+│   │   ├── executor.rs            # PRD 7.3 ComputerUseExecutor trait + HoloDesktopExecutor abstraction seam
+│   │   ├── policy.rs              # PRD 7.3/9/P0-7 typed 6-class action taxonomy + decision table; per-action interception remains unavailable in Holo's opaque runtime
 │   │   ├── registry.rs           # PRD 8/P0-4 app registry: alias->deterministic-launch routes (~/.holoiroh/registry.*), resolve()->Single/Ambiguous/NotFound, `open -b` launch (plaintext for now; not yet on a live voice path)
 │   │   └── holo_bridge/           # bridges control messages to `holo serve`'s A2A endpoint
 │   │       ├── mod.rs
@@ -328,7 +98,8 @@ holoiroh/
 │       ├── task_state_probe.rs            # TaskState serde round-trips + is_valid_transition, full lifecycle diagram
 │       ├── holo_bridge_queue_probe.rs     # HoloControlBridge concurrent-prompt-queueing races
 │       ├── holo_stop_probe.rs             # remote kill-switch: ClientMessage::Stop -> ControlMessage::Stop mapping + `holo stop`/`--force` arg construction + a real `holo stop` invocation + handle_stop queue-drain/error paths
-│       ├── local_model_probe.rs           # builds the exact llama-server + holo serve commands and verifies the local-inference env wiring, WITHOUT spawning the 21 GB model
+│       ├── local_model_probe.rs           # checks llama-server and holo serve argv/env without loading the model
+│       ├── local_llama_proxy_probe.rs     # fake-upstream witness for token cap, cache flag, bounds, headers, SSE, and log privacy
 │       ├── executor_probe.rs              # every ComputerUseExecutor trait method against the real HoloDesktopExecutor (unreachable A2A backend)
 │       ├── policy_probe.rs                # policy 6-class taxonomy + decision table incl. the PRD 16a adversarial zero-send acceptance test
 │       └── registry_probe.rs              # registry round-trip + Single/Ambiguous/NotFound resolution + `open -b` deterministic launch
@@ -347,7 +118,7 @@ holoiroh/
 │   └── Sources/HoloIrohApp/
 │       ├── HoloIrohApp.swift       # @main App entry point
 │       ├── ContentView.swift       # NavigationStack: PairingView -> MainView
-│       ├── PairingView.swift       # paste ticket + Scan QR placeholder + Connect
+│       ├── PairingView.swift       # paste ticket + scan QR code + verify phrase + connect
 │       ├── MainView.swift          # VideoRenderView, prompts, mic, status/log list
 │       ├── VoiceTranscriber.swift  # on-device SFSpeechRecognizer transcription + model wrapper
 │       ├── Video/
@@ -362,9 +133,9 @@ holoiroh/
 
 ## Architecture overview
 
-This architecture uses two processes, one on each end of a direct
-peer-to-peer link. A bridge into a third piece of software,
-`holo-desktop-cli`, actually drives the Mac.
+The architecture has one process at each end of a direct P2P link.
+A bridge connects the daemon to `holo-desktop-cli`.
+`holo-desktop-cli` drives the Mac.
 
 ```
 ┌─────────────────────────────┐                      ┌───────────────────────────────┐
@@ -378,7 +149,7 @@ peer-to-peer link. A bridge into a third piece of software,
 │  │  (screen frames)           ││  │                      │  │  │   Pairing screen      │  │  │
 │  │                             ││  │   iroh QUIC, P2P,   │  │  │   (scan/paste ticket) │  │  │
 │  │  System/mic audio ─────────┤├──┼── NAT hole-punch, ───┼──┼─▶│                       │  │  │
-│  │  capture                   ││  │   relay fallback     │  │  ├─────────────────────┤  │  │
+│  │  not captured             ││  │   relay fallback     │  │  ├─────────────────────┤  │  │
 │  │                             ││  │                      │  │  │   Live video view      │  │  │
 │  │  iroh-live::LocalBroadcast │  │  │                      │  │  │   (renders MoQ/iroh-   │  │  │
 │  │  publish() → iroh ticket   │  │  │                      │  │  │    live subscription)  │  │  │
@@ -403,120 +174,92 @@ peer-to-peer link. A bridge into a third piece of software,
 
 ### Mac-side: `mac-daemon` (Rust)
 
-`mac-daemon` is a single long-running process, built on
-[`iroh-live`](https://github.com/n0-computer/iroh-live). `iroh-live` is
-n0's real-time audio/video-over-iroh library. It is itself built on
-[`iroh`](https://github.com/n0-computer/iroh) for the P2P QUIC transport,
-and on [MoQ](https://quic.video/) for media framing. `mac-daemon` does the
-following:
+The daemon is one long-running process.
+It uses [`iroh-live`](https://github.com/n0-computer/iroh-live) for real-time media over iroh.
+[`iroh`](https://github.com/n0-computer/iroh) provides the P2P QUIC transport.
+[Media over QUIC (MoQ)](https://quic.video/) provides media framing.
 
-1. **Capture.** Screen frames come from `ScreenCaptureKit` (not the
-   camera; this streams the desktop, not a webcam). Audio comes from the
-   system output, and optionally the mic. Both use `iroh-live`'s capture
-   backends (`rusty-capture`/`cpal` under the hood).
-2. **Publish.** `mac-daemon` publishes the captured stream as an
-   `iroh-live` `LocalBroadcast`. This broadcast produces a shareable
-   **iroh ticket**: a self-describing string that encodes the daemon's
-   node ID and enough routing info for a peer to dial it directly.
-   `mac-daemon` encodes video as **H.264, using the hardware VideoToolbox
-   encoder** on macOS. `main.rs` selects the codec via
-   `VideoCodec::best_available()`. This call resolves to `VtbH264` in this
-   build, since `iroh-live`'s default features include `videotoolbox`.
-   `main.rs` falls back to software openh264 only if no hardware encoder
-   is available. This choice is the Project Aro PRD's OQ-5
-   "H.264-over-iroh" transport. [`mac-daemon/TRANSPORT_ADR.md`](./mac-daemon/TRANSPORT_ADR.md)
-   records the decision and its evidence, including why `iroh-live`'s
-   existing MoQ path already satisfies it, and why neither a custom iroh
-   QUIC video stream nor WebRTC is needed for the primary path.
-3. **Transport.** Connections use `iroh`'s QUIC transport. Peers attempt a
-   direct connection with NAT hole-punching first. If a direct path
-   cannot be established, the connection falls back to an iroh relay
-   server (n0's or a self-hosted one). This process is transparent to the
-   app layer. `iroh-live` consumers just see a connected stream.
-4. **Control channel.** Alongside the media broadcast, the daemon runs a
-   second, bidirectional logical stream. This stream carries small,
-   structured JSON messages: text prompts and voice transcripts *into*
-   the daemon, and status/log/ack events *out* to the iOS app. The iOS
-   app uses this channel to actually tell Holo what to do, and to see
-   what it is doing. This channel is **implemented** in
-   `mac-daemon/src/control_channel.rs`, as a dedicated `iroh` ALPN
-   (`holoiroh/control/1`). This ALPN is mounted on the *same*
-   `iroh::Endpoint`/`iroh::protocol::Router` as `iroh-live`'s own
-   MoQ/gossip protocols, via `Live::register_protocols` (the same
-   composition pattern `iroh-live` uses internally for its own two
-   ALPNs). This means the same peer, the same NAT-punch/relay path, and
-   the same connection lifecycle as the media broadcast. That is what "a
-   second logical stream on the same iroh QUIC connection" means in
-   `iroh`'s one-`Connection`-per-ALPN model (`iroh` does not multiplex
-   distinct app protocols inside a single `Connection` object).
-   [`PROTOCOL.md`](./PROTOCOL.md) specifies the wire schema
-   (`ClientMessage`/`ServerMessage`, newline-delimited JSON).
-5. **Holo bridge.** The control channel hands prompts to
-   `holo-desktop-cli`, [H Company](https://www.hcompany.ai/)'s Holo3
-   computer-use agent. `holo-desktop-cli` interprets the prompts and
-   drives the Mac (mouse, keyboard, app control) to carry out the task.
-   The control channel relays progress and results back, so the iOS
-   app's status panel can show what Holo is doing in near-real-time. The
-   screen broadcast itself shows the actual visual result on the next
-   frame.
+1. **Capture video.** ScreenCaptureKit supplies desktop frames, not camera frames.
+   The daemon does not capture system audio or microphone audio.
+2. **Publish video.** The daemon publishes an `iroh-live` `LocalBroadcast`.
+   The broadcast creates an iroh ticket.
+   The ticket contains the daemon node ID and peer-routing information.
+   The daemon uses H.264 video.
+   `main.rs` selects `VideoCodec::best_available()`.
+   This call selects hardware `VtbH264` when VideoToolbox is available.
+   The `iroh-live` default features include `videotoolbox` in this build.
+   The daemon uses software openh264 only when no hardware encoder is available.
+   This path implements Project Aro product requirements document (PRD) open question OQ-5.
+   [`mac-daemon/TRANSPORT_ADR.md`](./mac-daemon/TRANSPORT_ADR.md) records the decision and evidence.
+   The existing MoQ path meets the requirement.
+   The primary path does not need a custom iroh QUIC video stream or WebRTC.
+3. **Transport.** Peers first attempt direct QUIC with network address translation (NAT) hole-punching.
+   If this attempt fails, iroh uses an n0-hosted or self-hosted relay.
+   This fallback is transparent to the app.
+   `iroh-live` consumers see one connected media stream.
+4. **Run the control channel.** The daemon also runs a bidirectional logical stream.
+   It carries small, structured JavaScript Object Notation (JSON) messages.
+   Prompts and voice transcripts travel to the daemon.
+   Status, log, and acknowledgement events travel to the app.
+   The app uses these messages to direct Holo and show its status.
+   `mac-daemon/src/control_channel.rs` implements the control channel.
+   It uses the dedicated `holoiroh/control/1` application-layer protocol negotiation (ALPN) identifier.
+   The control channel and `iroh-live` use the same `iroh::Endpoint` and `iroh::protocol::Router`.
+   `Live::register_protocols` registers the MoQ and gossip protocols.
+   The peer, NAT or relay path, and connection lifecycle therefore remain the same.
+   Iroh uses one `Connection` per ALPN.
+   It does not multiplex distinct application protocols in one `Connection` object.
+   [`PROTOCOL.md`](./PROTOCOL.md) specifies newline-delimited JSON `ClientMessage` and `ServerMessage` values.
+5. **Bridge to Holo.** The control channel sends prompts to `holo-desktop-cli`.
+   [H Company](https://www.hcompany.ai/) provides this Holo3 computer-use agent.
+   The agent drives the mouse, keyboard, and apps on the Mac.
+   The control channel returns progress and results to the app.
+   The app shows these events in its status panel.
+   The media stream shows the visual result on the next frame.
 
 ### iOS-side: `HoloIrohApp` (SwiftUI, iOS 17+)
 
-A thin client:
+The app is a thin client.
 
-1. **Pairing.** The user pastes or scans (QR) the ticket the Mac daemon
-   printed. The app then dials the ticket via the iroh transport.
-   **Neither `iroh` nor `iroh-live` ships official Swift bindings for the
-   API this project actually needs.** `iroh` has official bindings via the
-   separate `n0-computer/iroh-ffi` repo, but that repo only covers raw
-   `Endpoint`/`Connection`. `iroh-live`'s `LocalBroadcast`/`subscribe`/
-   frame-pull surface has no bindings at all. See
-   [`ios/IROH_FFI.md`](./ios/IROH_FFI.md) for the full research and the
-   as-built details. The chosen path is a hand-written Rust staticlib
-   bridge, [`ios-bridge/`](./ios-bridge). Its `extern "C"` surface covers
-   ticket-connect, subscribe, and poll-next-frame. This surface now has a
-   **real `iroh-live` subscribe implementation** (verified against the
-   vendored crate source). It builds for the host **and** cross-compiles
-   to `aarch64-apple-ios` (both witnessed). It is packaged into an
-   `.xcframework` for the Swift side to import. The one remaining step is
-   a full Xcode app target linking that `.xcframework`. This SwiftPM
-   skeleton builds with or without that link.
-2. **Live view.** The render surface is real. `VideoRenderView`
-   (`AVSampleBufferDisplayLayer`) displays a stream of decoded frames,
-   delivered through a `VideoFrameSource`. The `iroh-live` subscription is
-   now wired on both sides. `ios-bridge`'s FFI pulls decoded RGBA8 frames.
-   `IrohLiveFrameSource` (Swift, conforming to `VideoFrameSource`) wraps
-   them into `CVPixelBuffer`s, and pushes them into this same surface.
-   This gives a live mirror of the Mac's screen, once a device links the
-   xcframework and reaches a live daemon. Until then, the view is bound to
-   an on-device `SyntheticVideoFrameSource`, so the render path is
-   exercised for real. The network source is now built and compiles for
-   iOS. Only the device, network, and xcframework-link last mile remain;
-   the source itself is complete.
-3. **Prompts.** A text field and a microphone button let the user send
-   instructions. Voice input is transcribed (on-device, or via a
-   transcription service — TBD) before it is sent as text over the
-   control channel. So the wire format is always a text prompt plus
-   metadata, never raw audio.
-4. **Status.** A log/status panel surfaces the daemon's control-channel
-   events. The user can see acks, in-progress steps, and completion from
-   Holo3 this way, without needing to watch the video feed frame-by-frame.
+1. **Pair.** The user pastes or scans the ticket that the daemon printed.
+   The app extracts a ticket from the QR code.
+   The app derives a four-word verification phrase from the ticket.
+   The app blocks connection until the user confirms that the daemon shows the same phrase.
+   The app then dials the ticket through iroh.
+   Neither `iroh` nor `iroh-live` provides the required official Swift surface.
+   The separate `n0-computer/iroh-ffi` repository covers raw `Endpoint` and `Connection` APIs only.
+   It does not cover `iroh-live` `LocalBroadcast`, `subscribe`, or frame pulling.
+   [`ios/IROH_FFI.md`](./ios/IROH_FFI.md) records the research and implementation.
+   The project uses the handwritten Rust static-library bridge in [`ios-bridge/`](./ios-bridge).
+   Its `extern "C"` surface implements ticket connection, subscription, frame polling, and the control channel.
+   The bridge builds for the host and `aarch64-apple-ios`.
+   The app packages it as an `.xcframework` and links it through the Xcode app target.
+2. **Show live video.** `VideoRenderView` uses `AVSampleBufferDisplayLayer`.
+   A `VideoFrameSource` supplies decoded frames.
+   The bridge pulls decoded RGBA8 frames from the `iroh-live` subscription.
+   `IrohLiveFrameSource` wraps these frames in pooled `CVPixelBuffer` values.
+   It pushes them into the same render surface.
+   `SyntheticVideoFrameSource` remains an on-device render witness for bridge-less builds.
+3. **Send prompts.** The user can enter text or use the microphone button.
+   The app requests on-device speech transcription when supported.
+   The app sends the resulting text and metadata through the control channel.
+   The wire format never carries raw audio for prompts.
+4. **Show status.** The status panel shows control-channel events.
+   These events include acknowledgements, work steps, input requests, and completion.
 
 ### Why iroh / iroh-live specifically
 
-- **No signaling server to run.** Ticket-based dialing means only the
-  ticket string itself has to be transmitted out-of-band (paste, QR,
-  airdrop, etc.). There is no separate account system, and no persistent
-  server, that the Mac daemon depends on to be reachable.
-- **NAT traversal with a safety net.** The connection uses direct P2P
-  when possible (LAN, favorable NAT). It uses transparent relay fallback
-  when not (symmetric NAT, restrictive firewalls). The app layer does not
-  need to know which path it got.
-- **One transport for both media and control.** `iroh-live` already
-  solves the hard "get audio+video across a NAT-punched QUIC connection
-  reliably" problem. Layering the control channel on the same `iroh`
-  endpoint means one connection lifecycle and one reconnect story. This
-  avoids stitching together two different networking stacks.
+- **No signaling server.** The user shares only the ticket out of band.
+  Sharing methods include paste, QR code, and AirDrop.
+  The daemon does not require a separate account system or persistent signaling server.
+- **NAT traversal with relay fallback.** Iroh uses direct P2P when possible.
+  Examples include a local area network (LAN) or a favorable NAT.
+  It uses a relay for symmetric NAT or restrictive firewalls.
+  The app does not select the path.
+- **One transport for media and control.** `iroh-live` carries video over NAT-traversed QUIC.
+  The control channel uses the same iroh endpoint.
+  Both channels therefore share connection and reconnection lifecycles.
+  The project does not combine separate networking stacks.
 
 ## Rust dependency note: `iroh-live` is not on crates.io
 
@@ -559,8 +302,10 @@ not `mac-daemon/target/`, since `mac-daemon` is a workspace member.
 **`mac-daemon` now does real `iroh-live` P2P publish work, not just a
 skeleton println.** `main.rs` does the following:
 
-1. Brings up an `iroh-live::Live` session (`Live::from_env().await?...spawn()`).
-   This reads `IROH_SECRET` if set, or else generates a fresh key.
+1. Loads `IROH_SECRET` when set.
+   Otherwise, it loads or creates `~/.holoiroh/iroh_secret`.
+   It builds an `iroh::Endpoint` and starts an `iroh-live::Live` session.
+   When the Mac lacks an IPv6 default route, it removes the IPv6 transport.
 2. Registers a `LocalBroadcast` with a macOS ScreenCaptureKit video source
    attached (`capture::setup_screen_video` -- `iroh_live::media::capture::ScreenCapturer`,
    never `CameraCapturer`). See "Status" above and `capture.rs`'s own doc
@@ -593,11 +338,11 @@ $ echo $?
 0
 ```
 
-The ticket differs on every run, because no `IROH_SECRET` is set in this
-environment. So `Live::from_env` generates a fresh iroh keypair, and thus
-a fresh node ID, each time. Setting `IROH_SECRET` pins the daemon to a
-stable identity/ticket across restarts. `Ctrl-C` triggers a clean shutdown
-(`live.shutdown().await`). It exits `0`, rather than aborting ungracefully.
+The transcript above came from an earlier run without a persisted identity.
+Current code reads `IROH_SECRET` when it is set.
+Otherwise, it loads `~/.holoiroh/iroh_secret` or creates that file with mode `0600`.
+The persisted identity keeps the node ID and ticket stable across restarts.
+`Ctrl-C` calls `live.shutdown().await` and exits with status `0`.
 
 This session found and fixed two build-blocking issues while producing
 this witness. Both issues pre-existed in the working tree; the
@@ -619,14 +364,14 @@ this witness. Both issues pre-existed in the working tree; the
   inherits a git dependency's `.cargo/config.toml`. So this flag has to be
   duplicated explicitly.
 
-**Control channel (`control_channel.rs` + `holo_bridge/`): `cargo build`
-succeeds, including the `[lib]` target.** This target lets
-`examples/control_probe.rs` dial the control channel as an external
-`iroh` peer. **There are no `#[cfg(test)]` unit tests in this crate as of
-this writing.** This repo deliberately removed them (`cargo test -p
-holoiroh-daemon` now runs 0 tests; see "Status" above). This repo
-re-witnessed their coverage instead, as `cargo run --example <name>_probe`
-binaries:
+**Control channel (`control_channel.rs` + `holo_bridge/`): `cargo build` succeeds.**
+The build includes the `[lib]` target.
+`examples/control_probe.rs` uses this target.
+It dials the control channel as an external iroh peer.
+This crate has no `#[cfg(test)]` unit tests.
+The repository deliberately removed them.
+`cargo test -p holoiroh-daemon` now runs 0 tests.
+The repository re-witnessed their coverage with `cargo run --example <name>_probe` binaries:
 
 ```
 $ cargo test -p holoiroh-daemon
@@ -691,19 +436,21 @@ configurations:
   layer that *is* reachable without full external network access, and
   confirmed it correct.
 
-**Startup auth/permission preflight (`auth.rs`, `permissions.rs`) and the
-`holo serve` health-check loop (`holo_bridge/health.rs`) are real, wired
-into `main.rs`/`HoloBridge`, and unit-level-witnessed** via
-`examples/auth_probe.rs`, `examples/auth_gate_probe.rs`, and
-`examples/permissions_probe.rs` (see above). This session exercised
-token-file parsing, PIN/allowlist gate logic, and
-`PreflightResult`/`MissingPermission` construction, each against real
-strings, files, or in-memory state, with passing output. This pass did
-**not** re-witness a live, end-to-end run of `holoiroh-daemon` itself on
-macOS hardware with Screen Recording/Accessibility actually granted. This
-run's purpose is to confirm the preflight passes cleanly and the daemon
-proceeds to publish. Treat that specific end-to-end path as
-real-but-not-freshly-verified, until it is re-witnessed.
+The startup authentication and permission preflight is implemented in `auth.rs` and `permissions.rs`.
+The `holo serve` health-check loop is implemented in `holo_bridge/health.rs`.
+`main.rs` and `HoloBridge` use these paths.
+The following probes witness them:
+
+- `examples/auth_probe.rs`
+- `examples/auth_gate_probe.rs`
+- `examples/permissions_probe.rs`
+
+The probes use real strings, files, or in-memory state.
+They cover token parsing, the PIN and allowlist gate, `PreflightResult`, and `MissingPermission`.
+All observed cases passed.
+This pass did not re-witness the complete daemon path on Mac hardware with both permissions granted.
+That path should publish after a successful preflight.
+Treat it as implemented but not freshly verified.
 
 **`TaskEnvelope`, `input_request`/`input_response`, `sensitive_categories.rs`,
 `audit_log.rs`, `task_state.rs`, and `limits.rs` are each independently
@@ -742,20 +489,21 @@ $ cargo run --example limits_probe
 limits_probe: OK -- all PRD 10.4 enforcement helpers behaved correctly under real execution.
 ```
 
-`examples/audit_log_probe.rs` is real, and its underlying module logic
-passes cleanly. It writes real JSON-Lines entries, and proves
-append-only behavior. As the PRD P0-12 acceptance test, it greps the
-literal on-disk bytes for a dictated-text marker string, and confirms the
-marker is absent. **This pass found one honest wrinkle while
-re-witnessing**: the probe's own first assertion (`subdir must not exist
-yet for this to be a real test`) panicked on a stale run. This happened
-because its "parent directory gets created" case uses a **fixed,
-non-unique** subdirectory name (`holoiroh-audit-probe-subdir`), left over
-in `$TMPDIR` from an earlier run in the same session. This is a real bug
-in the probe's own temp-path hygiene: every other path in this probe
-suite mixes in a PID and a nanosecond timestamp; this one line does not.
-It is not a defect in `audit_log.rs` itself. Deleting the stale directory
-and re-running produced a full clean pass:
+The `sensitive_categories_probe` note records the scope of that historical probe run.
+It does not describe the current daemon.
+The sensitive-category watchdog now runs on the live Holo bridge path.
+
+`examples/audit_log_probe.rs` exercises the underlying module with real files.
+It writes JSON Lines entries and proves append-only behavior.
+The PRD P0-12 acceptance check searches on-disk bytes for a dictated-text marker.
+The marker is absent.
+
+The probe initially failed its `subdir must not exist yet for this to be a real test` assertion.
+A previous run had left the fixed `holoiroh-audit-probe-subdir` directory in `$TMPDIR`.
+Every other probe path includes a process identifier (PID) and nanosecond timestamp.
+This one path did not.
+The defect affected probe temporary-path hygiene, not `audit_log.rs`.
+Deleting the stale directory produced a clean run:
 
 ```
 $ cargo run --example audit_log_probe
@@ -769,34 +517,27 @@ all real metadata fields ARE present (this is not an accidentally-empty-file fal
 audit_log_probe: OK -- metadata logged, dictated-text content proven absent via real log-file inspection
 ```
 
-This repo fixed the fixed-dirname reuse bug in the probe itself. The
-subdir name now mixes in a PID and a nanosecond timestamp, matching the
-rest of the probe suite's temp-path scheme. So the probe is idempotent.
-Running it twice back-to-back, without clearing `$TMPDIR`, verified this:
-both runs passed cleanly.
+The repository fixed the probe's fixed-directory reuse defect.
+The directory name now includes a PID and nanosecond timestamp.
+This scheme matches the other probe paths.
+The probe is now idempotent.
+Two consecutive runs passed without clearing `$TMPDIR`.
 
-This pass also re-ran `cargo run --example holo_bridge_queue_probe`. It
-still passes, for the same reason documented previously. This probe
-witnesses real concurrent-prompt-queueing logic against an unreachable
-A2A endpoint. The full live-daemon-plus-live-`holo-serve` path remains
-blocked in this sandbox, by the same two pre-existing causes: no
-Accessibility TCC grant, and no `holo` CLI on `PATH`. This block is not a
-regression from this pass's changes. `cargo test -p holoiroh-daemon`
-still runs 0 tests.
+This pass also ran `cargo run --example holo_bridge_queue_probe` again.
+The probe passed.
+It witnesses concurrent prompt queueing against an unreachable agent-to-agent (A2A) endpoint.
+The complete daemon and live `holo serve` path remains blocked in this sandbox.
+The sandbox lacks an Accessibility TCC grant and a `holo` command on `PATH`.
+This condition predates the current changes.
+`cargo test -p holoiroh-daemon` still runs 0 tests.
 
-**`swift build` in `holoiroh/ios`: succeeds, but only when given an iOS
-target explicitly.**
+**`swift build` in `holoiroh/ios` succeeds only with an explicit iOS target.**
 
-Bare `swift build`, with no flags, **fails**. This failure is expected; it
-is not a bug in the package. SwiftPM's `swift build` builds for the
-**host platform** by default (macOS on this machine). This package
-deliberately has no `.macOS(...)` entry in `Package.swift`, because it is
-an iOS-17+-only package per spec. So the SwiftUI APIs it uses (`View`,
-`App`, `Scene`, `@main`, etc.) are not available under the default macOS
-deployment target the toolchain falls back to. This is the normal,
-correct failure mode for an iOS-only SPM package, built with the bare CLI
-command on macOS. It is not evidence of a defect in `Package.swift` or
-the Swift sources.
+Bare `swift build` fails because Swift Package Manager (SwiftPM) selects the macOS host by default.
+This package intentionally has no `.macOS(...)` entry in `Package.swift`.
+It supports iOS 17 and later.
+The SwiftUI APIs `View`, `App`, `Scene`, and `@main` are unavailable under the fallback macOS deployment target.
+This expected failure does not show a defect in `Package.swift` or the Swift sources.
 
 Building with an explicit iOS Simulator target succeeds both ways. This
 pass re-witnessed this after adding `PairingView.swift`, `MainView.swift`,
@@ -827,99 +568,86 @@ the bare host-platform build succeed."
 
 ## Security model
 
-**Real, wired, tested as of this writing**: a PIN + device-allowlist second
-factor. See [`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md) for the full
-design and an honest real-vs-designed breakdown. In short:
+The daemon implements a PIN and exact full-ID device allowlist as a second factor.
+[`mac-daemon/PAIRING.md`](./mac-daemon/PAIRING.md) describes the design and implementation status.
 
-- The PIN generation, allowlist persistence, and the accept-path
-  enforcement gate are all real code, unit-tested and additionally
-  verified end-to-end over a live `iroh` connection.
-- A QR-code rendering of the ticket, and a `--rotate-every` rotation
-  flag, are designed but not yet implemented.
-- Device revocation has a real, tested data-structure method
-  (`Allowlist::remove_entry`), but no command or UI wired to call it yet.
+- The daemon implements PIN generation, allowlist persistence, and accept-path enforcement.
+- Live iroh probes verify this path end to end.
+- The daemon prints the ticket as a QR code.
+- The daemon prints a four-word verification phrase beside the QR code.
+- The app scans the QR code and derives the same phrase from the ticket.
+- The app requires user confirmation before it connects.
+- The `--rotate-every` option prints the current pairing block again.
+- `Allowlist::remove_entry` implements and verifies device revocation in the data structure.
+- No command or user interface calls `Allowlist::remove_entry` yet.
 
-In short, the daemon generates a fresh PIN on every startup, printed
-alongside the ticket. The daemon only lets an unrecognized device past the
-control channel's greeting after the device presents that PIN. A device
-that presents the PIN once is persisted to `~/.holoiroh/allowlist.json`.
-That device then skips the PIN on future connections. `--no-pin-auth`
-reverts to the old ticket-only behavior, for local dev/testing.
+By default, the daemon generates a fresh PIN at startup.
+Set `HOLOIROH_PIN` to keep the PIN stable across restarts.
+The daemon prints the PIN beside the ticket.
+An unrecognized device must send this PIN during the control-channel greeting.
+After successful authentication, the daemon stores the device in `~/.holoiroh/allowlist.json`.
+An allowlisted device skips PIN entry on future connections.
+Use `--no-pin-auth` only for local development or testing.
+This option restores ticket-only access.
 
 ### Remote kill-switch (stop/cancel)
 
-The remote **stop kill-switch** is an iOS "Stop"/"Cancel" control. It halts
-whatever the agent is doing on the Mac. This kill-switch is wired
-end-to-end **on the daemon side**, and structured-and-ready on the iOS
-side:
+The app provides a Stop or Cancel control.
+It stops the agent's current work on the Mac.
+The daemon and app implement this path through the control channel.
 
-- **Daemon side (real, wired, probe-witnessed).** A control-channel
-  `ClientMessage::Stop` maps to `ControlMessage::Stop`, via
-  `control_channel::to_control_message`. This mapping carries an
-  **optional `context_id`**:
-  - *Global form* (`context_id` absent; what every current client
-    sends): `HoloControlBridge::handle_stop` runs these steps in order:
-    1. It scoped-cancels the running turn via A2A `tasks/cancel`, using
-       the daemon's own resolved `contextId`/`Task.id` (captured
-       mid-stream by `a2a_client`'s `on_ids` callback; the client never
-       has one).
-    2. It drains any queued prompts; each queued prompt gets a terminal
-       `Done{Canceled}`.
+- **Daemon.** `control_channel::to_control_message` maps `ClientMessage::Stop` to `ControlMessage::Stop`.
+  The message can include `context_id`.
+  - **Global form:** Current clients omit `context_id`.
+    `HoloControlBridge::handle_stop` performs these actions in order:
+    1. It cancels the running turn with A2A `tasks/cancel`.
+       It uses the daemon's resolved `contextId` and `Task.id`.
+       The `a2a_client` `on_ids` callback captures these identifiers during the stream.
+       Clients do not have these identifiers.
+    2. It drains queued prompts.
+       Each queued prompt receives terminal `Done{Canceled}` status.
     3. It discards any paused turn.
-    4. It engages the CLI-level global kill switch: it shells out to
-       the real `holo stop` (see `holo_bridge/stop.rs`), the same
-       pause-then-cancel effect as `holo-desktop-cli`'s own double-Esc /
-       `holo stop`. It escalates to `holo stop --force` if the same turn
-       is still running ~3s later.
-  - *Scoped form* (`context_id` present): this form cancels ONE specific
-    turn, via an A2A `tasks/cancel` for exactly that context. It has
-    **none** of the all-or-nothing machinery: no queue drain, no global
-    `holo stop`, no force escalation. A paused stash under the same
-    `context_id` is discarded; other stashes survive. If nothing is
-    running under a context, the daemon resolves this to a polite status
-    note, never a global stop of an unrelated turn.
+    4. It runs the real `holo stop` command from `holo_bridge/stop.rs`.
+       This command has the same pause-then-cancel effect as double Escape in `holo-desktop-cli`.
+       If the turn remains active after approximately 3 seconds, it runs `holo stop --force`.
+  - **Scoped form:** A present `context_id` identifies one turn.
+    The daemon sends A2A `tasks/cancel` for that context only.
+    It does not drain the queue, run global `holo stop`, or escalate with `--force`.
+    It discards a paused turn with the same `context_id`.
+    Other paused turns remain.
+    If the context is not active, the daemon returns a status message.
+    It does not stop an unrelated turn.
 
-  `examples/holo_stop_probe.rs` witnesses this whole path (see "Build
-  status" below):
-  - the `ClientMessage::Stop → ControlMessage::Stop` mapping, in both
-    bare and scoped forms
-  - the exact `holo stop` / `holo stop --force` argument-vector
-    construction
-  - a **real `holo stop` invocation** against the installed
-    `~/.holo/bin/holo` (a benign no-op with no turn in flight)
-  - the full unscoped `handle_stop` queue-drain
-  - the scoped-only path: cancel attempted for exactly the named
-    context, no queue drain, no global stop, non-matching paused stash
-    survived
-  - the graceful `ControlEvent::Error` when the `holo` binary is missing
-- **iOS side (real over the control channel).** The `SessionView`
-  Working/Connecting/Input-needed/Draft-ready panels' "Cancel" control
-  sends the actual `ClientMessage.stop`. Once `HoloConnection` completes
-  the control-ALPN PIN handshake, the seam is the real
-  `FFIControlChannelSender`. It writes encoded bytes to the daemon over
-  the wire. Before that point, and in bridge-less simulator/CI builds,
-  the `LoggingControlChannelSender` stand-in performs the same real
-  encode, and surfaces it in the status/log panel. The wire payload is
-  the global form (`{"type":"stop"}`). The app's Cancel means "stop
-  everything". The daemon already scoped-cancels the running turn on its
-  own, before the wider kill; no per-turn ids exist on the client to
-  scope with.
+  `examples/holo_stop_probe.rs` witnesses these facts:
+
+  - Both forms of the `ClientMessage::Stop` to `ControlMessage::Stop` mapping.
+  - Exact argument vectors for `holo stop` and `holo stop --force`.
+  - A real, inactive-turn invocation of the installed `~/.holo/bin/holo`.
+  - Queue draining in the global path.
+  - Cancellation of only the named context in the scoped path.
+  - No queue drain or global stop in the scoped path.
+  - Survival of a paused turn with a different context.
+  - A `ControlEvent::Error` when the `holo` binary is missing.
+- **App.** Cancel controls in the `SessionView` panels send `ClientMessage.stop`.
+  These panels cover Working, Connecting, Input-needed, and Draft-ready states.
+  After the control-channel PIN handshake, `FFIControlChannelSender` writes encoded bytes to the daemon.
+  Before the handshake, `LoggingControlChannelSender` performs the same encoding.
+  Bridge-less simulator and continuous integration (CI) builds also use this stand-in.
+  The status panel shows its output.
+  The wire payload is the global `{"type":"stop"}` form.
+  Cancel therefore means "stop everything."
+  The daemon first cancels the current turn by its resolved identifiers.
+  The app has no per-turn identifiers for scoped cancellation.
 
 **Still missing:**
 
-1. A *different* kill-switch: the Mac-side control to immediately stop
-   the **broadcast**, or revoke an *active already-open session*.
-   Revocation data exists, but nothing calls it. Even calling it does
-   not drop an already-open connection (see `PAIRING.md`'s "Device
-   revocation" section).
-2. The iOS control-channel **transport** itself: the one wiring step
-   above, actually putting the encoded `stop`/`prompt` bytes on a real
-   `iroh` stream.
-3. The fuller mutual short-phrase-verification, iOS Keychain, and
-   cross-device-revocation spec. This repo tracks this spec separately,
-   as the `holoiroh-pairing-ticket-exchange` PRD row (Project Aro PRD
-   P0-2/7.1). This spec supersedes this PIN+allowlist scheme, once
-   built.
+1. The Mac has no control that immediately stops the media stream.
+   It also cannot revoke an active, open session.
+   Revocation data exists, but no live caller uses it.
+   Revoking an allowlist entry does not close an existing connection.
+   See the "Device revocation" section in `PAIRING.md`.
+2. The broader cross-device revocation specification remains incomplete.
+   The `holoiroh-pairing-ticket-exchange` PRD row tracks this work under Project Aro PRD P0-2/7.1.
 
 ## Session & rate limits (PRD 10.4)
 
@@ -949,96 +677,89 @@ this repo's convention). All four passed, in the witnessed run this
 section is based on. `cargo build` in `mac-daemon` stays warning-clean,
 with all of the above in place.
 
-## Setup (once implemented)
+## Setup
 
-**Mac side:**
-```
+### Mac
+
+```sh
 cd holoiroh/mac-daemon
 cargo run --release
-# prints an iroh ticket; share it with the iOS app
+# prints an iroh ticket; share it with the app
 ```
 
-**iOS side:**
+### iOS
 
-1. Open `holoiroh/ios` in Xcode. Or wrap it in a thin `.xcodeproj`/App
-   target that depends on this package (a pure SPM package cannot itself
-   produce an installable `.app` bundle).
-2. Build to a simulator or device.
-3. Paste or scan the ticket from the Mac.
-4. Connect.
+1. Open `holoiroh/ios/App/HoloIroh.xcodeproj` in Xcode.
+2. Select an iOS Simulator or device.
+3. Build and run the app.
+4. Paste or scan the ticket from the Mac.
+5. Compare the verification phrase with the daemon output.
+6. If the phrases match, confirm and connect.
 
 ## Running as a background service
 
-Running the daemon manually via `cargo run` only lasts as long as that
-terminal session. Closing the terminal, or logging out, kills it. For
-real remote-control use, the Mac side needs to survive terminal-close. It
-also needs to keep running across login sessions. The standard macOS
-mechanism for this is a **launchd LaunchAgent**. This repo provides one,
-at [`mac-daemon/LaunchAgent/com.holoiroh.daemon.plist`](./mac-daemon/LaunchAgent/com.holoiroh.daemon.plist).
+A daemon started with `cargo run` ends when its terminal session ends.
+Use a launchd LaunchAgent when the daemon must survive terminal closure and user login cycles.
+The repository provides [`mac-daemon/LaunchAgent/com.holoiroh.daemon.plist`](./mac-daemon/LaunchAgent/com.holoiroh.daemon.plist).
 
 ### Installing the LaunchAgent
 
-1. **Build the release binary first** (the plist points at the release
-   build, not `cargo run`'s debug build):
-   ```
+1. Build the release binary.
+   The property list points to this binary, not the debug binary from `cargo run`.
+
+   ```sh
    cd holoiroh
    cargo build --release
-   # binary lands at the WORKSPACE ROOT's target/release/holoiroh-daemon
-   # (not mac-daemon/target/) -- see "Build status" above for why.
+   # binary lands at the workspace root: target/release/holoiroh-daemon
+   # it does not land in mac-daemon/target/
    ```
-2. **Edit the plist's placeholder paths.** launchd plists do **not**
-   expand `~` or `$HOME` in `<string>` values. So
-   `com.holoiroh.daemon.plist`'s `ProgramArguments`,
-   `WorkingDirectory`, `StandardOutPath`, and `StandardErrorPath` entries
-   all contain a literal `/Users/YOUR_USERNAME/...` placeholder prefix.
-   This prefix covers both the repo-checkout path and your home
-   directory; this doc uses it separately for the binary/working-dir
-   paths, and for the `~/Library/Logs` paths. You must replace this
-   placeholder with real absolute paths before installing.
 
-   Run this command from inside `holoiroh/` (right after the `cd
-   holoiroh` in step 1). The plist's placeholder already has
-   `/holoiroh/...` baked on after the `.../Documents/agentOS` portion.
-   So the substitution needs the **parent** of the current directory
-   (`cd .. && pwd`), not `pwd` itself. Otherwise the result duplicates
-   the `holoiroh` path segment. This single command substitutes **both**
-   placeholder forms in one pass, since
-   `/Users/YOUR_USERNAME/Documents/agentOS` is itself a prefix of
-   `/Users/YOUR_USERNAME`:
-   ```
+2. Replace the placeholder paths in the property list.
+   Launchd does not expand `~` or `$HOME` inside `<string>` values.
+   Replace every literal `/Users/YOUR_USERNAME/...` prefix with an absolute path.
+   These placeholders occur in `ProgramArguments`, `WorkingDirectory`, `StandardOutPath`, and `StandardErrorPath`.
+
+   Run the following command from `holoiroh/`.
+   The first replacement uses the parent directory because the placeholder already includes `/holoiroh/`.
+   Keep the replacements in this order.
+   The specific pattern must run before the general pattern.
+
+   ```sh
    sed -i '' \
      -e "s#/Users/YOUR_USERNAME/Documents/agentOS#$(cd .. && pwd)#g" \
      -e "s#/Users/YOUR_USERNAME#$HOME#g" \
      mac-daemon/LaunchAgent/com.holoiroh.daemon.plist
    ```
-   The first `-e` must run before the second, since it is the more
-   specific pattern. If you reverse the order, the second rule consumes
-   the prefix first. It leaves `$(pwd)/Documents/agentOS`-style
-   duplication behind. Or, simply open the file and edit the four paths
-   by hand. `plutil -lint` (below) catches a typo either way.
-3. **Create the log directory first.** launchd creates the log *files*
-   on first launch, but it will not create missing *parent directories*.
-   The load silently fails to produce logs, if this directory does not
-   exist first:
-   ```
+
+   Reversing the replacements creates `$(pwd)/Documents/agentOS`-style duplication.
+   You can edit the four paths manually instead.
+   Run `plutil -lint` after either method to detect syntax errors.
+
+3. Create the log directory.
+   Launchd creates log files, but it does not create their parent directory.
+
+   ```sh
    mkdir -p ~/Library/Logs/holoiroh
    ```
-4. **Copy the plist into `~/Library/LaunchAgents/`.** This is the
-   per-user agent directory. It needs no `sudo`. The agent only runs
-   for this user, not system-wide:
-   ```
+
+4. Copy the property list into the per-user LaunchAgents directory.
+   Do not use `sudo`.
+   The LaunchAgent runs only for the current user.
+
+   ```sh
    cp mac-daemon/LaunchAgent/com.holoiroh.daemon.plist ~/Library/LaunchAgents/
    ```
-5. **Load it:**
-   ```
+
+5. Load the LaunchAgent.
+
+   ```sh
    launchctl load ~/Library/LaunchAgents/com.holoiroh.daemon.plist
    ```
-   `RunAtLoad` is `true`. So this command also starts the daemon
-   immediately; you do not need to log out and back in to see it
-   running. `KeepAlive` is `true`. So launchd relaunches the daemon
-   automatically, if it ever exits, whether from a crash or otherwise.
-   It will continue to auto-start on every subsequent login, until
-   unloaded.
+
+   `RunAtLoad` is `true`, so loading starts the daemon immediately.
+   `KeepAlive` is `true`, so launchd restarts the daemon after any exit.
+   Launchd also starts it at each later login.
+   Run `launchctl unload` to stop this behavior.
 
 ### Checking status / logs / stopping
 
@@ -1060,300 +781,251 @@ launchctl unload ~/Library/LaunchAgents/com.holoiroh.daemon.plist
 launchctl load ~/Library/LaunchAgents/com.holoiroh.daemon.plist
 ```
 
-The daemon is `KeepAlive`d, and prints its iroh ticket to
-`daemon.out.log` on every (re)start, rather than to an interactive
-terminal. So pairing from the iOS app means reading the current ticket
-out of that log file, rather than watching a terminal. The ticket also
-changes on every restart, unless `IROH_SECRET` is set in
-`mac-daemon/.env` to pin a stable node identity (see "Build status"
-above).
+Because launchd redirects standard output, read the pairing block from `daemon.out.log`.
+The daemon prints the ticket, QR code, and verification phrase after each start.
+The daemon persists its generated identity in `~/.holoiroh/iroh_secret` with mode `0600`.
+This identity keeps the ticket stable across restarts.
+If set, `IROH_SECRET` overrides the persisted identity.
 
 ### iOS distribution: this can't ship to the App Store as-is
 
-`HoloIrohApp` is a remote computer-control client. It lets a phone drive
-mouse/keyboard/app actions on a Mac over the network. Apps in this
-category face heavy App Review scrutiny. Remote-access/remote-control
-apps are frequently rejected or pulled, for guideline 2.4.5(?) or general
-"apps that control other devices" concerns. An app whose entire purpose
-is remote automation of another computer is exactly the shape Apple's
-review process is most cautious about. Realistically, this is **not** an
-app you submit to the public App Store, for this project's current
-stage. There are two practical alternatives:
+`HoloIrohApp` lets a phone control mouse, keyboard, and app actions on a Mac.
+Apple reviews remote-control apps before public App Store distribution.
+The applicable guideline number requires verification against Apple's current published guidelines.
+Do not guess or record an unverified guideline number.
+For the current project stage, use TestFlight or direct Xcode installation instead:
 
 **Option A — TestFlight (recommended for beta / sharing with others)**
 
-TestFlight builds still go through **Beta App Review**. This is a
-lighter version of full App Store review, but it is still a real review,
-not a rubber stamp. So a remote-control app can still be rejected here
-too. This option is the right choice when you want to install the app on
-a device other than the one plugged into your build machine. It is also
-right when you want to share the app with a small group of testers,
-without a full public listing.
+TestFlight builds require Beta App Review for external testing.
+Internal-only testing does not require Beta App Review.
+Use TestFlight when testers cannot install directly from the development Mac.
+It also supports distribution to a small tester group without a public listing.
+A remote-control app can still fail Beta App Review.
 
-1. Wrap `holoiroh/ios` (currently a bare SwiftPM package) in an actual
-   Xcode App target/`.xcodeproj`. Only an App target, not a raw SPM
-   package, can be archived and uploaded. Set the bundle identifier,
-   version, and build number in that target.
-2. In [App Store Connect](https://appstoreconnect.apple.com), create a
-   new app record under your Apple Developer account, with a matching
-   bundle ID. This step requires an active $99/yr Apple Developer
-   Program membership.
-3. In Xcode, select `Product → Archive`. Then, in the Organizer window,
-   select `Distribute App → TestFlight & App Store → Upload`.
-4. Once processing finishes in App Store Connect, add testers. You can
-   add **internal testers**: up to 100, your own team members on the
-   Developer account. Internal-only testing needs *no* Beta App Review.
-   Or you can add **external testers**: up to 10,000, invited by email
-   or public link. External testing *does* require Beta App Review.
-   This review is typically a much faster and lighter pass than full App
-   Store review, but it can still flag a remote-control app's
-   permissions.
-5. Testers install the **TestFlight** app from the App Store. They then
-   accept your invite link, to install `HoloIrohApp` through it. Builds
-   expire after 90 days, and need re-upload.
+1. Open `holoiroh/ios/App/HoloIroh.xcodeproj`.
+   Set the bundle identifier, version, and build number in the app target.
+2. Create an app record in [App Store Connect](https://appstoreconnect.apple.com).
+   Use the same bundle identifier.
+   This path requires an active Apple Developer Program membership at $99 per year.
+3. In Xcode, select `Product → Archive`.
+   In Organizer, select `Distribute App → TestFlight & App Store → Upload`.
+4. After processing finishes, add testers in App Store Connect.
+   You can add up to 100 internal testers from your developer team.
+   Internal-only testing does not require Beta App Review.
+   You can add up to 10,000 external testers by email or public link.
+   External testing requires Beta App Review.
+   That review can reject the app because of remote-control permissions.
+5. Testers install TestFlight from the App Store.
+   They accept the invitation and install `HoloIrohApp`.
+   Builds expire after 90 days.
+   Upload a new build after expiration.
 
 **Option B — Direct Xcode device deploy (recommended for personal/solo use)**
 
-This option is simplest, if you are the only person who will ever run
-the iOS app. It involves **no App Review at all**. Apple's review process
-never sees a build you install this way.
+Use direct Xcode installation for personal use.
+This method does not use App Review.
+Apple does not review a directly installed build.
 
-1. Connect your iPhone to your Mac via USB. Or use wireless debugging,
-   once you pair the device over USB once: go to `Xcode → Window →
-   Devices and Simulators`, and check "Connect via network".
-2. Open the wrapped Xcode project for `holoiroh/ios` (see step 1 in
-   Option A). You still need an actual App target, not the bare SPM
-   package, to run it on a physical device.
-3. In the target's `Signing & Capabilities` tab, select your Apple ID
-   under `Team`. A free Apple ID works for this; Xcode will auto-create
-   a personal-use provisioning profile. A paid Developer account is
-   **not** required for this path, only for TestFlight/App Store.
-4. Select your physical iPhone as the run destination, in the top
-   toolbar device picker. Hit `Run` (`⌘R`). Xcode builds, signs, and
-   installs the app directly onto the device.
-5. On first launch, the phone will show an "Untrusted Developer" prompt.
-   Go to `Settings → General → VPN & Device Management` on the iPhone.
-   Trust your developer certificate once.
-6. **Caveat:** apps installed this way, with a free Apple ID, re-sign
-   every 7 days (the provisioning profile expiry). The app stops
-   launching after 7 days, until you reconnect and `Run` from Xcode
-   again. A paid Developer Program account extends this to 1 year per
-   build. For truly "install once and forget," only TestFlight (Option
-   A) or a paid-account direct install avoid the 7-day free-tier expiry.
+1. Connect the iPhone to the Mac with Universal Serial Bus (USB).
+   For wireless debugging, first pair the device through USB.
+   Then open `Xcode → Window → Devices and Simulators`.
+   Enable `Connect via network`.
+2. Open `holoiroh/ios/App/HoloIroh.xcodeproj`.
+   Select its app target before you choose the device.
+3. Open the target's `Signing & Capabilities` tab.
+   Select your Apple ID under `Team`.
+   Xcode creates a personal-use provisioning profile for a free Apple ID.
+   This path does not require a paid account.
+   TestFlight and App Store distribution require a paid account.
+4. Select the physical iPhone as the run destination.
+   Select Run or press `⌘R`.
+   Xcode builds, signs, and installs the app.
+5. On the first launch, the iPhone can show an Untrusted Developer prompt.
+   Open `Settings → General → VPN & Device Management`.
+   Trust the developer certificate.
+6. A free-account provisioning profile expires after 7 days.
+   After expiration, reconnect the iPhone and run the app from Xcode again.
+   A paid Developer Program account extends direct-install validity to 1 year per build.
+   TestFlight or paid-account direct installation avoids the 7-day limit.
 
-Either option requires the wrapped App target from step 1 to actually
-exist first. See the PRD-tracked row for that, in this project's task
-list. This target does not yet exist as of this writing: `holoiroh/ios`
-is still a bare `Package.swift`, with no `.xcodeproj`.
+Both distribution options use the app target in `holoiroh/ios/App/HoloIroh.xcodeproj`.
 
 ## NAT traversal and "anywhere in the world" connectivity
 
-This capability is inherited entirely from `iroh`, via `iroh-live`. It
-is **not** custom networking code in this project. The daemon and app
-just consume whatever connection `iroh`'s transport layer establishes.
-Concretely:
+Iroh provides this capability through `iroh-live`.
+The project does not implement custom traversal logic.
+The daemon and app use the path that iroh establishes.
 
-1. **Direct P2P first, with automatic hole-punching.** When a peer dials
-   an iroh ticket, `iroh` first attempts to establish a **direct** QUIC
-   connection between the two machines' public IPs and ports. It uses
-   standard NAT hole-punching techniques: coordinated simultaneous
-   outbound packets from both sides, informed by each side's observed
-   address and port from iroh's STUN-like address-discovery. This
-   attempt succeeds for the large majority of home, office, and mobile
-   networks, including most consumer NAT routers and most cellular
-   carrier NAT. When it succeeds, traffic flows **directly** between the
-   Mac and the phone, with no third-party server in the media/control
-   path at all.
-2. **Relay fallback when direct fails.** Some network configurations
-   make hole-punching impossible in principle, not just difficult. The
-   two common real-world cases are **symmetric NAT** and **CGNAT**.
-   Under symmetric NAT, the NAT maps each outbound destination to a
-   *different* external port. So the port one peer observes is not the
-   port that will actually accept the other peer's return packets. CGNAT
-   is carrier-grade NAT, common on cellular networks and some ISPs.
-   Under CGNAT, many customers share one public IP, with no way to open
-   inbound ports at all. When a direct connection cannot be established,
-   `iroh` transparently falls back to relaying traffic through one of
-   **iroh's relay servers** (n0's hosted relay fleet by default, or a
-   self-hosted relay if configured). The app layer (this daemon, this
-   iOS app, `iroh-live` itself) does not need to know or care which path
-   it got. It just sees a connected stream either way.
-3. **What "anywhere in the world" actually means, operationally.** The
-   practical claim is: **this works between any two networks that both
-   have outbound internet access**, regardless of physical distance.
-   Examples: home wifi to cellular data, one country to another,
-   corporate network to residential ISP, etc.
+1. **Attempt direct P2P first.** A peer dials an iroh ticket.
+   Iroh first attempts a direct QUIC connection between the public Internet Protocol (IP) addresses and ports.
+   It coordinates outbound packets from both peers for NAT hole-punching.
+   Iroh discovers each peer's observed address and port through a STUN-like service.
+   A successful attempt sends media and control traffic directly between the Mac and iPhone.
+   No relay carries that traffic.
+2. **Use a relay when direct connection fails.** Symmetric NAT and carrier-grade NAT (CGNAT) can prevent hole-punching.
+   Symmetric NAT can assign a different external port for each destination.
+   The observed port can therefore reject return packets from the other peer.
+   CGNAT lets many customers share one public IP address.
+   Customers generally cannot open inbound ports through CGNAT.
+   When direct connection fails, iroh uses a relay.
+   The default is n0's hosted relay fleet.
+   A deployment can configure a self-hosted relay instead.
+   The daemon, app, and `iroh-live` do not select or expose this path.
+   They receive a connected media stream in either case.
+3. **Understand the connectivity boundary.** Both networks must permit outbound internet access.
+   Physical distance does not change this requirement.
+   Examples include home Wi-Fi to cellular, international connections, and corporate-to-residential connections.
 
-   This connection does not require any of the following:
-   - the two devices to be on the same LAN
-   - port-forwarding or router configuration on either end
-   - a static or public IP on either side
+   The connection does not require:
 
-   The one caveat: when a relay is used, rather than a direct
-   connection, **latency increases**. Traffic now makes an extra hop
-   through relay infrastructure, instead of going peer-to-peer. But
-   **connectivity is preserved**. The relay fallback exists specifically
-   so that "one or both sides are behind restrictive NAT" degrades to
-   "slightly higher latency," not to "doesn't work at all." For a
-   screen-control use case, this means two cases. Expect the best case
-   (lowest latency, most responsive Remote View) when both ends can
-   hole-punch directly. Expect a still-fully-functional-but-higher-latency
-   case when either end is behind symmetric NAT/CGNAT and traffic
-   relays. Both cases are "it works," just with different
-   responsiveness.
+   - Both devices on one LAN.
+   - Port forwarding or router configuration.
+   - A static or public IP address on either device.
 
-## Inference: local, on-device only (Aro Private mode, PRD P0-11)
+   A relay adds an extra network hop.
+   This hop increases latency compared with a direct path.
+   Direct hole-punching provides the lowest-latency case.
+   Symmetric NAT or CGNAT can force the higher-latency relay case.
+   Relay availability and network policy still determine whether fallback connectivity succeeds.
 
-The alpha's **only** inference backend is a local model, served on this
-Mac. There is no cloud inference code path (Project Aro PRD row P0-11).
-Concretely, the daemon (`mac-daemon/src/local_model.rs`) manages a
-[`llama.cpp`](https://github.com/ggml-org/llama.cpp) `llama-server`
-subprocess:
+## Inference: hosted default and opt-in Aro Private mode
+
+The daemon uses Holo's configured hosted backend by default.
+Set `HOLOIROH_LOCAL_MODEL=1`, `true`, or `yes` to enable local inference.
+In local inference mode, `mac-daemon/src/local_model.rs` manages this [`llama.cpp`](https://github.com/ggml-org/llama.cpp) process:
 
 ```text
 llama-server -hf Hcompany/Holo-3.1-35B-A3B-GGUF:Q4_K_M --host 127.0.0.1 --port 8080
 ```
 
-- **`-hf …:Q4_K_M`** resolves the already-downloaded GGUF from this machine's
-  Hugging Face cache. The repo ships a vision projector (`mmproj.f16.gguf`)
-  alongside the weights, and `-hf` auto-loads it. Holo3.1 is a *vision*
-  model; desktop screenshots are the input. So the projector is
-  load-bearing, and the daemon deliberately does **not** pass
-  `--no-mmproj`.
-- **`--host 127.0.0.1`** binds loopback only. The command builder never
-  emits any other host. So the inference endpoint is unreachable off-box.
-- The OpenAI-compatible base URL is **`http://127.0.0.1:8080/v1`**. The
-  port is overridable via `HOLOIROH_LOCAL_MODEL_PORT`; it must differ
-  from the `holo serve` A2A port, `HOLOIROH_HOLO_PORT` (default `8765`).
+- **`-hf …:Q4_K_M`** resolves the downloaded GGUF from this Mac's Hugging Face cache.
+  The repository places `mmproj.f16.gguf` beside the weights.
+  The `-hf` option loads this vision projector automatically.
+  Holo3.1 uses desktop screenshots as vision input.
+  The projector is required.
+  The daemon does not pass `--no-mmproj`.
+- **`--host 127.0.0.1`** binds only to loopback.
+  The command builder cannot emit another host.
+  Remote systems cannot reach this inference endpoint.
+- `llama-server` listens on `http://127.0.0.1:8080`.
+  `HOLOIROH_LOCAL_MODEL_PORT` can override this port.
+  It must differ from the `holo serve` A2A port.
+  `HOLOIROH_HOLO_PORT` controls that port and defaults to `8765`.
+- Holo does not receive the direct server URL.
+  The daemon starts a second loopback-only proxy on an ephemeral port.
+  It gives Holo the proxy's `/v1` URL.
+  The proxy forces `cache_prompt: true`.
+  It replaces each caller token limit with `n_predict: 512`.
+  `HOLOIROH_LOCAL_MAX_TOKENS` accepts values from 1 through 2048.
+  The proxy rejects malformed or oversized requests.
+  It preserves streamed Server-Sent Events (SSE) responses.
 
-The daemon (`mac-daemon/src/holo_bridge/process.rs`) points `holo serve`
-at that local endpoint. `holo serve` is the A2A front-end the control
-channel forwards prompts to. The daemon passes `holo serve --base-url
-http://127.0.0.1:8080/v1`, and also sets the `HAI_AGENT_RUNTIME_BASE_URL`
-environment variable. That specific env var, not `HAI_BASE_URL`, is the
-one that redirects **model inference** in `holo-desktop-cli`. This fact
-is verified directly against its installed source:
+`mac-daemon/src/holo_bridge/process.rs` points `holo serve` at the constrained local proxy.
+It passes the proxy URL through `--base-url` and `HAI_AGENT_RUNTIME_BASE_URL`.
+Only `HAI_AGENT_RUNTIME_BASE_URL` redirects model inference in `holo-desktop-cli`.
+`HAI_BASE_URL` does not perform this function.
+The installed source provides this evidence:
 
 - `cli/agent_api.py` maps `--base-url` to `HAI_AGENT_RUNTIME_BASE_URL`.
-- `agent_client/launcher.py` propagates it to the runtime child, and
-  *removes `HAI_API_KEY`*, so the hosted key cannot leak.
-- `agent_client/model_gateway.py` shows `HAI_BASE_URL` only overrides
-  the cloud *entitlement-probe gateway region*, not inference.
+- `agent_client/launcher.py` sends it to the runtime child.
+  It removes `HAI_API_KEY`, which prevents hosted-key disclosure.
+- `agent_client/model_gateway.py` uses `HAI_BASE_URL` only for the cloud entitlement-probe gateway region.
 
-The daemon also removes `HAI_API_KEY` from the `holo serve` child's
-environment, on the local path. So the no-cloud guarantee does not
-depend on the CLI's own popping logic firing.
+On the local path, the daemon also removes `HAI_API_KEY` from the `holo serve` child environment.
+The no-cloud property therefore does not depend only on the command's removal logic.
 
-**What is verified in-repo vs. benchmarked separately.** The command
-construction and env wiring above are real. `cargo run --example
-local_model_probe` witnesses them: it builds the exact `llama-server` and
-`holo serve` commands the daemon spawns, and prints and asserts their
-argv and env, **without spawning the model**. A full live model-serving
-run is intentionally *not* part of that verification. The GGUF is ~21 GB,
-and takes minutes plus large RAM to load. So re-running it every build is
-wasteful. The real end-to-end latency of actually serving it locally
-(**8.3 s/step at 720p** on this Apple M3 Pro / 36 GB Mac) is measured and
-discussed honestly in [`BENCHMARKS.md`](./BENCHMARKS.md), not re-derived
-by the build/probe path.
+The repository provides executable witnesses for command, environment, and request-rewrite behavior.
+`local_model_probe` checks process arguments without loading the model.
+`local_llama_proxy_probe` uses a fake loopback upstream.
+It checks the token cap, cache flag, body limit, header filtering, SSE streaming, and deadlines.
+It also checks that raw prompts are absent.
+These probes do not run a live model server.
+The GGUF is approximately 21 GB.
+It requires substantial memory and several minutes to load.
+Running it during every build would waste resources.
+[`BENCHMARKS.md`](./BENCHMARKS.md) records the separate end-to-end measurement.
+That measurement observed 8.3 seconds per step at 720p on an Apple M3 Pro Mac with 36 GB.
 
-## Aro Confidential Cloud (Tinfoil) — live in alpha, diverging from PRD row P0-11
+## Aro Confidential Cloud (Tinfoil) — live, attested, and opt-in
 
-This section previously said Tinfoil was deferred entirely to beta, and
-not wired into any code path. That statement was already stale by the
-time this repo corrected it here. Commits `5c4c91f` and `54af62a` wired a
-Tinfoil rate-limit fallback, and clarifying-questions inference, into the
-alpha build before this update. This build now wires Tinfoil into six
-code paths total. All six are gated on `TINFOIL_API_KEY` being set in the
-gitignored `holoiroh/mac-daemon/.env`. Each is independently optional:
-absence disables that one feature, logs the absence, and never causes a
-startup failure:
+Tinfoil support is live when `mac-daemon/.env` contains `TINFOIL_API_KEY`.
+Git ignores this environment file.
+At startup, the daemon creates one shared, origin-bound `tinfoil-rs` client.
+The client verifies the current Sigstore release identity and enclave attestation.
+It also verifies the endpoint certificate and attestation-hash binding.
+It permits egress only after successful verification.
+A 30-second deadline prevents optional attestation from blocking daemon startup.
+A verification failure disables Tinfoil.
+The daemon does not use an unverified endpoint.
 
-- **`tinfoil_proxy.rs`**: rate-limit fallback to `kimi-k2-6`, when the H
-  Company hosted backend 429s. This is a loopback auth-injecting proxy;
-  see that module's doc for why a proxy is the only workable auth path.
-- **`clarify.rs`**: clarifying-questions inference, before an ambiguous
-  instruction runs.
-- **`tinfoil_documents.rs`**: document-to-markdown conversion
-  (`/v1/convert/file`), for attached PDFs, DOCX, PPTX, XLSX, HTML, and
-  CSV files.
-- **`tinfoil_vision.rs`**: image analysis (`qwen3-vl-30b`/`gemma-4-31b`).
-  This analysis routes through `privacy.rs`'s on-device OCR and
-  redaction, before upload.
-- **`tinfoil_audio.rs`**: audio transcription (`voxtral-small-24b`), and
-  text-to-speech (`qwen3-tts`). Transcription is opt-in. It is scoped to
-  the client's own microphone capture only, never system or speaker
-  audio (see `tinfoil_audio.rs`'s module doc).
-- **`tinfoil_planner.rs`**: agentic task planning via tool-calling
-  (`glm-5.2`). It proposes a step list for the user to review, before
-  anything executes. It composes over the `ComputerUseExecutor` seam,
-  rather than reaching into it.
+The authenticated control channel sends verified evidence to the app.
+This evidence contains the host, code fingerprint, enclave fingerprint, Transport Layer Security (TLS) key, and HPKE key.
+It also contains the attestation binding.
+The Verification Center displays this evidence for the current session.
+The app clears it after disconnection, failure, or reconnection.
+Evidence from one Mac therefore cannot remain attached to another session.
+The bearer key remains on the Mac.
 
-**This directly conflicts with PRD row P0-11**: "the alpha binary must
-contain no cloud inference code path at all, verified by egress audit."
-It also conflicts with section 7.4/P1-3/Launch Gates 7-8's scoping of
-Confidential Cloud to beta. That conflict already existed silently,
-before this update. It is now large enough — six modules, not one
-fallback path — that it needs an explicit product decision, rather than
-another silent README correction. This decision has two options:
+The shared attested transport serves these paths:
 
-1. P0-11 is deliberately superseded for this build. In this case, the
-   PRD itself should be updated to say so. The beta-only deployment
-   requirements below (attestation, request minimization,
-   no-silent-fallback) should move up to apply now.
-2. This work is gated behind a build flag that reproduces alpha's
-   original no-cloud posture.
+- `tinfoil_proxy.rs`: optional rate-limit fallback to `kimi-k2-6`.
+- `clarify.rs`: clarifying-question inference.
+- `tinfoil_documents.rs`: document-to-markdown conversion.
+- `tinfoil_vision.rs`: image analysis with `gemma4-31b` or `kimi-k2-6`.
+  The device redacts text, personally identifiable information (PII), and faces before egress.
+  A processing error blocks egress.
+- `tinfoil_audio.rs`: optional microphone transcription with `voxtral-small-24b`.
+  It also provides speech synthesis with `qwen3-tts`.
+  The app does not request a digital system-audio mix.
+  Microphone recordings can include nearby ambient or speaker audio.
+- `tinfoil_planner.rs`: `glm-5-2` tool calling that returns a reviewable plan.
+  Planning does not execute the proposed desktop actions.
 
-This README flags this conflict here, rather than resolving it
-unilaterally, since it is a scope/compliance call, not an implementation
-one.
+Documents, images, recordings, and plans require explicit app actions.
+Request identifiers match late responses to the active sheet.
+The code bounds control frames, cloud-operation concurrency, recording duration, and recording size.
+It also bounds Hypertext Transfer Protocol (HTTP) operations and attestation bodies.
+Diagnostics contain bounded metadata and digests.
+They do not contain prompts, attachments, images, audio, or transcripts.
 
-None of the above is TEE-attested today. Every Tinfoil call is a plain
-HTTPS request with a bearer key; it has no client-side enclave
-attestation verification. See
-`verification-center-bridge`/`verification-center-webview`, in this
-repo's PRD history, for the in-progress Verification Center UI work.
-This work is the first step toward the attestation guarantee the beta
-deployment requirements table calls for. When beta work formally begins,
-the deployment requirements table's other items remain real build items:
-
-- Tinfoil Containers deployment (Aro-controlled immutable image in an
-  NVIDIA GPU TEE enclave)
-- a strict no-silent-fallback-to-non-confidential-endpoint guarantee
+This capability replaces the old P0-11 claim that the alpha binary has no cloud-inference path.
+The configured hosted Holo backend remains the default.
+Local inference remains an explicit opt-in mode.
+Tinfoil features require `TINFOIL_API_KEY` and an explicit user action.
+Product and compliance documents must describe confidential-inference egress as a current capability.
 
 ## Naming: `holoiroh` (technical) vs "Aro" (product)
 
-This subproject's directory, Cargo crate, and Swift package are all named
-`holoiroh`. This is a technical name that predates the product name. The
-Project Aro PRD, the authoritative spec this build follows, calls the
-product **Aro**. This name is provisional; formal trademark, App-Store,
-and domain clearance are an open question in the PRD, non-blocking until
-public beta.
+The directory, Cargo crate, and Swift package use the technical name `holoiroh`.
+This name predates the product name.
+The Project Aro PRD calls the product Aro.
+That PRD is the authoritative product specification.
+The product name remains provisional.
+The PRD defers trademark, App Store, and domain clearance until public beta.
 
-The deliberate decision is to **keep `holoiroh` as the internal/technical
-name**, and to use **"Aro" in user-facing strings**: the iOS app's
-display name, and any end-user-visible UI text. Renaming a Cargo
-workspace and Swift package mid-build has real churn cost. Also, the PRD
-itself scopes naming clearance to public-beta, not alpha. So a reader
-seeing both names should read `holoiroh` as "the repo, module, or build
-artifact," and Aro as "the product a user installs." This is not an
-inconsistency to fix. It is a scoped decision, to revisit only at the
-naming-clearance milestone the PRD defines.
+Keep `holoiroh` for internal technical identifiers.
+Use Aro for the app display name and other user-visible text.
+Renaming the Cargo workspace and Swift package during development would cause unnecessary changes.
+Treat `holoiroh` as the repository, module, or build artifact.
+Treat Aro as the installed product.
+This scoped naming decision is intentional.
+Revisit it at the PRD naming-clearance milestone.
 
 ## Contributing note: worktree isolation requires committed files first
 
-**The target files must already be committed to git, before worktree
-agents start.** This rule applies when running large refactors or
-rewrites via git-worktree-isolated agents (the pattern this project's
-build used heavily). Git worktrees only materialize tracked/committed
-content. So an agent dispatched into a fresh worktree cannot see files
-that exist only as uncommitted changes in the main checkout. It will
-correctly report the target as missing, rather than silently working
-around it.
+Commit target files before you start worktree-isolated agents.
+Git worktrees contain tracked content from the selected commit.
+A new worktree cannot contain files that exist only as uncommitted changes in the main checkout.
+The agent will report those files as missing.
 
-This rule bit the very first scaffold pass of this project: the
-`holoiroh/` tree was not committed before the first worktree agents ran.
-The fix was committing the scaffold first.
+The first scaffold pass exposed this condition.
+The `holoiroh/` tree was uncommitted before the first worktree agents started.
+Committing the scaffold resolved the failure.
 
-For the first scaffold-creation pass of any new subtree, either commit
-early, or use non-worktree agents. For any subsequent worktree-isolated
-pass, ensure the files it will edit are already committed.
+For a new subtree, use one of these methods:
+
+- Commit the scaffold before you create a worktree.
+- Use agents without worktree isolation for the scaffold pass.
+
+For later worktree passes, confirm that every target file is committed.

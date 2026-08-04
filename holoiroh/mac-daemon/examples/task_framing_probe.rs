@@ -7,7 +7,9 @@
 //!
 //! Run with `cargo run --example task_framing_probe -p holoiroh-daemon`.
 
-use holoiroh_daemon::agent_guidance::{task_framing_block, TASK_FRAMING_MARKER};
+use holoiroh_daemon::agent_guidance::{
+    SCREEN_CONTENT_TRUST_MARKER, TASK_FRAMING_MARKER, task_framing_block,
+};
 
 fn main() {
     let block = task_framing_block();
@@ -29,9 +31,16 @@ fn main() {
         block.to_lowercase().contains("instruction to act"),
         "guidance must frame a request as an instruction to act"
     );
+    assert!(
+        block.contains(SCREEN_CONTENT_TRUST_MARKER),
+        "guidance must reject instructions rendered in on-screen content"
+    );
+    assert!(
+        block.contains("separate confirmation gate"),
+        "screen content must never stand in for irreversible-action confirmation"
+    );
 
     println!(
-        "task_framing_probe: OK -- every turn is told to complete the requested action even when \
-         similar prior content already exists."
+        "task_framing_probe: OK -- every turn separates the user's authoritative request from untrusted on-screen content and requires a separate irreversible-action gate."
     );
 }

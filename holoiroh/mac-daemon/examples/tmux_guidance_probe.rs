@@ -1,11 +1,13 @@
 use holoiroh_daemon::tmux::{
-    terminal_work_guidance_for, SessionState, HOST_TERMINAL_APP, SESSION_NAME, WINDOW_TITLE,
+    HOST_TERMINAL_APP, SESSION_NAME, SessionState, WINDOW_TITLE, terminal_work_guidance_for,
 };
 
 const STATES: &[(&str, SessionState)] = &[
     (
         "attached",
-        SessionState::RunningWithAttachedWindow { attached_clients: 1 },
+        SessionState::RunningWithAttachedWindow {
+            attached_clients: 1,
+        },
     ),
     ("no-window", SessionState::RunningWithNoWindowAttached),
     ("tmux-absent", SessionState::TmuxNotInstalled),
@@ -144,5 +146,7 @@ fn main() {
         println!("{module}: no stale routing copy in source");
     }
 
-    println!("\nVERDICT: OK -- one destination for the agent's terminal work, in every state, Ghostty is protected rather than nominated, and no stale copy survives in source");
+    println!(
+        "\nVERDICT: OK -- one destination for the agent's terminal work, in every state, Ghostty is protected rather than nominated, and no stale copy survives in source"
+    );
 }

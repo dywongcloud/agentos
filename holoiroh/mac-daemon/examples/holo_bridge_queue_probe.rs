@@ -67,7 +67,9 @@ async fn main() {
         async {
             tokio::time::sleep(Duration::from_millis(20)).await;
             let (busy, queued) = bridge.busy_state();
-            println!("  [t=20ms, before sending second] busy_state() -> busy={busy} queued={queued}");
+            println!(
+                "  [t=20ms, before sending second] busy_state() -> busy={busy} queued={queued}"
+            );
             bridge
                 .handle(ControlMessage::Prompt {
                     request_id: "second".to_string(),
@@ -85,9 +87,15 @@ async fn main() {
         .iter()
         .find(|e| matches!(e, ControlEvent::Queued { request_id, .. } if request_id == "second"));
     println!("Queued event for 'second' -> {queued:?}");
-    assert!(queued.is_some(), "expected a Queued event for the second (racing) prompt");
+    assert!(
+        queued.is_some(),
+        "expected a Queued event for the second (racing) prompt"
+    );
     if let Some(ControlEvent::Queued { ahead, .. }) = queued {
-        assert_eq!(*ahead, 0, "second prompt was the only one queued behind the first");
+        assert_eq!(
+            *ahead, 0,
+            "second prompt was the only one queued behind the first"
+        );
     }
     let terminal_ids: Vec<&str> = events
         .iter()
@@ -161,8 +169,14 @@ async fn main() {
         let done = events.iter().find(|e| {
             matches!(e, ControlEvent::Done { request_id, status: holoiroh_daemon::holo_bridge::control::DoneStatus::Canceled, .. } if request_id == id)
         });
-        println!("Done{{Canceled}} event for '{id}' -> present={}", done.is_some());
-        assert!(done.is_some(), "expected queued prompt {id} to get a terminal Done{{Canceled}} event from Stop");
+        println!(
+            "Done{{Canceled}} event for '{id}' -> present={}",
+            done.is_some()
+        );
+        assert!(
+            done.is_some(),
+            "expected queued prompt {id} to get a terminal Done{{Canceled}} event from Stop"
+        );
     }
     let (busy_after, queued_after) = bridge.busy_state();
     println!("busy_state() after stop -> busy={busy_after} queued={queued_after}");
@@ -212,7 +226,11 @@ async fn main() {
     });
     println!("q1_ahead={q1_ahead:?} q2_ahead={q2_ahead:?}");
     assert_eq!(q1_ahead, Some(0), "q1 was queued first, 0 ahead of it");
-    assert_eq!(q2_ahead, Some(1), "q2 was queued second, 1 (q1) ahead of it");
+    assert_eq!(
+        q2_ahead,
+        Some(1),
+        "q2 was queued second, 1 (q1) ahead of it"
+    );
 
     println!();
     println!(

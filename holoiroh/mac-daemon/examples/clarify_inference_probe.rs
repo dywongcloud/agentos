@@ -7,7 +7,10 @@
 //!
 //! Run from the repo root: `cargo run --example clarify_inference_probe -p holoiroh-daemon`.
 
+use std::sync::Arc;
+
 use holoiroh_daemon::clarify::{ClarifyConfig, generate_clarifying_questions};
+use holoiroh_daemon::tinfoil_client::TinfoilClient;
 
 fn load_key() -> Option<String> {
     let env = std::fs::read_to_string("mac-daemon/.env").ok()?;
@@ -28,11 +31,15 @@ async fn main() {
         println!("no TINFOIL_API_KEY in mac-daemon/.env -- skipping (clarification disabled)");
         std::process::exit(3);
     };
-    let config = ClarifyConfig::new(key);
+    let client = TinfoilClient::new(key)
+        .await
+        .expect("Tinfoil attestation must verify before clarification");
+    let config = ClarifyConfig::new(Arc::new(client));
     println!("clarify model: {}", config.model());
 
     let ambiguous =
-        generate_clarifying_questions("send a message to the team about the meeting", &config).await;
+        generate_clarifying_questions("send a message to the team about the meeting", &config)
+            .await;
     println!("ambiguous -> {} question(s)", ambiguous.len());
     for q in &ambiguous {
         println!("  Q: {} | options: {:?}", q.question, q.options);
@@ -41,7 +48,10 @@ async fn main() {
     let clear = generate_clarifying_questions("open the Safari app", &config).await;
     println!("clear -> {} question(s)", clear.len());
 
-    assert!(!ambiguous.is_empty(), "an ambiguous prompt must yield clarifying questions");
+    assert!(
+        !ambiguous.is_empty(),
+        "an ambiguous prompt must yield clarifying questions"
+    );
     assert!(ambiguous.len() <= 3, "questions capped at 3");
     for q in &ambiguous {
         assert!(q.options.len() <= 3, "options capped at 3 per question");
@@ -49,7 +59,9 @@ async fn main() {
     }
 
     if clear.is_empty() {
-        println!("clarify_inference_probe: OK -- ambiguous produced structured questions, clear produced none");
+        println!(
+            "clarify_inference_probe: OK -- ambiguous produced structured questions, clear produced none"
+        );
     } else {
         println!(
             "clarify_inference_probe: OK (partial) -- ambiguous produced questions; the clear prompt also produced {} (model non-determinism, still capped/valid)",

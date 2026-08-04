@@ -67,11 +67,23 @@ pub struct ProcessInfo {
 /// shared `aro` session (see [`crate::tmux`]). Both Ghostty and
 /// Terminal.app host CLI sessions that must be left alone.
 const PROTECTED_COMMS: &[(&str, &str)] = &[
-    ("claude", "an active Claude Code CLI session -- NEVER interrupt, close, or type into it"),
-    ("ghostty", "the Ghostty terminal (this user's default) -- may host a Claude Code session; do not close or disturb"),
-    ("terminal", "a Terminal window -- may host a CLI/Claude Code session; do not close or disturb"),
+    (
+        "claude",
+        "an active Claude Code CLI session -- NEVER interrupt, close, or type into it",
+    ),
+    (
+        "ghostty",
+        "the Ghostty terminal (this user's default) -- may host a Claude Code session; do not close or disturb",
+    ),
+    (
+        "terminal",
+        "a Terminal window -- may host a CLI/Claude Code session; do not close or disturb",
+    ),
     ("holoiroh-daemon", "the Aro daemon itself -- never touch"),
-    ("tmux", "the tmux server hosting the shared `aro` work session -- killing it destroys in-flight terminal work and the user's view of it"),
+    (
+        "tmux",
+        "the tmux server hosting the shared `aro` work session -- killing it destroys in-flight terminal work and the user's view of it",
+    ),
 ];
 
 /// Enumerate running processes via `ps`. Flag protected ones.
@@ -97,8 +109,12 @@ pub fn enumerate() -> Vec<ProcessInfo> {
         // line as the full command -- robust against command paths that themselves contain
         // spaces (e.g. `/Applications/Some App.app/...`).
         let mut tokens = line.split_whitespace();
-        let (Some(pid_s), Some(ppid_s)) = (tokens.next(), tokens.next()) else { continue };
-        let (Ok(pid), Ok(ppid)) = (pid_s.parse::<u32>(), ppid_s.parse::<u32>()) else { continue };
+        let (Some(pid_s), Some(ppid_s)) = (tokens.next(), tokens.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid_s.parse::<u32>(), ppid_s.parse::<u32>()) else {
+            continue;
+        };
         // The command is the remainder of the iterator AFTER pid+ppid -- collected (not sliced
         // by `line.find`, which would false-match a digit substring, e.g. `find("1")` hitting
         // the `1` inside pid `613`). Interior arg spacing is collapsed to single spaces, which
@@ -112,7 +128,11 @@ pub fn enumerate() -> Vec<ProcessInfo> {
         // like `/Applications/Ghostty.app/Contents/MacOS/ghostty` reduces to `ghostty`; a bare
         // `claude` stays `claude`.
         let first_tok = command.split_whitespace().next().unwrap_or("");
-        let comm = first_tok.rsplit('/').next().unwrap_or(first_tok).to_string();
+        let comm = first_tok
+            .rsplit('/')
+            .next()
+            .unwrap_or(first_tok)
+            .to_string();
         let haystack = command.to_lowercase();
         let mut protected = false;
         let mut reason = String::new();
@@ -146,8 +166,15 @@ pub fn protected_summary(procs: &[ProcessInfo]) -> Vec<String> {
         let key = format!("{}|{}", p.comm, p.protected_reason);
         if seen.insert(key) {
             // Count how many pids share this comm for a "(N running)" hint.
-            let count = procs.iter().filter(|q| q.protected && q.comm == p.comm).count();
-            let suffix = if count > 1 { format!(" ({count} running)") } else { String::new() };
+            let count = procs
+                .iter()
+                .filter(|q| q.protected && q.comm == p.comm)
+                .count();
+            let suffix = if count > 1 {
+                format!(" ({count} running)")
+            } else {
+                String::new()
+            };
             out.push(format!("{}{}: {}", p.comm, suffix, p.protected_reason));
         }
     }

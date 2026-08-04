@@ -1,15 +1,11 @@
 import SwiftUI
 
-/// The full-screen sheet that hosts `QRScannerView` during pairing: a live
-/// camera preview with a framing reticle, a Cancel button, and a
-/// permission-denied fallback so the user is never left staring at a black
-/// rectangle with no explanation.
-///
-/// On a successful decode it hands the raw QR string back via `onScanned`
-/// and dismisses; the caller (`PairingView`) runs `PairingTicket.extract`
-/// on it and auto-fills the ticket field.
+/// Presents a full-screen Quick Response (QR) scanner during pairing.
+/// The sheet includes a camera preview, reticle, Cancel action, and permission guidance.
+/// After decoding, the sheet calls `onScanned` with the raw string and dismisses.
+/// `PairingView` extracts and fills the ticket.
 struct QRScannerSheet: View {
-    /// Called on the main thread with the decoded QR string.
+    /// The scanner calls this closure on the main thread with the decoded QR string.
     let onScanned: (String) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -36,7 +32,9 @@ struct QRScannerSheet: View {
                 }
             }
             .navigationTitle("Scan the Mac's QR")
+            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
@@ -45,7 +43,7 @@ struct QRScannerSheet: View {
         }
     }
 
-    /// A simple square framing guide so the user knows where to aim.
+    /// Shows a square aiming guide over the camera preview.
     private var reticle: some View {
         RoundedRectangle(cornerRadius: 16)
             .strokeBorder(Color.white.opacity(0.9), lineWidth: 3)
@@ -54,9 +52,8 @@ struct QRScannerSheet: View {
             .accessibilityHidden(true)
     }
 
-    /// Shown when camera access is denied/restricted — actionable guidance
-    /// plus the always-available paste fallback (the user can Cancel back to
-    /// the paste field).
+    /// Shows camera-permission guidance.
+    /// The user can cancel and paste the ticket instead.
     private var deniedView: some View {
         VStack(spacing: 16) {
             Image(systemName: "video.slash")

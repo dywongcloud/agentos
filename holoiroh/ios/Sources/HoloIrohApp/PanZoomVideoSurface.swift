@@ -1,32 +1,10 @@
 import SwiftUI
 
-/// The gesture-transform-affected slice of the live-share video: the
-/// `VideoRenderView` itself, scaled/offset by the current pinch/pan, plus the
-/// zoom badge that displays that same live scale.
-///
-/// Extracted out of `MainView.videoOverlay` (previously inline) to fix the
-/// live-reported "panning and scrolling is choppy" performance bug: pinch and
-/// pan gestures update `@GestureState` at touch-tracking frequency (up to
-/// 60-120Hz on ProMotion devices). When those `@GestureState` properties lived
-/// directly on `MainView` -- a single ~2200-line `View` whose `body` also
-/// builds the orb background, task pills, command bar, and log panel --
-/// SwiftUI had to re-evaluate and re-diff that ENTIRE tree on every single
-/// gesture tick, not just the small video-transform subtree that actually
-/// needed to change. SwiftUI's dependency tracking is scoped per-View-struct:
-/// moving `pinchScale`/`panDrag` (and everything that reads them) into this
-/// dedicated child means a gesture tick now only re-evaluates THIS struct's
-/// own (much smaller) `body`, leaving `MainView.body` untouched.
-///
-/// `MainView.videoOverlay` still owns and chains on every OTHER overlay
-/// (fullscreen toggle, RemoteControlSurface, remote-control toggle/banner,
-/// remote-type bar), applied as modifiers on this struct's rendered output.
-///
-/// Those overlays sit OUTSIDE the scaled subtree, which is why
-/// `RemoteControlSurface` is handed the committed zoom/pan and undoes them via
-/// the shared `VideoViewportTransform`: UIKit delivers it untransformed
-/// viewport coordinates while the video beneath it is scaled and offset. This
-/// doc previously claimed no other overlay depended on the transform; that
-/// claim is what left zoomed aiming sending the cursor to the wrong place.
+/// Renders the media stream with local pan and zoom gestures.
+/// This view owns intermediate gesture state.
+/// The parent owns committed pan and zoom values.
+/// The parent applies controls and other overlays outside the transformed video.
+/// `RemoteControlSurface` uses the same transform to map viewport coordinates.
 struct PanZoomVideoSurface: View {
     let frameSource: VideoFrameSource
     let viewport: CGSize
@@ -35,9 +13,11 @@ struct PanZoomVideoSurface: View {
     @Binding var zoomScale: CGFloat
     @Binding var panOffset: CGSize
 
-    /// The pinch currently under the user's fingers (1 while none).
+    /// Contains the active pinch scale.
+    /// The value is `1` when no pinch is active.
     @GestureState private var pinchScale: CGFloat = 1
-    /// The drag currently under the user's finger (.zero while none).
+    /// Contains the active pan translation.
+    /// The value is zero when no pan is active.
     @GestureState private var panDrag: CGSize = .zero
 
     private func clampZoom(_ value: CGFloat) -> CGFloat {
@@ -48,8 +28,8 @@ struct PanZoomVideoSurface: View {
         VideoViewportTransform.clampedPan(proposed, scale: scale, viewport: viewport)
     }
 
-    /// The rendered transform, and -- through the same type -- the one
-    /// `RemoteControlSurface` inverts to map touches back onto the desktop.
+    /// Combines committed and active gesture values.
+    /// `RemoteControlSurface` inverts this transform for coordinate mapping.
     private var liveTransform: VideoViewportTransform {
         VideoViewportTransform(
             zoom: zoomScale * pinchScale,
@@ -61,6 +41,19 @@ struct PanZoomVideoSurface: View {
     private var liveScale: CGFloat { liveTransform.scale }
 
     private var liveOffset: CGSize { liveTransform.offset }
+
+    private func recordGestureWitness(_ kind: String) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment["HOLOIROH_WITNESS_GESTURE_SURFACE"] == "1" else { return }
+        NSLog(
+            "HOLOIROH_GESTURE_WITNESS %@ zoom=%.3f pan_x=%.1f pan_y=%.1f",
+            kind,
+            zoomScale,
+            panOffset.width,
+            panOffset.height
+        )
+        #endif
+    }
 
     var body: some View {
         VideoRenderView(source: frameSource)
@@ -112,6 +105,7 @@ struct PanZoomVideoSurface: View {
                     .onEnded { value in
                         zoomScale = clampZoom(zoomScale * value)
                         panOffset = clampedPan(panOffset, scale: zoomScale, viewport: viewport)
+                        recordGestureWitness("pinch")
                     }
             )
             // Drag to pan -- only once zoomed (at fit, the drag is ignored so
@@ -141,6 +135,7 @@ struct PanZoomVideoSurface: View {
                             scale: zoomScale,
                             viewport: viewport
                         )
+                        recordGestureWitness("pan")
                     },
                 including: isControllingRemotely ? .none : .all
             )

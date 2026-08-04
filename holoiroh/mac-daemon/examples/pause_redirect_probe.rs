@@ -62,7 +62,9 @@ async fn main() {
     assert!(matches!(pause, Some(ControlMessage::Pause { ref request_id }) if request_id == "r1"));
     let resume = to_control_message("r2".into(), ClientMessage::Resume);
     println!("  Resume -> {resume:?}");
-    assert!(matches!(resume, Some(ControlMessage::Resume { ref request_id }) if request_id == "r2"));
+    assert!(
+        matches!(resume, Some(ControlMessage::Resume { ref request_id }) if request_id == "r2")
+    );
     let redirect = to_control_message(
         "r3".into(),
         ClientMessage::Redirect {
@@ -130,7 +132,10 @@ async fn main() {
         "expected the empty-redirect Error"
     );
     let (busy, queued) = bridge.busy_state();
-    assert!(!busy && queued == 0, "empty redirect must not start/queue anything");
+    assert!(
+        !busy && queued == 0,
+        "empty redirect must not start/queue anything"
+    );
 
     println!();
     println!("=== 5. pause mid-flight stashes; resume re-dispatches under the resume id ===");
@@ -187,7 +192,9 @@ async fn main() {
         .await;
     let events = drain(&mut rx).await;
     assert!(
-        statuses(&events).iter().any(|t| t.contains("no task to resume")),
+        statuses(&events)
+            .iter()
+            .any(|t| t.contains("no task to resume")),
         "double-resume must find an empty stash"
     );
 
@@ -222,7 +229,9 @@ async fn main() {
         println!("  event: {e:?}");
     }
     assert!(
-        statuses(&events).iter().any(|t| t.contains("discarded the paused task")),
+        statuses(&events)
+            .iter()
+            .any(|t| t.contains("discarded the paused task")),
         "stop must announce it discarded the paused stash"
     );
     // The stop's own terminal depends on the environment: with a real `holo`
@@ -235,7 +244,10 @@ async fn main() {
         matches!(e, ControlEvent::Done { request_id, status: DoneStatus::Canceled, .. } if request_id == "stop-b")
             || matches!(e, ControlEvent::Error { request_id, message } if request_id == "stop-b" && message.contains("holo stop"))
     });
-    assert!(stop_concluded, "stop must conclude with Done{{Canceled}} or an honest holo-stop Error");
+    assert!(
+        stop_concluded,
+        "stop must conclude with Done{{Canceled}} or an honest holo-stop Error"
+    );
     bridge
         .handle(ControlMessage::Resume {
             request_id: "resume-b".into(),
@@ -243,7 +255,9 @@ async fn main() {
         .await;
     let events = drain(&mut rx).await;
     assert!(
-        statuses(&events).iter().any(|t| t.contains("no task to resume")),
+        statuses(&events)
+            .iter()
+            .any(|t| t.contains("no task to resume")),
         "resume after stop must find nothing"
     );
 
@@ -295,7 +309,10 @@ async fn main() {
         "the redirect's own turn must run (and, here, fail on the unreachable endpoint) under its id"
     );
     let (busy, queued) = bridge.busy_state();
-    assert!(!busy && queued == 0, "everything settled after the redirect");
+    assert!(
+        !busy && queued == 0,
+        "everything settled after the redirect"
+    );
 
     println!();
     println!(

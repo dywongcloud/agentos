@@ -1,34 +1,17 @@
-//! This module adds authentication beyond ticket possession: a persisted
-//! device allowlist and a PIN check. Neither piece is wired into the
-//! control-channel accept path yet. See the "Implementation status" table
-//! in `holoiroh/PAIRING.md` for the real-vs-designed split.
+//! Persisted client-device allowlist and first-connection PIN helpers.
 //!
-//! ## Why this exists
-//!
-//! Per the "Security model" section of `holoiroh/README.md`, ticket
-//! possession alone is enough to connect today. A leaked QR screenshot or a
-//! pasted ticket string hands over full control. This module provides the
-//! two building blocks that `PAIRING.md` designs to close that gap:
-//!
-//! - [`Allowlist`]: a JSON file at `~/.holoiroh/allowlist.json` that
-//!   records previously-paired client device public keys. A device seen
-//!   once, and presumably PIN-verified at that time, can reconnect without
-//!   re-entering the PIN.
-//! - [`verify_pin`]: a constant-time-ish comparison for PIN strings entered
-//!   on first connection. The PIN is exchanged out-of-band: the Mac's
-//!   terminal displays it alongside the ticket and QR code, per
-//!   `PAIRING.md`.
-//!
-//! Both are real and independently callable. Unit tests below cover both
-//! (`cargo test -p holoiroh-daemon`). This module is not a stub. Neither
-//! type is constructed or called yet from `control_channel.rs`'s
-//! `ProtocolHandler::accept`. See the "Exact remaining wiring step" section
-//! in `PAIRING.md` for the exact steps.
+//! `control_channel.rs` enforces this allowlist on every authenticated iroh
+//! connection. A correct pre-session PIN adds the transport's complete endpoint
+//! ID; later connections must match that exact 64-character lowercase value.
+//! `mac-daemon/examples/allowlist_probe.rs` and `auth_gate_probe.rs` are the
+//! executable witnesses. Legacy short or malformed IDs are quarantined during
+//! load before the active list is used.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// One previously-paired client device, as recorded in `allowlist.json`.
@@ -65,6 +48,122 @@ pub struct Allowlist {
     entries: Vec<AllowlistEntry>,
 }
 
+const DEVICE_ID_HEX_LEN: usize = 64;
+const MIGRATION_BACKUP_SUFFIX: &str = ".invalid-device-ids-v1.json";
+
+/// Returns true only for a complete lowercase iroh endpoint identifier.
+pub fn is_valid_device_id(device_id: &str) -> bool {
+    device_id.len() == DEVICE_ID_HEX_LEN
+        && device_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// Returns the deterministic sibling file used to quarantine legacy invalid IDs.
+pub fn migration_backup_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("allowlist.json");
+    path.with_file_name(format!("{file_name}{MIGRATION_BACKUP_SUFFIX}"))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating allowlist directory {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("allowlist.json");
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| {
+                format!("creating temporary allowlist file {}", temp_path.display())
+            })?;
+        file.write_all(bytes)
+            .with_context(|| format!("writing temporary allowlist file {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing temporary allowlist file {}", temp_path.display()))?;
+        std::fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "atomically replacing allowlist file {} from {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_allowlist(path: &Path, list: &Allowlist) -> Result<()> {
+    let json = serde_json::to_vec_pretty(list).context("serializing allowlist")?;
+    atomic_write(path, &json)
+}
+
+fn migrate_invalid_entries(path: &Path, list: Allowlist) -> Result<Allowlist> {
+    let (valid, invalid): (Vec<_>, Vec<_>) = list
+        .entries
+        .into_iter()
+        .partition(|entry| is_valid_device_id(&entry.device_id));
+    if invalid.is_empty() {
+        return Ok(Allowlist { entries: valid });
+    }
+
+    let backup_path = migration_backup_path(path);
+    let mut quarantined = match std::fs::read(&backup_path) {
+        Ok(bytes) => serde_json::from_slice::<Allowlist>(&bytes).with_context(|| {
+            format!(
+                "parsing existing allowlist migration backup at {}",
+                backup_path.display()
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Allowlist::default(),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading existing allowlist migration backup at {}",
+                    backup_path.display()
+                )
+            });
+        }
+    };
+    for entry in invalid {
+        if !quarantined.entries.contains(&entry) {
+            quarantined.entries.push(entry);
+        }
+    }
+
+    // The backup lands first. If replacing the active list then fails, the
+    // original active file remains intact and every invalid entry is already
+    // preserved for the next deterministic retry.
+    write_allowlist(&backup_path, &quarantined)?;
+    let active = Allowlist { entries: valid };
+    write_allowlist(path, &active)?;
+    Ok(active)
+}
+
 impl Allowlist {
     /// Default location: `~/.holoiroh/allowlist.json`. This function
     /// resolves the path via `$HOME`, not a platform-dirs crate. This
@@ -78,18 +177,20 @@ impl Allowlist {
     }
 
     /// Loads the allowlist from `path`. A missing file counts as an empty
-    /// allowlist. This is the natural state before the first device ever
-    /// pairs. A missing file is not an error. Every other I/O or parse
-    /// failure is a real error. Treating a *corrupt* file as empty fails
-    /// open: it accepts an unregistered device. This function fails closed
-    /// instead.
+    /// allowlist. Every other I/O or parse failure fails closed.
+    ///
+    /// On the first load of a legacy file, entries whose device IDs are not
+    /// complete 64-character lowercase hex endpoint IDs are atomically moved
+    /// to [`migration_backup_path`]. The active file is atomically rewritten
+    /// with every valid entry preserved. A later load is idempotent because no
+    /// invalid entries remain active.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         match std::fs::read(path) {
             Ok(bytes) => {
                 let list: Allowlist = serde_json::from_slice(&bytes)
                     .with_context(|| format!("parsing allowlist JSON at {}", path.display()))?;
-                Ok(list)
+                migrate_invalid_entries(path, list)
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Allowlist::default()),
             Err(err) => {
@@ -108,23 +209,21 @@ impl Allowlist {
         Self::load(Self::default_path()?)
     }
 
-    /// Writes the current entries to `path` as pretty-printed JSON. It
-    /// creates the parent directory, `~/.holoiroh/`, if the directory does
-    /// not exist yet. This function overwrites the whole file. It does no
-    /// partial-write or lock handling. This daemon supports exactly one
-    /// concurrent control-channel connection today, per
-    /// `control_channel.rs`'s own doc comment. So concurrent writers are
-    /// not a real scenario yet.
+    /// Atomically writes the current entries to `path` as pretty JSON.
+    /// Every active entry must contain a complete lowercase endpoint ID.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating allowlist directory {}", parent.display()))?;
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| !is_valid_device_id(&entry.device_id))
+        {
+            bail!(
+                "refusing to save invalid device id to active allowlist: {}",
+                entry.device_id
+            );
         }
-        let json = serde_json::to_vec_pretty(self).context("serializing allowlist")?;
-        std::fs::write(path, json)
-            .with_context(|| format!("writing allowlist file at {}", path.display()))?;
-        Ok(())
+        write_allowlist(path, self)
     }
 
     /// Convenience wrapper around [`Self::save`] using [`Self::default_path`].
@@ -138,23 +237,21 @@ impl Allowlist {
         self.save(Self::default_path()?)
     }
 
-    /// Returns true if `device_id` was previously paired. This check exists
-    /// for a not-yet-wired accept path. That path will call this function
-    /// before it accepts a control stream from a peer that did not just
-    /// PIN-verify this session. See [`crate::control_channel`] and
-    /// `PAIRING.md`.
+    /// Returns true only for an exact, complete endpoint-ID match. Legacy
+    /// short prefixes and malformed IDs never authenticate.
     pub fn contains_key(&self, device_id: &str) -> bool {
-        self.entries.iter().any(|e| e.device_id == device_id)
+        is_valid_device_id(device_id)
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.device_id == device_id)
     }
 
-    /// Adds `device_id` to the allowlist. If `device_id` is already
-    /// present, this function does nothing: it leaves the existing entry,
-    /// including its original `paired_at`, untouched rather than
-    /// duplicating or refreshing it. Returns `true` if this function
-    /// actually adds a new entry.
+    /// Adds a complete lowercase endpoint ID. Invalid and duplicate IDs are
+    /// rejected without changing the list.
     pub fn add_entry(&mut self, device_id: impl Into<String>, label: Option<String>) -> bool {
         let device_id = device_id.into();
-        if self.contains_key(&device_id) {
+        if !is_valid_device_id(&device_id) || self.contains_key(&device_id) {
             return false;
         }
         let paired_at = std::time::SystemTime::now()
@@ -233,10 +330,12 @@ pub fn generate_pin(digits: u32) -> String {
     for i in 0..digits {
         let mut hasher = state.build_hasher();
         hasher.write_u32(i);
-        hasher.write_u128(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0));
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
         let digit = (hasher.finish() % 10) as u8;
         pin.push((b'0' + digit) as char);
     }

@@ -65,24 +65,33 @@ fn main() {
     // --- 1. Construct the bridge (real runtime + endpoint bind + Live spawn) ---
     println!("[1] holoiroh_ios_bridge_new()");
     let bridge = unsafe { holoiroh_ios_bridge_new() };
-    assert!(!bridge.is_null(), "bridge_new returned null (construction failed)");
-    println!("    -> non-null bridge handle ({bridge:p}): runtime + iroh Endpoint + Live session up\n");
+    assert!(
+        !bridge.is_null(),
+        "bridge_new returned null (construction failed)"
+    );
+    println!(
+        "    -> non-null bridge handle ({bridge:p}): runtime + iroh Endpoint + Live session up\n"
+    );
 
     // --- 2. ticket_connect with a MALFORMED ticket -> INVALID_TICKET, clean error ---
     println!("[2] ticket_connect(\"not-a-real-ticket\")  (malformed)");
     {
         let bad = CString::new("not-a-real-ticket").unwrap();
         let mut err: *mut c_char = ptr::null_mut();
-        let status =
-            unsafe { holoiroh_ios_bridge_ticket_connect(bridge, bad.as_ptr(), &mut err) };
+        let status = unsafe { holoiroh_ios_bridge_ticket_connect(bridge, bad.as_ptr(), &mut err) };
         let msg = take_error(err);
-        println!("    -> status={status} (expected HOLOIROH_ERR_INVALID_TICKET={HOLOIROH_ERR_INVALID_TICKET})");
+        println!(
+            "    -> status={status} (expected HOLOIROH_ERR_INVALID_TICKET={HOLOIROH_ERR_INVALID_TICKET})"
+        );
         println!("    -> error string: {msg:?}");
         assert_eq!(
             status, HOLOIROH_ERR_INVALID_TICKET,
             "malformed ticket must yield HOLOIROH_ERR_INVALID_TICKET, not {status}"
         );
-        assert!(msg.is_some(), "a malformed ticket must produce an error string");
+        assert!(
+            msg.is_some(),
+            "a malformed ticket must produce an error string"
+        );
         println!("    OK: malformed ticket rejected cleanly (no panic), error string freed\n");
     }
 
@@ -110,7 +119,10 @@ fn main() {
             status, HOLOIROH_OK,
             "an unreachable ticket must not report success"
         );
-        assert!(status < 0, "failure must be a negative status, got {status}");
+        assert!(
+            status < 0,
+            "failure must be a negative status, got {status}"
+        );
         println!("    OK: unreachable ticket failed cleanly (no panic), status negative\n");
     }
 
@@ -123,8 +135,14 @@ fn main() {
         let msg = take_error(err);
         println!("    -> subscription ptr = {sub:p} (expected null)");
         println!("    -> error string: {msg:?}");
-        assert!(sub.is_null(), "subscribe on a not-connected bridge must return null");
-        assert!(msg.is_some(), "not-connected subscribe must produce an error string");
+        assert!(
+            sub.is_null(),
+            "subscribe on a not-connected bridge must return null"
+        );
+        assert!(
+            msg.is_some(),
+            "not-connected subscribe must produce an error string"
+        );
         println!("    OK: not-connected subscribe returned null cleanly\n");
     }
 
@@ -140,10 +158,19 @@ fn main() {
             kind: 0,
         };
         let mut buf = [0u8; 16];
-        let poll_null =
-            unsafe { holoiroh_ios_bridge_poll_next_frame(ptr::null_mut(), buf.as_mut_ptr(), buf.len(), &mut frame) };
+        let poll_null = unsafe {
+            holoiroh_ios_bridge_poll_next_frame(
+                ptr::null_mut(),
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut frame,
+            )
+        };
         println!("    poll_next_frame(null sub) -> {poll_null} (negative, no crash)");
-        assert!(poll_null < 0, "poll on null subscription must be a negative status");
+        assert!(
+            poll_null < 0,
+            "poll on null subscription must be a negative status"
+        );
 
         // subscribe(null bridge) -> null, no crash.
         let mut err: *mut c_char = ptr::null_mut();
@@ -156,7 +183,9 @@ fn main() {
         unsafe { holoiroh_ios_bridge_free(ptr::null_mut()) };
         unsafe { holoiroh_ios_bridge_subscription_free(ptr::null_mut()) };
         unsafe { holoiroh_ios_bridge_free_error_string(ptr::null_mut()) };
-        println!("    free(NULL) / subscription_free(NULL) / free_error_string(NULL) -> no-op, no crash");
+        println!(
+            "    free(NULL) / subscription_free(NULL) / free_error_string(NULL) -> no-op, no crash"
+        );
         println!("    OK: null args tolerated across the surface\n");
     }
 
@@ -174,21 +203,30 @@ fn main() {
         let send_status =
             unsafe { holoiroh_ios_bridge_control_send(bridge, json.as_ptr(), &mut err) };
         let send_msg = take_error(err);
-        println!("    control_send (no control_connect yet) -> {send_status} (expected HOLOIROH_ERR_NOT_CONNECTED={HOLOIROH_ERR_NOT_CONNECTED})");
+        println!(
+            "    control_send (no control_connect yet) -> {send_status} (expected HOLOIROH_ERR_NOT_CONNECTED={HOLOIROH_ERR_NOT_CONNECTED})"
+        );
         println!("    control_send error string: {send_msg:?}");
         assert_eq!(send_status, HOLOIROH_ERR_NOT_CONNECTED);
 
         let mut out_json: *mut c_char = ptr::null_mut();
         let mut poll_err: *mut c_char = ptr::null_mut();
-        let poll_status = unsafe {
-            holoiroh_ios_bridge_poll_control_event(bridge, &mut out_json, &mut poll_err)
-        };
+        let poll_status =
+            unsafe { holoiroh_ios_bridge_poll_control_event(bridge, &mut out_json, &mut poll_err) };
         let poll_msg = take_error(poll_err);
-        println!("    poll_control_event (no control_connect yet) -> {poll_status} (out_json null? {})", out_json.is_null());
+        println!(
+            "    poll_control_event (no control_connect yet) -> {poll_status} (out_json null? {})",
+            out_json.is_null()
+        );
         println!("    poll_control_event error string: {poll_msg:?}");
         assert_eq!(poll_status, HOLOIROH_ERR_NOT_CONNECTED);
-        assert!(out_json.is_null(), "poll_control_event must null out_json when not connected");
-        println!("    OK: control channel reports NOT_CONNECTED cleanly before control_connect (no panic)\n");
+        assert!(
+            out_json.is_null(),
+            "poll_control_event must null out_json when not connected"
+        );
+        println!(
+            "    OK: control channel reports NOT_CONNECTED cleanly before control_connect (no panic)\n"
+        );
     }
 
     // --- 7. teardown: free the bridge (runs live.shutdown().await) ---
@@ -196,7 +234,9 @@ fn main() {
     unsafe { holoiroh_ios_bridge_free(bridge) };
     println!("    -> freed: subscription dropped, Live session shut down, runtime dropped\n");
 
-    println!("ffi_probe: OK -- extern \"C\" construction, error paths, null-tolerance, and teardown all witnessed via real execution");
+    println!(
+        "ffi_probe: OK -- extern \"C\" construction, error paths, null-tolerance, and teardown all witnessed via real execution"
+    );
 }
 
 /// A syntactically valid `iroh-live:` ticket pointing at an offline/random

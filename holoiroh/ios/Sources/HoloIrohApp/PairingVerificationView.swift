@@ -1,30 +1,34 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
-/// The short-phrase mutual-verification step (Project Aro PRD P0-2).
+private extension Color {
+    static var pairingSecondaryBackground: Color {
+        #if canImport(UIKit)
+        Color(uiColor: .secondarySystemBackground)
+        #else
+        Color(nsColor: .controlBackgroundColor)
+        #endif
+    }
+}
+
+/// Blocks connection until the user verifies the ticket phrase.
 ///
-/// After a ticket is scanned or pasted, this screen shows the verification
-/// phrase derived from that ticket (`PairingPhrase`) and asks the user to
-/// confirm it matches the phrase the **Mac** is displaying next to its QR.
-/// Only an explicit "matches" advances to connecting; a "doesn't match"
-/// aborts, because a mismatch means the ticket the phone holds is not the
-/// ticket the Mac published — the signature of a man-in-the-middle who
-/// substituted the QR.
-///
-/// This is deliberately a *blocking gate*: `onConfirmed` is the only path
-/// forward, and the caller must not connect until it fires. The phrase is
-/// derived purely and deterministically, so the same ticket always shows the
-/// same phrase here and (once the daemon side is wired — see
-/// `holoiroh/ios/PAIRING_PHRASE.md`) on the Mac.
+/// The app derives the phrase from the ticket.
+/// The daemon displays the same phrase beside its pairing code.
+/// A match calls `onConfirmed`.
+/// A mismatch or cancellation calls `onRejected`.
 struct PairingVerificationView: View {
-    /// The canonical ticket being verified. The phrase is derived from this.
+    /// Provides the ticket used to derive the verification phrase.
     let ticket: String
 
-    /// Called when the user confirms the phrase matches the Mac's — the only
-    /// path that should lead to an actual connection.
+    /// Runs only after the user confirms that both phrases match.
     let onConfirmed: () -> Void
 
-    /// Called when the user reports a mismatch, or cancels — pairing must be
-    /// abandoned (do not connect).
+    /// Runs after a mismatch or cancellation. The caller must abandon pairing.
     let onRejected: () -> Void
 
     private var words: [String] {
@@ -77,7 +81,9 @@ struct PairingVerificationView: View {
                 .padding(.bottom, 24)
             }
             .navigationTitle("Verify pairing")
+            #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { onRejected() }
@@ -86,7 +92,7 @@ struct PairingVerificationView: View {
         }
     }
 
-    /// The derived words rendered as a wrapping row of chips.
+    /// Displays the derived phrase as a wrapping row of word chips.
     private var phraseChips: some View {
         // A simple wrapping layout: for 4 short words a single HStack is
         // enough on any iPhone width, but allow it to wrap defensively.
@@ -97,7 +103,7 @@ struct PairingVerificationView: View {
                     .monospaced()
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
-                    .background(Color(.secondarySystemBackground))
+                    .background(Color.pairingSecondaryBackground)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .accessibilityLabel("Pairing word: \(word)")
             }
@@ -106,9 +112,7 @@ struct PairingVerificationView: View {
     }
 }
 
-/// A minimal wrapping horizontal layout (iOS 16+ `Layout`), so the phrase
-/// chips wrap to a new line on narrow widths rather than clipping. Kept tiny
-/// and local — the app has no general flow-layout need beyond this.
+/// Wraps phrase chips on narrow layouts. The app uses this layout only for pairing verification.
 private struct FlowRow: Layout {
     var spacing: CGFloat = 8
 

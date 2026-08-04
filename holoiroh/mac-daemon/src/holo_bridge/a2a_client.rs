@@ -345,7 +345,9 @@ impl A2aClient {
         }
 
         if !terminal_reached {
-            bail!("holo serve closed the message/stream connection before a terminal task state was observed");
+            bail!(
+                "holo serve closed the message/stream connection before a terminal task state was observed"
+            );
         }
 
         resolved_context_id
@@ -387,7 +389,10 @@ impl A2aClient {
             let body_text = resp.text().await.unwrap_or_default();
             bail!("holo serve tasks/cancel returned {status}: {body_text}");
         }
-        let frame: Value = resp.json().await.context("tasks/cancel response was not valid JSON")?;
+        let frame: Value = resp
+            .json()
+            .await
+            .context("tasks/cancel response was not valid JSON")?;
         if let Some(err) = frame.get("error") {
             bail!("holo serve tasks/cancel returned a JSON-RPC error: {err}");
         }
@@ -446,10 +451,12 @@ fn parse_task_event(result: &Value) -> Result<Option<TaskUpdate>> {
                     state: TerminalState::Failed,
                     message: message_text,
                 })),
-                "TASK_STATE_CANCELED" | "canceled" | "cancelled" => Ok(Some(TaskUpdate::Terminal {
-                    state: TerminalState::Canceled,
-                    message: message_text,
-                })),
+                "TASK_STATE_CANCELED" | "canceled" | "cancelled" => {
+                    Ok(Some(TaskUpdate::Terminal {
+                        state: TerminalState::Canceled,
+                        message: message_text,
+                    }))
+                }
                 // submitted / auth-required / rejected / unknown: not a case
                 // holo-desktop-cli's HoloExecutor emits (it only ever moves
                 // WORKING -> {COMPLETED,FAILED,CANCELED}), and not one this bridge has a

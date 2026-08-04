@@ -19,7 +19,9 @@ const PROBE_RUNTIME_PORT: &str = "18907";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info,holoiroh_daemon=debug").init();
+    tracing_subscriber::fmt()
+        .with_env_filter("info,holoiroh_daemon=debug")
+        .init();
     dotenvy::dotenv().ok();
     unsafe { std::env::set_var("HOLOIROH_AGENT_RUNTIME_PORT", PROBE_RUNTIME_PORT) };
 
@@ -50,7 +52,9 @@ async fn main() -> Result<()> {
     );
     bridge.control.attach_bridge(Arc::downgrade(&bridge));
 
-    println!("sending a prompt through the REAL control bridge (env-context injection should fire)...");
+    println!(
+        "sending a prompt through the REAL control bridge (env-context injection should fire)..."
+    );
     bridge
         .handle_message(ControlMessage::Prompt {
             request_id: "env-context-injection-probe".to_string(),
@@ -73,7 +77,10 @@ async fn main() -> Result<()> {
 
     let lower = answer.to_lowercase();
     let mentions_ghostty = lower.contains("ghostty");
-    println!("\n[{}] answer mentions Ghostty: {mentions_ghostty}", if mentions_ghostty { "OK" } else { "FAIL" });
+    println!(
+        "\n[{}] answer mentions Ghostty: {mentions_ghostty}",
+        if mentions_ghostty { "OK" } else { "FAIL" }
+    );
     println!("answer: {answer}");
 
     if let Ok(owned) = Arc::try_unwrap(bridge) {
@@ -88,6 +95,8 @@ async fn main() -> Result<()> {
              augmented_text wiring)"
         );
     }
-    println!("\nENV CONTEXT INJECTION: WITNESSED LIVE (the model correctly named Ghostty when asked)");
+    println!(
+        "\nENV CONTEXT INJECTION: WITNESSED LIVE (the model correctly named Ghostty when asked)"
+    );
     Ok(())
 }

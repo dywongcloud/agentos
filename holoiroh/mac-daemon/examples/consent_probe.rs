@@ -22,7 +22,7 @@ use std::env;
 use std::time::Duration;
 
 use holoiroh_daemon::control_channel::{
-    write_line, ClientMessage, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+    CONTROL_ALPN, ClientMessage, ServerMessage, TaskEnvelope, write_line,
 };
 use iroh::Endpoint;
 use iroh_live::ticket::LiveTicket;
@@ -41,8 +41,12 @@ async fn main() -> anyhow::Result<()> {
     let pin = args.next().expect("usage: consent_probe <ticket> <pin>");
     let ticket: LiveTicket = ticket_str.parse()?;
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut lines = BufReader::new(recv).lines();
 
@@ -56,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await
         {
             if let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) {
-                if matches!(&env.payload, ServerMessage::Status { text: Some(t) } if t.contains("control channel ready"))
+                if matches!(&env.payload, ServerMessage::Status { text: Some(t), .. } if t.contains("control channel ready"))
                 {
                     session_id = Some(env.session_id);
                 }
@@ -73,20 +77,20 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(task_id.clone()),
         seq,
-        ClientMessage::Prompt { text: PLANNING_ONLY.into() },
+        ClientMessage::Prompt {
+            text: PLANNING_ONLY.into(),
+        },
     );
     seq += 1;
     write_line(&mut send, &env).await?;
     println!("-> prompt ({task_id})");
 
-    let expect_hard_block =
-        std::env::var("CONSENT_PROBE_EXPECT").as_deref() == Ok("hard_block");
+    let expect_hard_block = std::env::var("CONSENT_PROBE_EXPECT").as_deref() == Ok("hard_block");
     // Which consent option to answer with ("Allow once" default; "Stop task"
     // witnesses the deny arm; the literal "none" witnesses the EXPIRY arm --
     // no answer is sent, and the probe waits out the daemon's 120s consent
     // TTL expecting the safe-pause status).
-    let answer =
-        std::env::var("CONSENT_PROBE_ANSWER").unwrap_or_else(|_| "Allow once".to_string());
+    let answer = std::env::var("CONSENT_PROBE_ANSWER").unwrap_or_else(|_| "Allow once".to_string());
 
     // Wait for real streaming progress, then trip the gate.
     let mut saw_progress = false;
@@ -121,9 +125,13 @@ async fn main() -> anyhow::Result<()> {
                     settings_opened = true;
                 }
             }
-            ServerMessage::Status { text: Some(t) } if expect_hard_block && t.contains("hard-blocked") => {
+            ServerMessage::Status { text: Some(t), .. }
+                if expect_hard_block && t.contains("hard-blocked") =>
+            {
                 println!("<- {t}");
-                println!("PASS(hard_block): watchdog stopped the turn outright for the hard-blocked category");
+                println!(
+                    "PASS(hard_block): watchdog stopped the turn outright for the hard-blocked category"
+                );
                 let env = TaskEnvelope::<ClientMessage>::wrap(
                     session_id.clone(),
                     Some(uuid::Uuid::new_v4().to_string()),
@@ -145,9 +153,14 @@ async fn main() -> anyhow::Result<()> {
                 response_options,
                 ..
             } => {
-                println!("<- input_request kind={kind:?} context={context:?} options={response_options:?}");
+                println!(
+                    "<- input_request kind={kind:?} context={context:?} options={response_options:?}"
+                );
                 assert!(
-                    matches!(kind, holoiroh_daemon::control_channel::InputRequestKind::SensitiveAccessConsent),
+                    matches!(
+                        kind,
+                        holoiroh_daemon::control_channel::InputRequestKind::SensitiveAccessConsent
+                    ),
                     "unexpected input_request kind: {kind:?}"
                 );
                 assert!(
@@ -181,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
             let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) else {
                 continue;
             };
-            if let ServerMessage::Status { text: Some(t) } = &env.payload {
+            if let ServerMessage::Status { text: Some(t), .. } = &env.payload {
                 if t.contains("expired with no response") {
                     println!("<- {t}");
                     break;
@@ -211,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
             let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) else {
                 continue;
             };
-            if let ServerMessage::Status { text: Some(t) } = &env.payload {
+            if let ServerMessage::Status { text: Some(t), .. } = &env.payload {
                 if t.contains("resuming") {
                     println!("<- {t}");
                     break;
@@ -231,7 +244,9 @@ async fn main() -> anyhow::Result<()> {
             .args(["-e", "tell application \"System Settings\" to quit"])
             .status();
         println!();
-        println!("consent_probe: OK -- expiry arm witnessed live: unanswered consent safe-paused, then resumed.");
+        println!(
+            "consent_probe: OK -- expiry arm witnessed live: unanswered consent safe-paused, then resumed."
+        );
         return Ok(());
     }
 
@@ -264,7 +279,7 @@ async fn main() -> anyhow::Result<()> {
             let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) else {
                 continue;
             };
-            if let ServerMessage::Status { text: Some(t) } = &env.payload {
+            if let ServerMessage::Status { text: Some(t), .. } = &env.payload {
                 if t.contains("consent denied") {
                     println!("<- {t}");
                     break;
@@ -285,7 +300,9 @@ async fn main() -> anyhow::Result<()> {
     let resume_deadline = tokio::time::Instant::now() + Duration::from_secs(420);
     while !(saw_granted && saw_resumed_progress) {
         if tokio::time::Instant::now() > resume_deadline {
-            panic!("consent-allow did not resume (granted={saw_granted}, progress={saw_resumed_progress})");
+            panic!(
+                "consent-allow did not resume (granted={saw_granted}, progress={saw_resumed_progress})"
+            );
         }
         let Ok(Ok(Some(line))) =
             tokio::time::timeout(Duration::from_secs(120), lines.next_line()).await
@@ -296,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
             continue;
         };
         match &env.payload {
-            ServerMessage::Status { text: Some(t) } if t.contains("consent granted") => {
+            ServerMessage::Status { text: Some(t), .. } if t.contains("consent granted") => {
                 println!("<- {t}");
                 saw_granted = true;
             }
@@ -321,6 +338,8 @@ async fn main() -> anyhow::Result<()> {
         .status();
 
     println!();
-    println!("consent_probe: OK -- privacy gate witnessed live: pause on sensitive app, consent ask, allow-once resume.");
+    println!(
+        "consent_probe: OK -- privacy gate witnessed live: pause on sensitive app, consent ask, allow-once resume."
+    );
     Ok(())
 }

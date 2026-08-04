@@ -19,7 +19,7 @@ use std::env;
 use std::time::Duration;
 
 use holoiroh_daemon::control_channel::{
-    write_line, ClientMessage, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+    CONTROL_ALPN, ClientMessage, ServerMessage, TaskEnvelope, write_line,
 };
 use iroh::Endpoint;
 use iroh_live::ticket::LiveTicket;
@@ -95,22 +95,32 @@ fn is_progress(env: &TaskEnvelope<ServerMessage>) -> bool {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let mut args = env::args().skip(1);
-    let ticket_str = args.next().expect("usage: holo_crash_redirect_probe <ticket> <pin>");
-    let pin = args.next().expect("usage: holo_crash_redirect_probe <ticket> <pin>");
+    let ticket_str = args
+        .next()
+        .expect("usage: holo_crash_redirect_probe <ticket> <pin>");
+    let pin = args
+        .next()
+        .expect("usage: holo_crash_redirect_probe <ticket> <pin>");
     let ticket: LiveTicket = ticket_str.parse()?;
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     println!("connected: remote={}", conn.remote_id().fmt_short());
 
     let (mut send, recv) = conn.open_bi().await?;
-    let mut wire = Wire { lines: BufReader::new(recv).lines() };
+    let mut wire = Wire {
+        lines: BufReader::new(recv).lines(),
+    };
 
     write_line(&mut send, &ClientMessage::Pin { pin }).await?;
 
     let greeting = wire
         .wait_for(Duration::from_secs(30), |env| {
-            matches!(&env.payload, ServerMessage::Status { text: Some(t) } if t.contains("control channel ready"))
+            matches!(&env.payload, ServerMessage::Status { text: Some(t), .. } if t.contains("control channel ready"))
         })
         .await
         .expect("no greeting within 30s");
@@ -128,7 +138,9 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(task_id.clone()),
         next_seq(),
-        ClientMessage::Prompt { text: PLANNING_ONLY.into() },
+        ClientMessage::Prompt {
+            text: PLANNING_ONLY.into(),
+        },
     );
     write_line(&mut send, &env).await?;
     println!("-> prompt ({task_id})");
@@ -139,10 +151,9 @@ async fn main() -> anyhow::Result<()> {
     println!("READY_FOR_KILL");
 
     // Fixed window for the external shell to SIGTERM the real holo-serve child and for the
-    // daemon's health-check to detect + respawn it (worst-case ~6s port-rebind TIME_WAIT per
-    // `process.rs`'s spawn_inner doc, plus health-check tick latency) BEFORE this probe sends
-    // its redirect -- so the redirect lands squarely inside the stale-epoch window the guard
-    // exists to catch, deterministically, without depending on the turn's own stall timing.
+    // daemon's health check to detect it and start a replacement on the inherited listener.
+    // This includes health-tick and child-startup latency before the redirect is sent into the
+    // stale-epoch window that the guard exists to catch.
     tokio::time::sleep(Duration::from_secs(12)).await;
 
     let redirect_id = uuid::Uuid::new_v4().to_string();
@@ -150,7 +161,9 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(redirect_id.clone()),
         next_seq(),
-        ClientMessage::Redirect { text: REDIRECT_TEXT.into() },
+        ClientMessage::Redirect {
+            text: REDIRECT_TEXT.into(),
+        },
     );
     write_line(&mut send, &env).await?;
     println!("-> redirect ({redirect_id}) sent after the crash window");

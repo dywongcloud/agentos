@@ -23,14 +23,23 @@ fn main() {
         let msg = ServerMessage::SecureInputState { active };
         let j = rt(&msg);
         println!("secure_input_state(active={active}) -> {j}");
-        assert!(j.contains("\"type\":\"secure_input_state\""), "wrong type tag: {j}");
-        assert!(j.contains(&format!("\"active\":{active}")), "active flag missing: {j}");
+        assert!(
+            j.contains("\"type\":\"secure_input_state\""),
+            "wrong type tag: {j}"
+        );
+        assert!(
+            j.contains(&format!("\"active\":{active}")),
+            "active flag missing: {j}"
+        );
     }
 
     let decoded: ServerMessage =
         serde_json::from_str(r#"{"type":"secure_input_state","active":true}"#)
             .expect("decode canonical secure_input_state");
-    assert!(matches!(decoded, ServerMessage::SecureInputState { active: true }));
+    assert!(matches!(
+        decoded,
+        ServerMessage::SecureInputState { active: true }
+    ));
 
     let translated = from_control_event(ControlEvent::SecureInputState { active: true });
     assert!(
@@ -46,10 +55,16 @@ fn main() {
         ServerMessage::task_done("completed", None),
         ServerMessage::auth_rejected("bad pin"),
         ServerMessage::current_ticket("iroh-live:abc/holoiroh"),
-        ServerMessage::TaskActive { paused: true, queued: 2 },
+        ServerMessage::TaskActive {
+            paused: true,
+            queued: 2,
+        },
     ] {
         let j = rt(&existing);
-        assert!(!j.contains("secure_input_state"), "existing kind polluted by new variant: {j}");
+        assert!(
+            !j.contains("secure_input_state"),
+            "existing kind polluted by new variant: {j}"
+        );
     }
 
     println!(

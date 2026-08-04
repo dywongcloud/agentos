@@ -135,6 +135,11 @@ pub const DEFAULT_LLAMA_SERVER_BIN: &str = "llama-server";
 /// `holo serve` A2A port (`main.rs`'s `holo_serve_port()`, default `8765`).
 pub const DEFAULT_LOCAL_MODEL_PORT: u16 = 8080;
 
+pub const DEFAULT_LOCAL_MAX_TOKENS: u32 = 512;
+pub const MIN_LOCAL_MAX_TOKENS: u32 = 1;
+pub const MAX_LOCAL_MAX_TOKENS: u32 = 2048;
+pub const LOCAL_MAX_TOKENS_ENV: &str = "HOLOIROH_LOCAL_MAX_TOKENS";
+
 /// The **only** host `llama-server` is ever bound to. Loopback, never caller-overridable to
 /// `0.0.0.0` or a routable address -- the local inference endpoint must not be reachable off-box.
 pub const LOOPBACK_HOST: &str = "127.0.0.1";
@@ -170,6 +175,15 @@ pub struct LocalModelConfig {
     pub model_hf_repo: String,
     /// Loopback port for the OpenAI-compatible HTTP server.
     pub port: u16,
+    /// Canonical llama-server completion-token ceiling injected by the daemon proxy.
+    pub max_tokens: u32,
+}
+
+pub fn local_max_tokens_from_value(value: Option<&str>) -> u32 {
+    value
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|tokens| (MIN_LOCAL_MAX_TOKENS..=MAX_LOCAL_MAX_TOKENS).contains(tokens))
+        .unwrap_or(DEFAULT_LOCAL_MAX_TOKENS)
 }
 
 impl Default for LocalModelConfig {
@@ -178,6 +192,7 @@ impl Default for LocalModelConfig {
             llama_server_bin: DEFAULT_LLAMA_SERVER_BIN.to_string(),
             model_hf_repo: DEFAULT_MODEL_HF_REPO.to_string(),
             port: DEFAULT_LOCAL_MODEL_PORT,
+            max_tokens: DEFAULT_LOCAL_MAX_TOKENS,
         }
     }
 }
@@ -205,6 +220,8 @@ impl LocalModelConfig {
                 }
             }
         }
+        cfg.max_tokens =
+            local_max_tokens_from_value(std::env::var(LOCAL_MAX_TOKENS_ENV).ok().as_deref());
         cfg
     }
 
@@ -374,7 +391,10 @@ impl LocalModelServer {
             }
             _ => {
                 tracing::warn!("llama-server did not exit within 5s of SIGTERM; killing");
-                self.child.kill().await.context("failed to kill llama-server")?;
+                self.child
+                    .kill()
+                    .await
+                    .context("failed to kill llama-server")?;
                 Ok(())
             }
         }

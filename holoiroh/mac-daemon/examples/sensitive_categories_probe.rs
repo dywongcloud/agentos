@@ -30,19 +30,26 @@ fn temp_path(name: &str, ext: &str) -> std::path::PathBuf {
 }
 
 fn main() {
-    println!("=== default_path / default_json_path resolve under $HOME/.holoiroh (no file written) ===");
+    println!(
+        "=== default_path / default_json_path resolve under $HOME/.holoiroh (no file written) ==="
+    );
     let home = std::env::var("HOME").expect("HOME must be set to run this probe");
     let toml_default = SensitiveCategories::default_path().expect("default_path should resolve");
-    let json_default = SensitiveCategories::default_json_path().expect("default_json_path should resolve");
+    let json_default =
+        SensitiveCategories::default_json_path().expect("default_json_path should resolve");
     println!("default_path()      -> {}", toml_default.display());
     println!("default_json_path() -> {}", json_default.display());
     assert_eq!(
         toml_default,
-        std::path::PathBuf::from(&home).join(".holoiroh").join("sensitive_categories.toml")
+        std::path::PathBuf::from(&home)
+            .join(".holoiroh")
+            .join("sensitive_categories.toml")
     );
     assert_eq!(
         json_default,
-        std::path::PathBuf::from(&home).join(".holoiroh").join("sensitive_categories.json")
+        std::path::PathBuf::from(&home)
+            .join(".holoiroh")
+            .join("sensitive_categories.json")
     );
 
     println!();
@@ -57,8 +64,16 @@ fn main() {
             c.bundle_ids.len(),
             c.setting
         );
-        assert_eq!(c.setting, CategorySetting::AlwaysAsk, "PRD default is always-ask");
-        assert!(!c.bundle_ids.is_empty(), "{} should have at least one illustrative bundle id", c.id);
+        assert_eq!(
+            c.setting,
+            CategorySetting::AlwaysAsk,
+            "PRD default is always-ask"
+        );
+        assert!(
+            !c.bundle_ids.is_empty(),
+            "{} should have at least one illustrative bundle id",
+            c.id
+        );
     }
     let expected_ids = [
         "password_managers",
@@ -72,7 +87,10 @@ fn main() {
     ];
     assert_eq!(defaults.categories.len(), expected_ids.len());
     for id in expected_ids {
-        assert!(defaults.find_by_id(id).is_some(), "missing expected category {id}");
+        assert!(
+            defaults.find_by_id(id).is_some(),
+            "missing expected category {id}"
+        );
     }
 
     println!();
@@ -80,30 +98,65 @@ fn main() {
     let onepassword = defaults.classify("com.1password.1password");
     let chrome_in_production_infra = defaults.classify("com.google.Chrome");
     let unknown = defaults.classify("com.example.totally-unrelated-app");
-    println!("classify(com.1password.1password) -> {:?}", onepassword.map(|c| &c.id));
-    println!("classify(com.google.Chrome) -> {:?}", chrome_in_production_infra.map(|c| &c.id));
-    println!("classify(com.example.totally-unrelated-app) -> {:?}", unknown.map(|c| &c.id));
-    assert_eq!(onepassword.map(|c| c.id.as_str()), Some("password_managers"));
-    assert_eq!(chrome_in_production_infra.map(|c| c.id.as_str()), Some("production_infra"));
-    assert!(unknown.is_none(), "an unrelated bundle id must not classify into any category");
+    println!(
+        "classify(com.1password.1password) -> {:?}",
+        onepassword.map(|c| &c.id)
+    );
+    println!(
+        "classify(com.google.Chrome) -> {:?}",
+        chrome_in_production_infra.map(|c| &c.id)
+    );
+    println!(
+        "classify(com.example.totally-unrelated-app) -> {:?}",
+        unknown.map(|c| &c.id)
+    );
+    assert_eq!(
+        onepassword.map(|c| c.id.as_str()),
+        Some("password_managers")
+    );
+    assert_eq!(
+        chrome_in_production_infra.map(|c| c.id.as_str()),
+        Some("production_infra")
+    );
+    assert!(
+        unknown.is_none(),
+        "an unrelated bundle id must not classify into any category"
+    );
 
     println!();
     println!("=== ConfigFormat::from_path inference ===");
     let toml_path = std::path::Path::new("/tmp/x/sensitive_categories.toml");
     let json_path = std::path::Path::new("/tmp/x/sensitive_categories.json");
     let no_ext_path = std::path::Path::new("/tmp/x/sensitive_categories");
-    println!("from_path(.toml) -> {:?}", ConfigFormat::from_path(toml_path));
-    println!("from_path(.json) -> {:?}", ConfigFormat::from_path(json_path));
-    println!("from_path(no ext) -> {:?}", ConfigFormat::from_path(no_ext_path));
+    println!(
+        "from_path(.toml) -> {:?}",
+        ConfigFormat::from_path(toml_path)
+    );
+    println!(
+        "from_path(.json) -> {:?}",
+        ConfigFormat::from_path(json_path)
+    );
+    println!(
+        "from_path(no ext) -> {:?}",
+        ConfigFormat::from_path(no_ext_path)
+    );
     assert_eq!(ConfigFormat::from_path(toml_path), ConfigFormat::Toml);
     assert_eq!(ConfigFormat::from_path(json_path), ConfigFormat::Json);
-    assert_eq!(ConfigFormat::from_path(no_ext_path), ConfigFormat::Toml, "no extension defaults to TOML");
+    assert_eq!(
+        ConfigFormat::from_path(no_ext_path),
+        ConfigFormat::Toml,
+        "no extension defaults to TOML"
+    );
 
     println!();
     println!("=== load: missing file -> defaults, not an error ===");
     let missing = temp_path("missing", "toml");
     let loaded = SensitiveCategories::load(&missing).expect("missing file should load as defaults");
-    println!("load({}) -> {} categories (no file written)", missing.display(), loaded.categories.len());
+    println!(
+        "load({}) -> {} categories (no file written)",
+        missing.display(),
+        loaded.categories.len()
+    );
     assert_eq!(loaded, SensitiveCategories::default_categories());
     assert!(!missing.exists(), "load() alone must not create the file");
 
@@ -115,7 +168,9 @@ fn main() {
     // persists, not just the bundle-id lists.
     to_save.find_by_id_mut("banking_brokerage").unwrap().setting = CategorySetting::HardBlock;
     to_save.find_by_id_mut("production_infra").unwrap().setting = CategorySetting::AlwaysAllow;
-    to_save.save(&toml_path).expect("TOML save should succeed and create parent dir");
+    to_save
+        .save(&toml_path)
+        .expect("TOML save should succeed and create parent dir");
     println!("saved to {}", toml_path.display());
     let toml_contents = std::fs::read_to_string(&toml_path).unwrap();
     println!("--- file contents (first 400 chars) ---");
@@ -129,9 +184,18 @@ fn main() {
         reloaded.find_by_id("production_infra").unwrap().setting,
         reloaded.find_by_id("password_managers").unwrap().setting,
     );
-    assert_eq!(reloaded.find_by_id("banking_brokerage").unwrap().setting, CategorySetting::HardBlock);
-    assert_eq!(reloaded.find_by_id("production_infra").unwrap().setting, CategorySetting::AlwaysAllow);
-    assert_eq!(reloaded.find_by_id("password_managers").unwrap().setting, CategorySetting::AlwaysAsk);
+    assert_eq!(
+        reloaded.find_by_id("banking_brokerage").unwrap().setting,
+        CategorySetting::HardBlock
+    );
+    assert_eq!(
+        reloaded.find_by_id("production_infra").unwrap().setting,
+        CategorySetting::AlwaysAllow
+    );
+    assert_eq!(
+        reloaded.find_by_id("password_managers").unwrap().setting,
+        CategorySetting::AlwaysAsk
+    );
     let _ = std::fs::remove_file(&toml_path);
 
     println!();
@@ -141,39 +205,67 @@ fn main() {
     to_save.find_by_id_mut("health").unwrap().setting = CategorySetting::HardBlock;
     to_save.save(&json_path).expect("JSON save should succeed");
     let json_contents = std::fs::read_to_string(&json_path).unwrap();
-    println!("saved to {} ({} bytes)", json_path.display(), json_contents.len());
-    assert!(json_contents.trim_start().starts_with('{'), "json format should actually write JSON, not TOML");
-    let reloaded_json = SensitiveCategories::load(&json_path).expect("load JSON after save should succeed");
-    println!("reloaded: health.setting={:?}", reloaded_json.find_by_id("health").unwrap().setting);
-    assert_eq!(reloaded_json.find_by_id("health").unwrap().setting, CategorySetting::HardBlock);
+    println!(
+        "saved to {} ({} bytes)",
+        json_path.display(),
+        json_contents.len()
+    );
+    assert!(
+        json_contents.trim_start().starts_with('{'),
+        "json format should actually write JSON, not TOML"
+    );
+    let reloaded_json =
+        SensitiveCategories::load(&json_path).expect("load JSON after save should succeed");
+    println!(
+        "reloaded: health.setting={:?}",
+        reloaded_json.find_by_id("health").unwrap().setting
+    );
+    assert_eq!(
+        reloaded_json.find_by_id("health").unwrap().setting,
+        CategorySetting::HardBlock
+    );
     let _ = std::fs::remove_file(&json_path);
 
     println!();
     println!("=== load_or_init: first run writes sensible defaults to disk ===");
     let init_path = temp_path("init", "toml");
     assert!(!init_path.exists());
-    let inited = SensitiveCategories::load_or_init(&init_path).expect("load_or_init should succeed");
+    let inited =
+        SensitiveCategories::load_or_init(&init_path).expect("load_or_init should succeed");
     println!(
         "load_or_init({}) -> {} categories, file now exists = {}",
         init_path.display(),
         inited.categories.len(),
         init_path.exists()
     );
-    assert!(init_path.exists(), "load_or_init must persist the defaults on first run");
+    assert!(
+        init_path.exists(),
+        "load_or_init must persist the defaults on first run"
+    );
     assert_eq!(inited, SensitiveCategories::default_categories());
 
     // Second call: file already exists, so this must load what's there (including any
     // edits), not silently overwrite with fresh defaults.
     let mut existing = SensitiveCategories::load(&init_path).unwrap();
-    existing.find_by_id_mut("identity_admin_consoles").unwrap().setting = CategorySetting::HardBlock;
+    existing
+        .find_by_id_mut("identity_admin_consoles")
+        .unwrap()
+        .setting = CategorySetting::HardBlock;
     existing.save(&init_path).unwrap();
-    let second_call = SensitiveCategories::load_or_init(&init_path).expect("second load_or_init should succeed");
+    let second_call =
+        SensitiveCategories::load_or_init(&init_path).expect("second load_or_init should succeed");
     println!(
         "second load_or_init call: identity_admin_consoles.setting={:?} (must reflect the user's edit, not reset)",
-        second_call.find_by_id("identity_admin_consoles").unwrap().setting
+        second_call
+            .find_by_id("identity_admin_consoles")
+            .unwrap()
+            .setting
     );
     assert_eq!(
-        second_call.find_by_id("identity_admin_consoles").unwrap().setting,
+        second_call
+            .find_by_id("identity_admin_consoles")
+            .unwrap()
+            .setting,
         CategorySetting::HardBlock,
         "load_or_init must not clobber an existing user-edited file"
     );
@@ -185,7 +277,10 @@ fn main() {
     std::fs::write(&corrupt_path, b"this is not valid toml {{{ at all").unwrap();
     let result = SensitiveCategories::load(&corrupt_path);
     println!("load(corrupt file) -> is_err={}", result.is_err());
-    assert!(result.is_err(), "a corrupt config must be a real error, not silently treated as defaults");
+    assert!(
+        result.is_err(),
+        "a corrupt config must be a real error, not silently treated as defaults"
+    );
     if let Err(e) = &result {
         println!("  error: {e:#}");
     }
@@ -195,8 +290,15 @@ fn main() {
     println!("=== all_bundle_ids: cross-category dedup diagnostic ===");
     let all_ids = defaults.all_bundle_ids();
     let total_listed: usize = defaults.categories.iter().map(|c| c.bundle_ids.len()).sum();
-    println!("total bundle ids listed across categories: {total_listed}, deduplicated: {}", all_ids.len());
-    assert_eq!(all_ids.len(), total_listed, "default lists are disjoint, so dedup should not drop anything");
+    println!(
+        "total bundle ids listed across categories: {total_listed}, deduplicated: {}",
+        all_ids.len()
+    );
+    assert_eq!(
+        all_ids.len(),
+        total_listed,
+        "default lists are disjoint, so dedup should not drop anything"
+    );
 
     println!();
     println!("All sensitive_categories probes passed.");

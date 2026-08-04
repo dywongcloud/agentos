@@ -1,8 +1,8 @@
 # HoloIroh control-channel protocol
 
-This document defines the JSON message schema exchanged between the iOS
-app (`ios/`) and the Mac daemon (`mac-daemon/`) over the **control
-channel**. The control channel is a second, bidirectional logical stream.
+This document defines the control channel JavaScript Object Notation (JSON)
+message schema. The app (`ios/`) and daemon (`mac-daemon/`) exchange these
+messages. The control channel is a second bidirectional logical stream.
 It runs alongside the `iroh-live` media broadcast, on the same `iroh`
 `Endpoint`. See `README.md`'s "Control channel" section and "Why iroh /
 iroh-live specifically" section for the architecture rationale.
@@ -11,17 +11,20 @@ This document is the source of truth for the wire schema. The Rust types
 that implement the schema via `serde` (`ClientMessage`, `ServerMessage`,
 `TaskEnvelope<T>`) live in the `holoiroh-wire` crate
 (`holoiroh-wire/src/lib.rs`). This lets both `mac-daemon` and `ios-bridge`
-share one definition instead of duplicating it. `ios-bridge` is the iOS
-FFI crate. It must cross-compile to `aarch64-apple-ios`. It cannot depend
+share one definition instead of duplicating it. `ios-bridge` is the iOS foreign function interface (FFI) crate. It must cross-compile to `aarch64-apple-ios`. It cannot depend
 on `mac-daemon`'s macOS-only `holo_bridge`/`audit_log` modules.
 `mac-daemon/src/control_channel.rs` re-exports them at the same
 `control_channel::{ClientMessage, ServerMessage, TaskEnvelope, ...}`
-paths. It also owns the connection-handling logic that *uses* this
-schema: the `iroh` `ProtocolHandler` impl, the PIN/allowlist auth gate,
-and per-connection sequence state. Any change here requires a matching
-change in `holoiroh-wire/src/lib.rs`, and eventually in the Swift client.
+paths. It also owns the connection-handling logic that uses this schema. This logic includes:
 
-## Project Aro PRD context: six logical streams, one implemented
+- The `iroh` `ProtocolHandler` implementation.
+- The PIN and allowlist authentication gate.
+- The per-connection sequence state.
+
+Any schema change requires a matching change in
+`holoiroh-wire/src/lib.rs`. It eventually also requires a Swift client change.
+
+## Project Aro product requirements document (PRD) context: six logical streams, one implemented
 
 The Project Aro PRD names **six** logical streams for this system: `control`,
 `pairing`, `media`, `manual_input`, `snapshot_fallback`, and `telemetry`.
@@ -37,30 +40,27 @@ itself.
 
 ## Transport
 
-- **ALPN:** `holoiroh/control/1`. This is a dedicated ALPN string. It is
-  registered on the same `iroh::Endpoint`/`iroh::protocol::Router` that
-  also serves `iroh-live`'s MoQ (`iroh-moq`) and, if enabled, gossip
-  ALPNs. See `iroh_live::Live::register_protocols`, which this project's
-  `ControlChannel::register_protocols` mirrors. The control channel uses a
-  distinct ALPN rather than a second stream multiplexed inside the media
-  `Connection`. Because of this, the control channel is its own
-  `iroh::endpoint::Connection`. It is still dialed to the *same peer*
-  (`EndpointId`) as the media broadcast, over the *same*
-  `iroh::Endpoint`. This gives it identical NAT-punched path/relay
-  fallback, and identical connection-lifecycle and reconnect story. This
-  is what "a second logical stream on the same iroh QUIC connection"
-  means in `iroh`'s connection-per-ALPN model.
+- **Application-Layer Protocol Negotiation (ALPN):** `holoiroh/control/1`.
+  This is a dedicated ALPN string. The same `iroh::Endpoint` and
+  `iroh::protocol::Router` register the control and media protocols. They also
+  register gossip ALPNs when gossip is enabled. The media protocol is
+  `iroh-live`'s Media over QUIC (MoQ) protocol, `iroh-moq`. See
+  `iroh_live::Live::register_protocols`. This project's
+  `ControlChannel::register_protocols` mirrors that function. The control
+  channel and media stream use the same endpoint and peer identity
+  (`EndpointId`). Each ALPN uses an independent `iroh::endpoint::Connection`.
+  Each connection has an independent lifecycle and reconnect process. Both
+  connections use the same path-selection machinery. This machinery provides
+  network address translation (NAT) traversal and relay fallback.
 - **Stream:** one bidirectional QUIC stream per control-channel
   connection. The dial side opens it via `Connection::open_bi()`. The
   accept side accepts it via `Connection::accept_bi()`, inside the
   `ProtocolHandler::accept` callback.
-- **Framing:** newline-delimited JSON (NDJSON). Each message is a single
-  JSON object serialized on one line, terminated by `\n`. The receiver
-  reads with a line-buffered reader
-  (`tokio::io::AsyncBufReadExt::read_line`). It deserializes each line
-  independently. This keeps framing trivial (no length-prefix codec
-  needed) since control messages are small and human-inspectable in a
-  packet capture or log.
+- **Framing:** newline-delimited JSON (NDJSON). Each message is one JSON
+  object terminated by `\n`. Both Rust network readers enforce a 96 MiB authenticated-frame limit.
+  They enforce this limit while scanning for the newline. They reject invalid
+  Unicode Transformation Format 8-bit (UTF-8) before JSON or signature processing. Thus, a peer cannot force
+  an unbounded line allocation before verification.
 - **Direction:** the iOS app is the dial side and the Mac daemon is the
   accept side:
   - The iOS app sends `ClientMessage` values.
@@ -75,9 +75,9 @@ itself.
 
 ## Envelope
 
-The sender wraps every control-channel message in a `TaskEnvelope`,
-**except the pre-session PIN handshake** (see "The one exception: the PIN
-handshake is unwrapped" below). This matches the Project Aro PRD's
+The sender wraps every control channel message in a `TaskEnvelope`. The
+pre-session personal identification number (PIN) handshake is the only exception. See "The one exception:
+the PIN handshake is unwrapped" below. This matches the Project Aro PRD's
 authoritative task-envelope shape:
 
 ```json
@@ -91,27 +91,59 @@ authoritative task-envelope shape:
   "expires_at": 1784349165135,
   "sequence_number": 0,
   "payload": { "type": "prompt", "text": "open safari and check my calendar" },
-  "signature": null
+  "signature": "ed25519:<128 lowercase hexadecimal characters>"
 }
 ```
 
 | Field              | Type                | Required | Meaning |
 |--------------------|---------------------|----------|---------|
-| `protocol_version` | `u32`                | yes | This is the envelope schema's version. It is currently always `1` (`control_channel::PROTOCOL_VERSION`). The daemon logs a mismatch instead of rejecting it, since only one version exists yet. |
+| `protocol_version` | `u32`                | yes | This is the envelope schema's version. It is currently always `1` (`control_channel::PROTOCOL_VERSION`). Both network boundaries reject any other value. |
 | `message_id`       | `string` (uuid v4)   | yes | Each message has a unique `message_id`, minted fresh by whichever side sends it. The daemon uses it for duplicate-message rejection (see "Rejection rules" below). |
 | `session_id`       | `string` (uuid v4)   | yes | The daemon mints `session_id` once per accepted `iroh` connection (see "Session lifecycle" below). It stays stable for that connection's lifetime. Every envelope on a given connection carries the same `session_id`, in either direction. |
 | `task_id`          | `string` \| `null`   | no  | `task_id` correlates an envelope with a specific bridge turn. A turn is a `prompt`/`voice_transcript`/`stop` and the `ack`/`status`/`task_progress`/`error` replies it produces. It is `null` or omitted for envelopes with no turn to correlate to, such as the initial greeting or a reconnect status update. See "task_id threading" below. |
-| `message_type`     | `string`             | yes | `message_type` mirrors `payload`'s own `type` discriminant (e.g. `"prompt"`, `"ack"`) as a top-level, envelope-inspectable field. This field is deliberately redundant with `payload.type` rather than unified with it. This redundancy lets a reader inspect the envelope's framing without deserializing into a concrete payload type first. |
+| `message_type`     | `string`             | yes | This must exactly equal the typed payload's `type` discriminant. Both network boundaries reject a mismatch after signature verification and typed payload parsing. |
 | `sent_at`          | `u64` (unix ms)      | yes | The time when the sender constructed this envelope. |
 | `expires_at`       | `u64` (unix ms)      | yes | The receiver rejects this envelope if it arrives after this instant. `TaskEnvelope::new`/`wrap` default `expires_at` to `sent_at + 30_000` (30s) when they construct the envelope; see "Rejection rules". |
 | `sequence_number`  | `u64`                | yes | `sequence_number` must strictly increase per `session_id`, per direction (see "Rejection rules" and "Two independent sequences, per direction" below). It starts at `0` for the first envelope either side sends on a fresh connection. |
 | `payload`          | `ClientMessage` \| `ServerMessage` | yes | The actual message content. It has exactly the `{type, text?}` (or `{type, pin}`) shape documented below in "`ClientMessage`"/"`ServerMessage`". Envelope-wrapping does not change this shape. |
-| `signature`        | `string` \| `null`   | no  | This field is present on the wire per the PRD schema. **The codebase does not cryptographically verify it as of this writing** — see "Known gaps" below. It is always `null`/omitted on envelopes this daemon constructs. |
+| `signature`        | `string`             | yes after auth | Strict `ed25519:` plus 128 lowercase hexadecimal characters. The signer is the authenticated iroh transport peer. Missing, malformed, uppercase, wrong-key, or invalid signatures are rejected before typed payload parsing or mutable envelope state. |
 
-The serializer omits `task_id` and `signature` from the JSON when they are
-absent (`#[serde(skip_serializing_if = "Option::is_none")]`). It does not
-emit them as `"task_id": null`. `ServerMessage.text` already used this same
-convention before this schema existed.
+The serializer omits `task_id` and `signature` when they are absent. This is
+useful only while an in-process constructor is assembling an envelope. The
+single daemon writer and the Rust iOS bridge attach `signature` immediately
+before serialization and network write. A post-auth network envelope with an
+omitted signature is invalid. `task_id` remains legitimately optional.
+
+### Envelope signatures
+
+Every post-auth envelope uses Ed25519 with the same identity that authenticated
+its iroh connection. The daemon signer is `Endpoint::secret_key()` from the
+persisted Live endpoint. The client signer is the iOS bridge endpoint key. The
+verifier is always `Connection::remote_id()`; no signing key is transmitted in
+JSON or exposed through a signing FFI.
+
+`TaskEnvelope::signing_payload` is the only canonical encoding. It separates
+the `holoiroh/control/1`, `task-envelope`, `ed25519`, and `signature-v1` domains.
+It binds the `ClientToDaemon` or `DaemonToClient` direction. It binds the signer
+and recipient 32-byte public keys. It length-prefixes every envelope field. Integer fields
+use fixed-width big-endian bytes. Payload objects use recursively sorted UTF-8
+keys and explicit JSON type tags. The `signature` field itself is excluded.
+
+Verification order is fail-closed:
+
+1. Parse only the bounded envelope shell.
+2. Require the strict signature codec, rebuild canonical bytes for the expected
+   direction and authenticated transport identities, and verify Ed25519.
+3. Parse the typed payload and require `message_type == payload.type`.
+4. Require protocol version and session, then validate expiry, replay ID, and
+   sequence.
+5. Only after all checks may the receiver mutate correlation/task/application
+   state or dispatch the payload.
+
+A rejection before step 4 consumes neither `message_id` nor sequence state.
+The daemon returns a bounded signed error and continues reading. The iOS bridge stores a bounded fatal reader error. It closes the invalid
+stream. The polling application binary interface (ABI) reports failure and
+does not queue the invalid event.
 
 ### The one exception: the PIN handshake is unwrapped
 
@@ -147,7 +179,7 @@ message on the stream is the envelope-wrapped greeting.
 
 ### Session lifecycle
 
-The daemon mints a `session_id` (`uuid::Uuid::new_v4()`) once per accepted
+The daemon mints a `session_id` (`uuid::Uuid::new_v4()`, universally unique identifier version 4) once per accepted
 `iroh` connection. It mints the `session_id` immediately after the
 PIN/allowlist auth gate passes. The daemon skips that gate when the
 device is already allowlisted, or when `--no-pin-auth` is set.
@@ -174,17 +206,15 @@ independently:
   daemon does not care what number the client used relative to what the
   daemon itself sent.
 
-This matches how the protocol scopes the envelope: "per `session_id` per
-direction." The envelope does not use one global ordering across both
-directions of a connection.
+The protocol scopes the envelope per `session_id` and per direction. The
+envelope does not use one global order for both connection directions.
 
 ### task_id threading
 
-- An inbound `ClientMessage` envelope's `task_id`, if present, becomes the
-  `request_id` the daemon uses internally when it forwards the message to
-  `holo_bridge`. A client that wants to correlate a
-  `prompt`/`voice_transcript`/`stop` with its resulting
-  `ack`/`task_progress`/`error` replies should set `task_id` itself. The
+- If present, an inbound `ClientMessage` envelope's `task_id` becomes the
+  daemon's internal `request_id`. The daemon forwards it to `holo_bridge`. To correlate a request with its replies, the client should set `task_id`.
+  Requests include `prompt`, `voice_transcript`, and `stop`. Replies include
+  `ack`, `task_progress`, and `error`. The
   daemon echoes that `task_id` back on every reply envelope for that turn.
 - If an inbound envelope omits `task_id`, the daemon synthesizes a fresh
   `uuid` for it. This matches the daemon's pre-envelope behavior, where it
@@ -198,38 +228,31 @@ directions of a connection.
 
 ## Rejection rules
 
-The daemon validates every inbound `TaskEnvelope` against three rules, in
-this order, **before** it even parses the `payload` as a `ClientMessage`.
-This applies to every message *except* the bare `pin` handshake (see
-above):
+Both directions apply the verification order in "Envelope signatures". The
+signature gate precedes typed payload parsing and all mutable replay/session/
+sequence or task state. After a valid signature and typed payload/message-type
+match, the receiver applies these state rules:
 
-1. **Expiry.** If the receiving side's current time is strictly greater
-   than `expires_at`, the receiver rejects the envelope. Exactly `now ==
-   expires_at` is **not** expired; only strictly-after counts as expired.
-   `TaskEnvelope::new`/`wrap` stamp a default 30-second window
-   (`expires_at = sent_at + 30_000`). A sender that wants a different
-   window constructs the struct directly with an explicit `expires_at`.
-2. **Duplicate `message_id`.** The daemon keeps an in-memory
-   (`std::collections::HashSet<String>`) set of every `message_id` already
-   seen on the current connection. The daemon rejects a repeated
-   `message_id`, even with a legitimately-advanced `sequence_number`. This
-   set is **per-connection** and not persisted. It starts empty on every
-   fresh connection, including a reconnect from the same, already-paired
-   device.
-3. **`sequence_number` monotonicity.** The daemon tracks the last accepted
-   inbound `sequence_number` for the current connection. A new envelope's
-   `sequence_number` must be **strictly greater** than that last-accepted
-   value. The daemon rejects an exact repeat or a lower number. Gaps are
-   fine: for example, the daemon accepts a jump from `0` straight to
-   `100`. The daemon rejects only non-increasing values.
+1. **Session.** `session_id` must equal the nonempty session established by the
+   verified ready greeting.
+2. **Expiry.** Current time must not be strictly greater than `expires_at`.
+3. **Duplicate `message_id`.** A previously accepted ID in this direction and
+   session is rejected.
+4. **Sequence monotonicity.** The first client envelope is sequence `0`; later
+   values must strictly increase. The daemon's greeting is server sequence `0`.
 
-The daemon **never forwards a rejected envelope to `holo_bridge`**. It
-replies with `{"type":"error","text":"envelope rejected: <reason>"}`
-(envelope-wrapped, echoing whatever `task_id` the rejected envelope
-carried). It then continues reading the next line. This follows the
-existing "malformed input is not a transport-level error" contract (see
-"Error handling on malformed input" below, which this extends rather
-than replaces).
+All checks complete before replay ID or sequence is recorded. These failures cannot consume the final valid sequence `0`:
+
+- Missing or invalid encoding.
+- Wrong key or signature tampering.
+- Payload or metadata tampering.
+- Wrong session or expiry.
+- Duplicate ID or sequence rejection.
+
+The daemon never forwards a rejected envelope to `holo_bridge`. It emits a
+bounded signed `error` with no rejected task correlation, then keeps reading.
+The bridge never queues a rejected daemon envelope; polling reports its bounded
+failure and the connection must reconnect.
 
 ## `ClientMessage` (iOS → Mac daemon)
 
@@ -245,6 +268,7 @@ entire bare message body):
 { "type": "redirect", "text": "actually, draft it as an email instead" }
 { "type": "pin", "pin": "123456" }
 { "type": "input_response", "request_id": "d290f1ee-6c54-4b01-90e6-d701748f0851", "selected_option": "Work calendar" }
+{ "type": "clarify_request", "prompt": "send a message to the team" }
 { "type": "remote_control", "event": { "action": "take_control" } }
 { "type": "remote_control", "event": { "action": "move", "x": 0.5, "y": 0.4 } }
 { "type": "remote_control", "event": { "action": "click", "x": 0.5, "y": 0.4, "button": "left", "count": 1 } }
@@ -255,9 +279,10 @@ entire bare message body):
 
 | Field             | Type                                                                        | Required | Meaning |
 |-------------------|------------------------------------------------------------------------------|----------|---------|
-| `type`            | `"prompt"` \| `"voice_transcript"` \| `"stop"` \| `"pause"` \| `"resume"` \| `"redirect"` \| `"pin"` \| `"input_response"` \| `"remote_control"` | yes | Discriminant. |
+| `type`            | `"prompt"` \| `"voice_transcript"` \| `"stop"` \| `"pause"` \| `"resume"` \| `"redirect"` \| `"pin"` \| `"input_response"` \| `"remote_control"` \| `"clarify_request"` \| `"process_document"` \| `"analyze_image"` \| `"transcribe_audio"` \| `"request_speech"` \| `"plan_task"` | yes | Discriminant. |
 | `event`           | `RemoteControlEvent`                                                          | only for `remote_control` | This field is the touch-derived action. It is itself tagged by `action` (see below). |
-| `text`            | `string`                                                                    | only for `prompt` / `voice_transcript` / `redirect` | The instruction text. The client always transcribes voice input before sending it. The wire format never carries raw audio (see README's "Prompts" section). |
+| `text`            | `string`                                                                    | only for `prompt` / `voice_transcript` / `redirect` / `request_speech` | Instruction or speech text. The default `voice_transcript` path carries client-side text, not raw audio. |
+| `prompt`          | `string`                                                                    | only for `clarify_request` / `analyze_image` | The instruction to clarify or the question to answer about an image. |
 | `pin`             | `string`                                                                    | only for `pin` | The PIN value. The Mac terminal shows this PIN to the user out-of-band, alongside the ticket. The user types or scans it into the client. |
 | `request_id`      | `string`                                                                    | only for `input_response` | This field echoes the `request_id` of the `input_request` it answers. |
 | `selected_option` | `string`                                                                    | only for `input_response` | The user's chosen option. It must be one of the original `input_request.response_options`. |
@@ -265,20 +290,19 @@ entire bare message body):
 - `prompt`: a typed text instruction. The daemon hands it to the
   `holo-desktop-cli` bridge as-is.
 - `voice_transcript`: functionally identical to `prompt` on the wire,
-  using the same `text` field. The daemon tags it separately so the
-  daemon/UI can distinguish input modality for logging or UX purposes.
-  For example, the status panel can show a mic icon, without
+  using the same `text` field. The daemon tags it separately to identify the
+  input modality. The user interface (UI) can use this tag for logging or user
+  experience (UX). For example, the status panel can show a mic icon without
   re-deriving the modality from context.
 - `stop`: the remote **kill-switch**. It cancels or interrupts agent work
   on the Mac. It is one variant with two forms:
   - **Global form** (`{"type":"stop"}`, `context_id` absent): stop
     *everything*. On the daemon this maps, via
     `control_channel::to_control_message`, to `ControlMessage::Stop` with
-    `context_id: None`. `HoloControlBridge::handle_stop` handles this in
-    order:
-    1. It scoped-cancels the currently running turn via A2A
-       `tasks/cancel`, using the daemon's own resolved `contextId`/`Task.id`
-       (the client never has one).
+    `context_id: None`. `HoloControlBridge::handle_stop` uses this order:
+    1. It scoped-cancels the current turn through agent-to-agent (A2A)
+       `tasks/cancel`. It uses the daemon's resolved `contextId` and `Task.id`.
+       The client never has these values.
     2. It drains any queued prompts. Each queued prompt gets a terminal
        `status`/`Done{Canceled}` with `"canceled: stop requested while
        queued"`.
@@ -292,9 +316,8 @@ entire bare message body):
     `holo stop --force`.
   - **Scoped form** (`{"type":"stop","context_id":"<a2a contextId>"}`):
     cancel ONE specific turn. The daemon issues A2A `tasks/cancel` for
-    exactly that context. It uses the real `Task.id` when the target is
-    the currently running turn; this is the only place a `Task.id` can
-    come from. A context-id-only cancel returns JSON-RPC `-32603` against
+    exactly that context. It uses the real `Task.id` when the target is the current turn.
+    A `Task.id` can come only from this location. A context-id-only cancel returns JSON-RPC `-32603` against
     the current `holo serve`. **None** of the all-or-nothing machinery
     runs for a scoped stop: no queue drain, no global `holo stop`, no
     force escalation. The daemon discards a paused turn stashed under the
@@ -314,20 +337,18 @@ entire bare message body):
   (`{"type":"stop"}`). Old `{"type":"stop"}` payloads deserialize
   unchanged.
 - `pause`: parks the in-flight turn so `resume` can continue it. The Holo
-  backend exposes **no pause RPC** over A2A; its own kill switch is
-  pause-then-cancel (see `mac-daemon/src/holo_bridge/stop.rs`'s source
-  notes). Because of this, the daemon implements pause as the only honest
+  backend exposes **no pause remote procedure call (RPC)** over A2A. Its kill
+  switch uses pause-then-cancel. See the source notes in
+  `mac-daemon/src/holo_bridge/stop.rs`. Because of this, the daemon implements pause as the only honest
   primitive available: it **cancels** the running turn. It uses scoped
   A2A `tasks/cancel` once the turn's `contextId` resolves, or else the
   graceful global `holo stop`. While it does this, it stashes the turn's
-  original instruction text and `contextId`. The canceled turn still
-  produces its normal `task_done` (`canceled`); a client showing a
-  "paused" state should expect and tolerate that terminal. Pausing with
+  original instruction text and `contextId`. The canceled turn still produces its normal `task_done` (`canceled`). A
+  client that shows a "paused" state must accept that terminal event. Pausing with
   nothing running, or pausing twice, is a polite `status` reply, never an
   error.
-- `resume`: re-dispatches the parked turn on the **same** `contextId`, so
-  the backend session's history carries the task forward from where it
-  was interrupted. The resumed turn runs under the `resume` envelope's
+- `resume`: re-dispatches the parked turn on the **same** `contextId`. The
+  backend session history continues the task from its interruption point. The resumed turn runs under the `resume` envelope's
   own `task_id`. Resuming with nothing parked is a polite `status` reply.
 - `redirect`: replaces whatever is running or queued with a new
   instruction. The daemon does the following, in order:
@@ -356,17 +377,18 @@ entire bare message body):
 - `input_response`: the user's answer to a `ServerMessage`'s
   `input_request` (see below). This message carries a **structured
   choice selection only**. `selected_option` must be one of the strings
-  the matching `input_request.response_options` offered. This message
-  deliberately has no free-text field, so a client cannot accidentally,
-  or on purpose, put a password, PIN, or MFA code into it. `request_id`
-  might not match a currently-outstanding `input_request` on this
-  connection — the request may already be expired, already answered, or
-  never sent. In that case, the daemon replies with a normal `error`
+  the matching `input_request.response_options` offered. This message deliberately has no free-text field. Thus, a client cannot put
+  a password, PIN, or multi-factor authentication (MFA) code into it. `request_id` might not match an outstanding `input_request` on this
+  connection. The request can be expired, answered, or never sent. In that case, the daemon replies with a normal `error`
   event, and the connection stays open. This is not a transport-level
   failure. It matches this document's general "malformed input"
-  philosophy below. See `input_request`'s own entry for the full
-  contract, including why real credential/MFA/manual entry is **not**
-  carried by this message at all.
+  philosophy below. See the `input_request` entry for the complete contract. It explains why
+  this message does **not** carry credentials, MFA codes, or manual input.
+- `clarify_request`: asks the daemon to generate zero to three structured
+  questions before a prompt runs. `prompt` is capped before inference. The
+  daemon handles this message outside the desktop-task pipeline and replies
+  with `clarify_questions`. An empty question list means no clarification is
+  needed and the client can send the original `prompt`.
 - `remote_control`: the user escalates to **hands-on control**. The user
   drives the Mac directly by touching the iOS live-share view. The
   `event` object is a nested tagged action (`{"action": ...}`):
@@ -410,13 +432,12 @@ disables each one when no key is configured, replying with its
   `"text"`/`"vision"`/`"images"`/`"raw"`/`"vlm"`. Unrecognized values
   default to `"text"`.
 - `analyze_image`: answers `prompt` about an attached image
-  (`tinfoil_vision.rs`). The daemon redacts the image on-device
-  (`privacy.rs`'s OCR + PII redaction) before it ever leaves the daemon.
+  (`tinfoil_vision.rs`). The daemon redacts the image on-device before egress.
+  `privacy.rs` performs optical character recognition (OCR) and personally
+  identifiable information (PII) redaction.
 - `transcribe_audio`: transcribes audio (`tinfoil_audio.rs`,
-  `voxtral-small-24b`). **This message must only ever carry audio
-  captured from the client's own microphone.** Never send system or
-  speaker output, since it could contain other call participants'
-  voices. This is an explicit opt-in alternative to the default
+  `voxtral-small-24b`). **This message must carry only audio from the client microphone.** Never send
+  system or speaker output. That output can contain other participants' voices. This is an explicit opt-in alternative to the default
   on-device `voice_transcript` path (`VoiceTranscriber.swift`'s on-device
   Speech framework). Sending this message means audio leaves the device.
   `format` is advisory only. Tinfoil infers the real format from
@@ -426,8 +447,86 @@ disables each one when no key is configured, replying with its
 - `plan_task`: asks Tinfoil's `glm-5.2` (tool-calling) to break `goal`
   into an ordered step list for the user to review. **This message
   plans; it does not execute.** Turning a step into action still
-  requires a separate `prompt`/`remote_control` message. This is already
-  how it works today.
+  requires a separate `prompt` or `remote_control` message. This is how
+  this message works today.
+
+### Typed screen-observation planner protocol
+
+The schema also defines `typed_prompt` for the typed planner path:
+
+```json
+{
+  "type": "typed_prompt",
+  "prompt": {
+    "goal_id": "goal-42",
+    "instruction": "Open Settings and show the display controls"
+  }
+}
+```
+
+The signed `TaskEnvelope` gives this `TypedPrompt` its authority. The verified
+`goal_id` and `instruction` are the only trusted goal input. Screen pixels,
+Accessibility (AX) data, document text, and tool output are untrusted
+observation data. They can describe state. They cannot change the goal, grant
+approval, or add an action.
+
+The planner accepts one `submit_plan` tool call. It rejects prose, unknown
+fields, unknown tools, extra choices, and extra tool calls. The plan contains
+one through 64 steps. It ends with exactly one terminal `complete` step.
+The only action vocabulary is:
+
+- `observe`.
+- `navigate` with `semantic_activate`, `coordinate_activate`, or `scroll`.
+- `focus`.
+- `draft_text`.
+- `commit` with `send_message`, `submit_form`, `publish`, `purchase`,
+  `transfer_funds`, or `delete_item`.
+
+Each action binds the goal digest, run, task, action, observation, target, and
+proposal digest. The target includes bundle, window, element, expected AX role,
+title digest, optional value digest, and resolved, sensitive, and credential
+flags. Unknown action types and malformed bindings are unsupported. They execute
+nothing.
+
+The planner request has these implemented bounds:
+
+- The goal is at most 16,384 bytes.
+- The observation is at most 65,536 bytes.
+- The plan has at most 64 steps.
+- Tool arguments are at most 524,288 bytes.
+- The response is at most 1,048,576 bytes.
+- The Tinfoil request timeout is 60 seconds.
+
+A stop, pause, redirect, disconnect, or terminal task event invalidates pending
+approvals. Denial, cancellation, expiry, replay, or stale state also stops the
+action. The typed path must not continue through Holo after any typed failure.
+
+`typed_plan_ready`, `planner_status`, and `planner_receipt` are the typed reply
+variants. `planner_status.status` is `planning`, `ready`, `executing`,
+`completed`, `failed`, or `canceled`. A receipt binds the plan and goal digests,
+action and proposal identifiers, and terminal status.
+
+These types do not make a live planner loop. The daemon does not currently
+handle `typed_prompt` on its live control path. It does not route a plan into a
+screen-observation loop or a macOS AX action adapter. Therefore, autonomous
+execution of every typed plan action is currently unsupported. This includes
+commit actions, sensitive-target mutations, and credential entry. The daemon
+must report unsupported behavior. It must not route these actions to Holo.
+
+A future live integration must route every typed action through the daemon-owned
+`DaemonActionExecutor`. It must recapture semantic AX state before each action.
+The bundle, window, element, role, title digest, and value digest must match.
+Coordinate proximity alone is not a semantic precondition.
+
+The model must never receive approval text. The app can send only the signed,
+action-bound `approval_response`. The daemon verifies and consumes this typed
+response outside planner inference. Approval does not change the trusted goal
+and does not add model context.
+
+Hosted planner egress must use only the attested Tinfoil client and its verified
+origin. There is no generic hosted-model fallback. A local planner mode must use
+a loopback-only endpoint and must not make network egress. The current code has
+no live typed planner loop or local typed planner mode.
 
 ## `ServerMessage` (Mac daemon → iOS)
 
@@ -442,13 +541,22 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
 { "type": "task_active", "paused": false, "queued": 0 }
 { "type": "error", "text": "holo-desktop-cli exited unexpectedly (code 1)" }
 { "type": "auth_rejected", "text": "incorrect PIN" }
+{ "type": "current_ticket", "ticket": "iroh-live:.../holoiroh" }
+{ "type": "clarify_questions", "questions": [{ "question": "Which team?", "options": ["Design", "Engineering"] }] }
+{ "type": "secure_input_state", "active": true }
+{ "type": "tinfoil_verification", "host": "https://router.inf6.tinfoil.sh", "ground_truth": { "digest": "173ed0...", "tls_public_key": "...", "hpke_public_key": "...", "code_measurement": { "type": "sev-snp", "registers": ["..."] }, "enclave_measurement": { "type": "sev-snp", "registers": ["..."] }, "code_fingerprint": "...", "enclave_fingerprint": "..." } }
 { "type": "input_request", "request_id": "d290f1ee-6c54-4b01-90e6-d701748f0851", "kind": "ambiguous_choice", "context": "Two calendars match 'team standup' -- which one?", "response_options": ["Work calendar", "Personal calendar"], "expires_at": 1800000120000 }
 ```
 
 | Field              | Type                                                                                          | Required | Meaning |
 |--------------------|-------------------------------------------------------------------------------------------------|----------|---------|
-| `type`             | `"ack"` \| `"status"` \| `"error"` \| `"task_progress"` \| `"task_done"` \| `"task_active"` \| `"auth_rejected"` \| `"input_request"` | yes | Discriminant. |
+| `type`             | `"ack"` \| `"status"` \| `"error"` \| `"task_progress"` \| `"task_done"` \| `"task_active"` \| `"auth_rejected"` \| `"current_ticket"` \| `"clarify_questions"` \| `"input_request"` \| `"secure_input_state"` \| `"tinfoil_verification"` \| Tinfoil reply variants below | yes | Discriminant. |
 | `text`             | `string`                                                                                       | optional on `ack`/`status`/`error`/`task_progress`/`task_done`/`auth_rejected` | Human-readable detail. |
+| `ticket`           | `string`                                                                                       | only for `current_ticket` | The authenticated daemon's current node ticket. |
+| `questions`        | `ClarifyingQuestion[]`                                                                         | only for `clarify_questions` | Zero to three questions, each with concrete `options`. |
+| `active`           | `bool`                                                                                         | only for `secure_input_state` | Whether macOS secure input is active. |
+| `host`             | `string`                                                                                       | only for `tinfoil_verification` | The verified HTTPS origin used for Tinfoil egress. |
+| `ground_truth`     | `TinfoilGroundTruth`                                                                           | only for `tinfoil_verification` | Verified release digest, measurements, TLS/HPKE keys, and code/enclave fingerprints. |
 | `status`           | `"completed"` \| `"failed"` \| `"canceled"`                                                     | only for `task_done` | Which terminal state the task reached. |
 | `paused`           | `bool`                                                                                          | only for `task_active` (defaults `false`) | Whether the still-live task is parked (Resume/Stop) or running (Pause/Stop). |
 | `queued`           | `number`                                                                                        | only for `task_active` (defaults `0`) | How many prompts are queued behind the still-live task. |
@@ -468,9 +576,9 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
   also uses it for the expiry-to-safe-pause notification described under
   `input_request` below.
 - `task_progress`: an in-progress update from the `holo-desktop-cli`
-  bridge. The bridge sends it while carrying out a
-  `prompt`/`voice_transcript` (per README's "Holo bridge" section:
-  "Progress/results are relayed back over the control channel").
+  bridge. The bridge sends it while processing a `prompt` or `voice_transcript`. See
+  README's "Holo bridge" section: "Progress/results are relayed back over
+  the control channel".
 - `task_done`: the terminal lifecycle signal for one task. The turn
   named by the envelope's `task_id` reached `status`
   (`completed`/`failed`/`canceled`), with optional human-readable detail
@@ -481,29 +589,50 @@ The `payload` field of every outbound `TaskEnvelope` (or, for
   above). Because of this, a `task_done` with `"canceled"` arrives even
   for a task the user considers merely paused.
 - `task_active`: the daemon sends this right after the greeting on a
-  **(re)connect**, when a task from before the connection drop is still
-  live: running, parked (`paused`), or with prompts `queued` behind it.
+  reconnect. It sends the message when an earlier task is still live. The
+  task can be running, parked (`paused`), or have prompts `queued` behind it.
   It exists so a reconnecting client can **restore its task-control
   surface** (the Pause/Stop pill) from a structured signal. This avoids
   keying UI state off a free-text `status` line. A parked task is
-  not otherwise "busy," so this is the only reconnect signal that
-  surfaces a *paused* task at all. This message type is additive and
+  not otherwise "busy." This is the only reconnect signal for a paused task. This message type is additive and
   optional. Older clients that do not recognize `task_active` fall back
-  to their generic "unrecognized control event" handling, and simply do
-  not restore the pill.
-- `error`: something failed. Causes include a bad envelope, a malformed
-  payload, an envelope rejected per the rules above, a bridge process
-  crash, or a capture failure. `text` should contain enough detail to
+  to their generic "unrecognized control event" handling. They do not
+  restore the pill.
+- `error`: something failed. Causes include:
+  - A bad envelope or malformed payload.
+  - An envelope rejection under the preceding rules.
+  - A bridge process crash or capture failure. `text` should contain enough detail to
   show the user; it does not need a full stack trace.
 - `auth_rejected`: the daemon sends this instead of the normal greeting
-  when an unrecognized device fails the PIN gate. Causes include a wrong
-  or missing PIN, a malformed first message, or a connection closed
-  before the client presents one; see `mac-daemon/PAIRING.md`. The
-  daemon sends this message **unwrapped**, not inside a `TaskEnvelope`,
-  since no `session_id` exists yet at this point (see "The one
-  exception" above). The daemon closes the connection immediately after
+  when an unrecognized device fails the PIN gate. Causes include:
+  - A wrong or missing PIN.
+  - A malformed first message.
+  - A closed connection before PIN submission.
+
+  See `mac-daemon/PAIRING.md`. The
+  daemon sends this message **unwrapped**, not inside a `TaskEnvelope`. No
+  `session_id` exists at this point. See "The one exception" above. The daemon closes the connection immediately after
   it sends this message. A client that receives it should return to a
   pairing/PIN-entry UI, rather than treating it like a generic `error`.
+- `current_ticket`: the daemon sends its current node-id-only ticket after the
+  greeting. The frame travels over the authenticated connection. The client
+  uses it to refresh a stale saved default after daemon identity rotation.
+- `clarify_questions`: returns the questions for `clarify_request`. Each item
+  has a `question` and an `options` array. An empty array tells the client to
+  send the original prompt without a clarification panel.
+- `secure_input_state`: reports transitions into and out of macOS secure input.
+  The client uses `active: true` to explain why ScreenCaptureKit hides a login,
+  lock-screen, Keychain, or password field.
+- `tinfoil_verification`: carries the ground truth from the same official
+  origin-bound Tinfoil client that performs Holoiroh cloud egress. The daemon
+  sends it after authentication only when attestation succeeded. `host` is the
+  exact pinned HTTPS origin. `ground_truth` includes the release digest and
+  code and enclave measurements. It also includes Transport Layer Security
+  (TLS) and Hybrid Public Key Encryption (HPKE) public keys. It includes both
+  fingerprints.
+  The bearer application programming interface (API) key is not part of this message and never leaves the daemon.
+  Absence means that Tinfoil is disabled or attestation failed. The client must
+  not use the hosted generic Verification Center as proof for this connection.
 - `input_request`: asks the user for structured input the agent cannot
   proceed without it (Project Aro PRD row P0-14). See the dedicated
   section below. This is the most involved variant on the wire, and it
@@ -560,29 +689,29 @@ stopped/paused. A `hard_block` category cancels the turn outright, with a
 
 **Credentials never travel on this channel — hard requirement, not a
 convention.** `input_request`'s `context`/`response_options` fields are
-metadata. They describe *what* is needed and *why*, for example "Holo
-needs your GitHub personal access token to push this branch" or "Enter
-the 6-digit code from your authenticator app." These fields never carry
-the actual credential/secret/MFA-code value. The Rust implementation
+metadata. They describe what is needed and why. Examples include:
+
+- "Holo needs your GitHub personal access token to push this branch."
+- "Enter the 6-digit code from your authenticator app."
+
+These fields never carry a credential, secret, or MFA code. The Rust implementation
 (`ServerMessage::input_request` in `control_channel.rs`) has no
 parameter through which a caller could thread one in.
 
-This directly implements the Project Aro PRD's requirement that
-"credential characters are never logged, never included in screenshots,
-never echoed in task events." For the `credential`/`mfa` kinds,
-`input_request` only ever announces that manual entry is needed. The
+This implements the Project Aro PRD requirement. Credential characters never
+appear in logs, screenshots, or task events. For `credential` and `mfa`,
+`input_request` only announces that manual entry is necessary. The
 actual value is designed to flow over a **separate `manual_input`
 channel**. This channel is not part of this wire schema, and this
-control channel does not implement it at all. The channel is
-architected so the value never reaches the model/agent context: the LLM
-driving `holo-desktop-cli` never sees the raw credential. Only a
+control channel does not implement it at all. The design prevents the value from reaching the model or agent context. The
+large language model (LLM) that drives `holo-desktop-cli` never receives the
+raw credential. Only a
 human-operated, out-of-band path sees it.
 
 The project tracks building that `manual_input` channel as its own,
-separate PRD row. This document only guarantees that
-`input_request`/`input_response` never become an accidental backdoor
-for a credential to leak into a control-channel message, a task-event
-log, or a screenshot.
+separate PRD row. This document guarantees one property. `input_request` and `input_response`
+cannot leak credentials into control channel messages, task-event logs, or
+screenshots.
 
 `input_response` (client → server, see `ClientMessage` above) is the
 user's answer for the `ambiguous_choice`/`missing_info`/
@@ -593,18 +722,16 @@ secret out of band, via the separate `manual_input` channel, never as an
 `input_response`.
 
 **Expiry-to-safe-pause.** If no `input_response` arrives before
-`expires_at`, the daemon does **not** treat this as a failure. It emits a
-`status` message (never `error`) whose `text` says the task safely paused
-and is waiting for input, e.g.:
+`expires_at`, the daemon does **not** treat this as a failure. It emits a `status` message, never an `error`. The `text` says that the task
+paused safely and waits for input. For example:
 
 ```json
 { "type": "status", "text": "input request d290f1ee-6c54-4b01-90e6-d701748f0851 expired with no response -- task safely paused, waiting for input" }
 ```
 
-The daemon then clears the pending request, connection-side. It treats a
-later `input_response` for that same `request_id` as unmatched (see the
-`input_response` entry under `ClientMessage` above), rather than
-resurrecting the expired request.
+The daemon then clears the pending request, connection-side. It treats a later `input_response` for that `request_id` as unmatched. It
+does not restore the expired request. See `input_response` under
+`ClientMessage` above.
 
 **At most one `input_request` is outstanding per connection at a
 time.** This matches the control channel's existing single-active-turn
@@ -613,6 +740,99 @@ per connection, with others queued (see the "Holo bridge" section of
 `README.md`). An `input_request` pauses that one in-flight turn. Because
 of this, no scenario today needs a second `input_request` before the
 first is answered or expires.
+
+## Typed action approval
+
+The protocol defines `approval_request` for one exact proposed action.
+The current Holo bridge does not issue this message on its live action path.
+All fields are required.
+
+```json
+{
+  "type": "approval_request",
+  "approval_id": "f6df06b4-bd84-4f84-a817-adf58a69a2ee",
+  "action_id": "action-42",
+  "proposal_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "run_id": "run-9",
+  "task_id": "task-7",
+  "risk": "critical",
+  "effect": {
+    "app": "Mail",
+    "target": "recipient@example.com",
+    "material": "Send the reviewed message"
+  },
+  "before_state_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+  "expires_at": 1784349165135
+}
+```
+
+`risk` is `low`, `medium`, `high`, or `critical`. The daemon assigns it.
+It does not accept a model-supplied risk value. `effect` is structured data.
+The app displays its exact `app`, `target`, and `material` values. It does not
+build a response from text on the screen.
+
+The app answers with a distinct `approval_response`. It does not use
+`input_response`.
+
+```json
+{
+  "type": "approval_response",
+  "approval_id": "f6df06b4-bd84-4f84-a817-adf58a69a2ee",
+  "action_id": "action-42",
+  "proposal_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "decision": "approve"
+}
+```
+
+`decision` is `approve`, `deny`, or `cancel`. The response repeats no effect,
+risk, run, task, state, or expiry data. The signed `TaskEnvelope` supplies the
+session and task metadata.
+
+The daemon applies these invariants:
+
+- It verifies the signed envelope before it handles `approval_response`.
+- It computes `proposal_digest` as domain-separated SHA-256 over length-prefixed
+  canonical fields. These fields include goal and intent digest, observation ID
+  and digest, run/task/action IDs, full target preconditions, and exact action
+  parameters. Draft text contributes only its SHA-256 digest.
+- It creates `approval_id` with a cryptographic random source.
+- It limits approval lifetime to 60 seconds.
+- It stores binding metadata and digests. It does not store raw effect or
+  secret content.
+- It requires exact session, task, action, proposal, and before-state bindings.
+- It consumes a matching response once. It rejects replay, expiry, denial as
+  approval, canceled tasks, and stale before-state.
+- Stop, pause, redirect, disconnect, and terminal task events invalidate
+  matching pending approvals. Invalidation does not consume or execute them.
+- The control channel routes verified responses into the daemon-shared approval
+  store. Only the typed executor consumes them.
+- The typed executor captures fresh target state before it issues a commitment
+  approval. It captures two independent states after the signed response and
+  immediately before atomic approval consumption and execution. Sensitive-target
+  mutation remains unsupported and issues no approval.
+- The executor appends metadata-only proposal, policy, approval, precondition,
+  receipt, and terminal-outcome records. It never logs draft text, effect
+  material, target title/value content, credentials, or observation content.
+
+The daemon-owned typed executor is the only autonomous path for structured
+actions. It accepts only its closed semantic action union and primitive adapter.
+It never routes a typed action to opaque Holo. Denial, cancel, expiry, replay,
+stale state, unresolved targets, credentials, and unsupported actions execute
+nothing. Planner integration is not implemented.
+
+The current Holo runtime remains an explicit unsafe compatibility backend. It
+owns an opaque action stream and has no typed before-action callback. A typed
+failure never falls back to this backend.
+
+The app fails closed when any required field, risk value, effect field, or
+message type is malformed. It requires identifiers of 1 through 128 printable
+ASCII bytes. It requires both digests to contain exactly 64 lowercase
+hexadecimal characters. It bounds `app` to 128 bytes, `target` to 512 bytes,
+and `material` to 1024 bytes. It requires `expires_at` to be in the future when
+it decodes the request. Approve, deny, explicit cancel, and sheet dismissal each
+send one signed typed response. Sheet dismissal sends `cancel`. The app clears
+its retained request before it sends, so a dismissal callback cannot send a
+second response. It does not show approval controls for a rejected frame.
 
 ## Serialization
 
@@ -632,9 +852,8 @@ the tagged enum above. See "Envelope" for its own field table.
 
 `input_request`'s fields (`request_id`, `kind`, `context`,
 `response_options`, `expires_at`) and `input_response`'s fields
-(`request_id`, `selected_option`) are **not** optional. Unlike `text`,
-every one of these is always present in the serialized JSON: plain
-`String`/`Vec<String>`/`u64` fields, with no `skip_serializing_if`. This
+(`request_id`, `selected_option`) are **not** optional. Unlike `text`, each field is always present in the serialized JSON. They are
+plain `String`, `Vec<String>`, or `u64` fields without `skip_serializing_if`. This
 is because `input_request`/`input_response` are structured messages,
 where a missing field would be ambiguous rather than "absent detail."
 
@@ -648,51 +867,23 @@ value.
 
 ## Error handling on malformed input
 
-**None of the following failures are a transport-level error:**
-
-- A line that fails to parse as valid JSON at the envelope level.
-- A line that parses as an envelope, but is missing or mistypes a
-  required framing field.
-- A line that parses as a valid envelope, but whose `payload` fails to
-  parse as `ClientMessage`.
-- A line that parses fine at every level, but fails one of the three
-  rejection rules above.
-
-The connection and stream stay open in every case. The receiving side
-logs the failure. On the daemon side, the daemon sends back an
-envelope-wrapped `{"type": "error", "text": "..."}` describing which of
-these categories the failure was. The exact text distinguishes
-"malformed envelope", "malformed payload", and "envelope rejected:
-<expiry|duplicate|sequence reason>" (see `control_channel.rs`'s
-`ProtocolHandler::accept` for the exact wording). The daemon then
-continues reading the next line.
-
-Only stream/connection-level failures (EOF, reset, peer disconnect) end
-the control-channel task. There is one case with no envelope to wrap a
-reply in: a completely unparseable line arriving during the bare-PIN
-pre-session window. `authenticate`'s own gate handles this case. It
-rejects the whole connection, rather than replying inline (see "The one
-exception" above).
+Post-auth malformed JSON/shell, signature failure, malformed typed payload,
+message-type mismatch, or state rejection is never dispatched. The daemon
+returns a bounded signed error when it can keep the stream open. Oversized or
+invalid-UTF-8 frames close the stream after bounded diagnostics. The iOS bridge fails the connection after any invalid daemon envelope or frame.
+It reports a bounded polling error. It never exposes the rejected line to Swift.
 
 ## Known gaps
 
-- **`signature` is not cryptographically verified.** The field exists on
-  the wire: present per the PRD schema, always `null`/omitted on
-  envelopes this daemon constructs. Nothing in this codebase verifies it
-  against anything, since there is no signing keypair/identity
-  infrastructure here yet. The `iroh` node keypair authenticates the
-  *transport*, meaning who the connection is to. It does not
-  authenticate individual envelopes. A genuine envelope-signing scheme —
-  what key, over which fields, verified where — is separate, unbuilt
-  work.
 - **Five of the six PRD-named streams are not implemented.** See
   "Project Aro PRD context" above. This document, and this codebase,
   cover `control` only.
-- **`protocol_version` mismatch is not hard-enforced.** The daemon logs
-  a mismatch instead of rejecting it, since exactly one version (`1`)
-  exists as of this writing. A real enforcement policy — reject unknown
-  versions? negotiate? — is unbuilt work for whenever a second version
-  actually exists.
+
+## Coordinated release requirement
+
+Signature enforcement has no unsigned compatibility flag. The app, bridge, and daemon must ship together. The new daemon rejects unsigned
+envelopes from an old client. The new bridge rejects unsigned greetings from
+an old daemon before it reports connection success.
 
 ## Envelope versioning
 
@@ -709,16 +900,20 @@ below, and do not need an envelope version bump.
 
 This schema intentionally started minimal, per the task scope:
 `prompt`/`voice_transcript`/`stop` and
-`ack`/`status`/`error`/`task_progress`. It grew additively since then:
-`pin`/`auth_rejected` for pairing, and `input_request`/`input_response`
-for Project Aro PRD row P0-14.
+`ack`/`status`/`error`/`task_progress`. The following additions extended it:
+
+- `pin` and `auth_rejected` for pairing.
+- `input_request` and `input_response` for structured user decisions.
+- `approval_request` and `approval_response` for typed action approval.
+- Clarification messages, task lifecycle, and secure input state.
+- Tinfoil feature request and reply pairs.
+- `current_ticket` and `tinfoil_verification`.
 
 Going forward, fields are additive-only. A future revision may add new
 optional fields or new `type` variants. Existing field names/types and
 existing `type` values must not change meaning. This lets a client built
-against an older revision of this document degrade gracefully. Once the
-client-side implementation exists, it should ignore or log unknown
-`type` values, rather than treat them as a hard parse error. This
+against an older revision of this document degrade gracefully. After client-side implementation, it should ignore or log unknown `type`
+values. It should not treat them as a hard parse error. This
 document versions the envelope shape itself (`TaskEnvelope<T>`'s own
 fields) separately — see "Envelope versioning" above.
 

@@ -2,42 +2,26 @@ import SwiftUI
 import AVFoundation
 import CoreMedia
 import CoreVideo
+#if canImport(UIKit)
+import UIKit
+#endif
 
-/// Low-latency video surface: a SwiftUI wrapper around a UIKit view whose
-/// backing layer is an `AVSampleBufferDisplayLayer`.
+/// Provides a SwiftUI video surface backed by `AVSampleBufferDisplayLayer`.
 ///
-/// This is the *render* half of the live-view feature. It knows nothing
-/// about iroh, networking, or decoding -- it only takes decoded frames
-/// (`CVPixelBuffer` or `CMSampleBuffer`) and puts pixels on screen with
-/// minimal latency. It binds to a `VideoFrameSource` (see
-/// `VideoFrameSource.swift`), so the concrete producer -- the on-device
-/// synthetic source today, the real `iroh-live` subscription later -- is
-/// swappable without touching this view.
+/// It accepts decoded frames from a `VideoFrameSource`.
+/// `IrohLiveFrameSource` supplies media stream frames in the current app.
+/// `SyntheticVideoFrameSource` supplies local diagnostic frames.
 ///
-/// ## Why `AVSampleBufferDisplayLayer`
-/// It is Apple's purpose-built surface for feeding a stream of
-/// `CMSampleBuffer`s straight to the compositor. For a remote-screen
-/// mirror the priorities are *low latency* and *not dropping frames*, not
-/// A/V sync against an audio track -- so each frame is tagged
-/// display-immediately and the layer shows it as soon as it is decoded,
-/// with no reordering/lookahead buffer. This matches the Mac daemon's
-/// `iroh-live` VideoToolbox-encoded H.264/HEVC stream (see
-/// `holoiroh/mac-daemon/src/capture.rs`): the source-side decoder produces
-/// `CVPixelBuffer`s that land here via `enqueue`.
-///
-/// ## Threading
-/// `enqueue(_:)` (both overloads) is safe to call from **any** thread. It
-/// hops to the layer's serial queue internally, because
-/// `AVSampleBufferDisplayLayer` is not safe to mutate concurrently and a
-/// real network/decode source delivers frames off the main thread.
+/// Sources can deliver frames from any thread.
+/// The view serializes display-layer changes.
+#if canImport(UIKit)
 struct VideoRenderView: UIViewRepresentable {
-    /// The frame producer to bind to. The view starts it on appear and
-    /// stops it on disappear, and routes its `onFrame` into `enqueue`.
+    /// Frame source for this view.
+    /// The view starts the source during creation and stops it during teardown.
     let source: VideoFrameSource
 
-    /// How the video is fit into the view's bounds. `.resizeAspect`
-    /// (letterbox, preserve aspect ratio) matches a desktop-capture mirror
-    /// where distorting the image would be worse than black bars.
+    /// Controls how video fits the view bounds.
+    /// The default preserves the aspect ratio and can add letterboxing.
     var videoGravity: AVLayerVideoGravity = .resizeAspect
 
     func makeCoordinator() -> Coordinator {
@@ -65,9 +49,8 @@ struct VideoRenderView: UIViewRepresentable {
         uiView.displayLayer.videoGravity = videoGravity
     }
 
-    /// SwiftUI calls this when the representable is torn down. Stop the
-    /// source and drop its closure so nothing keeps firing into a dead
-    /// view, and flush the layer so a later reuse starts clean.
+    /// Stops frame delivery when SwiftUI removes the view.
+    /// It also clears the callback and flushes the display layer.
     static func dismantleUIView(_ uiView: SampleBufferView, coordinator: Coordinator) {
         coordinator.source?.stop()
         coordinator.source?.onFrame = nil
@@ -75,45 +58,37 @@ struct VideoRenderView: UIViewRepresentable {
         uiView.flush()
     }
 
-    /// Holds the strong references SwiftUI's value-type `View` cannot, and
-    /// gives `dismantleUIView` something to stop/detach.
+    /// Retains the source and view references required during teardown.
     final class Coordinator {
         weak var view: SampleBufferView?
         var source: VideoFrameSource?
     }
 }
 
-/// A plain `UIView` whose backing layer *is* an
-/// `AVSampleBufferDisplayLayer` (via the `layerClass` override, the
-/// standard way to back a view with a specific `CALayer` subclass so the
-/// layer is sized/positioned by the view automatically).
-///
-/// Kept as a distinct UIKit type (rather than an inline closure in the
-/// representable) so the enqueue/flush/recovery logic has one clear home
-/// and the thread-safety contract lives in one place.
+/// Provides a `UIView` backed by `AVSampleBufferDisplayLayer`.
+/// The view owns frame enqueue, flush, and recovery operations.
 final class SampleBufferView: UIView {
     override class var layerClass: AnyClass { AVSampleBufferDisplayLayer.self }
 
-    /// Convenience typed accessor for the backing layer.
-    var displayLayer: AVSampleBufferDisplayLayer {
+    /// Provides typed access to the backing display layer.
+    private(set) lazy var displayLayer: AVSampleBufferDisplayLayer = {
         // Safe by construction: `layerClass` guarantees the backing layer's
-        // type. A failure here would mean UIKit ignored `layerClass`, which
-        // does not happen -- so a hard trap is the correct fail-fast.
+        // type. The first access is in `makeUIView` on the main thread. Later
+        // enqueue operations reuse this layer reference without reading the
+        // UIView's `layer` property from their worker queue.
         guard let layer = layer as? AVSampleBufferDisplayLayer else {
             fatalError("SampleBufferView.layer was not an AVSampleBufferDisplayLayer")
         }
         return layer
-    }
+    }()
 
-    /// Serial queue that owns every mutation of `displayLayer`. `enqueue`
-    /// hops here from whatever thread the frame arrived on, so the layer is
-    /// never touched concurrently.
+    /// Serializes all display-layer changes.
     private let layerQueue = DispatchQueue(label: "com.holoiroh.videorender.enqueue")
 
     // MARK: - Public enqueue API (thread-safe)
 
-    /// Enqueue one `VideoFrame` from a `VideoFrameSource`. Safe from any
-    /// thread.
+    /// Enqueues one decoded frame.
+    /// Callers can use any thread.
     func enqueue(_ frame: VideoFrame) {
         switch frame {
         case let .pixelBuffer(pixelBuffer, pts):
@@ -123,9 +98,8 @@ final class SampleBufferView: UIView {
         }
     }
 
-    /// Enqueue an already-formed `CMSampleBuffer` for display. Safe from
-    /// any thread. This is the path a decoder that emits sample buffers
-    /// (or a demuxer) would use directly.
+    /// Enqueues an existing sample buffer.
+    /// Callers can use any thread.
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
         layerQueue.async { [weak self] in
             guard let self else { return }
@@ -141,13 +115,9 @@ final class SampleBufferView: UIView {
         }
     }
 
-    /// Wrap a decoded `CVPixelBuffer` in a `CMSampleBuffer` (building a
-    /// format description + timing) and enqueue it. Safe from any thread.
-    ///
-    /// `pts` drives scheduling; pass `.invalid` to show the frame
-    /// immediately (a display-immediately attachment is added in that
-    /// case). Building the sample buffer is done on the caller's thread
-    /// (cheap, no layer access) and only the enqueue hops to `layerQueue`.
+    /// Converts a decoded pixel buffer to a sample buffer and enqueues it.
+    /// Callers can use any thread.
+    /// The method drops the frame if conversion fails.
     func enqueue(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
         guard let sampleBuffer = Self.makeSampleBuffer(from: pixelBuffer, pts: pts) else {
             // Conversion failed (bad OSStatus). Drop this frame rather than
@@ -159,10 +129,8 @@ final class SampleBufferView: UIView {
 
     // MARK: - Recovery
 
-    /// Recover the layer/renderer if it has entered `.failed` (e.g. after a
-    /// decode error or returning from background) or explicitly asked to be
-    /// flushed. Without this, one failure would silently swallow every
-    /// subsequent frame for the life of the layer. Must run on `layerQueue`.
+    /// Flushes a failed renderer before the next enqueue operation.
+    /// Call this method only on `layerQueue`.
     private func recoverIfNeeded() {
         let layer = displayLayer
         if #available(iOS 17.0, *) {
@@ -181,8 +149,8 @@ final class SampleBufferView: UIView {
         }
     }
 
-    /// Flush pending frames and clear the displayed image. Safe from any
-    /// thread; used on teardown so a reused view starts blank.
+    /// Flushes pending frames and clears the displayed image.
+    /// Callers can use any thread.
     func flush() {
         layerQueue.async { [weak self] in
             guard let self else { return }
@@ -197,10 +165,8 @@ final class SampleBufferView: UIView {
 
     // MARK: - CVPixelBuffer -> CMSampleBuffer
 
-    /// Build a display-ready `CMSampleBuffer` from a decoded pixel buffer.
-    ///
-    /// Returns `nil` (rather than trapping) on any failing `OSStatus`, so a
-    /// single bad frame degrades to a dropped frame, not a crash.
+    /// Creates a display-ready sample buffer from a decoded pixel buffer.
+    /// Returns `nil` if Core Media returns a failing status.
     static func makeSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
         // Format description derived from the buffer itself -- the layer
         // needs it to know the frame's dimensions/pixel format.
@@ -256,3 +222,18 @@ final class SampleBufferView: UIView {
         return sampleBuffer
     }
 }
+#else
+struct VideoRenderView: View {
+    let source: VideoFrameSource
+    var videoGravity: AVLayerVideoGravity = .resizeAspect
+
+    var body: some View {
+        Color.black
+            .onAppear { source.start() }
+            .onDisappear {
+                source.stop()
+                source.onFrame = nil
+            }
+    }
+}
+#endif

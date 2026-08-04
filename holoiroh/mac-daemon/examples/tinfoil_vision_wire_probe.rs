@@ -14,7 +14,10 @@ fn main() {
         prompt: "what is in this screenshot?".to_string(),
     };
     let rj = serde_json::to_string(&request).expect("serialize request");
-    assert!(rj.contains("\"type\":\"analyze_image\""), "wrong type tag: {rj}");
+    assert!(
+        rj.contains("\"type\":\"analyze_image\""),
+        "wrong type tag: {rj}"
+    );
     let back: ClientMessage = serde_json::from_str(&rj).expect("deserialize request");
     assert_eq!(back, request);
 
@@ -23,7 +26,10 @@ fn main() {
         text: "A login form.".to_string(),
     };
     let oj = serde_json::to_string(&ok).expect("serialize ok");
-    assert!(oj.contains("\"type\":\"image_analyzed\""), "wrong type tag: {oj}");
+    assert!(
+        oj.contains("\"type\":\"image_analyzed\""),
+        "wrong type tag: {oj}"
+    );
     let back_ok: ServerMessage = serde_json::from_str(&oj).expect("deserialize ok");
     assert_eq!(back_ok, ok);
 
@@ -32,7 +38,10 @@ fn main() {
         error: "bad image".to_string(),
     };
     let fj = serde_json::to_string(&failed).expect("serialize failed");
-    assert!(fj.contains("\"type\":\"image_analysis_failed\""), "wrong type tag: {fj}");
+    assert!(
+        fj.contains("\"type\":\"image_analysis_failed\""),
+        "wrong type tag: {fj}"
+    );
     println!("wire round-trip: OK");
 
     // Non-image MIME: control_channel.rs's AnalyzeImage handler decodes with
@@ -40,8 +49,14 @@ fn main() {
     // the exact rejection path it depends on, exercised directly and deterministically.
     let garbage = b"this is definitely not an image file, just plain text bytes";
     let result = image::load_from_memory(garbage);
-    assert!(result.is_err(), "garbage bytes must fail image decoding, not panic");
-    println!("non-image bytes -> decode error (as expected): {:?}", result.err());
+    assert!(
+        result.is_err(),
+        "garbage bytes must fail image decoding, not panic"
+    );
+    println!(
+        "non-image bytes -> decode error (as expected): {:?}",
+        result.err()
+    );
 
     println!(
         "tinfoil_vision_wire_probe: OK -- wire shapes round-trip and non-image input is rejected before any network call."

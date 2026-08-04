@@ -1,163 +1,103 @@
-//! The Aro policy wrapper: the central trust mechanism of Project Aro
-//! (PRD §7.3 "Policy wrapper / interception layer" and §9 "Safety, Consent,
-//! and Sensitive Apps").
+//! Implements the Project Aro policy decision mapping.
+//! The Product Requirements Document (PRD) specifies this mapping in §7.3 and §9.
 //!
-//! This module is **real interception logic, not a prompt string.** PRD row
-//! P0-7 is explicit that the 6-class action taxonomy and its decision table
-//! must be *enforced in the policy layer* -- a hard code gate between the
-//! agent proposing an action and the runtime executing it -- and must **not**
-//! be delegated to a natural-language instruction in the model's system
-//! prompt (which the model can ignore, be jailbroken past, or silently drift
-//! from). Everything here is a `match` over a typed [`ProposedAction`], never
-//! a comparison against model-generated free text.
+//! This module is the daemon-side classifier for typed desktop actions.
+//! [`crate::action_executor`] calls it before each typed action.
+//! The legacy Holo backend remains opaque and does not use this path.
 //!
-//! ## Where this sits: between "think" and "act"
+//! `examples/policy_probe.rs` exercises this standalone component.
+//! [`crate::sensitive_categories`] and [`crate::limits`] have the same standalone status.
 //!
-//! The Aro executor runs a computer-use loop of *think* (the VLM proposes a
-//! concrete next action from a screenshot + goal) and *act* (the runtime
-//! actually performs the click/keystroke/navigation). This wrapper is
-//! designed to sit **between** those two steps:
+//! ## Implemented decision mapping
 //!
-//! ```text
-//!   VLM proposes action ──▶ [ policy::classify ] ──▶ [ policy::decide ] ──▶ runtime acts
-//!        (think)                    │                       │                   (act)
-//!                                   ▼                       ▼
-//!                            ActionClass 0..5      PolicyDecision {Allow | Pause |
-//!                                                   RequireScopedConfirmation |
-//!                                                   RequireSensitiveApproval | Reject}
-//! ```
+//! The component models the PRD §9 six-class taxonomy.
+//! [`classify`] maps each available typed action to one [`ActionClass`].
+//! [`decide`] maps that class and applicable category configuration to one [`PolicyDecision`].
+//! Only [`PolicyDecision::Allow`] permits immediate execution at a future interception point.
 //!
-//! Only a [`PolicyDecision::Allow`] lets the action reach the runtime
-//! unchanged. Every other decision interposes a gate (pause-and-ask, a
-//! scoped time-boxed confirmation, a per-access sensitive approval, or an
-//! outright reject) *before* the "act" step -- the action is never performed
-//! speculatively and then undone.
+//! The mapping does not itself pause, request approval, reject runtime work, or dispatch an action.
+//! A caller with a per-action stream must implement those effects.
 //!
-//! ## Wiring status (honest, per this repo's convention)
+//! ## Unavailable per-action interception
 //!
-//! There is **no `executor.rs` / `ComputerUseExecutor` in this Rust daemon
-//! yet** -- `holo_bridge` forwards each prompt straight through to
-//! `holo serve`, which runs H Company's Holo3 agent server-side, and this
-//! daemon never sees the individual VLM-proposed actions that agent takes.
-//! So this module is a **real, standalone, exhaustively-witnessed policy
-//! engine** (see `examples/policy_probe.rs`) that is not yet consulted from a
-//! live interception point, exactly the same honest status
-//! [`crate::sensitive_categories`] and [`crate::limits`] carry.
-//!
-//! The **exact wiring point**, for the follow-up task that gives this daemon
-//! a real per-action stream to gate, is documented on [`decide`] and again in
-//! [`WIRING`] -- it is a hard code gate, not a prompt edit.
+//! A future executor can call [`decide_for`] between its proposal and execution steps.
+//! [`WIRING`] describes that intended integration point and its required behavior.
+//! This description is not a claim that the live path uses the component.
 //!
 //! ## Relationship to [`crate::audit_log::ActionClass`]
 //!
-//! `audit_log` already has a type spelled `ActionClass`, but it is a
-//! **different, coarser concept**: which *wire-message kind*
-//! (`Prompt`/`VoiceTranscript`/`Stop`) started a task, for audit attribution.
-//! *This* module's [`ActionClass`] is PRD §9's **6-class safety taxonomy** of
-//! a single proposed computer-use action (observe / navigate / draft /
-//! sensitive-transition / external-commitment / sensitive-target). The two
-//! live in separate modules and never collide at a use site; this doc note
-//! exists so a reader who greps `ActionClass` across the crate is not
-//! confused into thinking they are the same enum. They are deliberately not
-//! merged -- unifying an audit-attribution enum with a safety-gate enum would
-//! conflate two orthogonal axes.
+//! `audit_log::ActionClass` records the wire-message kind that started a task.
+//! Its values are `Prompt`, `VoiceTranscript`, and `Stop`.
+//! This module's [`ActionClass`] classifies one proposed computer-use action.
+//! The separate enums represent independent audit and policy concepts.
 //!
 //! ## Why `#![allow(dead_code)]`
 //!
-//! Nothing in `main.rs` / `control_channel.rs` calls into this module yet
-//! (see "Wiring status" above) -- this pass adds the module and registers it
-//! via `pub mod policy;` so it is compiled, reachable for the follow-up
-//! interception row to call, and exercised for real by
-//! `examples/policy_probe.rs`. Every item here is real, working, documented
-//! public API (same status the other not-yet-wired modules carry); this
-//! blanket module-level attribute avoids repeating `#[allow(dead_code)]` on
-//! every item below.
-
+//! `main.rs` and `control_channel.rs` do not call this module.
+//! `pub mod policy;` keeps the standalone API compiled and available to the probe.
+//! The module-level attribute avoids repeated `#[allow(dead_code)]` attributes.
 #![allow(dead_code)]
 
 use crate::sensitive_categories::{CategorySetting, SensitiveCategories};
 
-/// The default lifetime of a class-4 scoped confirmation, in seconds
-/// (PRD §9: "a distinct, scoped confirmation that expires after 60 seconds
-/// and defaults to reject on timeout"). Named here so the value cited by the
-/// PRD lives in exactly one place; [`decide`] stamps it onto
-/// [`PolicyDecision::RequireScopedConfirmation`]'s `expires_in_secs`.
+/// Sets the class-4 scoped-confirmation lifetime to 60 seconds.
+/// PRD §9 requires rejection when this lifetime expires.
+/// [`decide`] stores this value in `expires_in_secs`.
 pub const SCOPED_CONFIRMATION_TTL_SECS: u64 = 60;
 
-/// PRD §9's 6-class action taxonomy for a single proposed computer-use
-/// action. The discriminants are pinned to the exact ordinals the PRD gives
-/// (Observe = 0 … SensitiveTarget = 5) via `#[repr(u8)]` and explicit
-/// values, so [`ActionClass as u8`] is a stable, PRD-faithful wire/log number
-/// -- never left to Rust's default enum-ordering, which a later reordering of
-/// the variants could silently change.
+/// Represents PRD §9's six action classes.
 ///
-/// Ordering matters beyond the numbering: the classes are arranged from
-/// least to most trust-sensitive, and [`decide`]'s table is monotonic in that
-/// sense (a higher class never yields a *more* permissive decision than a
-/// lower one). The classifier ([`classify`]) returns the class; the decision
-/// function ([`decide`]) maps a class (plus, for class 5, the user's
-/// per-category configuration) to a [`PolicyDecision`].
+/// `#[repr(u8)]` and explicit values preserve the PRD ordinals from 0 through 5.
+/// Reordering variants cannot silently change these ordinals.
+/// [`classify`] selects a class from an available typed action.
+/// [`decide`] maps a class and applicable category configuration to a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum ActionClass {
-    /// **Class 0 -- Observe.** Reading the screen, taking a screenshot,
-    /// scrolling to read, moving the pointer to reveal a tooltip: anything
-    /// that gathers information without changing any state. Always allowed.
+    /// Class 0 observes without changing state.
+    /// Examples include reading, screenshots, scrolling, and tooltip reveals.
+    /// The mapping allows this class by default.
     Observe = 0,
-    /// **Class 1 -- Navigate.** Moving *within* an already-open, non-sensitive
-    /// context: switching tabs, opening a menu, clicking a non-committing
-    /// link, focusing a field. Changes what is on screen but commits nothing
-    /// and crosses no trust boundary. Allowed by default.
+    /// Class 1 changes the visible context without making a commitment.
+    /// Examples include tabs, menus, non-committing links, and field focus.
+    /// The mapping allows this class by default.
     Navigate = 1,
-    /// **Class 2 -- Draft.** Composing reversible local content that has not
-    /// been sent or committed anywhere: typing into a message/document body,
-    /// filling a form that has not been submitted, editing a draft. Fully
-    /// reversible and local, so allowed by default -- the commitment gate is
-    /// class 4, which is where "send"/"submit"/"pay" lands.
+    /// Class 2 creates reversible local content that has not been committed.
+    /// Examples include message bodies, document bodies, and unsubmitted forms.
+    /// The mapping allows this class by default.
+    /// Send, submit, and pay operations belong to class 4.
     Draft = 2,
-    /// **Class 3 -- SensitiveTransition.** The action would cross a
-    /// credential/authentication boundary: a login/sign-in field, a password
-    /// prompt, an MFA/2FA code entry, an unlock/authorize dialog. Per PRD §9
-    /// the executor must **pause** here and fire an `input_request` -- it
-    /// **never** performs the credential entry itself, and no credential ever
-    /// passes through the model/agent context. Maps to
-    /// [`PolicyDecision::PauseForInputRequest`].
+    /// Class 3 crosses a credential or authentication boundary.
+    /// Examples include login, password, multi-factor authentication, and authorization controls.
+    /// PRD §9 maps this class to [`PolicyDecision::PauseForInputRequest`].
+    /// A future caller must obtain credential input outside the agent context.
     SensitiveTransition = 3,
-    /// **Class 4 -- ExternalCommitment.** The action would take an
-    /// externally-visible, hard-to-reverse committing step: send a
-    /// message/email, submit a form, post, publish, confirm a purchase, pay,
-    /// transfer, delete/destroy, or otherwise "commit" something the outside
-    /// world will see. Requires a **distinct, scoped confirmation** that
-    /// expires after [`SCOPED_CONFIRMATION_TTL_SECS`] and **defaults to
-    /// reject on timeout**. Maps to
-    /// [`PolicyDecision::RequireScopedConfirmation`]. This is the class the
-    /// PRD's adversarial "zero-send" acceptance test (row 16a) pins: a `send`
-    /// action must classify here and get a scoped confirmation, **never**
-    /// [`PolicyDecision::Allow`].
+    /// Class 4 makes an externally visible or hard-to-reverse commitment.
+    /// Examples include send, submit, publish, purchase, payment, transfer, and deletion operations.
+    /// The mapping requires a distinct scoped confirmation.
+    /// The confirmation expires after [`SCOPED_CONFIRMATION_TTL_SECS`].
+    /// Expiration produces rejection.
+    /// PRD row 16a requires a `send` action to map here, never to `Allow`.
     ExternalCommitment = 4,
-    /// **Class 5 -- SensitiveTarget.** The action targets a sensitive
-    /// application/surface (password manager, banking/brokerage, health,
-    /// system/security settings, admin console, …) -- the class-5 category
-    /// set modeled by [`crate::sensitive_categories`]. Requires **per-access
-    /// approval** by default ([`PolicyDecision::RequireSensitiveApproval`]),
-    /// unless the user has configured that category to
-    /// [`CategorySetting::AlwaysAllow`] (then [`PolicyDecision::Allow`]) or
-    /// [`CategorySetting::HardBlock`] (then [`PolicyDecision::Reject`]).
+    /// Class 5 targets a category in [`crate::sensitive_categories`].
+    /// Examples include password managers, banking, brokerage, health, and system settings.
+    /// Other examples include security settings and administration consoles.
+    /// [`CategorySetting::AlwaysAsk`] maps to per-access approval.
+    /// [`CategorySetting::AlwaysAllow`] maps to [`PolicyDecision::Allow`].
+    /// [`CategorySetting::HardBlock`] maps to [`PolicyDecision::Reject`].
     SensitiveTarget = 5,
 }
 
 impl ActionClass {
-    /// The PRD ordinal (0..=5) of this class, as a stable `u8`. Equivalent to
-    /// `self as u8`, exposed as a named method so log/probe call sites read as
-    /// intent ("the PRD class number") rather than a bare cast.
+    /// Returns the stable PRD ordinal from 0 through 5 as a `u8`.
+    /// This named method makes log and probe call sites show their intent.
     pub fn ordinal(self) -> u8 {
         self as u8
     }
 
-    /// The PRD's short name for this class (e.g. `"external_commitment"`),
-    /// snake_case, for logging/diagnostics. Not a serde wire form (this enum
-    /// is an in-process gate input, not a wire type) -- purely for
-    /// human-readable trace output and the probe.
+    /// Returns the PRD short name in snake case.
+    /// Logging, diagnostics, and the probe use this human-readable label.
+    /// The label is not a Serde wire representation.
     pub fn label(self) -> &'static str {
         match self {
             ActionClass::Observe => "observe",
@@ -170,97 +110,75 @@ impl ActionClass {
     }
 }
 
-/// The kind of low-level computer-use operation the VLM proposed. This is the
-/// *verb* of a proposed action, deliberately modeled as a closed enum (not a
-/// free-text string) so the classifier is a total `match`, not a substring
-/// search over model output -- the whole point of P0-7 (enforcement, not a
-/// prompt).
+/// Represents the operation in an available typed action.
 ///
-/// A real executor's action vocabulary (Holo3's, or a future in-daemon VLM's)
-/// is richer than this, but every richer action reduces to one of these verbs
-/// for *classification* purposes: what matters to the policy gate is not the
-/// pixel coordinates but "is this reading, moving, drafting, crossing a
-/// credential boundary, committing externally, or entering a sensitive app".
-/// The follow-up wiring task maps the executor's concrete action type onto
-/// this enum at the interception point (see [`WIRING`]).
+/// The closed enum lets [`classify`] use a total `match` without inspecting free text.
+/// A future per-action integration must translate its concrete action vocabulary into these values.
+/// The live opaque backend does not currently provide such actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionVerb {
-    /// Read-only observation: screenshot, read screen, scroll-to-read, hover.
+    /// Observes through screenshots, screen reading, scrolling, or hovering.
     Observe,
-    /// A pointer click at a target (see [`ClickTarget`] for what the target
-    /// is -- a plain navigational control vs. a committing button vs. an
-    /// auth/credential control determines the class).
+    /// Clicks a target described by [`ClickTarget`].
+    /// The target determines the class.
     Click { target: ClickTarget },
-    /// Typing text into the currently-focused field. `into` describes the
-    /// semantic destination of the keystrokes (a draft body vs. a credential
-    /// field), which is what determines the class -- not the text itself
-    /// (the policy layer never inspects the typed characters; a credential's
-    /// *value* must never reach this gate, only the fact that the target is a
-    /// credential field).
+    /// Types into a semantic destination described by [`TypeTarget`].
+    /// The destination determines the class.
+    /// The mapping does not inspect typed characters.
+    /// Credential values must not reach this component.
     Type { into: TypeTarget },
-    /// Keyboard navigation / focus movement that commits nothing (Tab,
-    /// arrow keys, opening a menu via keyboard).
+    /// Moves focus or navigates by keyboard without making a commitment.
     Navigate,
-    /// An explicit high-level "commit" verb the executor may surface directly
-    /// (some agents emit a semantic `submit`/`send` rather than a raw click
-    /// on a specific button) -- always class 4 regardless of target, since
-    /// its whole meaning is "commit externally".
+    /// Represents an explicit external commitment with its [`CommitKind`].
+    /// The mapping assigns this verb to class 4 for every target.
     Commit { kind: CommitKind },
 }
 
-/// What a [`ActionVerb::Click`] is clicking on, at the granularity the policy
-/// gate cares about.
+/// Identifies the semantic target of [`ActionVerb::Click`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickTarget {
-    /// A non-committing navigational control: a tab, a menu item that just
-    /// navigates, a plain hyperlink, a disclosure triangle. Class 1.
+    /// Identifies a non-committing tab, menu item, link, or disclosure control.
+    /// The mapping assigns this target to class 1.
     Navigation,
-    /// A control that commits something externally visible when clicked: a
-    /// Send / Submit / Post / Publish / Pay / Confirm-purchase / Delete
-    /// button. Class 4. `kind` records which commit it is, for the eventual
-    /// confirmation prompt's human-readable context.
+    /// Identifies a send, submit, post, publish, payment, purchase, or deletion control.
+    /// The mapping assigns this target to class 4.
+    /// `kind` supplies context for a future confirmation prompt.
     CommitButton { kind: CommitKind },
-    /// A control that crosses a credential/auth boundary when clicked: a
-    /// "Sign in" button that submits a login, an "Authorize"/"Unlock" button
-    /// on an auth dialog, an MFA "Approve" button. Class 3 -- pause and fire
-    /// an `input_request`; never click it autonomously.
+    /// Identifies a login, authorization, unlock, or multi-factor approval control.
+    /// The mapping assigns this target to class 3.
+    /// A future caller must not click it without satisfying the mapped gate.
     AuthControl,
 }
 
-/// What a [`ActionVerb::Type`] is typing into, at the granularity the policy
-/// gate cares about.
+/// Identifies the semantic destination of [`ActionVerb::Type`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeTarget {
-    /// A reversible local draft surface: a message/document body, a
-    /// not-yet-submitted form field, a search box being composed. Class 2.
+    /// Identifies a reversible message, document, form, or search draft.
+    /// The mapping assigns this destination to class 2.
     DraftBody,
-    /// A credential/secret/MFA field: a password box, an API-key field, a
-    /// one-time-code entry. Class 3 -- the executor must **never** type into
-    /// this itself; it pauses and fires an `input_request` (`credential` /
-    /// `mfa` kind) so the value is entered out-of-band and never enters the
-    /// agent context.
+    /// Identifies a password, application programming interface (API) key, secret, or one-time-code field.
+    /// The mapping assigns this destination to class 3.
+    /// A future caller must collect the value outside the agent context.
     CredentialField,
 }
 
-/// Which kind of external commitment a class-4 action represents -- carried
-/// through so the eventual scoped-confirmation prompt can say *what* is about
-/// to be committed ("send this email", "confirm this $340 payment") rather
-/// than a generic "confirm?".
+/// Identifies the external commitment represented by a class-4 action.
+/// A future confirmation prompt can use it to describe the specific commitment.
+/// Examples include "send this email" and "confirm this $340 payment".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitKind {
-    /// Send a message/email/DM.
+    /// Sends a message, email, or direct message.
     Send,
-    /// Submit a form / post / publish.
+    /// Submits a form, post, or publication.
     Submit,
-    /// Confirm a purchase / pay / transfer money.
+    /// Confirms a purchase, payment, or money transfer.
     Payment,
-    /// A destructive/irreversible operation (delete account, wipe, etc.).
+    /// Performs a destructive or irreversible operation, such as deletion or wiping.
     Destructive,
 }
 
 impl CommitKind {
-    /// A short human-readable phrase for this commit kind, for the eventual
-    /// confirmation prompt's context text.
+    /// Returns a short phrase for human-readable confirmation context.
     pub fn label(self) -> &'static str {
         match self {
             CommitKind::Send => "send",
@@ -271,38 +189,31 @@ impl CommitKind {
     }
 }
 
-/// A single action the VLM proposed during the "think" step, in the form the
-/// policy gate classifies. This is the wrapper's *input*.
+/// Contains an available typed action for classification.
 ///
-/// `verb` is the operation; `target_bundle_id` (when known) is the macOS
-/// bundle ID of the app the action would land in, used **only** for the
-/// class-5 sensitive-target check (a `Click`/`Type` into a password manager
-/// is class 5 regardless of whether the click is navigational). The
-/// bundle-ID membership test is delegated wholesale to
-/// [`SensitiveCategories::classify`] -- this module reuses that class-5 data
-/// model rather than duplicating any app list.
+/// `verb` identifies the operation.
+/// `target_bundle_id` identifies the macOS app when attribution is available.
+/// Its value is the app's bundle identifier (ID).
+/// [`SensitiveCategories::classify`] performs the class-5 membership test.
+/// This component does not duplicate the sensitive-app list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedAction {
     /// What the action does.
     pub verb: ActionVerb,
-    /// The bundle ID of the foreground/target app this action lands in, if
-    /// the executor could attribute one. `None` when the executor has no
-    /// per-app attribution (the honest common case in this daemon today --
-    /// see [`crate::audit_log::AppCategory`]'s single `Desktop` variant),
-    /// which simply means the class-5 sensitive-target check cannot fire and
-    /// the action is classified on its verb alone.
+    /// Identifies the target app's bundle ID when attribution is available.
+    /// `None` indicates that per-app attribution is unavailable.
+    /// The daemon commonly uses `None` because `AppCategory` contains only `Desktop`.
+    /// With `None`, classification uses only the verb and its semantic target.
     pub target_bundle_id: Option<String>,
-    /// A short human-readable description of the action, for the eventual
-    /// confirmation/approval prompt's context and for trace output. **Never**
-    /// carries a credential value (a `Type { into: CredentialField }` action
-    /// must not put the typed secret here) -- same hard boundary the rest of
-    /// this codebase enforces around `input_request` (see
-    /// `control_channel::ServerMessage::InputRequest`'s doc).
+    /// Supplies human-readable context for traces and future approval prompts.
+    /// This field must never contain a credential value.
+    /// This restriction also applies to `Type { into: CredentialField }`.
+    /// `control_channel::ServerMessage::InputRequest` documents the same boundary.
     pub description: String,
 }
 
 impl ProposedAction {
-    /// Convenience constructor for an action with no app attribution.
+    /// Creates an action without app attribution.
     pub fn new(verb: ActionVerb, description: impl Into<String>) -> Self {
         ProposedAction {
             verb,
@@ -311,7 +222,7 @@ impl ProposedAction {
         }
     }
 
-    /// Convenience constructor for an action that lands in a known app.
+    /// Creates an action with a known target-app bundle ID.
     pub fn in_app(
         verb: ActionVerb,
         bundle_id: impl Into<String>,
@@ -325,38 +236,24 @@ impl ProposedAction {
     }
 }
 
-/// Classifies a [`ProposedAction`] into its PRD §9 [`ActionClass`].
+/// Maps an available typed action to its PRD §9 class.
 ///
-/// This is the real classifier P0-7 requires: a total `match` over the typed
-/// action, never a substring search over model-generated text. The rule set,
-/// in the order it is applied:
+/// The function first checks a non-observation action's `target_bundle_id`.
+/// A bundle ID in [`SensitiveCategories`] produces [`ActionClass::SensitiveTarget`].
+/// [`ActionVerb::Observe`] remains [`ActionClass::Observe`] for a sensitive target.
 ///
-/// 1. **Class 5 dominates when a sensitive target is present.** If the action
-///    lands in a bundle ID that [`SensitiveCategories::classify`] places in a
-///    sensitive category, it is class 5 -- *unless* the verb is a pure
-///    read-only [`ActionVerb::Observe`], which stays class 0 (merely *looking
-///    at* a sensitive app's already-visible screen changes nothing and is not
-///    a "sensitive access" in the PRD's sense; the sensitive-target gate is
-///    about *acting into* the app). This ordering is deliberate: a
-///    credential-field type or a commit *inside* a password manager is class
-///    5 (the more restrictive gate), not class 3/4 -- the sensitive-target
-///    approval is the outer boundary. (When class 5's category is
-///    `AlwaysAllow`, [`decide`] still lets class-3/4-shaped sub-actions be
-///    re-examined by the executor on the next action; this classifier's job
-///    is only to name the single most-restrictive applicable class for *this*
-///    action.)
-/// 2. **Otherwise the verb determines the class** via a total match:
-///    - [`ActionVerb::Observe`] → [`ActionClass::Observe`] (0)
-///    - [`ActionVerb::Navigate`] → [`ActionClass::Navigate`] (1)
-///    - [`ActionVerb::Click`] → depends on [`ClickTarget`]: `Navigation` → 1,
-///      `AuthControl` → 3, `CommitButton` → 4.
-///    - [`ActionVerb::Type`] → depends on [`TypeTarget`]: `DraftBody` → 2,
-///      `CredentialField` → 3.
-///    - [`ActionVerb::Commit`] → [`ActionClass::ExternalCommitment`] (4),
-///      unconditionally.
+/// Otherwise, the verb and target determine the class:
 ///
-/// The classifier is total and side-effect-free: every `ProposedAction`
-/// yields exactly one class, and the same input always yields the same class.
+/// - `Observe` maps to class 0.
+/// - `Navigate` maps to class 1.
+/// - A navigation click maps to class 1.
+/// - Draft-body typing maps to class 2.
+/// - An authentication click maps to class 3.
+/// - Credential-field typing maps to class 3.
+/// - A commit button or `Commit` verb maps to class 4.
+///
+/// The function is total and has no side effects.
+/// The same input and category data produce the same class.
 pub fn classify(action: &ProposedAction, categories: &SensitiveCategories) -> ActionClass {
     // Rule 1: sensitive-target dominance (reusing the class-5 data model),
     // except for pure observation, which never "accesses" the sensitive app.
@@ -385,84 +282,68 @@ pub fn classify(action: &ProposedAction, categories: &SensitiveCategories) -> Ac
     }
 }
 
-/// The `input_request` kind the executor should raise when [`decide`] returns
-/// [`PolicyDecision::PauseForInputRequest`] for a class-3 action. Mirrors
-/// `control_channel::InputRequestKind`'s credential/MFA kinds without
-/// depending on that wire type here (the policy layer stays free of transport
-/// concerns) -- the wiring point translates this into a real
-/// `ServerMessage::input_request(...)` call.
+/// Identifies the credential-boundary request associated with a class-3 decision.
 ///
-/// It is deliberately restricted to the two credential-boundary kinds: a
-/// class-3 pause is *always* a "manual, out-of-band credential/MFA entry is
-/// needed" pause, never a free-text prompt -- matching PRD §9's "credentials
-/// never pass through" and `PROTOCOL.md`'s "Credentials never travel on this
-/// channel".
+/// The values correspond to the `credential` and `mfa` input-request kinds.
+/// This transport-independent type does not raise an `input_request`.
+/// A future caller can translate it to `control_channel::InputRequestKind`.
+/// PRD §9 prohibits credentials from entering the agent context.
+/// `PROTOCOL.md` prohibits credentials from traveling on the control channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseKind {
-    /// A password / API key / secret is needed. → `input_request` kind
-    /// `credential`.
+    /// Identifies the `credential` request kind for a password, API key, or secret.
     Credential,
-    /// A multi-factor code / approval is needed. → `input_request` kind
-    /// `mfa`.
+    /// Identifies the `mfa` request kind for a multi-factor code or approval.
     Mfa,
 }
 
-/// The wrapper's *output*: what the runtime is allowed to do with a proposed
-/// action. Only [`PolicyDecision::Allow`] lets it run unchanged; every other
-/// variant is a gate the executor must satisfy (or honor) **before** the
-/// "act" step.
+/// Represents the result of the implemented policy decision mapping.
+///
+/// [`PolicyDecision::Allow`] permits immediate execution at a future interception point.
+/// Each other value describes a gate or rejection that a future caller must implement.
+/// This enum does not itself enforce, pause, approve, reject, or execute an action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecision {
-    /// The action may execute as proposed, immediately. Classes 0-2 by
-    /// default, plus a class-5 action whose category the user set to
-    /// [`CategorySetting::AlwaysAllow`].
+    /// Permits immediate execution at a future interception point.
+    /// Classes 0 through 2 map here by default.
+    /// Class 5 also maps here for [`CategorySetting::AlwaysAllow`].
     Allow,
-    /// The action is a class-3 credential/auth boundary crossing: **do not
-    /// execute it.** Pause the turn and raise an `input_request` of
-    /// [`PauseKind`] so the human supplies the credential/MFA out-of-band.
-    /// The action itself (typing the password, clicking "sign in") is never
-    /// performed by the agent, and no credential ever enters the agent
-    /// context. On expiry this follows the existing input-request
-    /// expiry-to-safe-pause path (see
-    /// `control_channel`), never a silent auto-proceed.
+    /// Requires a future caller to pause for out-of-band credential input.
+    /// Class 3 maps here.
+    /// The caller must not execute the proposed credential action.
+    /// Credential values must not enter the agent context.
+    /// `control_channel` uses its safe-pause path when an input request expires.
     PauseForInputRequest { kind: PauseKind },
-    /// The action is a class-4 external commitment: require a **distinct,
-    /// scoped confirmation** (a fresh, single-use approval bound to *this*
-    /// action) that expires after `expires_in_secs`
-    /// ([`SCOPED_CONFIRMATION_TTL_SECS`] = 60) and **defaults to reject on
-    /// timeout**. The action executes **only** if that specific confirmation
-    /// is granted before it expires. `commit` records what is being committed
-    /// so the confirmation prompt can be specific.
+    /// Requires a distinct, single-use confirmation for a class-4 action.
+    /// `expires_in_secs` specifies the confirmation lifetime.
+    /// The default lifetime is 60 seconds.
+    /// Expiration rejects the action.
+    /// `commit` identifies the external commitment for prompt context.
     RequireScopedConfirmation {
         commit: CommitKind,
         expires_in_secs: u64,
     },
-    /// The action targets a class-5 sensitive app and the category is set to
-    /// its default [`CategorySetting::AlwaysAsk`]: require **per-access
-    /// approval** (a sensitive-access consent round trip) before the action
-    /// runs. `category_id` is the [`crate::sensitive_categories::SensitiveCategory::id`]
-    /// that matched, for the approval prompt's context.
+    /// Requires per-access approval for a class-5 sensitive app.
+    /// [`CategorySetting::AlwaysAsk`] maps here by default.
+    /// `category_id` identifies the matched sensitive category.
     RequireSensitiveApproval { category_id: String },
-    /// The action is refused outright and must not run. Two sources: a class-5
-    /// action whose category the user set to [`CategorySetting::HardBlock`],
-    /// or any future explicitly-forbidden action. `reason` is
-    /// human-readable, for surfacing to the user / logging.
+    /// Requires a future caller to refuse the action.
+    /// [`CategorySetting::HardBlock`] produces this decision for class 5.
+    /// The implemented mapping produces this decision only for class 5.
+    /// The variant can also represent a future explicitly forbidden action.
+    /// `reason` supplies human-readable user and log context.
     Reject { reason: String },
 }
 
 impl PolicyDecision {
-    /// True iff this decision permits the action to reach the runtime
-    /// **without any further gate** -- i.e. exactly [`Self::Allow`]. Every
-    /// other decision requires a pause/confirmation/approval or is an outright
-    /// reject. The single predicate the wiring point's `if` hinges on (see
-    /// [`WIRING`]); centralized here so "does this let the action run" is
-    /// defined in one place and can never accidentally treat a
-    /// pause/confirm/reject as a go.
+    /// Reports whether the decision is exactly [`Self::Allow`].
+    ///
+    /// A future interception point can use this result before execution.
     pub fn permits_immediate_execution(&self) -> bool {
         matches!(self, PolicyDecision::Allow)
     }
 
-    /// Short label for logging/diagnostics.
+    /// Returns a short label for logging and diagnostics.
     pub fn label(&self) -> &'static str {
         match self {
             PolicyDecision::Allow => "allow",
@@ -474,69 +355,37 @@ impl PolicyDecision {
     }
 }
 
-/// The core decision function: PRD §9's decision table, as real code.
+/// Maps an [`ActionClass`] to the PRD §9 policy decision.
 ///
-/// Given a proposed action already classified by [`classify`], plus the
-/// user's class-5 category configuration (for the class-5 branch only),
-/// returns the [`PolicyDecision`] the runtime must honor. This is the single
-/// enforcement point P0-7 requires -- a total `match` over [`ActionClass`],
-/// with **no default-allow fall-through**: every class is handled explicitly,
-/// so adding a future class is a compile error here until its policy is
-/// decided, rather than silently defaulting to allow.
+/// `categories` supplies the user's class-5 category settings.
+/// `category_id` identifies the matched category for class 5.
+/// The function ignores `category_id` for classes 0 through 4.
 ///
-/// The table (PRD §9):
+/// The function implements this mapping:
 ///
-/// | Class | Name                 | Default decision                         |
-/// |-------|----------------------|------------------------------------------|
-/// | 0     | Observe              | [`Allow`](PolicyDecision::Allow)          |
-/// | 1     | Navigate             | [`Allow`](PolicyDecision::Allow)          |
-/// | 2     | Draft                | [`Allow`](PolicyDecision::Allow)          |
-/// | 3     | SensitiveTransition  | [`PauseForInputRequest`](PolicyDecision::PauseForInputRequest) -- never executes, credential never passes through |
-/// | 4     | ExternalCommitment   | [`RequireScopedConfirmation`](PolicyDecision::RequireScopedConfirmation) (60s, default reject on timeout) |
-/// | 5     | SensitiveTarget      | [`RequireSensitiveApproval`](PolicyDecision::RequireSensitiveApproval) by default; `AlwaysAllow` → [`Allow`]; `HardBlock` → [`Reject`] |
+/// | Class | Name | Decision |
+/// |---|---|---|
+/// | 0 | Observe | [`PolicyDecision::Allow`] |
+/// | 1 | Navigate | [`PolicyDecision::Allow`] |
+/// | 2 | Draft | [`PolicyDecision::Allow`] |
+/// | 3 | SensitiveTransition | [`PolicyDecision::PauseForInputRequest`] |
+/// | 4 | ExternalCommitment | [`PolicyDecision::RequireScopedConfirmation`] |
+/// | 5 | SensitiveTarget | The matching category setting controls the decision. |
 ///
-/// The class-4 → [`PolicyDecision::RequireScopedConfirmation`] mapping is the
-/// row-16a "adversarial zero-send" invariant: a class-4 action can **never**
-/// come back [`PolicyDecision::Allow`] from this function -- there is no
-/// branch that does so, by construction.
+/// Class 3 never returns [`PolicyDecision::Allow`].
+/// Class 4 never returns [`PolicyDecision::Allow`].
+/// Class 4 uses a 60-second confirmation lifetime and rejects on timeout.
+/// Class 5 defaults to [`CategorySetting::AlwaysAsk`] when category lookup fails.
 ///
-/// ## Exact wiring point (for the follow-up interception row)
+/// This function returns a decision value only.
+/// It does not intercept an action or enforce the returned decision.
+/// The live opaque backend does not provide the daemon with a per-action stream.
 ///
-/// In `control_channel::ProtocolHandler::accept`'s read loop, immediately
-/// before `self.bridge.handle_message(control_message).await` (the "act"
-/// dispatch into `holo serve`), once this daemon has a per-action stream:
-///
-/// ```ignore
-/// let class = policy::classify(&proposed, &self.categories);
-/// match policy::decide(class, &self.categories, category_id_for(&proposed)) {
-///     d if d.permits_immediate_execution() => self.bridge.handle_message(control_message).await,
-///     policy::PolicyDecision::PauseForInputRequest { kind } => {
-///         // raise ServerMessage::input_request(.., kind.into(), ..); do NOT dispatch the action
-///     }
-///     policy::PolicyDecision::RequireScopedConfirmation { commit, expires_in_secs } => {
-///         // mint a distinct 60s ApprovalToken (see limits::ApprovalToken), await consent,
-///         // dispatch ONLY if granted before expiry; default reject on timeout
-///     }
-///     policy::PolicyDecision::RequireSensitiveApproval { category_id } => {
-///         // sensitive-access consent round trip; dispatch only on approval
-///     }
-///     policy::PolicyDecision::Reject { reason } => {
-///         // ServerMessage::error(reason); do NOT dispatch
-///     }
-/// }
-/// ```
-///
-/// See [`WIRING`] for the same in prose. It is a hard code gate -- the action
-/// is dispatched to the runtime *only* on the `permits_immediate_execution`
-/// arm (or, for the gated arms, only after the corresponding
-/// pause/confirm/approve is genuinely satisfied), never as a prompt
-/// instruction.
-///
-/// `category_id` is `Some` only for a class-5 action (it names the matched
-/// sensitive category); it is looked up by the caller via
-/// [`SensitiveCategories::classify`] and passed in so this function does not
-/// need the bundle ID again. For classes 0-4 it is ignored (and conventionally
-/// `None`).
+/// A future per-action executor must call this mapping before action execution.
+/// It must execute immediately only for [`PolicyDecision::Allow`].
+/// It must complete each other gate before execution, or not execute the action.
+/// See [`WIRING`] for the proposed integration point.
+
 pub fn decide(
     class: ActionClass,
     categories: &SensitiveCategories,
@@ -601,15 +450,13 @@ pub fn decide(
     }
 }
 
-/// One-call convenience: classify `action` and decide in a single step,
-/// threading the concrete class-5 category id and, for a class-4 action, the
-/// real [`CommitKind`] from the [`ProposedAction`] (which the ordinal-only
-/// [`decide`] cannot recover) into the returned decision. This is the form a
-/// wiring point holding a full `ProposedAction` should call.
+/// Classifies an action and returns its mapped decision.
 ///
-/// The class-4 invariant is preserved: this only ever *refines* the
-/// `CommitKind` inside a [`PolicyDecision::RequireScopedConfirmation`]; it
-/// never turns a class-4 action into an [`PolicyDecision::Allow`].
+/// For class 5, the function passes the matched category ID to [`decide`].
+/// For class 4, it preserves the action's concrete [`CommitKind`] when available.
+/// Otherwise, class 4 uses [`CommitKind::Submit`].
+/// The function never maps class 4 to [`PolicyDecision::Allow`].
+/// It returns a value and does not intercept or execute the action.
 pub fn decide_for(action: &ProposedAction, categories: &SensitiveCategories) -> PolicyDecision {
     let class = classify(action, categories);
 
@@ -645,8 +492,8 @@ pub fn decide_for(action: &ProposedAction, categories: &SensitiveCategories) -> 
     }
 }
 
-/// Extracts the [`CommitKind`] a verb commits, if any -- used by
-/// [`decide_for`] to put the real commit kind into a class-4 decision.
+/// Returns the [`CommitKind`] carried by a commit verb or commit button.
+/// Returns `None` for all other verbs.
 fn commit_kind_of(verb: &ActionVerb) -> Option<CommitKind> {
     match verb {
         ActionVerb::Commit { kind } => Some(*kind),
@@ -657,21 +504,12 @@ fn commit_kind_of(verb: &ActionVerb) -> Option<CommitKind> {
     }
 }
 
-/// Human-readable description of the exact wiring point for the follow-up
-/// interception row, so it is discoverable both in rustdoc and as a real
-/// (probe-printable) string constant rather than only in a comment.
+/// Describes a proposed integration point for a future per-action executor.
 ///
-/// The policy wrapper is wired by calling [`decide_for`] (or
-/// [`classify`]+[`decide`]) in `control_channel::ProtocolHandler::accept`'s
-/// read loop, immediately before `self.bridge.handle_message(...)` -- the
-/// "act" dispatch -- once this daemon receives a per-action stream to gate
-/// (today it forwards whole prompts to `holo serve`, which runs the
-/// per-action think/act loop server-side, so the individual actions are not
-/// visible here yet). The dispatch happens **only** on
-/// [`PolicyDecision::permits_immediate_execution`]; the gated variants
-/// (pause / scoped-confirmation / sensitive-approval / reject) each interpose
-/// their round trip before -- or instead of -- dispatch. Enforcement lives in
-/// this code gate, never in the model's prompt (PRD P0-7).
+/// The live opaque backend does not expose individual actions to the daemon.
+/// Therefore, this integration is not currently available or active.
+/// The constant is probe-printable and does not perform interception.
+
 pub const WIRING: &str = "\
 policy wrapper wiring point: call policy::decide_for(&proposed_action, &categories) in \
 control_channel::ProtocolHandler::accept's read loop, immediately before \

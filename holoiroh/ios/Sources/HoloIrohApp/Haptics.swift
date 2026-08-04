@@ -1,13 +1,14 @@
+import Foundation
+#if canImport(UIKit)
 import UIKit
+#endif
 
-/// One place for tactile feedback, so the app's haptics are consistent and
-/// centrally muteable. Honors the `hapticsEnabled` setting (default ON) and is
-/// safe to call from anywhere on the main actor -- e.g. a connection-completion
-/// closure, an `.onChange`, or a button action. No-ops cleanly on devices
-/// without a Taptic Engine (the generators simply do nothing).
+/// Provides consistent haptic feedback for the app.
+/// Reads `hapticsEnabled`, which defaults to `true`.
+/// Calls do nothing on platforms without UIKit haptic generators.
 @MainActor
 enum Haptics {
-    /// The tactile vocabulary of the app.
+    /// Defines the app haptic events.
     enum Event {
         case connect        // a control channel just connected
         case introReveal    // the intro finished and handed off to pairing
@@ -16,14 +17,14 @@ enum Haptics {
         case warning        // something needs attention
     }
 
-    /// Whether haptics are enabled. UserDefaults has no key by default, which we
-    /// treat as ON (opt-out), matching the iOS convention for system feedback.
+    /// Indicates whether the user enables haptics. A missing setting returns `true`.
     static var isEnabled: Bool {
         UserDefaults.standard.object(forKey: "hapticsEnabled") as? Bool ?? true
     }
 
     static func fire(_ event: Event) {
         guard isEnabled else { return }
+        #if canImport(UIKit)
         switch event {
         case .connect:
             UINotificationFeedbackGenerator().notificationOccurred(.success)
@@ -36,5 +37,8 @@ enum Haptics {
         case .takeControl:
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         }
+        #else
+        _ = event
+        #endif
     }
 }

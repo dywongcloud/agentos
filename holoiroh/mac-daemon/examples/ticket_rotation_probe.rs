@@ -52,7 +52,9 @@ fn main() {
         }
     }
 
-    println!("\n=== (2) rotation effect: distinct tickets -> distinct phrases, stable per-ticket ===");
+    println!(
+        "\n=== (2) rotation effect: distinct tickets -> distinct phrases, stable per-ticket ==="
+    );
     // Two different ticket strings, as a real rotation (new iroh identity) would produce.
     let ticket_a = "iroh-live:AAAA_rotation_probe_ticket_one_DAQDAqAFM/holoiroh";
     let ticket_b = "iroh-live:BBBB_rotation_probe_ticket_two_DAQDAqAFM/holoiroh";

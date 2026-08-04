@@ -105,15 +105,26 @@ use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, RouterBuilder},
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::allowlist::{Allowlist, verify_pin};
+use crate::action_executor::{DaemonActionExecutor, ExecutionOutcome};
+use crate::agent_loop::{
+    AgentLoopError, AgentLoopLimits, AgentLoopOutcome, ObservePlanExecuteLoop,
+    TrustedTaskBindings, build_agent_loop,
+};
+use crate::semantic_ax::{SystemAxError, SystemAxSource};
+use crate::tinfoil_planner::TinfoilTurnPlanner;
+use crate::allowlist::{Allowlist, is_valid_device_id, verify_pin};
+use crate::approval::ApprovalStore;
 use crate::audit_log::{
     ActionClass, AppCategory, AuditEntry, AuditLogger, ConnectionPath, FinalStatus,
     InferenceMode, RemoteViewState, now_ms,
 };
+use crate::execution_mode::ExecutionMode;
 use crate::holo_bridge::{ControlEvent, ControlMessage, DoneStatus, HoloBridge, HoloControlBridge};
 
 // Wire-protocol types/constants/framing helpers: these used to be defined
@@ -134,10 +145,247 @@ use crate::holo_bridge::{ControlEvent, ControlMessage, DoneStatus, HoloBridge, H
 // break those examples' `use` statements.
 #[allow(unused_imports)]
 pub use holoiroh_wire::{
-    CONTROL_ALPN, ClientMessage, DEFAULT_EXPIRY_MS, EnvelopeRejection, InboundEnvelopeState,
-    InputRequestKind, MouseButton, PROTOCOL_VERSION, RemoteControlEvent, ServerMessage,
-    TaskEnvelope, epoch_millis_now, input_request_expired_text, read_line, write_line,
+    ActionApprovalRequest, ActionApprovalResponse, ActionId, ApprovalDecision, ApprovalEffect,
+    ApprovalRisk, CONTROL_ALPN, ClientMessage, DEFAULT_EXPIRY_MS, EnvelopeDirection,
+    EnvelopeRejection, InboundEnvelopeState, InputRequestKind, MouseButton, PROTOCOL_VERSION,
+    RemoteControlEvent, ServerMessage, TaskEnvelope, decode_ed25519_signature,
+    encode_ed25519_signature, epoch_millis_now, input_request_expired_text, read_line, write_line,
 };
+
+pub const MAX_AUTH_FRAME_BYTES: usize = 4 * 1024;
+pub const MAX_CONTROL_FRAME_BYTES: usize = 96 * 1024 * 1024;
+
+/// Identifies a production lifecycle event that invalidates pending approvals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalLifecycleInvalidation<'a> {
+    Stop { session_id: &'a str },
+    Pause { session_id: &'a str },
+    Redirect { session_id: &'a str },
+    Disconnect { session_id: &'a str },
+    Terminal { task_id: &'a str },
+}
+
+/// Applies the same approval invalidation decision as the live control channel.
+///
+/// This function does not consume an approval or execute an action.
+pub fn invalidate_approvals_for_lifecycle(
+    store: &mut ApprovalStore,
+    invalidation: ApprovalLifecycleInvalidation<'_>,
+) -> usize {
+    match invalidation {
+        ApprovalLifecycleInvalidation::Stop { session_id }
+        | ApprovalLifecycleInvalidation::Pause { session_id }
+        | ApprovalLifecycleInvalidation::Redirect { session_id }
+        | ApprovalLifecycleInvalidation::Disconnect { session_id } => {
+            store.cancel_session(session_id)
+        }
+        ApprovalLifecycleInvalidation::Terminal { task_id } => store.cancel_task_id(task_id),
+    }
+}
+const MAX_TINFOIL_OPERATIONS_PER_CONNECTION: usize = 4;
+const TINFOIL_BUSY_ERROR: &str = "too many Tinfoil operations are already running";
+
+type ProductionTypedLoop = ObservePlanExecuteLoop<SystemAxSource, TinfoilTurnPlanner>;
+
+struct PendingTypedContinuation {
+    session_id: String,
+    task_id: String,
+    agent_loop: Arc<tokio::sync::Mutex<ProductionTypedLoop>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+type TypedContinuationRegistry = Arc<
+    std::sync::Mutex<std::collections::HashMap<String, PendingTypedContinuation>>,
+>;
+
+type ActiveTypedTaskRegistry = Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            (String, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::Mutex<()>>),
+        >,
+    >,
+>;
+const FRAME_DIGEST_BYTES: usize = 12;
+const MAX_LOG_IDENTIFIER_BYTES: usize = 128;
+const UNAVAILABLE_LOG_IDENTIFIER: &str = "unavailable";
+
+#[derive(Debug)]
+enum FrameReadError {
+    Io(std::io::Error),
+    InvalidUtf8 {
+        byte_count: usize,
+        frame_digest: String,
+    },
+    TooLarge {
+        limit: usize,
+        frame_digest: String,
+    },
+}
+
+impl From<std::io::Error> for FrameReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+pub fn control_frame_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    data_encoding::HEXLOWER.encode(&digest[..FRAME_DIGEST_BYTES])
+}
+
+fn short_device_id(device_id: &str) -> &str {
+    device_id.get(..10).unwrap_or(device_id)
+}
+
+fn safe_log_identifier(value: Option<&str>) -> String {
+    match value {
+        Some(value)
+            if value.len() <= MAX_LOG_IDENTIFIER_BYTES
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                }) =>
+        {
+            value.to_string()
+        }
+        _ => UNAVAILABLE_LOG_IDENTIFIER.to_string(),
+    }
+}
+
+fn envelope_message_id(value: &serde_json::Value) -> String {
+    safe_log_identifier(value.get("message_id").and_then(serde_json::Value::as_str))
+}
+
+fn payload_request_id(value: &serde_json::Value) -> String {
+    let request_id = value
+        .get("payload")
+        .and_then(|payload| payload.get("request_id"))
+        .or_else(|| value.get("request_id"))
+        .and_then(serde_json::Value::as_str);
+    safe_log_identifier(request_id)
+}
+
+fn decode_frame(mut bytes: Vec<u8>) -> std::result::Result<String, FrameReadError> {
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    let byte_count = bytes.len();
+    let frame_digest = control_frame_digest(&bytes);
+    String::from_utf8(bytes).map_err(|_| FrameReadError::InvalidUtf8 {
+        byte_count,
+        frame_digest,
+    })
+}
+
+async fn read_bounded_ndjson_line<R>(
+    reader: &mut R,
+    limit: usize,
+) -> std::result::Result<Option<String>, FrameReadError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                decode_frame(bytes).map(Some)
+            };
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        if content_len > limit.saturating_sub(bytes.len()) {
+            let bounded_consumed = limit.saturating_sub(bytes.len()).saturating_add(1);
+            let prefix_len = content_len.min(bounded_consumed);
+            bytes.extend_from_slice(&available[..prefix_len]);
+            let frame_digest = control_frame_digest(&bytes);
+            reader.consume(consumed.min(bounded_consumed));
+            return Err(FrameReadError::TooLarge {
+                limit,
+                frame_digest,
+            });
+        }
+
+        bytes.extend_from_slice(&available[..content_len]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return decode_frame(bytes).map(Some);
+        }
+    }
+}
+
+fn safe_json_error(error: &serde_json::Error) -> String {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "io",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "eof",
+    };
+    format!(
+        "{category} error at line {} column {}",
+        error.line(),
+        error.column()
+    )
+}
+
+fn known_client_message_kind(value: &serde_json::Value) -> &'static str {
+    let candidate = value
+        .get("payload")
+        .and_then(|payload| payload.get("type"))
+        .or_else(|| value.get("type"))
+        .or_else(|| value.get("message_type"))
+        .and_then(serde_json::Value::as_str);
+    match candidate {
+        Some("prompt") => "prompt",
+        Some("voice_transcript") => "voice_transcript",
+        Some("stop") => "stop",
+        Some("pause") => "pause",
+        Some("resume") => "resume",
+        Some("redirect") => "redirect",
+        Some("pin") => "pin",
+        Some("input_response") => "input_response",
+        Some("approval_response") => "approval_response",
+        Some("remote_control") => "remote_control",
+        Some("clarify_request") => "clarify_request",
+        Some("process_document") => "process_document",
+        Some("analyze_image") => "analyze_image",
+        Some("transcribe_audio") => "transcribe_audio",
+        Some("request_speech") => "request_speech",
+        Some("plan_task") => "plan_task",
+        _ => "unknown",
+    }
+}
+
+pub fn transcription_filename_for_format(
+    format: &str,
+) -> std::result::Result<&'static str, &'static str> {
+    let format = format.trim();
+    let aliases: &[(&[&str], &str)] = &[
+        (&["wav", "wave", "audio/wav", "audio/x-wav"], "audio.wav"),
+        (
+            &["m4a", "mp4", "audio/m4a", "audio/x-m4a", "audio/mp4"],
+            "audio.m4a",
+        ),
+        (&["mp3", "audio/mpeg"], "audio.mp3"),
+        (&["aac", "audio/aac"], "audio.aac"),
+        (&["flac", "audio/flac", "audio/x-flac"], "audio.flac"),
+        (&["ogg", "oga", "audio/ogg"], "audio.ogg"),
+        (&["webm", "audio/webm"], "audio.webm"),
+    ];
+    aliases
+        .iter()
+        .find_map(|(accepted, filename)| {
+            accepted
+                .iter()
+                .any(|alias| format.eq_ignore_ascii_case(alias))
+                .then_some(*filename)
+        })
+        .ok_or("unsupported audio format")
+}
 
 /// Per-connection outbound envelope state: this connection's minted
 /// `session_id`, plus a monotonic counter for the daemon's own outbound
@@ -189,6 +437,350 @@ impl Default for OutboundEnvelopeState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn sign_daemon_envelope<T: serde::Serialize>(
+    envelope: &mut TaskEnvelope<T>,
+    signer: &iroh::SecretKey,
+    recipient: &iroh::PublicKey,
+) -> Result<()> {
+    let signer_public = signer.public();
+    let payload = envelope
+        .signing_payload(
+            EnvelopeDirection::DaemonToClient,
+            signer_public.as_bytes(),
+            recipient.as_bytes(),
+        )
+        .context("building daemon envelope signing payload")?;
+    let signature = signer.sign(&payload);
+    envelope.signature = Some(encode_ed25519_signature(&signature.to_bytes()));
+    Ok(())
+}
+
+fn verify_client_envelope<T: serde::Serialize>(
+    envelope: &TaskEnvelope<T>,
+    signer: &iroh::PublicKey,
+    recipient: &iroh::PublicKey,
+) -> std::result::Result<(), String> {
+    let encoded = envelope
+        .signature
+        .as_deref()
+        .ok_or_else(|| "signature is required".to_string())?;
+    let bytes = decode_ed25519_signature(encoded)
+        .map_err(|error| format!("invalid signature encoding: {error}"))?;
+    let signature = iroh::Signature::from_bytes(&bytes);
+    let payload = envelope
+        .signing_payload(
+            EnvelopeDirection::ClientToDaemon,
+            signer.as_bytes(),
+            recipient.as_bytes(),
+        )
+        .map_err(|error| format!("invalid signing payload: {error}"))?;
+    signer
+        .verify(&payload, &signature)
+        .map_err(|_| "signature verification failed".to_string())
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn sign_daemon_envelope_for_probing<T: serde::Serialize>(
+    envelope: &mut TaskEnvelope<T>,
+    signer: &iroh::SecretKey,
+    recipient: &iroh::PublicKey,
+) -> Result<()> {
+    sign_daemon_envelope(envelope, signer, recipient)
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn verify_client_envelope_for_probing<T: serde::Serialize>(
+    envelope: &TaskEnvelope<T>,
+    signer: &iroh::PublicKey,
+    recipient: &iroh::PublicKey,
+) -> std::result::Result<(), String> {
+    verify_client_envelope(envelope, signer, recipient)
+}
+
+pub fn admit_post_signature_envelope<T: serde::Serialize>(
+    envelope: &TaskEnvelope<T>,
+    message: &ClientMessage,
+    expected_session_id: &str,
+    first_inbound_envelope: bool,
+    inbound_state: &mut InboundEnvelopeState,
+    execution_mode: ExecutionMode,
+    executor: &Arc<std::sync::Mutex<DaemonActionExecutor>>,
+    now: u64,
+) -> std::result::Result<(), String> {
+    if envelope.protocol_version != PROTOCOL_VERSION {
+        return Err("protocol version mismatch".to_owned());
+    }
+    if envelope.message_type != message.type_tag() {
+        return Err("message type mismatch".to_owned());
+    }
+    if envelope.session_id != expected_session_id {
+        return Err("session binding mismatch".to_owned());
+    }
+    if first_inbound_envelope && envelope.sequence_number != 0 {
+        return Err("first sequence must be zero".to_owned());
+    }
+    inbound_state
+        .validate_inbound(envelope)
+        .map_err(|error| error.to_string())?;
+    if !execution_mode.admits(message) {
+        return Err("message rejected by execution mode".to_owned());
+    }
+    match message {
+        ClientMessage::TypedPrompt { .. } if envelope.task_id.is_none() => {
+            return Err("typed prompt requires a signed task binding".to_owned());
+        }
+        ClientMessage::ApprovalResponse { response } => route_validated_approval_response(
+            response,
+            &envelope.session_id,
+            envelope.task_id.as_deref(),
+            executor,
+            now,
+        )?,
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn build_production_typed_loop<P>(
+    executor: Arc<std::sync::Mutex<DaemonActionExecutor>>,
+    planner: P,
+    limits: AgentLoopLimits,
+) -> crate::agent_loop::ObservePlanExecuteLoop<SystemAxSource, P> {
+    build_agent_loop(executor, SystemAxSource, planner, limits)
+}
+
+fn typed_publication_allowed(
+    active_session: &str,
+    expected_session: &str,
+    canceled: &std::sync::atomic::AtomicBool,
+) -> bool {
+    active_session == expected_session
+        && !canceled.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[doc(hidden)]
+pub fn typed_publication_allowed_for_probing(
+    active_session: &str,
+    expected_session: &str,
+    canceled: &std::sync::atomic::AtomicBool,
+) -> bool {
+    typed_publication_allowed(active_session, expected_session, canceled)
+}
+
+async fn publish_typed_loop_result(
+    result: std::result::Result<AgentLoopOutcome, AgentLoopError<anyhow::Error, SystemAxError>>,
+    session_id: String,
+    request_id: String,
+    agent_loop: Arc<tokio::sync::Mutex<ProductionTypedLoop>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    continuations: TypedContinuationRegistry,
+    active_tasks: ActiveTypedTaskRegistry,
+    tx: mpsc::UnboundedSender<ControlEvent>,
+) {
+    if !matches!(&result, Ok(AgentLoopOutcome::ApprovalRequired { .. })) {
+        active_tasks.lock().await.remove(&request_id);
+    }
+    match result {
+        Ok(AgentLoopOutcome::Completed { .. }) => {
+            let _ = tx.send(ControlEvent::Done {
+                request_id,
+                context_id: None,
+                status: DoneStatus::Completed,
+                message: None,
+            });
+        }
+        Ok(AgentLoopOutcome::ApprovalRequired { receipt, .. }) => {
+            let remaining = agent_loop.lock().await.remaining();
+            let publication = active_tasks
+                .lock()
+                .await
+                .get(&request_id)
+                .and_then(|(active_session, canceled, execution_gate)| {
+                    (active_session == &session_id).then(|| {
+                        (
+                            active_session.clone(),
+                            canceled.clone(),
+                            execution_gate.clone(),
+                        )
+                    })
+                });
+            let Some((active_session, canceled, execution_gate)) = publication else {
+                return;
+            };
+            let _publication = execution_gate
+                .lock()
+                .expect("typed execution gate lock poisoned");
+            if !typed_publication_allowed(&active_session, &session_id, &canceled) {
+                return;
+            }
+            if let ExecutionOutcome::ApprovalRequired(request) = receipt.outcome {
+                let approval_id = request.approval_id.clone();
+                continuations
+                    .lock()
+                    .expect("typed continuation registry lock poisoned")
+                    .insert(
+                    approval_id.clone(),
+                    PendingTypedContinuation {
+                        session_id: session_id.clone(),
+                        task_id: request_id.clone(),
+                        agent_loop,
+                        permit,
+                    },
+                );
+                let _ = tx.send(ControlEvent::ApprovalRequested {
+                    request_id: request_id.clone(),
+                    request,
+                });
+                let deadline_continuations = continuations.clone();
+                let deadline_active_tasks = active_tasks.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(remaining).await;
+                    let Some(pending) = deadline_continuations
+                        .lock()
+                        .expect("typed continuation registry lock poisoned")
+                        .remove(&approval_id)
+                    else {
+                        return;
+                    };
+                    if let Some((_, canceled, execution_gate)) =
+                        deadline_active_tasks.lock().await.remove(&request_id)
+                    {
+                        let _execution = execution_gate
+                            .lock()
+                            .expect("typed execution gate lock poisoned");
+                        canceled.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    pending
+                        .agent_loop
+                        .lock()
+                        .await
+                        .executor()
+                        .lock()
+                        .expect("typed_action_executor lock poisoned")
+                        .cancel_approval(&approval_id);
+                    let _ = tx.send(ControlEvent::Done {
+                        request_id,
+                        context_id: None,
+                        status: DoneStatus::Failed,
+                        message: Some("typed planner deadline reached".to_string()),
+                    });
+                });
+            } else {
+                let _ = tx.send(ControlEvent::Error {
+                    request_id,
+                    message: "typed executor returned an invalid approval receipt".to_string(),
+                });
+            }
+        }
+        Ok(AgentLoopOutcome::Rejected { .. }) => {
+            let _ = tx.send(ControlEvent::Done {
+                request_id,
+                context_id: None,
+                status: DoneStatus::Failed,
+                message: Some("typed action rejected".to_string()),
+            });
+        }
+        Ok(AgentLoopOutcome::Canceled { .. }) => {
+            let _ = tx.send(ControlEvent::Done {
+                request_id,
+                context_id: None,
+                status: DoneStatus::Canceled,
+                message: Some("typed planner canceled".to_string()),
+            });
+        }
+        Ok(AgentLoopOutcome::StepLimit) => {
+            let _ = tx.send(ControlEvent::Done {
+                request_id,
+                context_id: None,
+                status: DoneStatus::Failed,
+                message: Some("typed planner step limit reached".to_string()),
+            });
+        }
+        Ok(AgentLoopOutcome::Deadline) => {
+            let _ = tx.send(ControlEvent::Done {
+                request_id,
+                context_id: None,
+                status: DoneStatus::Failed,
+                message: Some("typed planner deadline reached".to_string()),
+            });
+        }
+        Err(error) => {
+            let message: String = format!("{error:?}").chars().take(1024).collect();
+            let _ = tx.send(ControlEvent::Error {
+                request_id: request_id.clone(),
+                message,
+            });
+            let _ = tx.send(ControlEvent::Done {
+                request_id,
+                context_id: None,
+                status: DoneStatus::Failed,
+                message: Some("typed planner failed".to_string()),
+            });
+        }
+    }
+}
+
+async fn cancel_typed_continuations(
+    continuations: &TypedContinuationRegistry,
+    active_tasks: &ActiveTypedTaskRegistry,
+    session_id: &str,
+    task_id: Option<&str>,
+) {
+    {
+        let mut active = active_tasks.lock().await;
+        let task_ids: Vec<_> = active
+            .iter()
+            .filter_map(|(active_task_id, (active_session_id, _, _))| {
+                (active_session_id == session_id
+                    && task_id.is_none_or(|task_id| active_task_id == task_id))
+                    .then(|| active_task_id.clone())
+            })
+            .collect();
+        for active_task_id in task_ids {
+            if let Some((_, canceled, execution_gate)) = active.remove(&active_task_id) {
+                let _execution = execution_gate
+                    .lock()
+                    .expect("typed execution gate lock poisoned");
+                canceled.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+    let mut registry = continuations
+        .lock()
+        .expect("typed continuation registry lock poisoned");
+    let approval_ids: Vec<_> = registry
+        .iter()
+        .filter_map(|(approval_id, pending)| {
+            (pending.session_id == session_id
+                && task_id.is_none_or(|task_id| pending.task_id == task_id))
+                .then(|| approval_id.clone())
+        })
+        .collect();
+    for approval_id in approval_ids {
+        registry.remove(&approval_id);
+    }
+}
+
+pub fn route_validated_approval_response(
+    response: &ActionApprovalResponse,
+    session_id: &str,
+    task_id: Option<&str>,
+    executor: &Arc<std::sync::Mutex<DaemonActionExecutor>>,
+    now: u64,
+) -> std::result::Result<(), String> {
+    let store = executor
+        .lock()
+        .map_err(|_| "typed action executor lock poisoned".to_owned())?
+        .approval_store();
+    let result = store
+        .lock()
+        .map_err(|_| "approval store lock poisoned".to_owned())?
+        .route_response(response, session_id, task_id, now);
+    result.map_err(|error| format!("approval response rejected: {error:?}"))
 }
 
 /// Translates a [`crate::holo_bridge::control::ControlEvent`] (the
@@ -273,9 +865,7 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
         ControlEvent::DaemonStatus { text } => ServerMessage::status(text),
         // Live auto-yield pause/resume -> the same wire message the reconnect
         // path uses, so the phone's Pause/Stop pill updates in real time.
-        ControlEvent::TaskActive { paused, queued } => {
-            ServerMessage::TaskActive { paused, queued }
-        }
+        ControlEvent::TaskActive { paused, queued } => ServerMessage::TaskActive { paused, queued },
         // The sensitive-app consent gate's ask, verbatim onto the wire's P0-14 shape.
         ControlEvent::InputRequested {
             request_id,
@@ -290,13 +880,18 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
             response_options,
             expires_at,
         },
-        ControlEvent::ClarifyQuestions { questions } => {
-            ServerMessage::clarify_questions(questions)
-        }
+        ControlEvent::ClarifyQuestions { questions } => ServerMessage::clarify_questions(questions),
         ControlEvent::SecureInputState { active } => ServerMessage::SecureInputState { active },
-        ControlEvent::DocumentProcessed { request_id, markdown } => {
-            ServerMessage::DocumentProcessed { request_id, markdown }
+        ControlEvent::ApprovalRequested { request, .. } => {
+            ServerMessage::ApprovalRequest { request }
         }
+        ControlEvent::DocumentProcessed {
+            request_id,
+            markdown,
+        } => ServerMessage::DocumentProcessed {
+            request_id,
+            markdown,
+        },
         ControlEvent::DocumentProcessFailed { request_id, error } => {
             ServerMessage::DocumentProcessFailed { request_id, error }
         }
@@ -312,9 +907,13 @@ pub fn from_control_event(event: ControlEvent) -> ServerMessage {
         ControlEvent::AudioTranscriptionFailed { request_id, error } => {
             ServerMessage::AudioTranscriptionFailed { request_id, error }
         }
-        ControlEvent::SpeechReady { request_id, audio_data_base64 } => {
-            ServerMessage::SpeechReady { request_id, audio_data_base64 }
-        }
+        ControlEvent::SpeechReady {
+            request_id,
+            audio_data_base64,
+        } => ServerMessage::SpeechReady {
+            request_id,
+            audio_data_base64,
+        },
         ControlEvent::SpeechFailed { request_id, error } => {
             ServerMessage::SpeechFailed { request_id, error }
         }
@@ -346,6 +945,7 @@ fn event_request_id(event: &ControlEvent) -> Option<String> {
         | ControlEvent::Error { request_id, .. }
         | ControlEvent::Queued { request_id, .. }
         | ControlEvent::InputRequested { request_id, .. }
+        | ControlEvent::ApprovalRequested { request_id, .. }
         | ControlEvent::DocumentProcessed { request_id, .. }
         | ControlEvent::DocumentProcessFailed { request_id, .. }
         | ControlEvent::ImageAnalyzed { request_id, .. }
@@ -386,7 +986,7 @@ fn log_cloud_egress(
         byte_count,
     };
     if let Err(err) = audit.append(&entry) {
-        warn!(error = %err, request_id, "control channel: failed to append cloud-egress audit entry");
+        warn!(error = %err, "control channel: failed to append cloud-egress audit entry");
     }
 }
 
@@ -464,13 +1064,14 @@ pub fn to_control_message(request_id: String, msg: ClientMessage) -> Option<Cont
         ClientMessage::Redirect { text } => Some(ControlMessage::Redirect { request_id, text }),
         ClientMessage::RemoteControl { event } => Some(ControlMessage::RemoteControl { event }),
         ClientMessage::Pin { .. } => None,
-        ClientMessage::InputResponse { .. } => None,
+        ClientMessage::InputResponse { .. } | ClientMessage::ApprovalResponse { .. } => None,
         // Clarification runs off the desktop-task pipeline (handled inline in
         // the control-channel read loop), so it never becomes a ControlMessage.
         ClientMessage::ClarifyRequest { .. } => None,
         // Handled entirely by their own arms in the read loop below, off the desktop-task
         // pipeline (same as ClarifyRequest) -- listed only to keep this match exhaustive.
-        ClientMessage::ProcessDocument { .. }
+        ClientMessage::TypedPrompt { .. }
+        | ClientMessage::ProcessDocument { .. }
         | ClientMessage::AnalyzeImage { .. }
         | ClientMessage::TranscribeAudio { .. }
         | ClientMessage::RequestSpeech { .. }
@@ -662,7 +1263,7 @@ impl AuthState {
     /// normally perform. This function is `pub`, not only reachable via
     /// those constructors, specifically so `examples/auth_gate_probe.rs`
     /// can exercise the actual gate function against a real in-memory
-    /// `AuthState` and a real `tokio::io::Lines` reader.
+    /// `AuthState` and a bounded `AsyncBufRead` reader.
     /// `examples/auth_gate_probe.rs` is a real, run-by-hand live witness
     /// for [`ControlChannel::authenticate`]'s PIN/allowlist gate logic
     /// (see this repo's no-unit-tests rule). It uses the same seam the
@@ -673,7 +1274,11 @@ impl AuthState {
     /// function carries `#[allow(dead_code)]` there, the same status as
     /// `allowlist.rs`'s own probe-only convenience methods.
     #[allow(dead_code)]
-    pub fn for_probing(expected_pin: Option<&str>, pre_allowed: &[&str], allowlist_path: std::path::PathBuf) -> Self {
+    pub fn for_probing(
+        expected_pin: Option<&str>,
+        pre_allowed: &[&str],
+        allowlist_path: std::path::PathBuf,
+    ) -> Self {
         let mut allowlist = Allowlist::default();
         for device in pre_allowed {
             allowlist.add_entry(device.to_string(), None);
@@ -708,6 +1313,10 @@ impl AuthState {
 #[derive(Clone)]
 pub struct ControlChannel {
     bridge: Arc<HoloBridge>,
+    execution_mode: ExecutionMode,
+    /// The same persisted identity key owned by the shared Live endpoint.
+    /// It signs every post-auth daemon envelope; no second identity exists.
+    signing_key: Arc<iroh::SecretKey>,
     auth: Arc<std::sync::Mutex<AuthState>>,
     /// Metadata-only local audit log (Project Aro PRD row P0-12) -- see
     /// `crate::audit_log`'s module doc for exactly what is and isn't
@@ -737,7 +1346,9 @@ pub struct ControlChannel {
     /// `*Failed` event stating no key is configured, mirroring
     /// `clarify`'s empty-questions-when-disabled posture rather than
     /// silently hanging.
-    tinfoil_key: Option<Arc<str>>,
+    tinfoil_client: Option<Arc<crate::tinfoil_client::TinfoilClient>>,
+    approval_store: Arc<std::sync::Mutex<ApprovalStore>>,
+    typed_action_executor: Arc<std::sync::Mutex<DaemonActionExecutor>>,
 }
 
 impl std::fmt::Debug for ControlChannel {
@@ -763,14 +1374,23 @@ impl ControlChannel {
     /// change to actually enable enforcement by default.
     pub fn new(
         bridge: Arc<HoloBridge>,
+        execution_mode: ExecutionMode,
+        signing_key: Arc<iroh::SecretKey>,
         audit: Arc<AuditLogger>,
         current_ticket: Arc<str>,
         clarify: Option<crate::clarify::ClarifyConfig>,
-        tinfoil_key: Option<Arc<str>>,
+        tinfoil_client: Option<Arc<crate::tinfoil_client::TinfoilClient>>,
     ) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
+        let approval_store = Arc::new(std::sync::Mutex::new(ApprovalStore::default()));
+        let typed_action_executor = Arc::new(std::sync::Mutex::new(DaemonActionExecutor::new(
+            approval_store.clone(),
+            crate::approval::DEFAULT_APPROVAL_CAPACITY,
+        )));
         Self {
             bridge,
+            execution_mode,
+            signing_key,
             auth: Arc::new(std::sync::Mutex::new(AuthState {
                 allowlist,
                 allowlist_path,
@@ -779,7 +1399,9 @@ impl ControlChannel {
             audit,
             current_ticket,
             clarify,
-            tinfoil_key,
+            tinfoil_client,
+            approval_store,
+            typed_action_executor,
         }
     }
 
@@ -796,15 +1418,24 @@ impl ControlChannel {
     /// wiring step" section.
     pub fn with_auth(
         bridge: Arc<HoloBridge>,
+        execution_mode: ExecutionMode,
+        signing_key: Arc<iroh::SecretKey>,
         expected_pin: String,
         audit: Arc<AuditLogger>,
         current_ticket: Arc<str>,
         clarify: Option<crate::clarify::ClarifyConfig>,
-        tinfoil_key: Option<Arc<str>>,
+        tinfoil_client: Option<Arc<crate::tinfoil_client::TinfoilClient>>,
     ) -> Self {
         let (allowlist, allowlist_path) = Self::load_allowlist_best_effort();
+        let approval_store = Arc::new(std::sync::Mutex::new(ApprovalStore::default()));
+        let typed_action_executor = Arc::new(std::sync::Mutex::new(DaemonActionExecutor::new(
+            approval_store.clone(),
+            crate::approval::DEFAULT_APPROVAL_CAPACITY,
+        )));
         Self {
             bridge,
+            execution_mode,
+            signing_key,
             auth: Arc::new(std::sync::Mutex::new(AuthState {
                 allowlist,
                 allowlist_path,
@@ -813,8 +1444,30 @@ impl ControlChannel {
             audit,
             current_ticket,
             clarify,
-            tinfoil_key,
+            tinfoil_client,
+            approval_store,
+            typed_action_executor,
         }
+    }
+
+    pub fn with_action_executor(
+        mut self,
+        typed_action_executor: Arc<std::sync::Mutex<DaemonActionExecutor>>,
+    ) -> Self {
+        self.approval_store = typed_action_executor
+            .lock()
+            .expect("typed action executor lock poisoned")
+            .approval_store();
+        self.typed_action_executor = typed_action_executor;
+        self
+    }
+
+    pub fn typed_action_executor(&self) -> Arc<std::sync::Mutex<DaemonActionExecutor>> {
+        self.typed_action_executor.clone()
+    }
+
+    pub fn approval_store(&self) -> Arc<std::sync::Mutex<ApprovalStore>> {
+        self.approval_store.clone()
     }
 
     fn load_allowlist_best_effort() -> (Allowlist, std::path::PathBuf) {
@@ -828,7 +1481,10 @@ impl ControlChannel {
             },
             Err(err) => {
                 warn!(error = %err, "control channel: could not resolve allowlist path (HOME unset?), auth allowlist is in-memory-only this run");
-                (Allowlist::default(), std::path::PathBuf::from(".holoiroh-allowlist-fallback.json"))
+                (
+                    Allowlist::default(),
+                    std::path::PathBuf::from(".holoiroh-allowlist-fallback.json"),
+                )
             }
         }
     }
@@ -842,7 +1498,7 @@ impl ControlChannel {
     /// [`ServerMessage::auth_rejected`] before closing.
     ///
     /// For an unknown device with PIN auth enabled, this reads exactly one
-    /// line off `lines`, expecting `{"type":"pin","pin":"..."}`. This must
+    /// bounded NDJSON frame from `reader`, expecting `{"type":"pin","pin":"..."}`. This must
     /// be the very first line the peer sends before anything else is
     /// processed. A `Prompt`/`VoiceTranscript`/`Stop` sent before a
     /// successful `Pin` from an unknown device is rejected, not queued or
@@ -863,11 +1519,21 @@ impl ControlChannel {
     pub async fn authenticate<R>(
         auth: &Arc<std::sync::Mutex<AuthState>>,
         remote: &str,
-        lines: &mut tokio::io::Lines<R>,
+        reader: &mut R,
     ) -> std::result::Result<(), String>
     where
         R: tokio::io::AsyncBufRead + Unpin,
     {
+        let remote_log = short_device_id(remote);
+        if !is_valid_device_id(remote) {
+            warn!(
+                peer = remote_log,
+                "control channel: invalid authenticated endpoint id rejected"
+            );
+            return Err(
+                "authenticated endpoint id is not a full lowercase 64-hex value".to_string(),
+            );
+        }
         // Fast path: already allowlisted (or PIN auth disabled entirely) --
         // no need to consume any input off the stream at all.
         {
@@ -879,33 +1545,123 @@ impl ControlChannel {
 
         // Unknown device, PIN auth enabled: the first line on the stream
         // must be a valid Pin message with the correct PIN.
-        let line = match lines.next_line().await {
+        let line = match read_bounded_ndjson_line(reader, MAX_AUTH_FRAME_BYTES).await {
             Ok(Some(line)) => line,
             Ok(None) => return Err("connection closed before PIN was presented".to_string()),
-            Err(err) => return Err(format!("read error waiting for PIN: {err}")),
+            Err(FrameReadError::TooLarge {
+                limit,
+                frame_digest,
+            }) => {
+                warn!(
+                    peer = remote_log,
+                    message_kind = "unknown",
+                    message_id = UNAVAILABLE_LOG_IDENTIFIER,
+                    request_id = UNAVAILABLE_LOG_IDENTIFIER,
+                    byte_count_at_least = limit + 1,
+                    frame_digest,
+                    digest_scope = "bounded_prefix",
+                    "control channel: oversized pre-auth frame"
+                );
+                return Err(format!("PIN frame exceeds {limit}-byte limit"));
+            }
+            Err(FrameReadError::InvalidUtf8 {
+                byte_count,
+                frame_digest,
+            }) => {
+                warn!(
+                    peer = remote_log,
+                    message_kind = "unknown",
+                    message_id = UNAVAILABLE_LOG_IDENTIFIER,
+                    request_id = UNAVAILABLE_LOG_IDENTIFIER,
+                    byte_count,
+                    frame_digest,
+                    parse_error = "invalid utf-8",
+                    "control channel: malformed pre-auth frame"
+                );
+                return Err("PIN frame is not valid UTF-8".to_string());
+            }
+            Err(FrameReadError::Io(error)) => {
+                warn!(
+                    peer = remote_log,
+                    error_kind = ?error.kind(),
+                    "control channel: read error waiting for PIN"
+                );
+                return Err(format!("read error waiting for PIN: {}", error.kind()));
+            }
         };
+        let byte_count = line.len();
+        let frame_digest = control_frame_digest(line.as_bytes());
 
-        let msg: ClientMessage = match serde_json::from_str(&line) {
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                let parse_error = safe_json_error(&error);
+                warn!(
+                    peer = remote_log,
+                    message_kind = "unknown",
+                    message_id = UNAVAILABLE_LOG_IDENTIFIER,
+                    request_id = UNAVAILABLE_LOG_IDENTIFIER,
+                    byte_count,
+                    frame_digest,
+                    parse_error,
+                    "control channel: malformed pre-auth JSON"
+                );
+                return Err(format!("expected a PIN message first, got {parse_error}"));
+            }
+        };
+        let message_kind = known_client_message_kind(&value);
+        let message_id = envelope_message_id(&value);
+        let request_id = payload_request_id(&value);
+        let msg: ClientMessage = match serde_json::from_value(value) {
             Ok(msg) => msg,
-            Err(err) => return Err(format!("expected a PIN message first, got unparseable input: {err}")),
+            Err(error) => {
+                let parse_error = safe_json_error(&error);
+                warn!(
+                    peer = remote_log,
+                    message_kind,
+                    message_id,
+                    request_id,
+                    byte_count,
+                    frame_digest,
+                    parse_error,
+                    "control channel: malformed pre-auth message"
+                );
+                return Err(format!("expected a PIN message first, got {parse_error}"));
+            }
         };
 
         let candidate = match msg {
             ClientMessage::Pin { pin } => pin,
             other => {
+                warn!(
+                    peer = remote_log,
+                    message_kind = other.type_tag(),
+                    message_id,
+                    request_id,
+                    byte_count,
+                    "control channel: non-PIN pre-auth message rejected"
+                );
                 return Err(format!(
-                    "expected a PIN message first from an unrecognized device, got {other:?} instead"
+                    "expected a PIN message first from an unrecognized device, got {} instead",
+                    other.type_tag()
                 ));
             }
         };
 
         let mut state = auth.lock().expect("auth lock poisoned");
-        let expected = state
-            .expected_pin
-            .clone()
-            .expect("checked Some above; not mutated between the two locks on this task-local path");
+        let expected = state.expected_pin.clone().expect(
+            "checked Some above; not mutated between the two locks on this task-local path",
+        );
 
         if !verify_pin(&candidate, &expected) {
+            warn!(
+                peer = remote_log,
+                message_kind = "pin",
+                message_id,
+                request_id,
+                byte_count,
+                "control channel: incorrect PIN rejected"
+            );
             return Err("incorrect PIN".to_string());
         }
 
@@ -920,9 +1676,9 @@ impl ControlChannel {
             // error, not an auth failure), but it does mean the device will
             // have to re-enter the PIN after a daemon restart. Logged, not
             // silently swallowed.
-            warn!(peer = %remote, error = %err, "control channel: PIN accepted but failed to persist allowlist -- device will need to re-pair after daemon restart");
+            warn!(peer = %remote_log, error = %err, "control channel: PIN accepted but failed to persist allowlist -- device will need to re-pair after daemon restart");
         }
-        info!(peer = %remote, "control channel: new device paired via PIN, added to allowlist");
+        info!(peer = %remote_log, "control channel: new device paired via PIN, added to allowlist");
         Ok(())
     }
 
@@ -942,27 +1698,13 @@ impl ControlChannel {
     pub fn register_protocols(&self, router: RouterBuilder) -> RouterBuilder {
         router.accept(CONTROL_ALPN, self.clone())
     }
-
-    /// Sends `msg` to a connected peer over a freshly opened bidirectional
-    /// stream (dial side). The Mac daemon uses this when it needs to push
-    /// a [`ServerMessage`] proactively, rather than as a reply within an
-    /// already-accepted stream (the common case, handled inline in
-    /// [`ProtocolHandler::accept`] below). `main.rs` does not call this
-    /// function yet, since nothing today needs to push a message outside
-    /// of an active request/response turn. It is still the dial-side
-    /// primitive this module exists to provide alongside the accept side.
-    #[allow(dead_code)]
-    pub async fn send_on_new_stream(conn: &Connection, msg: &ServerMessage) -> Result<()> {
-        let (mut send, _recv) = conn.open_bi().await.context("opening control stream")?;
-        write_line(&mut send, msg).await?;
-        send.finish().context("finishing control stream")?;
-        Ok(())
-    }
 }
 
 impl ProtocolHandler for ControlChannel {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        let remote = connection.remote_id().fmt_short();
+        let remote_id = connection.remote_id();
+        let remote_device_id = remote_id.to_string();
+        let remote = remote_id.fmt_short();
         info!(peer = %remote, "control channel: accepted connection");
 
         let (mut send, recv) = connection
@@ -970,7 +1712,7 @@ impl ProtocolHandler for ControlChannel {
             .await
             .map_err(AcceptError::from_err)?;
 
-        let mut lines = BufReader::new(recv).lines();
+        let mut reader = BufReader::new(recv);
 
         // Auth gate: allowlisted devices pass through immediately; unknown
         // devices (with PIN auth enabled via `ControlChannel::with_auth`)
@@ -984,8 +1726,8 @@ impl ProtocolHandler for ControlChannel {
         // `ServerMessage::auth_rejected` reply, same as before this task's
         // envelope wrapping. See `PROTOCOL.md`'s "Envelope" section for the
         // explicit statement of this boundary.
-        if let Err(reason) = Self::authenticate(&self.auth, &remote.to_string(), &mut lines).await {
-            warn!(peer = %remote, reason = %reason, "control channel: rejecting connection, auth failed");
+        if let Err(reason) = Self::authenticate(&self.auth, &remote_device_id, &mut reader).await {
+            warn!(peer = %remote, "control channel: rejecting connection, auth failed");
             let _ = write_line(&mut send, &ServerMessage::auth_rejected(reason)).await;
             let _ = send.finish();
             connection.close(0u32.into(), b"auth rejected");
@@ -997,7 +1739,7 @@ impl ProtocolHandler for ControlChannel {
         // `OutboundEnvelopeState`'s doc for why this is per-connection, not
         // persisted, and why it's a separate type from
         // `InboundEnvelopeState`.
-        let mut outbound_state = OutboundEnvelopeState::new();
+        let outbound_state = OutboundEnvelopeState::new();
         let session_id = outbound_state.session_id.clone();
         info!(peer = %remote, session_id = %session_id, "control channel: session established");
 
@@ -1010,6 +1752,8 @@ impl ProtocolHandler for ControlChannel {
         async fn send_envelope<W>(
             send: &mut W,
             outbound_state: &mut OutboundEnvelopeState,
+            signing_key: &iroh::SecretKey,
+            recipient: &iroh::PublicKey,
             session_id: &str,
             task_id: Option<String>,
             msg: ServerMessage,
@@ -1018,12 +1762,9 @@ impl ProtocolHandler for ControlChannel {
             W: tokio::io::AsyncWrite + Unpin,
         {
             let seq = outbound_state.next_outbound_sequence();
-            let envelope =
+            let mut envelope =
                 TaskEnvelope::<ServerMessage>::wrap(session_id.to_string(), task_id, seq, msg);
-            // `write_line` returns `std::io::Result<()>` (moved to `holoiroh-wire`, which
-            // deliberately has no `anyhow` dependency -- see that crate's doc comment on
-            // `write_line`); `?` converts via `anyhow::Error: From<std::io::Error>` into this
-            // function's own `anyhow::Result<()>`.
+            sign_daemon_envelope(&mut envelope, signing_key, recipient)?;
             write_line(send, &envelope).await?;
             Ok(())
         }
@@ -1034,37 +1775,31 @@ impl ProtocolHandler for ControlChannel {
         // path renegotiation would be a new `Connection`), so every task audited on this
         // connection shares one `ConnectionPath` value rather than re-deriving it per task.
         let connection_path = ConnectionPath::from_connection(&connection);
+        let mut initial_messages: Vec<(Option<String>, ServerMessage)> = vec![
+            (
+                None,
+                ServerMessage::greeting(
+                    "control channel ready",
+                    self.execution_mode.wire_name(),
+                    self.execution_mode.capabilities().iter().copied(),
+                ),
+            ),
+            (None, ServerMessage::current_ticket(&*self.current_ticket)),
+        ];
 
-        // Greet the peer so it knows the control channel is live -- this
-        // also exercises the write path immediately, surfacing transport
-        // errors early rather than only on the first real reply.
-        if let Err(err) = send_envelope(
-            &mut send,
-            &mut outbound_state,
-            &session_id,
-            None,
-            ServerMessage::status("control channel ready"),
-        )
-        .await
-        {
-            warn!(peer = %remote, error = %err, "control channel: failed to send greeting");
-        }
-
-        // Hand the peer this daemon's current node-id-only ticket right after the
-        // greeting, so a client whose stored default went stale on an identity
-        // rotation can refresh it over the already-authenticated channel instead
-        // of needing a QR re-scan. Best-effort: a send failure here never fails
-        // the connection (the greeting already succeeded above).
-        if let Err(err) = send_envelope(
-            &mut send,
-            &mut outbound_state,
-            &session_id,
-            None,
-            ServerMessage::current_ticket(&*self.current_ticket),
-        )
-        .await
-        {
-            warn!(peer = %remote, error = %err, "control channel: failed to send current ticket");
+        if let Some(client) = &self.tinfoil_client {
+            match serde_json::from_str(client.ground_truth_json().as_ref()) {
+                Ok(ground_truth) => {
+                    let message = ServerMessage::TinfoilVerification {
+                        host: client.base_url(),
+                        ground_truth,
+                    };
+                    initial_messages.push((None, message));
+                }
+                Err(err) => {
+                    warn!(error = %err, "control channel: verified Tinfoil ground truth was not JSON");
+                }
+            }
         }
 
         // Reconnect visibility: if a Holo task survived a previous connection's drop (still
@@ -1093,34 +1828,14 @@ impl ProtocolHandler for ControlChannel {
                 ),
                 (false, false, n) => format!("reconnected: {n} queued Holo task(s) waiting to run"),
             };
-            // Human status for the log panel (unchanged behaviour).
-            if let Err(err) = send_envelope(
-                &mut send,
-                &mut outbound_state,
-                &session_id,
+            initial_messages.push((None, ServerMessage::status(text)));
+            initial_messages.push((
                 None,
-                ServerMessage::status(text),
-            )
-            .await
-            {
-                warn!(peer = %remote, error = %err, "control channel: failed to send reconnect status");
-            }
-            // Plus a STRUCTURED signal the client keys its task-control pill off,
-            // so the Pause/Stop taskbar reappears on reconnect -- a free-text
-            // status line cannot reliably drive UI state. `paused` is true only
-            // when the task is parked (running takes precedence): the app then
-            // shows the pill in its Paused state, otherwise the running state.
-            if let Err(err) = send_envelope(
-                &mut send,
-                &mut outbound_state,
-                &session_id,
-                None,
-                ServerMessage::TaskActive { paused: paused && !busy, queued },
-            )
-            .await
-            {
-                warn!(peer = %remote, error = %err, "control channel: failed to send reconnect task_active");
-            }
+                ServerMessage::TaskActive {
+                    paused: paused && !busy,
+                    queued,
+                },
+            ));
         }
 
         // Per-connection channel carrying translated ServerMessages back
@@ -1140,6 +1855,12 @@ impl ProtocolHandler for ControlChannel {
         // unbounded channel here avoids the bridge ever blocking on a slow
         // iroh peer.
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<ControlEvent>();
+        let tinfoil_operations = Arc::new(Semaphore::new(MAX_TINFOIL_OPERATIONS_PER_CONNECTION));
+        let mut tinfoil_tasks = JoinSet::new();
+        let typed_continuations: TypedContinuationRegistry =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let active_typed_tasks: ActiveTypedTaskRegistry =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
         // Point the bridge at THIS connection now, on accept -- not later, on the
         // first dispatchable message.
@@ -1182,6 +1903,7 @@ impl ProtocolHandler for ControlChannel {
         // gives for its std lock.
         let audit_starts: Arc<std::sync::Mutex<std::collections::HashMap<String, AuditTaskStart>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let typed_action_executor = self.typed_action_executor.clone();
 
         // Forward ControlEvents -> ServerMessage envelopes on this stream,
         // on its own task so a slow/stalled write to `send` doesn't block
@@ -1204,13 +1926,34 @@ impl ProtocolHandler for ControlChannel {
         // README.md's security model. A future multi-client fan-out would
         // need `HoloBridge` to accept a per-request event sink instead.
         let mut send_task = tokio::spawn({
-            let remote = remote.clone();
+            let remote = remote.to_string();
             let session_id = session_id.clone();
             let current_task_id = current_task_id.clone();
             let audit = self.audit.clone();
             let audit_starts = audit_starts.clone();
+            let typed_action_executor = typed_action_executor.clone();
+            let typed_continuations = typed_continuations.clone();
+            let active_typed_tasks = active_typed_tasks.clone();
+            let signing_key = self.signing_key.clone();
+            let recipient = remote_id;
             async move {
                 let mut outbound_state = outbound_state;
+                for (task_id, message) in initial_messages {
+                    if let Err(error) = send_envelope(
+                        &mut send,
+                        &mut outbound_state,
+                        &signing_key,
+                        &recipient,
+                        &session_id,
+                        task_id,
+                        message,
+                    )
+                    .await
+                    {
+                        warn!(peer = %remote, error = %error, "control channel: failed to write initial signed envelope");
+                        return;
+                    }
+                }
                 // Per-connection action-step tally: incremented on every `Progress` event,
                 // consumed (and removed) when that `request_id`'s `Done` arrives. Never touches
                 // event content -- only counts how many `Progress` events were seen.
@@ -1225,19 +1968,46 @@ impl ProtocolHandler for ControlChannel {
                         &mut action_counts,
                         &event,
                     );
+                    if let ControlEvent::Done { request_id, .. } = &event {
+                        cancel_typed_continuations(
+                            &typed_continuations,
+                            &active_typed_tasks,
+                            &session_id,
+                            Some(request_id),
+                        )
+                        .await;
+                        typed_action_executor
+                            .lock()
+                            .expect("typed_action_executor lock poisoned")
+                            .cancel_task_id(request_id);
+                    }
                     // Correlate by the event's OWN request_id first (concurrent turns are
                     // real now that the read loop spawns them); the last-inbound-envelope
                     // fallback only covers events that genuinely carry no id of their own.
-                    let task_id = event_request_id(&event).or_else(|| {
-                        current_task_id
-                            .lock()
-                            .expect("current_task_id lock poisoned")
-                            .clone()
-                    });
+                    let task_id = if matches!(
+                        &event,
+                        ControlEvent::Error { request_id, .. } if request_id.is_empty()
+                    ) {
+                        None
+                    } else {
+                        event_request_id(&event).or_else(|| {
+                            current_task_id
+                                .lock()
+                                .expect("current_task_id lock poisoned")
+                                .clone()
+                        })
+                    };
                     let msg = from_control_event(event);
-                    if let Err(err) =
-                        send_envelope(&mut send, &mut outbound_state, &session_id, task_id, msg)
-                            .await
+                    if let Err(err) = send_envelope(
+                        &mut send,
+                        &mut outbound_state,
+                        &signing_key,
+                        &recipient,
+                        &session_id,
+                        task_id,
+                        msg,
+                    )
+                    .await
                     {
                         warn!(peer = %remote, error = %err, "control channel: failed to write event");
                         break;
@@ -1250,7 +2020,8 @@ impl ProtocolHandler for ControlChannel {
         // sequence_number), owned by this read loop -- see
         // `InboundEnvelopeState`'s doc for why it's a separate type/
         // instance from the writer task's `outbound_state` above.
-        let mut inbound_state = InboundEnvelopeState::new();
+        let mut inbound_state = InboundEnvelopeState::for_session(session_id.clone());
+        let mut first_inbound_envelope = true;
 
         // The `request_id` of the single outstanding `InputRequest` this
         // connection is waiting on, if any -- see `PendingInputRequest`'s
@@ -1273,7 +2044,18 @@ impl ProtocolHandler for ControlChannel {
             // `Option` by reference and immediately returning if `None` is
             // simpler and allocation-free).
             let line = tokio::select! {
-                line = lines.next_line() => line,
+                line = read_bounded_ndjson_line(&mut reader, MAX_CONTROL_FRAME_BYTES) => line,
+                completed = tinfoil_tasks.join_next(), if !tinfoil_tasks.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        warn!(
+                            peer = %remote,
+                            cancelled = error.is_cancelled(),
+                            panicked = error.is_panic(),
+                            "control channel: Tinfoil operation task ended unexpectedly"
+                        );
+                    }
+                    continue;
+                }
                 _ = &mut send_task => {
                     debug!(peer = %remote, "control channel: writer task ended");
                     break;
@@ -1317,11 +2099,53 @@ impl ProtocolHandler for ControlChannel {
                     debug!(peer = %remote, "control channel: peer closed stream");
                     break;
                 }
-                Err(err) => {
-                    warn!(peer = %remote, error = %err, "control channel: read error");
+                Err(FrameReadError::TooLarge {
+                    limit,
+                    frame_digest,
+                }) => {
+                    warn!(
+                        peer = %remote,
+                        message_kind = "unknown",
+                        message_id = UNAVAILABLE_LOG_IDENTIFIER,
+                        request_id = UNAVAILABLE_LOG_IDENTIFIER,
+                        byte_count_at_least = limit + 1,
+                        frame_digest,
+                        digest_scope = "bounded_prefix",
+                        "control channel: oversized authenticated frame rejected"
+                    );
+                    let _ = events_tx.send(ControlEvent::Error {
+                        request_id: String::new(),
+                        message: format!("control frame exceeds {limit}-byte limit"),
+                    });
+                    break;
+                }
+                Err(FrameReadError::InvalidUtf8 {
+                    byte_count,
+                    frame_digest,
+                }) => {
+                    warn!(
+                        peer = %remote,
+                        message_kind = "unknown",
+                        message_id = UNAVAILABLE_LOG_IDENTIFIER,
+                        request_id = UNAVAILABLE_LOG_IDENTIFIER,
+                        byte_count,
+                        frame_digest,
+                        parse_error = "invalid utf-8",
+                        "control channel: malformed authenticated frame"
+                    );
+                    break;
+                }
+                Err(FrameReadError::Io(error)) => {
+                    warn!(
+                        peer = %remote,
+                        error_kind = ?error.kind(),
+                        "control channel: read error"
+                    );
                     break;
                 }
             };
+            let frame_byte_count = line.len();
+            let frame_digest = control_frame_digest(line.as_bytes());
 
             if line.trim().is_empty() {
                 continue;
@@ -1340,8 +2164,17 @@ impl ProtocolHandler for ControlChannel {
             let envelope_value = match envelope_value {
                 Ok(v) => v,
                 Err(parse_err) => {
-                    warn!(peer = %remote, error = %parse_err, line = %line, "control channel: malformed envelope JSON");
-                    *current_task_id.lock().expect("current_task_id lock poisoned") = None;
+                    let safe_error = safe_json_error(&parse_err);
+                    warn!(
+                        peer = %remote,
+                        message_kind = "unknown",
+                        message_id = UNAVAILABLE_LOG_IDENTIFIER,
+                        request_id = UNAVAILABLE_LOG_IDENTIFIER,
+                        byte_count = frame_byte_count,
+                        frame_digest,
+                        parse_error = safe_error,
+                        "control channel: malformed envelope JSON"
+                    );
                     if events_tx
                         .send(ControlEvent::Error {
                             request_id: String::new(),
@@ -1356,56 +2189,131 @@ impl ProtocolHandler for ControlChannel {
                 }
             };
 
-            let envelope: TaskEnvelope<serde_json::Value> =
-                match serde_json::from_value(envelope_value) {
-                    Ok(env) => env,
-                    Err(shape_err) => {
-                        warn!(peer = %remote, error = %shape_err, line = %line, "control channel: envelope missing required framing fields");
-                        *current_task_id.lock().expect("current_task_id lock poisoned") = None;
-                        if events_tx
-                            .send(ControlEvent::Error {
-                                request_id: String::new(),
-                                message: format!("malformed envelope: {shape_err}"),
-                            })
-                            .is_err()
-                        {
-                            debug!(peer = %remote, "control channel: writer task gone, dropping parse-error reply");
-                            break;
-                        }
-                        continue;
+            let envelope_message_kind = known_client_message_kind(&envelope_value);
+            let log_message_id = envelope_message_id(&envelope_value);
+            let log_request_id = payload_request_id(&envelope_value);
+            let envelope: TaskEnvelope<serde_json::Value> = match serde_json::from_value(
+                envelope_value,
+            ) {
+                Ok(env) => env,
+                Err(shape_err) => {
+                    let safe_error = safe_json_error(&shape_err);
+                    warn!(
+                        peer = %remote,
+                        message_kind = envelope_message_kind,
+                        message_id = log_message_id,
+                        request_id = log_request_id,
+                        byte_count = frame_byte_count,
+                        frame_digest,
+                        parse_error = safe_error,
+                        "control channel: envelope missing required framing fields"
+                    );
+                    if events_tx
+                        .send(ControlEvent::Error {
+                            request_id: String::new(),
+                            message: format!("malformed envelope: {shape_err}"),
+                        })
+                        .is_err()
+                    {
+                        debug!(peer = %remote, "control channel: writer task gone, dropping parse-error reply");
+                        break;
                     }
-                };
+                    continue;
+                }
+            };
 
-            // Every reply this iteration echoes this envelope's task_id
-            // (possibly `None`) -- set once here so the writer task picks
-            // it up regardless of which arm below actually replies.
-            *current_task_id.lock().expect("current_task_id lock poisoned") =
-                envelope.task_id.clone();
-
-            // Envelope shell parsed. Validate expiry/dedup/sequence before
-            // touching the payload at all -- a rejected envelope is never
-            // forwarded to holo_bridge regardless of what its payload
-            // contains.
-            if let Err(rejection) = inbound_state.validate_inbound(&envelope) {
-                warn!(peer = %remote, %rejection, message_id = %envelope.message_id, "control channel: envelope rejected");
+            // Authenticate the complete envelope shell before payload deserialization
+            // or any session/replay/correlation state mutation.
+            let local_public = self.signing_key.public();
+            if let Err(reason) = verify_client_envelope(&envelope, &remote_id, &local_public) {
+                warn!(
+                    peer = %remote,
+                    message_kind = envelope_message_kind,
+                    message_id = log_message_id,
+                    request_id = log_request_id,
+                    byte_count = frame_byte_count,
+                    frame_digest,
+                    rejection = %reason,
+                    "control channel: envelope signature rejected"
+                );
                 if events_tx
                     .send(ControlEvent::Error {
                         request_id: String::new(),
-                        message: format!("envelope rejected: {rejection}"),
+                        message: "envelope rejected".to_string(),
                     })
                     .is_err()
                 {
-                    debug!(peer = %remote, "control channel: writer task gone, dropping rejection reply");
                     break;
                 }
                 continue;
             }
 
-            // Envelope accepted: now parse `payload` as the actual
-            // ClientMessage. A well-formed envelope wrapping a malformed/
-            // unknown-type payload is reported distinctly from the
-            // envelope-shape failures above.
-            match serde_json::from_value::<ClientMessage>(envelope.payload) {
+            let payload_message_kind = known_client_message_kind(&envelope.payload);
+            let msg = match serde_json::from_value::<ClientMessage>(envelope.payload.clone()) {
+                Ok(message) => message,
+                Err(parse_err) => {
+                    let safe_error = safe_json_error(&parse_err);
+                    warn!(
+                        peer = %remote,
+                        message_kind = payload_message_kind,
+                        message_id = log_message_id,
+                        request_id = log_request_id,
+                        byte_count = frame_byte_count,
+                        frame_digest,
+                        parse_error = safe_error,
+                        "control channel: malformed payload"
+                    );
+                    if events_tx
+                        .send(ControlEvent::Error {
+                            request_id: String::new(),
+                            message: "malformed payload".to_string(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            if let Err(rejection) = admit_post_signature_envelope(
+                &envelope,
+                &msg,
+                &session_id,
+                first_inbound_envelope,
+                &mut inbound_state,
+                self.execution_mode,
+                &typed_action_executor,
+                epoch_millis_now(),
+            ) {
+                warn!(
+                    peer = %remote,
+                    message_kind = payload_message_kind,
+                    message_id = log_message_id,
+                    request_id = log_request_id,
+                    byte_count = frame_byte_count,
+                    frame_digest,
+                    rejection,
+                    "control channel: post-signature admission rejected"
+                );
+                if events_tx
+                    .send(ControlEvent::Error {
+                        request_id: String::new(),
+                        message: "envelope rejected".to_string(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            first_inbound_envelope = false;
+
+            *current_task_id
+                .lock()
+                .expect("current_task_id lock poisoned") = envelope.task_id.clone();
+
+            match Ok::<ClientMessage, serde_json::Error>(msg) {
                 Ok(ClientMessage::Pin { .. }) => {
                     // A Pin sent after auth already passed (e.g. an already-
                     // allowlisted device, or a second Pin from a device that
@@ -1413,21 +2321,183 @@ impl ProtocolHandler for ControlChannel {
                     // keep reading rather than tearing down the connection.
                     debug!(peer = %remote, "control channel: redundant Pin message after auth, acking");
                     if events_tx
-                        .send(ControlEvent::Ack { request_id: String::new() })
+                        .send(ControlEvent::Ack {
+                            request_id: String::new(),
+                        })
                         .is_err()
                     {
                         break;
                     }
                 }
-                Ok(ClientMessage::InputResponse { request_id, selected_option }) => {
+                Ok(ClientMessage::ApprovalResponse { response }) => {
+                    let approval_id = response.approval_id.clone();
+                    let continuation = typed_continuations
+                        .lock()
+                        .expect("typed continuation registry lock poisoned")
+                        .remove(&approval_id);
+                    if let Some(continuation) = continuation {
+                        let tx = events_tx.clone();
+                        let continuations = typed_continuations.clone();
+                        let active_tasks = active_typed_tasks.clone();
+                        tinfoil_tasks.spawn(async move {
+                            let result = continuation
+                                .agent_loop
+                                .lock()
+                                .await
+                                .resume_approved(&approval_id)
+                                .await;
+                            publish_typed_loop_result(
+                                result,
+                                continuation.session_id,
+                                continuation.task_id,
+                                continuation.agent_loop,
+                                continuation.permit,
+                                continuations,
+                                active_tasks,
+                                tx,
+                            )
+                            .await;
+                        });
+                    } else if events_tx
+                        .send(ControlEvent::Ack {
+                            request_id: response.approval_id,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(ClientMessage::TypedPrompt { prompt }) => {
+                    let request_id = envelope
+                        .task_id
+                        .clone()
+                        .expect("typed prompt task binding admitted");
+                    let tx = events_tx.clone();
+                    let executor = typed_action_executor.clone();
+                    match self.tinfoil_client.clone() {
+                        Some(client) => {
+                            let permit = match tinfoil_operations.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    if tx
+                                        .send(ControlEvent::Error {
+                                            request_id,
+                                            message: TINFOIL_BUSY_ERROR.to_string(),
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            let bindings = match TrustedTaskBindings::new(
+                                &prompt.goal_id,
+                                &prompt.instruction,
+                                &session_id,
+                                &envelope.message_id,
+                                &request_id,
+                            ) {
+                                Ok(bindings) => bindings,
+                                Err(_) => {
+                                    if tx
+                                        .send(ControlEvent::Error {
+                                            request_id,
+                                            message: "invalid typed prompt bindings".to_string(),
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            let audit = self.audit.clone();
+                            let continuations = typed_continuations.clone();
+                            let active_tasks = active_typed_tasks.clone();
+                            let loop_session_id = session_id.clone();
+                            let planner = TinfoilTurnPlanner::new(client);
+                            let loop_value = build_production_typed_loop(
+                                executor,
+                                planner,
+                                AgentLoopLimits::default(),
+                            );
+                            let canceled = loop_value.cancellation_handle();
+                            let execution_gate = loop_value.execution_gate();
+                            let agent_loop = Arc::new(tokio::sync::Mutex::new(loop_value));
+                            {
+                                let mut active = active_typed_tasks.lock().await;
+                                if active.contains_key(&request_id) {
+                                    let _ = tx.send(ControlEvent::Error {
+                                        request_id,
+                                        message: "typed task binding is already active".to_string(),
+                                    });
+                                    continue;
+                                }
+                                active.insert(
+                                    request_id.clone(),
+                                    (loop_session_id.clone(), canceled, execution_gate),
+                                );
+                            }
+                            tinfoil_tasks.spawn(async move {
+                                let _ = tx.send(ControlEvent::Ack {
+                                    request_id: request_id.clone(),
+                                });
+                                let byte_count = prompt.instruction.len() as u64;
+                                let result = agent_loop.lock().await.run_bound(bindings).await;
+                                let success = matches!(
+                                    &result,
+                                    Ok(AgentLoopOutcome::Completed { .. })
+                                );
+                                log_cloud_egress(
+                                    &audit,
+                                    &request_id,
+                                    crate::audit_log::CloudEgressCapability::Planner,
+                                    success,
+                                    byte_count,
+                                );
+                                publish_typed_loop_result(
+                                    result,
+                                    loop_session_id,
+                                    request_id,
+                                    agent_loop,
+                                    permit,
+                                    continuations,
+                                    active_tasks,
+                                    tx,
+                                )
+                                .await;
+                            });
+                        }
+                        None => {
+                            if tx
+                                .send(ControlEvent::Error {
+                                    request_id,
+                                    message: "no attested Tinfoil planner configured".to_string(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(ClientMessage::InputResponse {
+                    request_id,
+                    selected_option,
+                }) => {
                     // Sensitive-app consent decisions are resolved by the bridge itself
                     // (it owns the paused turn + allowance state); everything else falls
                     // through to this connection's generic pending-input tracking.
-                    if HoloControlBridge::resolve_consent(&self.bridge, &request_id, &selected_option) {
+                    if HoloControlBridge::resolve_consent(
+                        &self.bridge,
+                        &request_id,
+                        &selected_option,
+                    ) {
                         debug!(
                             peer = %remote,
-                            request_id = %request_id,
-                            selected_option = %selected_option,
+                            message_kind = "input_response",
+                            byte_count = frame_byte_count,
                             "control channel: sensitive-app consent resolved"
                         );
                         if events_tx
@@ -1444,8 +2514,8 @@ impl ProtocolHandler for ControlChannel {
                         Some(pending) if pending.request_id == request_id => {
                             debug!(
                                 peer = %remote,
-                                request_id = %request_id,
-                                selected_option = %selected_option,
+                                message_kind = "input_response",
+                                byte_count = frame_byte_count,
                                 "control channel: input_request answered"
                             );
                             pending_input_request = None;
@@ -1467,7 +2537,8 @@ impl ProtocolHandler for ControlChannel {
                             // keep the connection open.
                             warn!(
                                 peer = %remote,
-                                request_id = %request_id,
+                                message_kind = "input_response",
+                                byte_count = frame_byte_count,
                                 "control channel: input_response for no matching pending input_request (already expired or unknown), ignoring"
                             );
                             if events_tx
@@ -1492,18 +2563,40 @@ impl ProtocolHandler for ControlChannel {
                     let clarify_tx = events_tx.clone();
                     match self.clarify.clone() {
                         Some(config) => {
-                            tokio::spawn(async move {
-                                let questions = crate::clarify::generate_clarifying_questions(
-                                    &prompt, &config,
-                                )
-                                .await;
-                                let _ = clarify_tx
-                                    .send(ControlEvent::ClarifyQuestions { questions });
+                            let permit = match tinfoil_operations.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    warn!(
+                                        peer = %remote,
+                                        message_kind = "clarify_request",
+                                        limit = MAX_TINFOIL_OPERATIONS_PER_CONNECTION,
+                                        "control channel: Tinfoil operation limit reached"
+                                    );
+                                    if clarify_tx
+                                        .send(ControlEvent::ClarifyQuestions {
+                                            questions: Vec::new(),
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            tinfoil_tasks.spawn(async move {
+                                let _permit = permit;
+                                let questions =
+                                    crate::clarify::generate_clarifying_questions(&prompt, &config)
+                                        .await;
+                                let _ =
+                                    clarify_tx.send(ControlEvent::ClarifyQuestions { questions });
                             });
                         }
                         None => {
                             if clarify_tx
-                                .send(ControlEvent::ClarifyQuestions { questions: Vec::new() })
+                                .send(ControlEvent::ClarifyQuestions {
+                                    questions: Vec::new(),
+                                })
                                 .is_err()
                             {
                                 break;
@@ -1511,15 +2604,43 @@ impl ProtocolHandler for ControlChannel {
                         }
                     }
                 }
-                Ok(ClientMessage::ProcessDocument { request_id, filename, data_base64, mode }) => {
+                Ok(ClientMessage::ProcessDocument {
+                    request_id,
+                    filename,
+                    data_base64,
+                    mode,
+                }) => {
                     // Off the desktop-task pipeline, same shape as ClarifyRequest: spawn the
                     // (potentially slow, up to 120s per tinfoil_documents) call so the read loop
                     // keeps draining, deliver the result as a ControlEvent.
                     let tx = events_tx.clone();
                     let audit = self.audit.clone();
-                    match self.tinfoil_key.clone() {
-                        Some(key) => {
-                            tokio::spawn(async move {
+                    match self.tinfoil_client.clone() {
+                        Some(client) => {
+                            let permit = match tinfoil_operations.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    log_cloud_egress(
+                                        &audit,
+                                        &request_id,
+                                        crate::audit_log::CloudEgressCapability::Document,
+                                        false,
+                                        0,
+                                    );
+                                    if tx
+                                        .send(ControlEvent::DocumentProcessFailed {
+                                            request_id,
+                                            error: TINFOIL_BUSY_ERROR.to_string(),
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            tinfoil_tasks.spawn(async move {
+                                let _permit = permit;
                                 let bytes = match base64::Engine::decode(
                                     &base64::engine::general_purpose::STANDARD,
                                     data_base64,
@@ -1553,29 +2674,36 @@ impl ProtocolHandler for ControlChannel {
                                     bytes,
                                 }];
                                 let audit_request_id = request_id.clone();
-                                let (event, success) = match crate::tinfoil_documents::convert_documents(
-                                    &key,
-                                    &files,
-                                    convert_mode,
-                                )
-                                .await
-                                {
-                                    Ok(docs) => {
-                                        let markdown = docs
-                                            .into_iter()
-                                            .map(|d| d.markdown)
-                                            .collect::<Vec<_>>()
-                                            .join("\n\n---\n\n");
-                                        (ControlEvent::DocumentProcessed { request_id, markdown }, true)
-                                    }
-                                    Err(err) => (
-                                        ControlEvent::DocumentProcessFailed {
-                                            request_id,
-                                            error: err.to_string(),
-                                        },
-                                        false,
-                                    ),
-                                };
+                                let (event, success) =
+                                    match crate::tinfoil_documents::convert_documents(
+                                        &client,
+                                        &files,
+                                        convert_mode,
+                                    )
+                                    .await
+                                    {
+                                        Ok(docs) => {
+                                            let markdown = docs
+                                                .into_iter()
+                                                .map(|d| d.markdown)
+                                                .collect::<Vec<_>>()
+                                                .join("\n\n---\n\n");
+                                            (
+                                                ControlEvent::DocumentProcessed {
+                                                    request_id,
+                                                    markdown,
+                                                },
+                                                true,
+                                            )
+                                        }
+                                        Err(err) => (
+                                            ControlEvent::DocumentProcessFailed {
+                                                request_id,
+                                                error: err.to_string(),
+                                            },
+                                            false,
+                                        ),
+                                    };
                                 log_cloud_egress(
                                     &audit,
                                     &audit_request_id,
@@ -1599,19 +2727,52 @@ impl ProtocolHandler for ControlChannel {
                         }
                     }
                 }
-                Ok(ClientMessage::AnalyzeImage { request_id, image_data_base64, prompt }) => {
+                Ok(ClientMessage::AnalyzeImage {
+                    request_id,
+                    image_data_base64,
+                    prompt,
+                }) => {
                     let tx = events_tx.clone();
                     let audit = self.audit.clone();
-                    match self.tinfoil_key.clone() {
-                        Some(key) => {
-                            tokio::spawn(async move {
+                    match self.tinfoil_client.clone() {
+                        Some(client) => {
+                            let permit = match tinfoil_operations.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    log_cloud_egress(
+                                        &audit,
+                                        &request_id,
+                                        crate::audit_log::CloudEgressCapability::Image,
+                                        false,
+                                        0,
+                                    );
+                                    if tx
+                                        .send(ControlEvent::ImageAnalysisFailed {
+                                            request_id,
+                                            error: TINFOIL_BUSY_ERROR.to_string(),
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            tinfoil_tasks.spawn(async move {
+                                let _permit = permit;
                                 let bytes = match base64::Engine::decode(
                                     &base64::engine::general_purpose::STANDARD,
                                     image_data_base64,
                                 ) {
                                     Ok(b) => b,
                                     Err(err) => {
-                                        log_cloud_egress(&audit, &request_id, crate::audit_log::CloudEgressCapability::Image, false, 0);
+                                        log_cloud_egress(
+                                            &audit,
+                                            &request_id,
+                                            crate::audit_log::CloudEgressCapability::Image,
+                                            false,
+                                            0,
+                                        );
                                         let _ = tx.send(ControlEvent::ImageAnalysisFailed {
                                             request_id,
                                             error: format!("invalid base64: {err}"),
@@ -1623,7 +2784,13 @@ impl ProtocolHandler for ControlChannel {
                                 let image = match image::load_from_memory(&bytes) {
                                     Ok(img) => img,
                                     Err(err) => {
-                                        log_cloud_egress(&audit, &request_id, crate::audit_log::CloudEgressCapability::Image, false, byte_count);
+                                        log_cloud_egress(
+                                            &audit,
+                                            &request_id,
+                                            crate::audit_log::CloudEgressCapability::Image,
+                                            false,
+                                            byte_count,
+                                        );
                                         let _ = tx.send(ControlEvent::ImageAnalysisFailed {
                                             request_id,
                                             error: format!("failed to decode image: {err}"),
@@ -1633,20 +2800,31 @@ impl ProtocolHandler for ControlChannel {
                                 };
                                 let audit_request_id = request_id.clone();
                                 let (event, success) = match crate::tinfoil_vision::analyze_image(
-                                    &key,
+                                    &client,
                                     &image,
                                     &prompt,
                                     crate::tinfoil_vision::VisionModel::Gemma431b,
                                 )
                                 .await
                                 {
-                                    Ok(text) => (ControlEvent::ImageAnalyzed { request_id, text }, true),
-                                    Err(err) => (ControlEvent::ImageAnalysisFailed {
-                                        request_id,
-                                        error: err.to_string(),
-                                    }, false),
+                                    Ok(text) => {
+                                        (ControlEvent::ImageAnalyzed { request_id, text }, true)
+                                    }
+                                    Err(err) => (
+                                        ControlEvent::ImageAnalysisFailed {
+                                            request_id,
+                                            error: err.to_string(),
+                                        },
+                                        false,
+                                    ),
                                 };
-                                log_cloud_egress(&audit, &audit_request_id, crate::audit_log::CloudEgressCapability::Image, success, byte_count);
+                                log_cloud_egress(
+                                    &audit,
+                                    &audit_request_id,
+                                    crate::audit_log::CloudEgressCapability::Image,
+                                    success,
+                                    byte_count,
+                                );
                                 let _ = tx.send(event);
                             });
                         }
@@ -1663,12 +2841,61 @@ impl ProtocolHandler for ControlChannel {
                         }
                     }
                 }
-                Ok(ClientMessage::TranscribeAudio { request_id, audio_data_base64, format: _ }) => {
+                Ok(ClientMessage::TranscribeAudio {
+                    request_id,
+                    audio_data_base64,
+                    format,
+                }) => {
                     let tx = events_tx.clone();
                     let audit = self.audit.clone();
-                    match self.tinfoil_key.clone() {
-                        Some(key) => {
-                            tokio::spawn(async move {
+                    let filename = match transcription_filename_for_format(&format) {
+                        Ok(filename) => filename,
+                        Err(error) => {
+                            log_cloud_egress(
+                                &audit,
+                                &request_id,
+                                crate::audit_log::CloudEgressCapability::AudioTranscribe,
+                                false,
+                                0,
+                            );
+                            if tx
+                                .send(ControlEvent::AudioTranscriptionFailed {
+                                    request_id,
+                                    error: error.to_string(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    match self.tinfoil_client.clone() {
+                        Some(client) => {
+                            let permit = match tinfoil_operations.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    log_cloud_egress(
+                                        &audit,
+                                        &request_id,
+                                        crate::audit_log::CloudEgressCapability::AudioTranscribe,
+                                        false,
+                                        0,
+                                    );
+                                    if tx
+                                        .send(ControlEvent::AudioTranscriptionFailed {
+                                            request_id,
+                                            error: TINFOIL_BUSY_ERROR.to_string(),
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            tinfoil_tasks.spawn(async move {
+                                let _permit = permit;
                                 let bytes = match base64::Engine::decode(
                                     &base64::engine::general_purpose::STANDARD,
                                     audio_data_base64,
@@ -1685,18 +2912,31 @@ impl ProtocolHandler for ControlChannel {
                                 };
                                 let byte_count = bytes.len() as u64;
                                 let audit_request_id = request_id.clone();
-                                let (event, success) = match crate::tinfoil_audio::transcribe(
-                                    &key, bytes, "audio",
-                                )
-                                .await
-                                {
-                                    Ok(text) => (ControlEvent::AudioTranscribed { request_id, text }, true),
-                                    Err(err) => (ControlEvent::AudioTranscriptionFailed {
-                                        request_id,
-                                        error: err.to_string(),
-                                    }, false),
-                                };
-                                log_cloud_egress(&audit, &audit_request_id, crate::audit_log::CloudEgressCapability::AudioTranscribe, success, byte_count);
+                                let (event, success) =
+                                    match crate::tinfoil_audio::transcribe(
+                                        &client, bytes, filename,
+                                    )
+                                        .await
+                                    {
+                                        Ok(text) => (
+                                            ControlEvent::AudioTranscribed { request_id, text },
+                                            true,
+                                        ),
+                                        Err(err) => (
+                                            ControlEvent::AudioTranscriptionFailed {
+                                                request_id,
+                                                error: err.to_string(),
+                                            },
+                                            false,
+                                        ),
+                                    };
+                                log_cloud_egress(
+                                    &audit,
+                                    &audit_request_id,
+                                    crate::audit_log::CloudEgressCapability::AudioTranscribe,
+                                    success,
+                                    byte_count,
+                                );
                                 let _ = tx.send(event);
                             });
                         }
@@ -1713,29 +2953,69 @@ impl ProtocolHandler for ControlChannel {
                         }
                     }
                 }
-                Ok(ClientMessage::RequestSpeech { request_id, text, voice }) => {
+                Ok(ClientMessage::RequestSpeech {
+                    request_id,
+                    text,
+                    voice,
+                }) => {
                     let tx = events_tx.clone();
                     let audit = self.audit.clone();
-                    match self.tinfoil_key.clone() {
-                        Some(key) => {
-                            tokio::spawn(async move {
+                    match self.tinfoil_client.clone() {
+                        Some(client) => {
+                            let permit = match tinfoil_operations.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    log_cloud_egress(
+                                        &audit,
+                                        &request_id,
+                                        crate::audit_log::CloudEgressCapability::AudioSpeech,
+                                        false,
+                                        0,
+                                    );
+                                    if tx
+                                        .send(ControlEvent::SpeechFailed {
+                                            request_id,
+                                            error: TINFOIL_BUSY_ERROR.to_string(),
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            tinfoil_tasks.spawn(async move {
+                                let _permit = permit;
                                 let byte_count = text.len() as u64;
                                 let audit_request_id = request_id.clone();
-                                let (event, success) = match crate::tinfoil_audio::speech(&key, &text, &voice)
-                                    .await
+                                let (event, success) = match crate::tinfoil_audio::speech(
+                                    &client, &text, &voice,
+                                )
+                                .await
                                 {
-                                    Ok(wav) => (ControlEvent::SpeechReady {
-                                        request_id,
-                                        audio_data_base64: crate::tinfoil_audio::encode_speech_base64(
-                                            &wav,
-                                        ),
-                                    }, true),
-                                    Err(err) => (ControlEvent::SpeechFailed {
-                                        request_id,
-                                        error: err.to_string(),
-                                    }, false),
+                                    Ok(wav) => (
+                                        ControlEvent::SpeechReady {
+                                            request_id,
+                                            audio_data_base64:
+                                                crate::tinfoil_audio::encode_speech_base64(&wav),
+                                        },
+                                        true,
+                                    ),
+                                    Err(err) => (
+                                        ControlEvent::SpeechFailed {
+                                            request_id,
+                                            error: err.to_string(),
+                                        },
+                                        false,
+                                    ),
                                 };
-                                log_cloud_egress(&audit, &audit_request_id, crate::audit_log::CloudEgressCapability::AudioSpeech, success, byte_count);
+                                log_cloud_egress(
+                                    &audit,
+                                    &audit_request_id,
+                                    crate::audit_log::CloudEgressCapability::AudioSpeech,
+                                    success,
+                                    byte_count,
+                                );
                                 let _ = tx.send(event);
                             });
                         }
@@ -1755,21 +3035,70 @@ impl ProtocolHandler for ControlChannel {
                 Ok(ClientMessage::PlanTask { request_id, goal }) => {
                     let tx = events_tx.clone();
                     let audit = self.audit.clone();
-                    match self.tinfoil_key.clone() {
-                        Some(key) => {
-                            tokio::spawn(async move {
+                    match self.tinfoil_client.clone() {
+                        Some(client) => {
+                            let permit = match tinfoil_operations.clone().try_acquire_owned() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    log_cloud_egress(
+                                        &audit,
+                                        &request_id,
+                                        crate::audit_log::CloudEgressCapability::Planner,
+                                        false,
+                                        0,
+                                    );
+                                    if tx
+                                        .send(ControlEvent::PlanFailed {
+                                            request_id,
+                                            error: TINFOIL_BUSY_ERROR.to_string(),
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            tinfoil_tasks.spawn(async move {
+                                let _permit = permit;
                                 let byte_count = goal.len() as u64;
                                 let audit_request_id = request_id.clone();
-                                let (event, success) = match crate::tinfoil_planner::plan_task(&key, &goal)
-                                    .await
-                                {
-                                    Ok(steps) => (ControlEvent::PlanReady { request_id, steps }, true),
-                                    Err(err) => (ControlEvent::PlanFailed {
-                                        request_id,
-                                        error: err.to_string(),
-                                    }, false),
-                                };
-                                log_cloud_egress(&audit, &audit_request_id, crate::audit_log::CloudEgressCapability::Planner, success, byte_count);
+                                let (event, success) =
+                                    match crate::tinfoil_planner::plan_task(&client, &goal).await {
+                                        Ok(plan) => {
+                                            let steps = plan
+                                                .steps
+                                                .iter()
+                                                .map(|step| {
+                                                    match step {
+                                                crate::tinfoil_planner::PlannedStep::Action(
+                                                    action,
+                                                ) => {
+                                                    format!("Typed action {:?}", action.action)
+                                                }
+                                                crate::tinfoil_planner::PlannedStep::Complete => {
+                                                    "Complete".to_string()
+                                                }
+                                            }
+                                                })
+                                                .collect();
+                                            (ControlEvent::PlanReady { request_id, steps }, true)
+                                        }
+                                        Err(err) => (
+                                            ControlEvent::PlanFailed {
+                                                request_id,
+                                                error: err.to_string(),
+                                            },
+                                            false,
+                                        ),
+                                    };
+                                log_cloud_egress(
+                                    &audit,
+                                    &audit_request_id,
+                                    crate::audit_log::CloudEgressCapability::Planner,
+                                    success,
+                                    byte_count,
+                                );
                                 let _ = tx.send(event);
                             });
                         }
@@ -1787,7 +3116,33 @@ impl ProtocolHandler for ControlChannel {
                     }
                 }
                 Ok(msg) => {
-                    debug!(peer = %remote, ?msg, "control channel: received message");
+                    if matches!(
+                        &msg,
+                        ClientMessage::Stop { .. }
+                            | ClientMessage::Pause
+                            | ClientMessage::Redirect { .. }
+                    ) {
+                        cancel_typed_continuations(
+                            &typed_continuations,
+                            &active_typed_tasks,
+                            &session_id,
+                            None,
+                        )
+                        .await;
+                        typed_action_executor
+                            .lock()
+                            .expect("typed_action_executor lock poisoned")
+                            .cancel_session(&session_id);
+                    }
+                    debug!(
+                        peer = %remote,
+                        message_kind = msg.type_tag(),
+                        message_id = log_message_id,
+                        request_id = log_request_id,
+                        byte_count = frame_byte_count,
+                        frame_digest,
+                        "control channel: received message"
+                    );
                     // task_id threading: an inbound envelope that already
                     // names a task_id reuses it as the bridge's
                     // request_id (continuing/correlating with that task);
@@ -1833,6 +3188,7 @@ impl ProtocolHandler for ControlChannel {
                         | ClientMessage::Pause
                         | ClientMessage::Pin { .. }
                         | ClientMessage::InputResponse { .. }
+                        | ClientMessage::ApprovalResponse { .. }
                         // Remote-control input events are not agent turns; they
                         // inject direct user input and produce no audit entry.
                         | ClientMessage::RemoteControl { .. }
@@ -1842,6 +3198,7 @@ impl ProtocolHandler for ControlChannel {
                         // Same: each has its own arm above, off the desktop-task pipeline, and
                         // is audited separately by control-channel-audit-logging (cloud egress),
                         // not as an agent-turn ActionClass.
+                        | ClientMessage::TypedPrompt { .. }
                         | ClientMessage::ProcessDocument { .. }
                         | ClientMessage::AnalyzeImage { .. }
                         | ClientMessage::TranscribeAudio { .. }
@@ -1883,7 +3240,17 @@ impl ProtocolHandler for ControlChannel {
                     });
                 }
                 Err(parse_err) => {
-                    warn!(peer = %remote, error = %parse_err, line = %line, "control channel: malformed payload");
+                    let safe_error = safe_json_error(&parse_err);
+                    warn!(
+                        peer = %remote,
+                        message_kind = payload_message_kind,
+                        message_id = log_message_id,
+                        request_id = log_request_id,
+                        byte_count = frame_byte_count,
+                        frame_digest,
+                        parse_error = safe_error,
+                        "control channel: malformed payload"
+                    );
                     if events_tx
                         .send(ControlEvent::Error {
                             request_id: String::new(),
@@ -1900,6 +3267,18 @@ impl ProtocolHandler for ControlChannel {
             }
         }
 
+        cancel_typed_continuations(
+                            &typed_continuations,
+                            &active_typed_tasks,
+                            &session_id,
+                            None,
+                        )
+                        .await;
+        typed_action_executor
+            .lock()
+            .expect("typed_action_executor lock poisoned")
+            .cancel_session(&session_id);
+
         // The client is gone. If it disappeared mid-drag -- connection dropped,
         // app swiped away, phone locked -- a mouse button can still be latched
         // down on the Mac with no touch anywhere able to release it, leaving the
@@ -1907,6 +3286,9 @@ impl ProtocolHandler for ControlChannel {
         // remote-control state here is the only place that can notice.
         crate::remote_input::release_all();
         self.bridge.clear_remote_control_active();
+
+        tinfoil_tasks.abort_all();
+        while tinfoil_tasks.join_next().await.is_some() {}
 
         drop(events_tx);
         let _ = send_task.await;

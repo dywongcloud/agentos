@@ -12,6 +12,7 @@ struct ContentView: View {
     @EnvironmentObject private var profileStore: ConnectionProfileStore
 
     @StateObject private var reachability = ReachabilityMonitor(ticket: "")
+    @StateObject private var tinfoilVerificationStore = TinfoilVerificationStore()
 
     @AppStorage(AppSettings.AutoConnect.storageKey)
     private var autoConnectEnabled = AppSettings.AutoConnect.enabledByDefault
@@ -21,6 +22,7 @@ struct ContentView: View {
     @State private var manualDisconnectThisSession = false
 
     @State private var showDiagnostics = false
+    @State private var identityErrorAlert: String?
 
     private static var debugAutoPairFromEnvironment: (ticket: String, pin: String)? {
         #if DEBUG
@@ -34,12 +36,25 @@ struct ContentView: View {
         #endif
     }
 
+    @ViewBuilder
     var body: some View {
+        #if DEBUG && canImport(UIKit)
+        if ProcessInfo.processInfo.environment["HOLOIROH_WITNESS_GESTURE_SURFACE"] == "1" {
+            GestureWitnessSurface()
+        } else {
+            appBody
+        }
+        #else
+        appBody
+        #endif
+    }
+
+    private var appBody: some View {
         ZStack {
             NavigationStack(path: $path) {
                 PairingView(onConnect: { ticket, pin in
                     profileStore.markConnected(ticket: ticket)
-                    path.append(.main(ticket: ticket, pin: pin))
+                    openMain(ticket: ticket, pin: pin)
                 }, onInteract: {
                     userEngagedPairing = true
                 })
@@ -52,13 +67,24 @@ struct ContentView: View {
                             path.removeAll()
                         }
                         .environmentObject(profileStore)
+                        .environmentObject(tinfoilVerificationStore)
                     }
                 }
             }
             .onAppear {
                 startReachability()
+                if let identityError = reachability.identityErrorDescription {
+                    identityErrorAlert = identityError
+                }
                 guard path.isEmpty, let auto = Self.debugAutoPairFromEnvironment else { return }
-                path.append(.main(ticket: auto.ticket, pin: auto.pin))
+                openMain(ticket: auto.ticket, pin: auto.pin)
+            }
+            .onChange(of: path) { _, newPath in
+                if newPath.isEmpty {
+                    startReachability()
+                } else {
+                    reachability.stop()
+                }
             }
             .onChange(of: profileStore.autoConnectProfile?.ticket) { _, newTicket in
                 reachability.ticket = newTicket ?? ""
@@ -66,6 +92,9 @@ struct ContentView: View {
             }
             .onChange(of: reachability.state) { _, _ in
                 autoConnectIfAllowed()
+            }
+            .onChange(of: reachability.identityErrorDescription) { _, newError in
+                identityErrorAlert = newError
             }
 
             if isIntroPlaying {
@@ -85,14 +114,32 @@ struct ContentView: View {
             DiagnosticsView()
                 .environmentObject(profileStore)
                 .environmentObject(reachability)
+                .environmentObject(tinfoilVerificationStore)
+        }
+        .alert(
+            "Iroh Identity Unavailable",
+            isPresented: Binding(
+                get: { identityErrorAlert != nil },
+                set: { if !$0 { identityErrorAlert = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(identityErrorAlert ?? "The persistent iOS identity could not be loaded.")
         }
     }
 
     private func startReachability() {
+        guard path.isEmpty else { return }
         if let ticket = profileStore.autoConnectProfile?.ticket, reachability.ticket != ticket {
             reachability.ticket = ticket
         }
         reachability.start()
+    }
+
+    private func openMain(ticket: String, pin: String) {
+        reachability.stop()
+        path.append(.main(ticket: ticket, pin: pin))
     }
 
     private var userHasNotTakenOverPairing: Bool {
@@ -116,9 +163,32 @@ struct ContentView: View {
         ConnectionDiagnostics.shared.note("auto-connect: \(target.name) reachable -> opening session")
         Haptics.fire(.connect)
         profileStore.markConnected(ticket: target.ticket)
-        path.append(.main(ticket: target.ticket, pin: target.pin))
+        openMain(ticket: target.ticket, pin: target.pin)
     }
 }
+
+#if DEBUG && canImport(UIKit)
+private struct GestureWitnessSurface: View {
+    @State private var zoomScale: CGFloat = 1
+    @State private var panOffset: CGSize = .zero
+    @State private var frameSource: VideoFrameSource = SyntheticVideoFrameSource()
+
+    var body: some View {
+        GeometryReader { geometry in
+            PanZoomVideoSurface(
+                frameSource: frameSource,
+                viewport: geometry.size,
+                isVideoFullscreen: true,
+                isControllingRemotely: false,
+                zoomScale: $zoomScale,
+                panOffset: $panOffset
+            )
+            .accessibilityLabel("Live remote view of the Mac")
+        }
+        .background(Color.black)
+    }
+}
+#endif
 
 #Preview {
     ContentView()

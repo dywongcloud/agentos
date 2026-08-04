@@ -1,16 +1,17 @@
+import HoloIrohMicrophoneCapture
 import SwiftUI
 
-/// Record-and-transcribe sheet for the opt-in Tinfoil audio path
-/// (`TinfoilAudioRecorder` + `ClientMessage.transcribeAudio`). Deliberately separate from the
-/// existing mic button (which drives the default on-device `VoiceTranscriberModel` path) so the
-/// two recording flows never share state -- see `TinfoilAudioRecorder`'s doc comment.
+/// Records microphone audio for confidential transcription through Tinfoil.
+/// This flow uses `TinfoilAudioRecorder` and `ClientMessage.transcribeAudio`.
+/// It does not share state with `VoiceTranscriberModel`.
 struct TinfoilRecordSheet: View {
     @ObservedObject var recorder: TinfoilAudioRecorder
-    let onSend: (Data) -> Void
+    let onSend: (CapturedMicrophoneAudio) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @Binding var resultText: String?
     @Binding var resultError: String?
+    @State private var startTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -23,22 +24,26 @@ struct TinfoilRecordSheet: View {
                 Text(recorder.isRecording ? "Recording your microphone…" : "Tap to record")
                     .font(.headline)
 
-                Text("Your own microphone audio is sent to Tinfoil's confidential-computing cloud for transcription. This never captures system or call audio.")
+                Text("Only audio picked up by your device's microphone is sent to Tinfoil's confidential-computing cloud for transcription. This does not capture a digital system-audio or call-audio mix, but the microphone may capture nearby people, speakers, or other ambient audio. Inspect this connection's cryptographic proof in Diagnostics → Verification Center.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
 
                 Button {
-                    Task {
-                        if recorder.isRecording {
-                            if let data = recorder.stopAndReadBytes() {
-                                onSend(data)
-                            }
-                        } else {
-                            resultText = nil
-                            resultError = nil
+                    if recorder.isRecording {
+                        startTask?.cancel()
+                        startTask = nil
+                        if let capture = recorder.stopAndCapture() {
+                            onSend(capture)
+                        }
+                    } else {
+                        resultText = nil
+                        resultError = nil
+                        startTask?.cancel()
+                        startTask = Task {
                             await recorder.start()
+                            if Task.isCancelled { recorder.discard() }
                         }
                     }
                 } label: {
@@ -69,10 +74,17 @@ struct TinfoilRecordSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") {
-                        if recorder.isRecording { _ = recorder.stopAndReadBytes() }
+                        startTask?.cancel()
+                        startTask = nil
+                        recorder.discard()
                         dismiss()
                     }
                 }
+            }
+            .onDisappear {
+                startTask?.cancel()
+                startTask = nil
+                recorder.discard()
             }
         }
     }

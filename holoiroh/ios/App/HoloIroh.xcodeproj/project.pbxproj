@@ -7,14 +7,29 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		43A0EF840955AACF39594145 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = 200666F3A9354C6283209143 /* README.md */; };
 		5C7172340B18FCEE301CD4E0 /* HoloIrohApp in Frameworks */ = {isa = PBXBuildFile; productRef = E27593FFC46C4F8E3A76E85D /* HoloIrohApp */; };
 		6CE8D24DD40BCC8C730CEF2B /* AppShellPlaceholder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A47D50700B5EB2A1C5C141B /* AppShellPlaceholder.swift */; };
+		EC9679F4117A05FDFDF5B38F /* HoloIrohRemoteInputWitnessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 268940BED928CCE2DA355C14 /* HoloIrohRemoteInputWitnessTests.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		F39CF3ED9C82005BF24554C3 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6E8B010370C277D3BBA15238 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 86C2F348EFEB7E7B71BD89AE;
+			remoteInfo = HoloIroh;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		149444068ED51E517BF32F1F /* HoloIroh.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = HoloIroh.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		200666F3A9354C6283209143 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		268940BED928CCE2DA355C14 /* HoloIrohRemoteInputWitnessTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HoloIrohRemoteInputWitnessTests.swift; sourceTree = "<group>"; };
 		80F8FA7DC2802F0083E27102 /* ios */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ios; path = ..; sourceTree = SOURCE_ROOT; };
 		8A47D50700B5EB2A1C5C141B /* AppShellPlaceholder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppShellPlaceholder.swift; sourceTree = "<group>"; };
+		DCFC1AF612B02BD716D34CC5 /* HoloIrohUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = HoloIrohUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -29,6 +44,16 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		1A0B8DFD06F8E6F279AEA913 /* UITests */ = {
+			isa = PBXGroup;
+			children = (
+				268940BED928CCE2DA355C14 /* HoloIrohRemoteInputWitnessTests.swift */,
+				200666F3A9354C6283209143 /* README.md */,
+			);
+			name = UITests;
+			path = ../UITests;
+			sourceTree = "<group>";
+		};
 		85E49C681DC0CF04EAF82965 /* Sources */ = {
 			isa = PBXGroup;
 			children = (
@@ -42,6 +67,7 @@
 			children = (
 				D4F85161BBB07B8D5169E80B /* Packages */,
 				85E49C681DC0CF04EAF82965 /* Sources */,
+				1A0B8DFD06F8E6F279AEA913 /* UITests */,
 				D9A449F00F12024CE9C9C9E9 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -58,6 +84,7 @@
 			isa = PBXGroup;
 			children = (
 				149444068ED51E517BF32F1F /* HoloIroh.app */,
+				DCFC1AF612B02BD716D34CC5 /* HoloIrohUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -84,6 +111,25 @@
 			productReference = 149444068ED51E517BF32F1F /* HoloIroh.app */;
 			productType = "com.apple.product-type.application";
 		};
+		9E401D4B07D6494922B85C9A /* HoloIrohUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0A8ED94A9D47F7A7EAD13F4C /* Build configuration list for PBXNativeTarget "HoloIrohUITests" */;
+			buildPhases = (
+				BA92EEBF3696A1DB29A27E52 /* Sources */,
+				E6096E91050F24FFA73E73A7 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5E44AC82CBF8AFA9651F236C /* PBXTargetDependency */,
+			);
+			name = HoloIrohUITests;
+			packageProductDependencies = (
+			);
+			productName = HoloIrohUITests;
+			productReference = DCFC1AF612B02BD716D34CC5 /* HoloIrohUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -96,6 +142,11 @@
 					86C2F348EFEB7E7B71BD89AE = {
 						DevelopmentTeam = XBBQ2LGY3K;
 						ProvisioningStyle = Automatic;
+					};
+					9E401D4B07D6494922B85C9A = {
+						DevelopmentTeam = XBBQ2LGY3K;
+						ProvisioningStyle = Automatic;
+						TestTargetID = 86C2F348EFEB7E7B71BD89AE;
 					};
 				};
 			};
@@ -117,9 +168,21 @@
 			projectRoot = "";
 			targets = (
 				86C2F348EFEB7E7B71BD89AE /* HoloIroh */,
+				9E401D4B07D6494922B85C9A /* HoloIrohUITests */,
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		E6096E91050F24FFA73E73A7 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				43A0EF840955AACF39594145 /* README.md in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		5F5BE2DA126B080001E1AF1F /* Sources */ = {
@@ -130,9 +193,46 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		BA92EEBF3696A1DB29A27E52 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EC9679F4117A05FDFDF5B38F /* HoloIrohRemoteInputWitnessTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXTargetDependency section */
+		5E44AC82CBF8AFA9651F236C /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 86C2F348EFEB7E7B71BD89AE /* HoloIroh */;
+			targetProxy = F39CF3ED9C82005BF24554C3 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		63272850D1592B5B9F1941BC /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = XBBQ2LGY3K;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.holoiroh.HoloIrohUITests;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+				TEST_TARGET_NAME = HoloIroh;
+			};
+			name = Release;
+		};
 		DACF0316F0667901995DAEE8 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -150,6 +250,27 @@
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		DE0A7206192016300A08E8B3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = XBBQ2LGY3K;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.holoiroh.HoloIrohUITests;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 2;
+				TEST_TARGET_NAME = HoloIroh;
 			};
 			name = Debug;
 		};
@@ -295,6 +416,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		0A8ED94A9D47F7A7EAD13F4C /* Build configuration list for PBXNativeTarget "HoloIrohUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DE0A7206192016300A08E8B3 /* Debug */,
+				63272850D1592B5B9F1941BC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		4C577701E1F1B2BCBB3A8C12 /* Build configuration list for PBXNativeTarget "HoloIroh" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

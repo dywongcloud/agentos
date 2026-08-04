@@ -145,7 +145,10 @@ fn main() {
     );
     checks.check(
         &format!("args carry `--port {DEFAULT_LOCAL_MODEL_PORT}`"),
-        window_has(&llama_args, &["--port", &DEFAULT_LOCAL_MODEL_PORT.to_string()]),
+        window_has(
+            &llama_args,
+            &["--port", &DEFAULT_LOCAL_MODEL_PORT.to_string()],
+        ),
     );
     checks.check(
         "does NOT pass --no-mmproj (vision projector must load for screenshot inference)",
@@ -163,21 +166,20 @@ fn main() {
     // A representative holo-serve port distinct from the model port (main.rs defaults 8765).
     let holo_port: u16 = 8765;
     let fake_token = "fake-token-for-inspection-only";
-    let holo_cmd =
-        HoloServeProcess::build_command("holo", holo_port, Some(base_url.as_str()), None, fake_token);
-    print_command(
-        "holo serve command (pointed at the LOCAL model)",
-        &holo_cmd,
+    let holo_cmd = HoloServeProcess::build_command(
+        "holo",
+        holo_port,
+        Some(base_url.as_str()),
+        None,
+        fake_token,
     );
+    print_command("holo serve command (pointed at the LOCAL model)", &holo_cmd);
 
     let (_holo_prog, holo_args) = program_and_args(&holo_cmd);
     let holo_env = env_overrides(&holo_cmd);
 
     println!("  Checks for the holo serve command (LOCAL mode):");
-    checks.check(
-        "args carry `serve`",
-        holo_args.iter().any(|a| a == "serve"),
-    );
+    checks.check("args carry `serve`", holo_args.iter().any(|a| a == "serve"));
     checks.check(
         &format!("args carry `--port {holo_port}`"),
         window_has(&holo_args, &["--port", &holo_port.to_string()]),
@@ -291,7 +293,10 @@ fn main() {
              not performed by this probe."
         );
     } else {
-        eprintln!("{} check(s) FAILED -- see [FAIL] lines above.", checks.failed);
+        eprintln!(
+            "{} check(s) FAILED -- see [FAIL] lines above.",
+            checks.failed
+        );
         std::process::exit(1);
     }
 }

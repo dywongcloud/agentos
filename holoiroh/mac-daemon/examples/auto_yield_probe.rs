@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use holoiroh_daemon::auto_yield::{decide, AutoYieldConfig, YieldAction};
+use holoiroh_daemon::auto_yield::{AutoYieldConfig, YieldAction, decide};
 
 fn main() {
     let cfg = AutoYieldConfig {
@@ -60,8 +60,14 @@ fn main() {
     assert_eq!(decide(&cfg, true, false, false, None), YieldAction::None);
     assert_eq!(decide(&cfg, false, true, false, None), YieldAction::None);
     // Disabled by config -> never act.
-    let off = AutoYieldConfig { enabled: false, ..cfg };
-    assert_eq!(decide(&off, true, false, false, Some(0.1)), YieldAction::None);
+    let off = AutoYieldConfig {
+        enabled: false,
+        ..cfg
+    };
+    assert_eq!(
+        decide(&off, true, false, false, Some(0.1)),
+        YieldAction::None
+    );
 
     // Env-derived config keeps the hysteresis invariant (resume > activity),
     // even if someone sets a resume threshold below the activity threshold.

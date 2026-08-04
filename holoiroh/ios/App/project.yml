@@ -35,3 +35,34 @@ targets:
         CODE_SIGN_STYLE: Automatic
         OTHER_LDFLAGS: "-lc++"
 
+  HoloIrohUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: ../UITests
+    dependencies:
+      - target: HoloIroh
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.holoiroh.HoloIrohUITests
+        DEVELOPMENT_TEAM: XBBQ2LGY3K
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "2"
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  HoloIroh:
+    build:
+      targets:
+        HoloIroh: all
+        HoloIrohUITests: [test]
+    test:
+      targets:
+        - HoloIrohUITests
+      environmentVariables:
+        HOLOIROH_WITNESS_TICKET: "$(HOLOIROH_WITNESS_TICKET)"
+        HOLOIROH_WITNESS_PIN: "$(HOLOIROH_WITNESS_PIN)"
+        HOLOIROH_WITNESS_USE_SAVED_PROFILE: "$(HOLOIROH_WITNESS_USE_SAVED_PROFILE)"
+        HOLOIROH_WITNESS_INPUT_DRY_RUN_CONFIRMED: "$(HOLOIROH_WITNESS_INPUT_DRY_RUN_CONFIRMED)"

@@ -1,48 +1,50 @@
-# iOS FFI: does iroh or iroh-live ship official Swift bindings?
+# iOS Foreign Function Interface: official Swift bindings for iroh and iroh-live
 
-**Finding: the base `iroh` crate does. `iroh-live` (the crate this project
-actually depends on) does not. Path taken: (b) -- a hand-written Rust
-staticlib crate, `holoiroh/ios-bridge/`. It is now a real implementation,
-not a scaffold. See the "As-built" sections below.**
+## Finding
 
-This document records the research behind that decision, so it doesn't
-need re-doing. As of the as-built pass, it also documents the real
-subscribe FFI, its witnessed builds, and the exact xcframework packaging +
-Swift integration.
+The base `iroh` crate provides official Swift bindings. The `iroh-live` crate does not.
 
-This research used `gh api`, `gh repo view`, and `WebFetch` on 2026-07-17.
-It checked the live GitHub repos and raw READMEs, podspecs, and manifests.
-It also verified the as-built subscribe API against the vendored
-`iroh-live` source at commit `5f95758`. It did not rely on training-data
-memory of these projects. These projects move fast, so memory would likely
-be stale.
+This project uses path (b): the hand-written Rust static library in `holoiroh/ios-bridge/`.
+The bridge is a real implementation, not a scaffold. See the as-built sections below.
 
-## What was checked
+This document records the research that supports this decision. It also describes these implemented items:
 
-- `n0-computer/iroh` (base P2P crate) -- repo root contents, README,
-  `TRANSPORTS.md`, and a search of the `n0-computer` GitHub org for
-  sibling FFI repos.
-- `n0-computer/iroh-live` (media-streaming-over-iroh crate this project's
-  `mac-daemon` depends on) -- repo root contents, `README.md`,
-  `docs/platforms.md`, and every subdirectory/crate in its Cargo workspace.
-- `n0-computer` org repo listing (129 repos), searched for names like
-  `*-ffi`, `*-swift`, `*-uniffi`, or similar. This search aimed to catch
-  bindings that live in a separate repo, not inside `iroh`/`iroh-live`
-  themselves. This search found the actual answer.
+- the subscribe Foreign Function Interface (FFI)
+- witnessed builds
+- exact XCFramework packaging
+- Swift integration
 
-## Finding (a): official Swift bindings exist for base `iroh`
+The research used `gh api`, `gh repo view`, and `WebFetch` on 2026-07-17.
+It checked the live GitHub repositories, raw README files, podspecs, and manifests.
+It also checked the subscribe application binary interface (ABI) against vendored `iroh-live` commit `5f95758`.
+It did not use training-data memory. These projects change quickly, so such memory can be stale.
 
-They live in a **separate repo**, not inside `n0-computer/iroh` itself:
-**[`n0-computer/iroh-ffi`](https://github.com/n0-computer/iroh-ffi)**
-("FFI bindings for iroh"). It wraps `iroh`'s `Endpoint`/`Connection`/
-`EndpointTicket` types with [`uniffi-rs`](https://mozilla.github.io/uniffi-rs/)
-(`#[derive(uniffi::Object)]`, `#[uniffi::export]` throughout `src/*.rs`) and
-produces Swift, Kotlin, Python, and JS bindings from one Rust source tree.
-A companion repo, **[`n0-computer/hello-iroh-ffi`](https://github.com/n0-computer/hello-iroh-ffi)**,
-has minimal example apps per language including `swift/`.
+## Items checked
 
-This is real, maintained, released infrastructure, not a stub. `iroh-ffi`'s
-repo root has:
+- `n0-computer/iroh` is the base peer-to-peer (P2P) crate.
+  The research checked its root, `README`, and `TRANSPORTS.md`.
+  It also searched the `n0-computer` GitHub organization for related FFI repositories.
+- `n0-computer/iroh-live` provides media streaming over iroh.
+  The daemon depends on this crate.
+  The research checked its root, `README.md`, `docs/platforms.md`, and each Cargo workspace crate.
+- The `n0-computer` organization had 129 repositories.
+  The research searched names such as `*-ffi`, `*-swift`, and `*-uniffi`.
+  This search found bindings stored outside `iroh` and `iroh-live`.
+
+## Finding (a): base `iroh` has official Swift bindings
+
+The bindings are in a separate repository:
+**[`n0-computer/iroh-ffi`](https://github.com/n0-computer/iroh-ffi)**.
+Its description is "FFI bindings for iroh."
+
+It wraps `iroh` types such as `Endpoint`, `Connection`, and `EndpointTicket`.
+It uses [`uniffi-rs`](https://mozilla.github.io/uniffi-rs/) with `#[derive(uniffi::Object)]` and `#[uniffi::export]` in `src/*.rs`.
+One Rust source tree generates Swift, Kotlin, Python, and JavaScript bindings.
+
+The companion repository **[`n0-computer/hello-iroh-ffi`](https://github.com/n0-computer/hello-iroh-ffi)** provides minimal applications.
+Its language examples include `swift/`.
+
+The repository contained maintained release infrastructure, not a stub:
 
 - `Package.swift`
 - `IrohLib.podspec`
@@ -52,19 +54,24 @@ repo root has:
 - `README.python.md`
 - `make_swift.sh`
 - `uniffi-bindgen.rs`
-- a `.github` release pipeline that builds a prebuilt
-  `IrohLib.xcframework.zip` and attaches it to each GitHub release
+- a `.github` release pipeline
 
-### SwiftPM integration (exact steps, from `Package.swift` + `README.swift.md`)
+The release pipeline builds `IrohLib.xcframework.zip` and attaches it to each GitHub release.
 
-`iroh-ffi`'s `Package.swift` (`swift-tools-version:5.9`) resolves its
-binary xcframework target one of two ways. It uses a locally-built
-xcframework if present (source checkouts, CI). Otherwise, it uses a pinned
-prebuilt zip attached to a GitHub release. The `releaseTag`/`releaseChecksum`
-constants near the top of the file control this, and the repo's own
-release automation rewrites them. A consumer app is an app that pulls
-`iroh-ffi` in as a dependency. For a consumer app, this resolves to a
-plain SwiftPM package dependency:
+### Swift Package Manager integration
+
+These steps came from `Package.swift` and `README.swift.md`.
+
+`iroh-ffi` uses `swift-tools-version:5.9`.
+Its manifest resolves the binary XCFramework in one of two ways:
+
+- For source checkouts and continuous integration (CI), it uses a local XCFramework when present.
+- Otherwise, it uses a pinned prebuilt ZIP file from a GitHub release.
+
+The `releaseTag` and `releaseChecksum` constants control the release artifact.
+The repository release automation rewrites these constants.
+
+A consumer app adds this Swift Package Manager dependency:
 
 ```swift
 // In your app's Package.swift, or via Xcode's
@@ -74,37 +81,39 @@ dependencies: [
 ]
 ```
 
-or, per `README.swift.md`'s own documented Xcode flow (building from a
-local clone rather than the released package):
+For a local clone, follow the `README.swift.md` Xcode procedure:
 
 1. Clone `iroh-ffi`.
-2. Run `cargo make swift-xcframework` (requires
-   [`cargo-make`](https://crates.io/crates/cargo-make)). This command
-   builds a release iOS+macOS xcframework via `uniffi-bindgen` + `cargo
-   build --target aarch64-apple-ios` etc. under the hood. See "How
-   `iroh-ffi` builds its own xcframework" below for the exact steps this
-   triggers.
-3. In Xcode, add `IrohLib` (the cloned checkout's `ios/` directory --
-   really the repo root, since `Package.swift` lives there) as a **local
-   package dependency**. Do this under your target's **General ->
-   Frameworks, Libraries, and Embedded Content**.
-4. Build once. Confirm `IrohLib` now appears under that same list. Re-add
-   it with the `+` button if Xcode dropped it -- a known SwiftPM quirk
-   with binary targets.
-5. Add **`SystemConfiguration`** and **`CoreWLAN`** as linked frameworks.
-   This is required because `iroh`'s `netwatch` module, which detects
-   network changes, calls into them on Apple platforms. (`Package.swift`
-   also links `Network.framework` for the same reason, plus `CoreWLAN`
-   conditionally on macOS only.)
-6. Add `import IrohLib` in Swift source.
+2. Run `cargo make swift-xcframework`.
+   This command requires [`cargo-make`](https://crates.io/crates/cargo-make).
+   It builds a release iOS and macOS XCFramework.
+   It uses `uniffi-bindgen` and commands such as `cargo build --target aarch64-apple-ios`.
+3. In Xcode, add `IrohLib` as a local package dependency.
+   The package is the cloned checkout's `ios/` directory.
+   This location is effectively the repository root because `Package.swift` is there.
+   Add it under **General -> Frameworks, Libraries, and Embedded Content** for the target.
+4. Build once.
+5. Confirm that `IrohLib` appears in the same list.
+   If Xcode removes it, add it again with the `+` button.
+   The source identifies this behavior as a known Swift Package Manager quirk with binary targets.
+6. Link **`SystemConfiguration`** and **`CoreWLAN`**.
+   The `iroh` `netwatch` module calls these frameworks on Apple platforms.
+   `Package.swift` also links `Network.framework` for this reason.
+   It links `CoreWLAN` only on macOS.
+7. Add `import IrohLib` to Swift source.
 
-Platform floor per `Package.swift`: `.iOS("17.5")`, `.macOS("14.5")`,
-`.macCatalyst("17.5")`.
+`Package.swift` specifies these minimum platforms:
 
-### CocoaPods integration (from `IrohLib.podspec` + `IrohLibFramework.podspec`)
+- `.iOS("17.5")`
+- `.macOS("14.5")`
+- `.macCatalyst("17.5")`
 
-Two pods, split the same way the SwiftPM manifest splits Swift wrapper
-code from the compiled binary:
+### CocoaPods integration
+
+These facts came from `IrohLib.podspec` and `IrohLibFramework.podspec`.
+
+The two pods separate the Swift wrapper from the compiled binary.
+The Swift Package Manager manifest uses the same separation.
 
 ```ruby
 # Podfile
@@ -112,28 +121,30 @@ pod 'IrohLib'   # pulls in IrohLibFramework transitively via
                 # spec.dependency 'IrohLibFramework', "#{spec.version}"
 ```
 
-- **`IrohLib`** (version `0.35.0` at research time) -- the Swift source
-  wrapper (`IrohLib/Sources/IrohLib/*.swift`), `ios.deployment_target
-  '15.0'`, `static_framework = true`, links `SystemConfiguration`.
-- **`IrohLibFramework`** (version `0.23.0` at research time, versioned
-  independently of `IrohLib` since it tracks the release cadence of the
-  compiled binary) -- vendors the prebuilt `Iroh.xcframework` fetched via
-  `spec.source = { :http => ".../releases/download/v#{version}/IrohLib.xcframework.zip" }`.
+- **`IrohLib`** had version `0.35.0` at research time.
+  It contains the Swift wrapper at `IrohLib/Sources/IrohLib/*.swift`.
+  It sets `ios.deployment_target '15.0'` and `static_framework = true`.
+  It links `SystemConfiguration`.
+- **`IrohLibFramework`** had version `0.23.0` at research time.
+  Its version changes independently because it tracks the compiled binary release cadence.
+  It vendors the prebuilt `Iroh.xcframework`.
+  The podspec fetches `".../releases/download/v#{version}/IrohLib.xcframework.zip"` through `spec.source`.
 
-Pin both podspec versions explicitly in the `Podfile` when you integrate
-them. Do not assume they track each other. The two podspecs' version
-numbers are **not** kept in lockstep in the repo, as inspected (0.35.0 vs
-0.23.0).
+Pin both podspec versions explicitly in the `Podfile`.
+Do not assume that their versions match.
+The inspected repository used `0.35.0` and `0.23.0`, so the versions were not synchronized.
 
-### Swift API surface (from `src/*.rs`'s `#[uniffi::export]` items)
+### Swift API surface
 
-`iroh-ffi` exposes the base transport layer -- endpoints, connections, and
-tickets -- not a media-streaming abstraction. That layer does not exist in
-`iroh` itself. See Finding (b).
+This section comes from the `#[uniffi::export]` items in `src/*.rs`.
 
-These are the relevant pieces, as they would appear on the Swift side via
-uniffi's generated bindings. Rust's `Result<T, IrohError>` becomes a
-`throws` Swift function. `Arc<T>` becomes a Swift class:
+`iroh-ffi` exposes transport endpoints, connections, and tickets.
+It does not expose a media-stream abstraction because base `iroh` has no such abstraction.
+See Finding (b).
+
+UniFFI maps Rust `Result<T, IrohError>` to a throwing Swift function.
+It maps `Arc<T>` to a Swift class.
+The following example shows the relevant generated surface:
 
 ```swift
 // Ticket: connect
@@ -155,14 +166,11 @@ let connection = try await endpoint.connect(addr: addr, alpn: alpnBytes)
 // iroh-live does in Rust -- and exactly what has no Swift equivalent.
 ```
 
-The list below shows the authoritative Rust source for the API above.
-Direct fetch of `n0-computer/iroh-ffi`'s `src/` directory confirmed every
-file. Every item carries a `#[uniffi::export]` annotation.
+A direct fetch of `n0-computer/iroh-ffi/src/` confirmed each source file below.
+Each listed item has `#[uniffi::export]`.
 
-- `src/ticket.rs` (`EndpointTicket::from_string`, `::from_addr`,
-  `.endpoint_addr()`)
-- `src/endpoint.rs` (`EndpointBuilder::new/apply_n0/bind`,
-  `Endpoint::connect/accept_next/watch_addr/...`)
+- `src/ticket.rs`: `EndpointTicket::from_string`, `::from_addr`, and `.endpoint_addr()`
+- `src/endpoint.rs`: `EndpointBuilder::new/apply_n0/bind` and `Endpoint::connect/accept_next/watch_addr/...`
 - `src/net.rs`
 - `src/key.rs`
 - `src/watch.rs`
@@ -170,195 +178,210 @@ file. Every item carries a `#[uniffi::export]` annotation.
 - `src/path.rs`
 - `src/accept.rs`
 
-## Finding (b): `iroh-live` has no bindings of any kind -- this is the crate that actually matters here
+## Finding (b): `iroh-live` has no Swift bindings
 
-`holoiroh/mac-daemon` depends on **`iroh-live`** for its media layer, not
-on base `iroh` directly. It also depends on `iroh` directly, for the
-control channel -- see `holoiroh/README.md`. `iroh-live` provides
-`LocalBroadcast`, `Live::subscribe`/`subscribe_media`,
-`Subscription::media()`, and `LiveTicket`. This is the actual API surface
-an iOS client needs to receive the Mac's screen broadcast. Checked
-directly:
+The daemon uses **`iroh-live`** for the media layer.
+It also uses base `iroh` directly for the control channel.
+See `holoiroh/README.md`.
 
-- `n0-computer/iroh-live`'s repo root: **no** `bindings/`, `ffi/`,
-  `ios/`, `swift/`, `uniffi/`, or `Package.swift`/podspec of any kind.
-- `Cargo.toml` / `iroh-live/Cargo.toml`: **no** `uniffi` dependency
-  anywhere in the workspace.
-- `docs/platforms.md` is the doc most likely to mention it, if it existed.
-  It lists iOS platform status as `"Compiles, untested"` under `Software
-  and VideoToolbox | AVFoundation | Metal via wgpu`. This means the Rust
-  crate compiles for an iOS target. The document is explicit that this
-  target is unverified. It offers **zero** guidance on language bindings
-  or package distribution for Swift. The next-steps section literally
-  says *"iOS: Compiles but untested. Needs on-device validation."*
-- The one mobile-bindings precedent that *does* exist in this workspace is
-  **Android**. It is not uniffi-based either. `moq-media-android` is a
-  hand-rolled **JNI bridge crate** ("Android camera, EGL rendering, JNI
-  bridge"), with a matching `demos/android/` Kotlin+Rust app. There is no
-  `moq-media-ios` counterpart. This is direct evidence of the project's
-  own established pattern for mobile bindings when they're needed:
-  hand-write the bridge crate, not adopt uniffi. The fallback plan below
-  does exactly this for iOS.
+`iroh-live` provides these media APIs:
 
-Conclusion: **no official Swift bindings exist for `iroh-live`**. Nothing
-suggests new bindings are coming: no open issue, roadmap doc, or
-in-progress directory references one. `iroh-ffi` cannot substitute for
-this. It has no knowledge of `LocalBroadcast`, MoQ subscriptions, or
-frames. It stops at raw `Connection`.
+- `LocalBroadcast`
+- `Live::subscribe` and `subscribe_media`
+- `Subscription::media()`
+- `LiveTicket`
 
-Wrapping *only* `iroh-ffi` on the Swift side is not enough by itself. A
-consumer must then hand-roll the MoQ/broadcast protocol a second time, in
-Swift, on top of raw streams. That reimplements everything `iroh-live`
-already solves in Rust. `iroh-ffi` is the wrong layer to bind at.
+The app needs this surface to receive the Mac screen broadcast.
+The research checked these facts directly:
 
-## Path taken: (b) -- fallback Rust staticlib bridge
+- The `n0-computer/iroh-live` root had no `bindings/`, `ffi/`, `ios/`, `swift/`, or `uniffi/` directory.
+  It also had no `Package.swift` or podspec.
+- Neither `Cargo.toml` nor `iroh-live/Cargo.toml` had a `uniffi` dependency.
+- `docs/platforms.md` was the most likely document for platform support.
+  It listed iOS as `"Compiles, untested"`.
+  The related stack was `Software and VideoToolbox | AVFoundation | Metal via wgpu`.
+  This claim means that the Rust crate compiles for an iOS target.
+  The document explicitly described the target as unverified.
+  It gave no Swift binding or package-distribution instructions.
+  Its next-steps section said, *"iOS: Compiles but untested. Needs on-device validation."*
+- The workspace contained one mobile-binding precedent for Android.
+  `moq-media-android` is a hand-written Java Native Interface (JNI) bridge crate.
+  Its description is "Android camera, EGL rendering, JNI bridge."
+  The matching `demos/android/` application uses Kotlin and Rust.
+  No `moq-media-ios` counterpart existed.
+  This precedent uses a hand-written bridge instead of UniFFI.
 
-`iroh-live` is the crate with the actual functionality this project needs:
-ticket-based connect, subscribe to a broadcast, and pull frames. This
-crate has no bindings layer. Hand-writing a bridge is this project's own
-established pattern (per `moq-media-android` above), not an unusual
-choice. Because of this, the fallback plan applies: **`holoiroh/ios-bridge/`**,
-a small Rust `staticlib` crate that:
+Therefore, no official Swift bindings existed for `iroh-live` at research time.
+The search found no open issue, roadmap document, or in-progress directory for such bindings.
 
-- Depends directly on `iroh-live` (same git-pinned dependency
-  `mac-daemon/Cargo.toml` already uses), plus `iroh` for the control
-  channel. This lets it call `Live::subscribe`/`Subscription::media()`/
-  `LiveTicket::from_str` internally.
-- Exposes a small, stable `extern "C"` surface: ticket-connect, subscribe,
-  poll-next-frame, plus the control-channel send/recv from `PROTOCOL.md`.
-  Opaque handles cross the FFI boundary as raw pointers. A Tokio runtime,
-  owned inside the crate, drives the async Rust futures. This runtime is
-  not exposed across FFI, because `async`/`await` does not cross a C ABI.
-- Builds via `cargo build --target aarch64-apple-ios` (device) and
-  `aarch64-apple-ios-sim` / `x86_64-apple-ios-sim` (simulator, Apple
-  Silicon and Intel Macs respectively). These builds produce `.a` static
-  libraries. `xcodebuild -create-xcframework` combines them into one
-  `.xcframework`. This is the same shape `iroh-ffi` itself produces, but
-  hand-assembled instead of generated through `uniffi-bindgen`. There is
-  no uniffi Rust source to generate from on the `iroh-live` side.
-- Ships a hand-written C header, `ios-bridge.h`.
-  [`cbindgen`](https://github.com/mozilla/cbindgen) generates this header
-  from the `extern "C"` signatures. It also ships a `module.modulemap`, so
-  Swift can `import IosBridge` and call the C functions directly. A thin
-  hand-written Swift class wraps these calls for ergonomics. This Swift
-  wrapper is not committed yet. It is separate follow-on work, to be done
-  once the Rust implementations are real, not stubs.
+`iroh-ffi` cannot replace an `iroh-live` binding.
+It does not know about `LocalBroadcast`, Media over QUIC (MoQ) subscriptions, or frames.
+It stops at raw `Connection`.
 
-See `holoiroh/ios-bridge/src/lib.rs` for the real `extern "C"`
-implementation and its module-level doc comment. The "As-built" section
-below records exactly what it does and what was witnessed.
+If the app used only `iroh-ffi`, it would need a second MoQ implementation in Swift.
+That approach would duplicate the Rust behavior in `iroh-live`.
+Therefore, `iroh-ffi` is the wrong binding layer for this app.
 
-## As-built: the real subscribe FFI
+## Selected path: (b), a Rust static-library bridge
 
-The `ios-bridge` crate is **no longer a scaffold**. Every `extern "C"`
-function has a real body, wired to the actual `iroh-live` subscribe API.
-This wiring was verified against the vendored crate source at the pinned
-commit `5f95758`, not guessed. The exact call chain came from
-`~/.cargo/git/checkouts/iroh-live-*/5f95758/iroh-live/examples/subscribe_test.rs`,
-`frame_dump.rs`, `iroh-live/src/{live,subscription,ticket}.rs`, and
-`moq-media/src/subscribe.rs`.
+`iroh-live` provides ticket connections, broadcast subscriptions, and frame retrieval.
+It has no binding layer.
+The hand-written bridge follows the upstream `moq-media-android` pattern.
 
-### The verified call chain
+The bridge is in **`holoiroh/ios-bridge/`** and has these properties:
 
-| Step | Real `iroh-live` API (source location) |
+- It depends directly on `iroh-live` at the daemon's pinned Git commit.
+  It also depends on `iroh` for the control channel.
+  It parses tickets with `LiveTicket::from_str`.
+  It subscribes with `subscribe_with_playback_policy`.
+  It obtains video with `subscription.broadcast().video_ready()`.
+- It exposes a stable `extern "C"` ABI.
+  The ABI supports ticket connection, subscription, frame polling, reachability probes, and control-channel operations from `PROTOCOL.md`.
+  Raw pointers carry opaque handles across the FFI boundary.
+  An internal Tokio runtime drives asynchronous Rust futures.
+  Rust `async` and `await` do not cross the C ABI.
+- Device builds use `cargo build --target aarch64-apple-ios`.
+  Apple Silicon simulator builds use `aarch64-apple-ios-sim`.
+  Intel simulator builds use `x86_64-apple-ios-sim`.
+  These commands produce `.a` static libraries.
+  `xcodebuild -create-xcframework` combines them into one `.xcframework`.
+  This output matches the shape of `iroh-ffi` output.
+  This project assembles it manually because `iroh-live` has no UniFFI source.
+- cbindgen generates `HoloirohIosBridge.h`.
+  After any C ABI change, run `cargo run -p holoiroh-ios-bridge --example generate_header`.
+  The include directory also contains `module.modulemap`.
+  Swift imports `HoloirohIosBridge` and calls the C functions directly.
+  `HoloConnection` and `IrohLiveFrameSource` are the maintained Swift wrappers.
+
+See `holoiroh/ios-bridge/src/lib.rs` for the `extern "C"` implementation.
+Its module documentation gives the implementation contract.
+The following sections describe the built behavior and witnesses.
+
+## As built: subscribe FFI
+
+The `ios-bridge` crate is not a scaffold.
+Its subscribe functions call the real `iroh-live` subscribe API.
+All exported C functions have implemented bodies.
+The original implementation checked vendored commit `5f95758`.
+
+The exact call chain came from these sources:
+
+- `~/.cargo/git/checkouts/iroh-live-*/5f95758/iroh-live/examples/subscribe_test.rs`
+- `frame_dump.rs`
+- `iroh-live/src/{live,subscription,ticket}.rs`
+- `moq-media/src/subscribe.rs`
+
+### Verified call chain
+
+| Step | Real `iroh-live` API and source |
 | --- | --- |
-| Bind + session | `iroh::Endpoint::builder(iroh::endpoint::presets::N0).bind().await` -> `iroh_live::Live::builder(ep).with_router().spawn()` (the exact pattern `subscribe_test.rs`/`frame_dump.rs` use) |
-| Parse ticket | `iroh_live::ticket::LiveTicket::from_str(s)` -> a struct with public `endpoint: EndpointAddr` + `broadcast_name: String` (`iroh-live/src/ticket.rs`) |
-| Connect + subscribe | `live.subscribe(ticket.endpoint, &ticket.broadcast_name).await` -> `iroh_live::Subscription` (`iroh-live/src/live.rs:229`) |
-| Get video track | `subscription.broadcast().video_ready().await` -> `moq_media::subscribe::VideoTrack` (waits for the catalog to advertise a video rendition, then subscribes best-quality and starts the decoder pipeline -- VideoToolbox on Apple targets; `moq-media/src/subscribe.rs:688`) |
-| Pull a frame | `track.try_recv()` (non-blocking, drains to the latest) -> `Option<moq_media::format::VideoFrame>` (`moq-media/src/subscribe.rs:1089`) |
-| Frame bytes | `frame.rgba_image().as_raw()` -> tightly-packed `width*height*4` RGBA8 `&[u8]`, normalizing any backing pixel format (packed RGBA/BGRA, GPU, NV12) (`rusty-codecs/src/format.rs:748`) |
+| Bind and create session | `iroh::Endpoint::builder(iroh::endpoint::presets::N0).bind().await` -> `iroh_live::Live::builder(ep).with_router().spawn()`. The `subscribe_test.rs` and `frame_dump.rs` examples use this pattern. |
+| Parse ticket | `iroh_live::ticket::LiveTicket::from_str(s)` -> public `endpoint: EndpointAddr` and `broadcast_name: String` fields in `iroh-live/src/ticket.rs`. |
+| Connect and subscribe | `live.subscribe(ticket.endpoint, &ticket.broadcast_name).await` -> `iroh_live::Subscription` in `iroh-live/src/live.rs:229`. |
+| Get video track | `subscription.broadcast().video_ready().await` -> `moq_media::subscribe::VideoTrack`. It waits for a catalog video rendition. It then selects the best quality and starts decoding. Apple targets use VideoToolbox. See `moq-media/src/subscribe.rs:688`. |
+| Pull frame | `track.try_recv()` -> `Option<moq_media::format::VideoFrame>` in `moq-media/src/subscribe.rs:1089`. This nonblocking call drains through the latest frame. |
+| Get frame bytes | `frame.rgba_image().as_raw()` -> tightly packed `width*height*4` RGBA8 bytes in `rusty-codecs/src/format.rs:748`. It normalizes packed RGBA, packed BGRA, graphics processing unit (GPU), and NV12 storage. |
 
-The C surface maps onto that chain as follows:
+The current C surface maps to that chain as follows:
 
-- `holoiroh_ios_bridge_new` -- runtime + endpoint bind + `Live` spawn
-- `holoiroh_ios_bridge_ticket_connect` -- parse + `live.subscribe`
-- `holoiroh_ios_bridge_subscribe` -- `video_ready`
-- `holoiroh_ios_bridge_poll_next_frame` -- non-blocking `try_recv`; RGBA8
-  bytes into a caller-owned buffer, plus a `HoloirohFrame` metadata struct
-  with `width`/`height`/`timestamp_us`/`pixel_format`/`kind`
-- explicit `_subscription_free`/`_free`
+- `holoiroh_ios_bridge_new` creates a generated process-lifetime identity.
+- `holoiroh_ios_bridge_new_with_secret_key` creates an identity from exactly 32 seed bytes.
+- `holoiroh_ios_bridge_probe_reachable` and `_with_secret_key` probe daemon reachability.
+- `holoiroh_ios_bridge_ticket_connect` parses the ticket and subscribes through `iroh-live`.
+- `holoiroh_ios_bridge_subscribe` waits through `video_ready`.
+- `holoiroh_ios_bridge_poll_next_frame` performs nonblocking `try_recv`.
+  It converts RGBA8 to tightly packed BGRA8 during copy-out.
+  The caller owns the output buffer.
+  `HoloirohFrame` reports `width`, `height`, `timestamp_us`, `pixel_format`, and `kind`.
+- `holoiroh_ios_bridge_control_connect`, `_control_send`, and `_poll_control_event` implement the control channel.
+- `holoiroh_ios_bridge_subscription_free`, `_free`, and `_free_error_string` release owned resources.
 
-`async`/`await` never crosses the C ABI. A Tokio multi-thread runtime,
-owned inside the crate, drives every async call via `block_on` for
-connect/subscribe. Poll uses a synchronous `try_recv` instead.
+Rust `async` and `await` never cross the C ABI.
+The crate owns a Tokio multithread runtime.
+Connect and subscribe operations use `block_on`.
+Polling uses synchronous `try_recv`.
 
-`catch_unwind` wraps every fallible function, so a Rust panic can never
-unwind across the boundary. Unwinding across this boundary is undefined
-behavior. Instead, the function returns a negative `HoloirohStatus` plus a
-heap error string, freed via `holoiroh_ios_bridge_free_error_string`.
+`catch_unwind` wraps each fallible C entry point.
+This prevents a Rust panic from unwinding across the C boundary.
+Such unwinding has undefined behavior.
+On failure, the function returns a negative `HoloirohStatus`.
+When applicable, it also returns a heap error string.
+The caller must free that string with `holoiroh_ios_bridge_free_error_string`.
 
-The two control-channel functions, `_control_send`/`_poll_control_event`,
-are **not implemented** in this build. The control channel is a separate
-iroh ALPN (`holoiroh/control/1`), not part of the media subscribe path.
-Because of this, they return `HOLOIROH_ERR_UNSUPPORTED`, never a panic,
-until the iOS control transport is built. This work is tracked separately.
-See `holoiroh/README.md`'s "Remote kill-switch".
+The control channel uses a separate Application-Layer Protocol Negotiation (ALPN) identifier: `holoiroh/control/1`.
+The bridge sends the bare personal identification number (PIN) handshake first.
+It then signs each client envelope with the persistent endpoint identity.
+It verifies each daemon envelope against the authenticated transport peer before Swift can poll it.
+See `examples/control_ffi_probe.rs` for the executable fake-daemon witness.
 
-### Witnessed builds (this environment, real execution)
+### Witnessed builds
 
-The prior "cross-compilation not available here" note is **superseded**.
-This environment has Xcode (iPhoneOS SDK 26.4). The iOS rustup target is
-installable here. Witnessed:
+The earlier cross-compilation limitation is superseded.
+This environment has Xcode and iPhoneOS software development kit (SDK) 26.4.
+The iOS rustup target is installable.
+The following executions were witnessed:
 
-- **`cargo build -p holoiroh-ios-bridge` (host `aarch64-apple-darwin`):**
-  succeeds, with **0 warnings**. It compiles the full `iroh-live` /
-  `iroh-moq` / `moq-media` / `rusty-codecs` / `openh264` /
-  `objc2-av-foundation` graph into the staticlib+rlib.
-- **`rustup target add aarch64-apple-ios` then `cargo build -p
-  holoiroh-ios-bridge --target aarch64-apple-ios`:** **succeeds** (exit 0).
-  This produces `target/aarch64-apple-ios/debug/libholoiroh_ios_bridge.a`.
-  Running `nm` on it lists all nine `_holoiroh_ios_bridge_*` `extern "C"`
-  symbols as Mach-O text symbols. **This is a real finding: the entire
-  `iroh-live` transitive dependency graph cross-compiles to a
-  physical-device iOS target here.** No crate in the graph blocked it.
-- **`examples/ffi_probe.rs`** (`cargo run --example ffi_probe`, no unit
-  test file per this repo's rule): exit 0. This probe witnesses the C-ABI
-  contract end to end:
-  - `_new` returns a non-null handle.
-  - A malformed ticket returns `HOLOIROH_ERR_INVALID_TICKET` plus a freed
-    error string.
-  - A well-formed but unreachable ticket returns
-    `HOLOIROH_ERR_CONNECT_FAILED` ("No addressing information available"),
-    with no panic or hang. The real `live.subscribe` dial failed cleanly,
-    since this sandbox has no reachable iroh relay.
-  - Not-connected `_subscribe` returns null.
-  - The C surface tolerates null arguments everywhere.
-  - The control functions report `HOLOIROH_ERR_UNSUPPORTED`.
-  - Full teardown runs with no crash or leak.
-- **`swift build` for the iOS 17 simulator** (`--sdk iphonesimulator
-  --triple arm64-apple-ios17.0-simulator`): succeeds. `IrohLiveFrameSource.swift`
-  compiles against the real iOS SDK.
+- **`cargo build -p holoiroh-ios-bridge` on host `aarch64-apple-darwin`:**
+  The command succeeded with **0 warnings**.
+  It compiled the complete dependency graph into staticlib and rlib outputs.
+  The graph included `iroh-live`, `iroh-moq`, `moq-media`, `rusty-codecs`, `openh264`, and `objc2-av-foundation`.
+- **`rustup target add aarch64-apple-ios` followed by `cargo build -p holoiroh-ios-bridge --target aarch64-apple-ios`:**
+  The build succeeded with exit status 0.
+  It produced `target/aarch64-apple-ios/debug/libholoiroh_ios_bridge.a`.
+  At that pass, `nm` listed all nine `_holoiroh_ios_bridge_*` functions as Mach-O text symbols.
+  This witness proved that the complete transitive graph cross-compiled for a physical iOS device.
+  No crate in the graph blocked the build.
+  The current ABI has additional identity, reachability, and implemented control functions.
+- **`examples/ffi_probe.rs` with `cargo run --example ffi_probe`:**
+  The executable probe replaced a standing unit-test file, per repository rules.
+  It exited with status 0 and exercised the C ABI end to end.
+  - `_new` returned a non-null handle.
+  - A malformed ticket returned `HOLOIROH_ERR_INVALID_TICKET` and an error string.
+    The probe freed the string.
+  - A valid but unreachable ticket returned `HOLOIROH_ERR_CONNECT_FAILED`.
+    Its message was `"No addressing information available"`.
+    The real `live.subscribe` dial failed without a panic or hang.
+    This sandbox had no reachable iroh relay.
+  - `_subscribe` returned null before connection.
+  - The C surface accepted null arguments without a crash.
+  - At that historical pass, the unimplemented control functions returned `HOLOIROH_ERR_UNSUPPORTED`.
+    Current code implements these functions and keeps the constant only for ABI stability.
+  - Full teardown completed without a crash or detected leak.
+- **`swift build` for the iOS 17 simulator:**
+  The command used `--sdk iphonesimulator --triple arm64-apple-ios17.0-simulator`.
+  It succeeded.
+  `IrohLiveFrameSource.swift` compiled against the real iOS SDK.
 
-### What is real vs. still needs a device / network / Xcode-link
+### Witness scope
 
-**Real and witnessed:**
+The original headless witness proved these items:
 
-- the C ABI, its error handling, and its null-tolerance
-- the Rust subscribe wiring compiling and linking (host +
-  `aarch64-apple-ios` staticlib with the exported symbols)
-- the probe exercising construction, error paths, and teardown
-- the C header compiling as valid C
-- `IrohLiveFrameSource.swift` compiling against the iOS SDK
+- C ABI error handling and null tolerance
+- host and `aarch64-apple-ios` static-library compilation
+- exported Mach-O symbols
+- construction, error paths, and teardown
+- valid C header compilation
+- `IrohLiveFrameSource.swift` compilation against the iOS SDK
 
-**Still needed: a real device, a network, and a full Xcode project.**
-These are needed for an actual frame to arrive. This requires:
+That witness did not prove an on-screen frame.
+It had no reachable live publisher, device run, or final application link.
+A real frame requires a reachable daemon media stream through direct or relayed iroh connectivity.
 
-- a live publisher (the Mac daemon), reachable over a real iroh connection
-  that is either NAT-punched or relayed
-- an Xcode app target that links the `.xcframework` (the one build step
-  below)
+The current repository now contains the installable target at `ios/App/HoloIroh.xcodeproj`.
+`ios/Package.swift` links the iOS-only `HoloirohIosBridge` binary target.
+Current bridge source records an on-device decoder witness of `20-40fps` during a black-screen diagnosis.
+That diagnosis found unsupported `kCVPixelFormatType_32RGBA` pool creation on iOS.
+The bridge now swizzles red and blue bytes and emits `HOLOIROH_PIXFMT_BGRA8`.
+The source does not record a post-fix, on-screen frame witness.
+Therefore, this document does not claim that end-to-end live display is witnessed.
 
-Headlessly, the dial cannot complete. No `VideoFrame` is produced. So this
-is **not** "live video works." Instead: the C ABI, the real subscribe
-wiring, and the cross-compile are all real and witnessed. The last mile --
-frames on screen -- needs a device, a network, and a link.
+## As built: XCFramework packaging
 
-## As-built: xcframework packaging (the one build step Xcode needs)
+The app links the static library through an `.xcframework`.
+This shape matches the `iroh-ffi` binary target.
+This project assembles it manually because `iroh-live` has no UniFFI code generation.
 
-The staticlib becomes an `.xcframework` that the app target links. This is
-the same shape that `iroh-ffi`'s own `Iroh` binary target uses. Here, it is
-hand-assembled, since there is no uniffi codegen on the `iroh-live` side:
+Run these ordered steps from `holoiroh/`:
 
 ```sh
 cd holoiroh
@@ -379,13 +402,9 @@ lipo -create \
   target/x86_64-apple-ios-sim/release/libholoiroh_ios_bridge.a \
   -output target/libholoiroh_ios_bridge-sim.a
 
-# 4. The C header + module map already live in ios-bridge/include/ (committed:
-#    HoloirohIosBridge.h + module.modulemap). Regenerate the header's type
-#    section any time the extern "C" signatures change:
-#      (cd ios-bridge && cbindgen --config cbindgen.toml \
-#         --crate holoiroh-ios-bridge --output include/HoloirohIosBridge.h)
-#    then re-append the hand-kept function-prototype block (cbindgen 0.27 skips
-#    edition-2024 `#[unsafe(no_mangle)]` fns -- see the header's own note).
+# 4. Regenerate the authoritative C header and module declarations after any
+#    Rust C ABI change. The command is repeatable when the header is unchanged.
+cargo run -p holoiroh-ios-bridge --example generate_header
 
 # 5. Assemble the xcframework: device slice + fused simulator slice, each
 #    paired with the same headers dir (which carries the module map too).
@@ -394,62 +413,49 @@ xcodebuild -create-xcframework \
   -headers ios-bridge/include \
   -library target/libholoiroh_ios_bridge-sim.a \
   -headers ios-bridge/include \
-  -output HoloirohIosBridge.xcframework
+  -output ios/Artifacts/HoloirohIosBridge.xcframework
 ```
 
-### Linking it into the app (the single remaining Xcode step)
+### Link the XCFramework into the app
 
-`ios/` is a pure SwiftPM package. A pure package cannot produce an
-installable `.app` by itself. So a thin Xcode app target, or a SwiftPM
-binary target, wraps it.
+`ios/Package.swift` declares the generated XCFramework as the iOS-only `HoloirohIosBridge` binary target.
+`ios/App/HoloIroh.xcodeproj` defines the installable app target.
+The package provides macOS stubs when the iOS binary module is unavailable.
 
-To wire in the FFI, that target needs exactly one thing: add
-**`HoloirohIosBridge.xcframework`** under General -> Frameworks,
-Libraries, and Embedded Content. (Alternatively, add a
-`.binaryTarget(name: "HoloirohIosBridge", path:
-"HoloirohIosBridge.xcframework")` in a `Package.swift`.)
+`HoloConnection` owns one keyed bridge for the control channel and media stream.
+It loads one 32-byte iroh seed from the iOS Keychain.
+It reuses the seed across launches.
+If Keychain access fails, it fails instead of rotating the identity.
 
-With it linked, `#if canImport(HoloirohIosBridge)` in
-`ios/Sources/HoloIrohApp/Video/IrohLiveFrameSource.swift` flips on, and the
-real implementation compiles. Without it, the file still builds. The
-`#else` branch is a compile-honest stub: it logs "not linked" and produces
-no frames. This is why the headless `swift build` above succeeds.
+The shared `IrohLiveFrameSource` polls decoded BGRA8 frames on a background queue.
+It wraps them in pooled `kCVPixelFormatType_32BGRA` buffers for `VideoRenderView`.
 
-Also link **`SystemConfiguration`** and **`Network.framework`**. This is
-required because `iroh`'s `netwatch` module calls into them on Apple
-platforms. (These are the same frameworks `iroh-ffi`'s own `Package.swift`
-links -- see Finding (a) above.)
+The Rust output is a static library, so it does not carry its Apple framework dependencies.
+`ios/Package.swift` explicitly links `SystemConfiguration` and `VideoToolbox` for iOS.
+Keep those linker settings when integrating the binary into another target.
 
-Then, at `MainView`'s single binding site, replace
-`SyntheticVideoFrameSource()` with `IrohLiveFrameSource(ticket: pastedTicket)`.
-`IrohLiveFrameSource` conforms to `VideoFrameSource`. It pulls RGBA8
-frames off `holoiroh_ios_bridge_poll_next_frame` on a background queue. It
-wraps them in pooled `kCVPixelFormatType_32RGBA` `CVPixelBuffer`s. It
-pushes `.pixelBuffer(pb, pts: .invalid)` through the exact same `onFrame`
-seam the synthetic source uses. So `VideoRenderView` shows them
-display-immediately, with no change to the view.
+## Sources consulted
 
-## Sources consulted (all fetched live, not from memory)
+All sources were fetched live instead of recalled from memory.
 
 - `gh repo view n0-computer/iroh`, `gh api repos/n0-computer/iroh/contents`
-- `gh repo view n0-computer/iroh-live`,
-  `gh api repos/n0-computer/iroh-live/contents` (root + `moq-media-android/`,
-  `moq-media/`, `cross/`, `docs/`)
+- `gh repo view n0-computer/iroh-live`
+- `gh api repos/n0-computer/iroh-live/contents`
+  The request covered the root, `moq-media-android/`, `moq-media/`, `cross/`, and `docs/`.
 - `WebFetch` of `raw.githubusercontent.com/n0-computer/iroh-live/main/README.md`
-- `WebFetch` + `curl` of `raw.githubusercontent.com/n0-computer/iroh-live/main/docs/platforms.md`
-- `gh api orgs/n0-computer/repos --paginate` (full 129-repo org listing --
-  found `iroh-ffi`, `hello-iroh-ffi`, `iroh-c-ffi`, `iroh-js` this way)
-- `gh repo view n0-computer/iroh-ffi`,
-  `gh api repos/n0-computer/iroh-ffi/contents`,
-  `gh api repos/n0-computer/hello-iroh-ffi/contents`
-- `curl` of `raw.githubusercontent.com/n0-computer/iroh-ffi/main/README.swift.md`,
-  `Package.swift`, `IrohLib.podspec`, `IrohLibFramework.podspec`
-- `gh api repos/n0-computer/iroh-ffi/contents/IrohLib/Sources/IrohLib`,
-  `.../contents/src` (confirms `src/{ticket,endpoint,net,key,watch,relay,
-  path,accept}.rs` as the uniffi-exported surface)
+- `WebFetch` and `curl` of `raw.githubusercontent.com/n0-computer/iroh-live/main/docs/platforms.md`
+- `gh api orgs/n0-computer/repos --paginate`
+  This command returned the complete 129-repository organization listing.
+  It found `iroh-ffi`, `hello-iroh-ffi`, `iroh-c-ffi`, and `iroh-js`.
+- `gh repo view n0-computer/iroh-ffi`
+- `gh api repos/n0-computer/iroh-ffi/contents`
+- `gh api repos/n0-computer/hello-iroh-ffi/contents`
+- `curl` of `raw.githubusercontent.com/n0-computer/iroh-ffi/main/README.swift.md`
+- `curl` of `Package.swift`, `IrohLib.podspec`, and `IrohLibFramework.podspec`
+- `gh api repos/n0-computer/iroh-ffi/contents/IrohLib/Sources/IrohLib`
+- `gh api repos/n0-computer/iroh-ffi/contents/src`
+  This request confirmed `src/{ticket,endpoint,net,key,watch,relay,path,accept}.rs` as the UniFFI-exported surface.
 - `curl` of `raw.githubusercontent.com/n0-computer/iroh-ffi/main/src/{ticket,endpoint}.rs`
-- `curl` of `raw.githubusercontent.com/n0-computer/iroh-live/main/{Cargo.toml,
-  iroh-live/Cargo.toml,iroh-live/src/{live,subscription,ticket}.rs}` --
-  confirms no `uniffi` dependency anywhere, and the exact
-  `Live::subscribe`/`subscribe_media`/`Subscription::media`/`LiveTicket`
-  signatures the fallback bridge wraps.
+- `curl` of `raw.githubusercontent.com/n0-computer/iroh-live/main/{Cargo.toml,iroh-live/Cargo.toml,iroh-live/src/{live,subscription,ticket}.rs}`
+  These files confirmed that the workspace had no `uniffi` dependency.
+  They also confirmed the wrapped `Live::subscribe`, `subscribe_media`, `Subscription::media`, and `LiveTicket` signatures.

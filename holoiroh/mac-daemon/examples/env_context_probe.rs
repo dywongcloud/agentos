@@ -25,7 +25,9 @@ async fn main() -> Result<()> {
     let home = std::env::var_os("HOME").context("HOME not set")?;
     let probe_dir = std::path::PathBuf::from(&home).join(".holoiroh_env_context_probe");
     let _ = std::fs::remove_dir_all(&probe_dir); // fresh corpus/db every run
-    let real_home_cache = std::path::PathBuf::from(&home).join(".holoiroh").join("models/bge-small-en-v1.5");
+    let real_home_cache = std::path::PathBuf::from(&home)
+        .join(".holoiroh")
+        .join("models/bge-small-en-v1.5");
     let store = EnvContextStore::open_at(
         probe_dir.join("context"),
         probe_dir.join("context.db"),
@@ -54,7 +56,10 @@ async fn main() -> Result<()> {
         ),
     ];
     for (key, text) in facts {
-        store.remember(key, text).await.with_context(|| format!("remembering {key}"))?;
+        store
+            .remember(key, text)
+            .await
+            .with_context(|| format!("remembering {key}"))?;
         println!("  remembered: {key}");
     }
 
@@ -71,11 +76,18 @@ async fn main() -> Result<()> {
     let top_keys: Vec<&str> = retrieved.iter().map(|f| f.key.as_str()).collect();
     let found_ghostty = top_keys.contains(&"terminal-app-ghostty");
     let found_project = top_keys.contains(&"project-aro-holoiroh");
-    let music_not_top1 = retrieved.first().map(|f| f.key != "unrelated-music-preference").unwrap_or(false);
+    let music_not_top1 = retrieved
+        .first()
+        .map(|f| f.key != "unrelated-music-preference")
+        .unwrap_or(false);
 
     println!(
         "\n[{}] found_ghostty={found_ghostty} found_project={found_project} music_not_top1={music_not_top1}",
-        if found_ghostty && found_project && music_not_top1 { "OK" } else { "FAIL" }
+        if found_ghostty && found_project && music_not_top1 {
+            "OK"
+        } else {
+            "FAIL"
+        }
     );
 
     let block = format_context_block(&retrieved);
@@ -88,16 +100,25 @@ async fn main() -> Result<()> {
     // storage, matching this module's documented "corpus is the source of truth" design.
     std::fs::remove_file(probe_dir.join("context.db")).ok();
     let reindexed = store.reindex().await.context("reindex")?;
-    let post_reindex = store.retrieve(query, 3).await.context("retrieve after reindex")?;
+    let post_reindex = store
+        .retrieve(query, 3)
+        .await
+        .context("retrieve after reindex")?;
     let survived_reindex = post_reindex.iter().any(|f| f.key == "terminal-app-ghostty");
     println!(
         "[{}] reindexed={reindexed} survived_reindex={survived_reindex}",
-        if reindexed == facts.len() && survived_reindex { "OK" } else { "FAIL" }
+        if reindexed == facts.len() && survived_reindex {
+            "OK"
+        } else {
+            "FAIL"
+        }
     );
 
     if !(found_ghostty && found_project && music_not_top1 && survived_reindex) {
         bail!("ENV CONTEXT PROBE FAILED");
     }
-    println!("\nENV CONTEXT PROBE: ALL WITNESSED OK (real BGE embeddings, real libsql vector_top_k, real reindex-from-corpus)");
+    println!(
+        "\nENV CONTEXT PROBE: ALL WITNESSED OK (real BGE embeddings, real libsql vector_top_k, real reindex-from-corpus)"
+    );
     Ok(())
 }

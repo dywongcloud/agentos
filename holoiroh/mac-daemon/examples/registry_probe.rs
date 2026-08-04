@@ -43,7 +43,9 @@ fn temp_path(name: &str, ext: &str) -> std::path::PathBuf {
 }
 
 fn main() {
-    println!("=== default_path / default_json_path resolve under $HOME/.holoiroh (no file written) ===");
+    println!(
+        "=== default_path / default_json_path resolve under $HOME/.holoiroh (no file written) ==="
+    );
     let home = std::env::var("HOME").expect("HOME must be set to run this probe");
     let toml_default = Registry::default_path().expect("default_path should resolve");
     let json_default = Registry::default_json_path().expect("default_json_path should resolve");
@@ -51,18 +53,28 @@ fn main() {
     println!("default_json_path() -> {}", json_default.display());
     assert_eq!(
         toml_default,
-        std::path::PathBuf::from(&home).join(".holoiroh").join("registry.toml")
+        std::path::PathBuf::from(&home)
+            .join(".holoiroh")
+            .join("registry.toml")
     );
     assert_eq!(
         json_default,
-        std::path::PathBuf::from(&home).join(".holoiroh").join("registry.json")
+        std::path::PathBuf::from(&home)
+            .join(".holoiroh")
+            .join("registry.json")
     );
 
     println!();
-    println!("=== default_registry: the alpha P0 verified-tier Slack native_app entry (PRD §8) ===");
+    println!(
+        "=== default_registry: the alpha P0 verified-tier Slack native_app entry (PRD §8) ==="
+    );
     let defaults = Registry::default_registry();
     println!("entry count: {}", defaults.entries.len());
-    assert_eq!(defaults.entries.len(), 1, "alpha scope: one seed entry (Slack)");
+    assert_eq!(
+        defaults.entries.len(),
+        1,
+        "alpha scope: one seed entry (Slack)"
+    );
     let slack = &defaults.entries[0];
     println!(
         "  aliases={:?}\n  entry_type={:?}\n  bundle_id={:?}\n  defaults.workspace={:?}\n  policy.allowed_actions={:?} policy.remote_view_required={}",
@@ -74,11 +86,23 @@ fn main() {
         slack.policy.remote_view_required,
     );
     assert_eq!(slack.entry_type, EntryType::NativeApp);
-    assert_eq!(slack.bundle_id.as_deref(), Some("com.tinyspeck.slackmacgap"));
-    assert!(slack.alias.iter().any(|a| a == "slack"), "Slack must resolve on the plain 'slack' alias");
-    assert!(slack.defaults.workspace.is_some(), "Slack seed has a default workspace");
+    assert_eq!(
+        slack.bundle_id.as_deref(),
+        Some("com.tinyspeck.slackmacgap")
+    );
     assert!(
-        slack.policy.allowed_actions.contains(&"send_message".to_string()),
+        slack.alias.iter().any(|a| a == "slack"),
+        "Slack must resolve on the plain 'slack' alias"
+    );
+    assert!(
+        slack.defaults.workspace.is_some(),
+        "Slack seed has a default workspace"
+    );
+    assert!(
+        slack
+            .policy
+            .allowed_actions
+            .contains(&"send_message".to_string()),
         "PRD §8 example policy lists send_message"
     );
 
@@ -89,16 +113,27 @@ fn main() {
     let no_ext_p = std::path::Path::new("/tmp/x/registry");
     println!("from_path(.toml) -> {:?}", ConfigFormat::from_path(toml_p));
     println!("from_path(.json) -> {:?}", ConfigFormat::from_path(json_p));
-    println!("from_path(no ext) -> {:?}", ConfigFormat::from_path(no_ext_p));
+    println!(
+        "from_path(no ext) -> {:?}",
+        ConfigFormat::from_path(no_ext_p)
+    );
     assert_eq!(ConfigFormat::from_path(toml_p), ConfigFormat::Toml);
     assert_eq!(ConfigFormat::from_path(json_p), ConfigFormat::Json);
-    assert_eq!(ConfigFormat::from_path(no_ext_p), ConfigFormat::Toml, "no extension defaults to TOML");
+    assert_eq!(
+        ConfigFormat::from_path(no_ext_p),
+        ConfigFormat::Toml,
+        "no extension defaults to TOML"
+    );
 
     println!();
     println!("=== load: missing file -> defaults, not an error ===");
     let missing = temp_path("missing", "toml");
     let loaded = Registry::load(&missing).expect("missing file should load as defaults");
-    println!("load({}) -> {} entries (no file written)", missing.display(), loaded.entries.len());
+    println!(
+        "load({}) -> {} entries (no file written)",
+        missing.display(),
+        loaded.entries.len()
+    );
     assert_eq!(loaded, Registry::default_registry());
     assert!(!missing.exists(), "load() alone must not create the file");
 
@@ -109,18 +144,22 @@ fn main() {
     // Add a second, browser_url entry AND a second native_app entry that shares
     // an alias with Slack, so the round-trip proves the full schema persists and
     // sets up the ambiguity test below.
-    to_save.entries.push(holoiroh_daemon::registry::RegistryEntry {
-        alias: vec!["docs".to_string(), "documentation".to_string()],
-        entry_type: EntryType::BrowserUrl,
-        bundle_id: None,
-        browser_url: Some("https://example.com/docs".to_string()),
-        defaults: Default::default(),
-        policy: holoiroh_daemon::registry::Policy {
-            allowed_actions: vec!["read".to_string()],
-            remote_view_required: true,
-        },
-    });
-    to_save.save(&toml_path).expect("TOML save should succeed and create parent dir");
+    to_save
+        .entries
+        .push(holoiroh_daemon::registry::RegistryEntry {
+            alias: vec!["docs".to_string(), "documentation".to_string()],
+            entry_type: EntryType::BrowserUrl,
+            bundle_id: None,
+            browser_url: Some("https://example.com/docs".to_string()),
+            defaults: Default::default(),
+            policy: holoiroh_daemon::registry::Policy {
+                allowed_actions: vec!["read".to_string()],
+                remote_view_required: true,
+            },
+        });
+    to_save
+        .save(&toml_path)
+        .expect("TOML save should succeed and create parent dir");
     println!("saved to {}", toml_path.display());
     let toml_contents = std::fs::read_to_string(&toml_path).unwrap();
     println!("--- file contents ---");
@@ -128,14 +167,24 @@ fn main() {
     println!("--- end ---");
 
     let reloaded = Registry::load(&toml_path).expect("load after save should succeed");
-    assert_eq!(reloaded, to_save, "TOML round-trip must preserve every field");
-    let docs = reloaded.entries.iter().find(|e| e.alias.contains(&"docs".to_string())).unwrap();
+    assert_eq!(
+        reloaded, to_save,
+        "TOML round-trip must preserve every field"
+    );
+    let docs = reloaded
+        .entries
+        .iter()
+        .find(|e| e.alias.contains(&"docs".to_string()))
+        .unwrap();
     println!(
         "reloaded browser_url entry: entry_type={:?} browser_url={:?} remote_view_required={}",
         docs.entry_type, docs.browser_url, docs.policy.remote_view_required
     );
     assert_eq!(docs.entry_type, EntryType::BrowserUrl);
-    assert_eq!(docs.browser_url.as_deref(), Some("https://example.com/docs"));
+    assert_eq!(
+        docs.browser_url.as_deref(),
+        Some("https://example.com/docs")
+    );
     assert!(docs.policy.remote_view_required);
     let _ = std::fs::remove_file(&toml_path);
 
@@ -145,11 +194,24 @@ fn main() {
     let src = Registry::default_registry();
     src.save(&json_path).expect("JSON save should succeed");
     let json_contents = std::fs::read_to_string(&json_path).unwrap();
-    println!("saved to {} ({} bytes)", json_path.display(), json_contents.len());
-    assert!(json_contents.trim_start().starts_with('{'), "json format should actually write JSON, not TOML");
+    println!(
+        "saved to {} ({} bytes)",
+        json_path.display(),
+        json_contents.len()
+    );
+    assert!(
+        json_contents.trim_start().starts_with('{'),
+        "json format should actually write JSON, not TOML"
+    );
     let reloaded_json = Registry::load(&json_path).expect("load JSON after save should succeed");
-    assert_eq!(reloaded_json, src, "JSON round-trip must preserve every field");
-    println!("JSON round-trip: entries preserved = {}", reloaded_json == src);
+    assert_eq!(
+        reloaded_json, src,
+        "JSON round-trip must preserve every field"
+    );
+    println!(
+        "JSON round-trip: entries preserved = {}",
+        reloaded_json == src
+    );
     let _ = std::fs::remove_file(&json_path);
 
     println!();
@@ -163,18 +225,25 @@ fn main() {
         inited.entries.len(),
         init_path.exists()
     );
-    assert!(init_path.exists(), "load_or_init must persist the defaults on first run");
+    assert!(
+        init_path.exists(),
+        "load_or_init must persist the defaults on first run"
+    );
     assert_eq!(inited, Registry::default_registry());
     // Second call must load the (possibly user-edited) file, not reset it.
     let mut existing = Registry::load(&init_path).unwrap();
     existing.entries[0].defaults.workspace = Some("acme-corp".to_string());
     existing.save(&init_path).unwrap();
-    let second_call = Registry::load_or_init(&init_path).expect("second load_or_init should succeed");
+    let second_call =
+        Registry::load_or_init(&init_path).expect("second load_or_init should succeed");
     println!(
         "second load_or_init: slack.defaults.workspace={:?} (must reflect the user's edit, not reset)",
         second_call.entries[0].defaults.workspace
     );
-    assert_eq!(second_call.entries[0].defaults.workspace.as_deref(), Some("acme-corp"));
+    assert_eq!(
+        second_call.entries[0].defaults.workspace.as_deref(),
+        Some("acme-corp")
+    );
     let _ = std::fs::remove_file(&init_path);
 
     println!();
@@ -183,14 +252,19 @@ fn main() {
     std::fs::write(&corrupt_path, b"this is not valid toml {{{ at all").unwrap();
     let result = Registry::load(&corrupt_path);
     println!("load(corrupt file) -> is_err={}", result.is_err());
-    assert!(result.is_err(), "a corrupt registry must be a real error, not silently treated as defaults");
+    assert!(
+        result.is_err(),
+        "a corrupt registry must be a real error, not silently treated as defaults"
+    );
     if let Err(e) = &result {
         println!("  error: {e:#}");
     }
     let _ = std::fs::remove_file(&corrupt_path);
 
     println!();
-    println!("=== resolve: SINGLE match -> deterministic target (PRD §8 steps 2-3, exactly one) ===");
+    println!(
+        "=== resolve: SINGLE match -> deterministic target (PRD §8 steps 2-3, exactly one) ==="
+    );
     let reg = Registry::default_registry();
     // Case- and whitespace-insensitive: "  SLACK  App " must resolve to the Slack entry.
     match reg.resolve("  SLACK  App ") {
@@ -199,7 +273,10 @@ fn main() {
                 "resolve('  SLACK  App ') -> Single -> aliases={:?} bundle_id={:?}",
                 entry.alias, entry.bundle_id
             );
-            assert_eq!(entry.bundle_id.as_deref(), Some("com.tinyspeck.slackmacgap"));
+            assert_eq!(
+                entry.bundle_id.as_deref(),
+                Some("com.tinyspeck.slackmacgap")
+            );
         }
         other => panic!("expected a single Slack match, got {other:?}"),
     }
@@ -207,10 +284,16 @@ fn main() {
     println!();
     println!("=== resolve: NOT FOUND -> NotFound (no autonomous guess) ===");
     let nf = reg.resolve("some destination that isn't registered");
-    println!("resolve('some destination that isn't registered') -> {:?}", nf);
+    println!(
+        "resolve('some destination that isn't registered') -> {:?}",
+        nf
+    );
     assert!(matches!(nf, Resolution::NotFound));
     // Empty/whitespace-only input is also NotFound, not a spurious match.
-    assert!(matches!(reg.resolve("   "), Resolution::NotFound), "blank input must be NotFound");
+    assert!(
+        matches!(reg.resolve("   "), Resolution::NotFound),
+        "blank input must be NotFound"
+    );
 
     println!();
     println!("=== resolve: AMBIGUOUS -> choice required, NEVER an autonomous guess (PRD §8) ===");
@@ -221,22 +304,34 @@ fn main() {
     // Give Slack the alias "chat" too...
     ambiguous_reg.entries[0].alias.push("chat".to_string());
     // ...and add a second, distinct native_app entry also aliased "chat".
-    ambiguous_reg.entries.push(holoiroh_daemon::registry::RegistryEntry {
-        alias: vec!["chat".to_string(), "messages".to_string()],
-        entry_type: EntryType::NativeApp,
-        bundle_id: Some("com.apple.MobileSMS".to_string()),
-        browser_url: None,
-        defaults: Default::default(),
-        policy: Default::default(),
-    });
+    ambiguous_reg
+        .entries
+        .push(holoiroh_daemon::registry::RegistryEntry {
+            alias: vec!["chat".to_string(), "messages".to_string()],
+            entry_type: EntryType::NativeApp,
+            bundle_id: Some("com.apple.MobileSMS".to_string()),
+            browser_url: None,
+            defaults: Default::default(),
+            policy: Default::default(),
+        });
     match ambiguous_reg.resolve("chat") {
         Resolution::Ambiguous(candidates) => {
-            println!("resolve('chat') -> Ambiguous with {} candidates:", candidates.len());
+            println!(
+                "resolve('chat') -> Ambiguous with {} candidates:",
+                candidates.len()
+            );
             for c in &candidates {
                 println!("    - aliases={:?} bundle_id={:?}", c.alias, c.bundle_id);
             }
-            assert_eq!(candidates.len(), 2, "both distinct entries must be surfaced for a user choice");
-            let bundle_ids: Vec<&str> = candidates.iter().filter_map(|c| c.bundle_id.as_deref()).collect();
+            assert_eq!(
+                candidates.len(),
+                2,
+                "both distinct entries must be surfaced for a user choice"
+            );
+            let bundle_ids: Vec<&str> = candidates
+                .iter()
+                .filter_map(|c| c.bundle_id.as_deref())
+                .collect();
             assert!(bundle_ids.contains(&"com.tinyspeck.slackmacgap"));
             assert!(bundle_ids.contains(&"com.apple.MobileSMS"));
         }
@@ -245,7 +340,9 @@ fn main() {
 
     println!();
     println!("=== deterministic launch (PRD §8 step 4): construct the real `open -b` command ===");
-    let launch_cmd = slack.launch_command().expect("native_app with a bundle_id builds a launch command");
+    let launch_cmd = slack
+        .launch_command()
+        .expect("native_app with a bundle_id builds a launch command");
     println!(
         "launch_command() for Slack -> {:?} {:?}",
         launch_cmd.get_program(),
@@ -253,7 +350,13 @@ fn main() {
     );
     assert_eq!(launch_cmd.get_program(), std::ffi::OsStr::new("open"));
     let args: Vec<&std::ffi::OsStr> = launch_cmd.get_args().collect();
-    assert_eq!(args, vec![std::ffi::OsStr::new("-b"), std::ffi::OsStr::new("com.tinyspeck.slackmacgap")]);
+    assert_eq!(
+        args,
+        vec![
+            std::ffi::OsStr::new("-b"),
+            std::ffi::OsStr::new("com.tinyspeck.slackmacgap")
+        ]
+    );
 
     // A browser_url entry has no `open -b` route -> launch_command errors (doesn't guess).
     let browser_entry = holoiroh_daemon::registry::RegistryEntry {
@@ -265,13 +368,21 @@ fn main() {
         policy: Default::default(),
     };
     let browser_launch = browser_entry.launch_command();
-    println!("launch_command() for a browser_url entry -> is_err={}", browser_launch.is_err());
-    assert!(browser_launch.is_err(), "browser_url has no native-app `open -b` route");
+    println!(
+        "launch_command() for a browser_url entry -> is_err={}",
+        browser_launch.is_err()
+    );
+    assert!(
+        browser_launch.is_err(),
+        "browser_url has no native-app `open -b` route"
+    );
 
     println!();
     let really_launch = std::env::var("HOLOIROH_PROBE_REALLY_LAUNCH").is_ok();
     if really_launch {
-        println!("=== HOLOIROH_PROBE_REALLY_LAUNCH set: ACTUALLY running `open -b com.tinyspeck.slackmacgap` ===");
+        println!(
+            "=== HOLOIROH_PROBE_REALLY_LAUNCH set: ACTUALLY running `open -b com.tinyspeck.slackmacgap` ==="
+        );
         match slack.launch() {
             Ok(()) => println!("launch() -> Ok (Slack was asked to open via LaunchServices)"),
             Err(e) => println!("launch() -> Err (likely Slack not installed): {e:#}"),

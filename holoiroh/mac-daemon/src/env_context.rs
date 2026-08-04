@@ -144,7 +144,11 @@ impl EnvContextStore {
             .map(PathBuf::from)
             .context("HOME not set; cannot locate ~/.holoiroh/context")?;
         let base = home.join(".holoiroh");
-        Self::open_at(base.join("context"), base.join("context.db"), base.join(EMBEDDING_CACHE_SUBDIR))
+        Self::open_at(
+            base.join("context"),
+            base.join("context.db"),
+            base.join(EMBEDDING_CACHE_SUBDIR),
+        )
     }
 
     /// Like [`Self::open`], but with explicit paths -- the real entry point `open()` calls
@@ -153,7 +157,11 @@ impl EnvContextStore {
     /// location. It still shares the real `$HOME`-cached model weights, avoiding a redundant
     /// ~130MB re-download on every probe run. Probing must never touch or depend on the real
     /// daemon's `~/.holoiroh/context/` corpus.
-    pub fn open_at(corpus_dir: PathBuf, db_path: PathBuf, model_cache_dir: PathBuf) -> Result<Self> {
+    pub fn open_at(
+        corpus_dir: PathBuf,
+        db_path: PathBuf,
+        model_cache_dir: PathBuf,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&corpus_dir)
             .with_context(|| format!("creating {}", corpus_dir.display()))?;
         Ok(Self {
@@ -188,7 +196,9 @@ impl EnvContextStore {
                 return Ok(());
             }
         }
-        tracing::info!("env_context: loading BGE-small-en-v1.5 embedding model (first use may download ~130MB)");
+        tracing::info!(
+            "env_context: loading BGE-small-en-v1.5 embedding model (first use may download ~130MB)"
+        );
         std::fs::create_dir_all(&self.model_cache_dir)
             .with_context(|| format!("creating {}", self.model_cache_dir.display()))?;
 
@@ -197,7 +207,8 @@ impl EnvContextStore {
         let weights_path = self.fetch_model_file("model.safetensors").await?;
 
         let config_json = std::fs::read_to_string(&config_path).context("reading config.json")?;
-        let config: BertConfig = serde_json::from_str(&config_json).context("parsing BERT config.json")?;
+        let config: BertConfig =
+            serde_json::from_str(&config_json).context("parsing BERT config.json")?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("loading tokenizer.json: {e}"))?;
@@ -209,7 +220,11 @@ impl EnvContextStore {
         };
         let model = BertModel::load(vb, &config).context("constructing BertModel")?;
 
-        *self.embedder.lock().expect("embedder lock poisoned") = Some(Embedder { model, tokenizer, device });
+        *self.embedder.lock().expect("embedder lock poisoned") = Some(Embedder {
+            model,
+            tokenizer,
+            device,
+        });
         tracing::info!("env_context: embedding model ready");
         Ok(())
     }
@@ -229,11 +244,15 @@ impl EnvContextStore {
             .with_context(|| format!("GET {url}"))?
             .error_for_status()
             .with_context(|| format!("GET {url} returned an error status"))?;
-        let bytes = response.bytes().await.with_context(|| format!("reading body of {url}"))?;
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("reading body of {url}"))?;
         // Write to a temp file then rename, so a killed/crashed download never leaves a
         // partial file that a later run mistakes for a complete, valid cache entry.
         let tmp_path = cached.with_extension("tmp-download");
-        std::fs::write(&tmp_path, &bytes).with_context(|| format!("writing {}", tmp_path.display()))?;
+        std::fs::write(&tmp_path, &bytes)
+            .with_context(|| format!("writing {}", tmp_path.display()))?;
         std::fs::rename(&tmp_path, &cached)
             .with_context(|| format!("renaming {} -> {}", tmp_path.display(), cached.display()))?;
         Ok(cached)
@@ -277,7 +296,13 @@ impl EnvContextStore {
         let (_batch, seq_len, _hidden) = output.dims3().context("output dims3")?;
         let pooled = (output.sum(1).context("sum over sequence dim")? / (seq_len as f64))
             .context("mean-pool divide")?;
-        let norm = pooled.sqr().context("square")?.sum_keepdim(1).context("sum for norm")?.sqrt().context("sqrt for norm")?;
+        let norm = pooled
+            .sqr()
+            .context("square")?
+            .sum_keepdim(1)
+            .context("sum for norm")?
+            .sqrt()
+            .context("sqrt for norm")?;
         let normalized = pooled.broadcast_div(&norm).context("normalize")?;
 
         let vec: Vec<f32> = normalized
@@ -286,7 +311,10 @@ impl EnvContextStore {
             .to_vec1()
             .context("tensor to Vec<f32>")?;
         if vec.len() != EMBEDDING_DIM {
-            bail!("unexpected embedding dimension {} (expected {EMBEDDING_DIM})", vec.len());
+            bail!(
+                "unexpected embedding dimension {} (expected {EMBEDDING_DIM})",
+                vec.len()
+            );
         }
         Ok(vec)
     }
@@ -336,7 +364,11 @@ impl EnvContextStore {
     /// mechanically. It only documents the convention.
     pub async fn remember(&self, key: &str, text: &str) -> Result<()> {
         let now = now_ms();
-        let existing_created = self.read_markdown(key).ok().flatten().map(|f| f.created_at_ms);
+        let existing_created = self
+            .read_markdown(key)
+            .ok()
+            .flatten()
+            .map(|f| f.created_at_ms);
         let created_at_ms = existing_created.unwrap_or(now);
 
         self.write_markdown(key, text, created_at_ms, now)?;
@@ -365,7 +397,8 @@ impl EnvContextStore {
     /// `rssearch_vectors.rs` uses -- confirmed real SQL, not a hand-rolled scan).
     pub async fn retrieve(&self, query_text: &str, limit: usize) -> Result<Vec<ContextFact>> {
         let query_embedding = self.embed(query_text, true).await?;
-        let query_json = serde_json::to_string(&query_embedding).context("serializing query embedding")?;
+        let query_json =
+            serde_json::to_string(&query_embedding).context("serializing query embedding")?;
         let conn = self.open_db().await?;
 
         // vector_top_k requires the ANN index name (not the table) as its first argument,
@@ -428,7 +461,13 @@ impl EnvContextStore {
         self.corpus_dir.join(format!("{key}.md"))
     }
 
-    fn write_markdown(&self, key: &str, text: &str, created_at_ms: u64, updated_at_ms: u64) -> Result<()> {
+    fn write_markdown(
+        &self,
+        key: &str,
+        text: &str,
+        created_at_ms: u64,
+        updated_at_ms: u64,
+    ) -> Result<()> {
         let contents = format!(
             "---\nkey: {key}\nns: default\ncreated: {created_at_ms}\nupdated: {updated_at_ms}\n---\n\n{text}\n"
         );
@@ -449,7 +488,8 @@ impl EnvContextStore {
     /// crate, since the format is small and has a fixed shape. This matches the same "don't add
     /// a dependency for five fields" judgment call this daemon already makes elsewhere.
     fn parse_markdown_file(&self, path: &Path) -> Result<Option<ContextFact>> {
-        let contents = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let contents =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let Some(rest) = contents.strip_prefix("---\n") else {
             return Ok(None);
         };
@@ -457,14 +497,19 @@ impl EnvContextStore {
             return Ok(None);
         };
         let frontmatter = &rest[..end];
-        let body = rest[end + 5..].trim_start_matches('\n').trim_end().to_string();
+        let body = rest[end + 5..]
+            .trim_start_matches('\n')
+            .trim_end()
+            .to_string();
 
         let mut key = None;
         let mut ns = None;
         let mut created_at_ms = None;
         let mut updated_at_ms = None;
         for line in frontmatter.lines() {
-            let Some((field, value)) = line.split_once(':') else { continue };
+            let Some((field, value)) = line.split_once(':') else {
+                continue;
+            };
             let value = value.trim();
             match field.trim() {
                 "key" => key = Some(value.to_string()),

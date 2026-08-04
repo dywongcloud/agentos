@@ -1,28 +1,16 @@
 import SwiftUI
 
-/// Shared Aro visual identity: the one brand accent blue (single-sourced here
-/// so the intro, the pairing screen, and the orb reaction effects all draw the
-/// exact same hue instead of each re-hardcoding `Color(red: 0.30, ...)`), plus
-/// the reusable building blocks the pairing screen is composed from -- the
-/// wordmark, the frosted input card, the living backdrop, and the button
-/// styles.
-///
-/// Everything here is pure SwiftUI (no UIKit), on purpose: the same components
-/// that render on device also render headlessly via `ImageRenderer` on macOS,
-/// which is exactly what the pixel-witness harness for this redesign renders.
+/// Defines the shared Aro accent and background colors.
 extension Color {
-    /// The Aro orb blue -- the single brand accent, matching the Spline blob
-    /// and the orb reaction effects (`OrbEffects.swift`).
+    /// Defines the shared Aro orb-blue accent.
     static let aroAccent = Color(red: 0.30, green: 0.56, blue: 1.0)
-    /// A brighter tint of the accent for highlights, rings and gradient tops.
+    /// Defines the brighter accent used for highlights, rings, and gradient tops.
     static let aroAccentBright = Color(red: 0.45, green: 0.70, blue: 1.0)
-    /// The deep near-black field the dark UI sits on (a hair of blue so the
-    /// accent glow blends instead of banding against pure `.black`).
+    /// Defines the near-black background with a blue tint that blends with the accent glow.
     static let aroVoid = Color(red: 0.02, green: 0.03, blue: 0.06)
 }
 
-/// The "Aro" wordmark: rounded-bold with a white -> accent vertical gradient.
-/// One definition, reused by the intro's resting state and the pairing header.
+/// Displays the Aro wordmark with a rounded bold font and vertical gradient.
 struct AroWordmark: View {
     var size: CGFloat = 40
     var body: some View {
@@ -35,8 +23,7 @@ struct AroWordmark: View {
     }
 }
 
-/// A small self-contained glowing orb mark -- the brand's compact form, tying
-/// the pairing header back to the intro's orb. Purely decorative.
+/// Displays the compact decorative Aro orb mark.
 struct AroOrbMark: View {
     var diameter: CGFloat = 54
     var body: some View {
@@ -63,9 +50,7 @@ struct AroOrbMark: View {
     }
 }
 
-/// A frosted-glass grouping card: ultraThinMaterial with a soft hairline
-/// gradient border and continuous rounded corners -- the container the ticket
-/// and PIN inputs live in, giving the screen its premium, high-tech feel.
+/// Groups ticket and PIN inputs in a frosted card with rounded corners and a gradient border.
 struct AroCard<Content: View>: View {
     var cornerRadius: CGFloat = 16
     @ViewBuilder var content: Content
@@ -90,7 +75,7 @@ struct AroCard<Content: View>: View {
     }
 }
 
-/// A small accent section label (e.g. "IROH TICKET") -- icon + tracked caps.
+/// Displays a tracked uppercase field label with a system icon.
 struct AroFieldLabel: View {
     var title: String
     var systemImage: String
@@ -104,8 +89,7 @@ struct AroFieldLabel: View {
     }
 }
 
-/// Primary action button: a filled, rounded, accent panel with a soft glow --
-/// the visual anchor for "Connect". Fills its slot; dims when disabled.
+/// Styles the primary action as a filled accent panel. Disabled buttons use dim neutral colors.
 struct AroPrimaryButtonStyle: ButtonStyle {
     var enabled: Bool = true
     func makeBody(configuration: Configuration) -> some View {
@@ -135,9 +119,9 @@ struct AroPrimaryButtonStyle: ButtonStyle {
     }
 }
 
-/// Secondary action button: a glass/bordered pill for less-prominent actions
-/// (Scan QR, Save). Sizes to its label -- add `.frame(maxWidth: .infinity)` on
-/// the label for a full-width variant.
+/// Styles secondary actions as bordered material buttons.
+/// The style sizes to its label.
+/// Callers can apply a full-width frame to the label.
 struct AroSecondaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -158,10 +142,8 @@ struct AroSecondaryButtonStyle: ButtonStyle {
     }
 }
 
-/// The pairing screen's living backdrop: a deep near-black field with a slow,
-/// gentle orb-accent glow breathing near the top -- consistent with the intro
-/// orb so the two screens feel like one product. Non-interactive; the pairing
-/// view layers its own tap-to-dismiss gesture over this.
+/// Displays the pairing backdrop with a slowly animated accent glow.
+/// The backdrop does not handle input.
 struct PairingBackdrop: View {
     @State private var breathe = false
     var body: some View {

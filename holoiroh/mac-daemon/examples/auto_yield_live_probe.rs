@@ -17,7 +17,7 @@ use std::env;
 use std::time::Duration;
 
 use holoiroh_daemon::control_channel::{
-    write_line, ClientMessage, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+    CONTROL_ALPN, ClientMessage, ServerMessage, TaskEnvelope, write_line,
 };
 use iroh::Endpoint;
 use iroh_live::ticket::LiveTicket;
@@ -49,7 +49,7 @@ async fn await_task_active(
                     println!("  <- task_active {{ paused: {paused} }}");
                     return true;
                 }
-                ServerMessage::Status { text: Some(t) } => println!("  <- status: {t}"),
+                ServerMessage::Status { text: Some(t), .. } => println!("  <- status: {t}"),
                 _ => {}
             }
         }
@@ -61,7 +61,9 @@ async fn await_task_active(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let mut args = env::args().skip(1);
-    let ticket_str = args.next().expect("usage: auto_yield_live_probe <ticket> <pin> <force_idle_file>");
+    let ticket_str = args
+        .next()
+        .expect("usage: auto_yield_live_probe <ticket> <pin> <force_idle_file>");
     let pin = args.next().expect("usage: <pin>");
     let force_file = args.next().expect("usage: <force_idle_file>");
     let ticket: LiveTicket = ticket_str.parse()?;
@@ -69,8 +71,12 @@ async fn main() -> anyhow::Result<()> {
     // Start with the user "idle" so the turn is allowed to begin.
     set_idle(&force_file, 60.0);
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut lines = BufReader::new(recv).lines();
     write_line(&mut send, &ClientMessage::Pin { pin }).await?;
@@ -78,9 +84,12 @@ async fn main() -> anyhow::Result<()> {
     let mut session_id: Option<String> = None;
     let start = tokio::time::Instant::now();
     while session_id.is_none() && start.elapsed() < Duration::from_secs(30) {
-        if let Ok(Ok(Some(line))) = tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await {
+        if let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await
+        {
             if let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) {
-                if matches!(&env.payload, ServerMessage::Status { text: Some(t) } if t.contains("control channel ready")) {
+                if matches!(&env.payload, ServerMessage::Status { text: Some(t), .. } if t.contains("control channel ready"))
+                {
                     session_id = Some(env.session_id);
                 }
             }
@@ -93,14 +102,23 @@ async fn main() -> anyhow::Result<()> {
     let task_id = uuid::Uuid::new_v4().to_string();
     write_line(
         &mut send,
-        &TaskEnvelope::<ClientMessage>::wrap(session_id.clone(), Some(task_id), 0, ClientMessage::Prompt { text: LONG_TEXT_PROMPT.into() }),
+        &TaskEnvelope::<ClientMessage>::wrap(
+            session_id.clone(),
+            Some(task_id),
+            0,
+            ClientMessage::Prompt {
+                text: LONG_TEXT_PROMPT.into(),
+            },
+        ),
     )
     .await?;
     println!("-> long text prompt; waiting for it to stream...");
     let live_start = tokio::time::Instant::now();
     let mut streaming = false;
     while !streaming && live_start.elapsed() < Duration::from_secs(120) {
-        if let Ok(Ok(Some(line))) = tokio::time::timeout(Duration::from_secs(120), lines.next_line()).await {
+        if let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(120), lines.next_line()).await
+        {
             if let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) {
                 if matches!(env.payload, ServerMessage::TaskProgress { .. }) {
                     streaming = true;
@@ -126,7 +144,9 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!("=== RESULT ===");
     if paused && resumed {
-        println!("VERDICT: OK -- auto-yield paused when the user went active and resumed when they went idle.");
+        println!(
+            "VERDICT: OK -- auto-yield paused when the user went active and resumed when they went idle."
+        );
     } else {
         println!("VERDICT: BROKEN -- auto_pause_seen={paused} auto_resume_seen={resumed}");
         std::process::exit(1);

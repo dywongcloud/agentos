@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::time::Duration;
 
-use crate::tinfoil_models::TINFOIL_BASE_URL;
+use crate::tinfoil_client::{DOCUMENT_SUCCESS_BODY_LIMIT_BYTES, collect_tinfoil_response};
 
 const CONVERT_ENDPOINT_PATH: &str = "/v1/convert/file";
 
@@ -101,11 +101,7 @@ struct ConvertResponseDocument {
 /// processing is different: a caller explicitly requested it and is
 /// waiting on it. So a failure must be reported, not silently downgraded
 /// to "no documents."
-pub async fn convert_documents(
-    api_key: &str,
-    files: &[DocumentInput],
-    mode: ConvertMode,
-) -> Result<Vec<ConvertedDocument>> {
+pub fn validate_documents(files: &[DocumentInput]) -> Result<()> {
     if files.is_empty() {
         bail!("convert_documents called with zero files");
     }
@@ -129,43 +125,54 @@ pub async fn convert_documents(
             );
         }
     }
+    Ok(())
+}
+
+pub async fn convert_documents(
+    transport: &crate::tinfoil_client::TinfoilClient,
+    files: &[DocumentInput],
+    mode: ConvertMode,
+) -> Result<Vec<ConvertedDocument>> {
+    validate_documents(files)?;
 
     let mut form = reqwest::multipart::Form::new();
     for file in files {
-        let part = reqwest::multipart::Part::bytes(file.bytes.clone())
-            .file_name(file.filename.clone());
+        let part =
+            reqwest::multipart::Part::bytes(file.bytes.clone()).file_name(file.filename.clone());
         form = form.part("files", part);
     }
 
     let url = format!(
-        "{TINFOIL_BASE_URL}{CONVERT_ENDPOINT_PATH}?mode={}",
+        "{}{CONVERT_ENDPOINT_PATH}?mode={}",
+        transport.base_url(),
         mode.as_query_value()
     );
 
-    let client = reqwest::Client::new();
-    let response = tokio::time::timeout(
-        Duration::from_secs(120),
-        client
+    let client = transport
+        .client()
+        .http_client()
+        .context("Tinfoil verified HTTP client unavailable")?;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let response = client
             .post(&url)
-            .header("authorization", format!("Bearer {api_key}"))
+            .header("authorization", transport.bearer())
             .multipart(form)
-            .send(),
-    )
+            .send()
+            .await
+            .context("tinfoil document conversion request failed")?;
+
+        let raw = collect_tinfoil_response(
+            response,
+            DOCUMENT_SUCCESS_BODY_LIMIT_BYTES,
+            "tinfoil /v1/convert/file",
+        )
+        .await?;
+        let raw = std::str::from_utf8(&raw)
+            .context("tinfoil /v1/convert/file response was not valid UTF-8")?;
+        parse_convert_response(raw)
+    })
     .await
     .context("tinfoil document conversion timed out")?
-    .context("tinfoil document conversion request failed")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!("tinfoil /v1/convert/file returned {status}: {body}");
-    }
-
-    let raw = response
-        .text()
-        .await
-        .context("failed to read tinfoil /v1/convert/file response body")?;
-    parse_convert_response(&raw)
 }
 
 /// Parses a `/v1/convert/file` response body. This function is extracted
@@ -199,5 +206,5 @@ pub fn parse_convert_response(raw: &str) -> Result<Vec<ConvertedDocument>> {
             .collect());
     }
 
-    bail!("tinfoil /v1/convert/file response did not match either expected shape: {raw}");
+    bail!("tinfoil /v1/convert/file response did not match either expected shape");
 }

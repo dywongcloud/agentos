@@ -73,7 +73,10 @@ impl AutoYieldConfig {
     pub fn from_env() -> Self {
         let d = Self::default();
         let enabled = match std::env::var("HOLOIROH_AUTO_YIELD") {
-            Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
             Err(_) => d.enabled,
         };
         let parse_secs = |key: &str, fallback: f64| -> f64 {
@@ -90,7 +93,12 @@ impl AutoYieldConfig {
         if resume_secs <= activity_secs {
             resume_secs = activity_secs + 1.0;
         }
-        Self { enabled, activity_secs, resume_secs, poll: d.poll }
+        Self {
+            enabled,
+            activity_secs,
+            resume_secs,
+            poll: d.poll,
+        }
     }
 }
 

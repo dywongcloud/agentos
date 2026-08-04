@@ -10,9 +10,12 @@
 //!   `HOLOIROH_AGENT_RUNTIME_PORT` (daemon default 18899, `holo` CLI default 18795) --
 //!   this probe spawns and reaps only its OWN `hai-agent-runtime`.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
 use holoiroh_daemon::holo_bridge::HoloServeProcess;
-use holoiroh_daemon::tinfoil_proxy::{DEFAULT_UPSTREAM, TinfoilProxy};
+use holoiroh_daemon::tinfoil_client::TinfoilClient;
+use holoiroh_daemon::tinfoil_proxy::TinfoilProxy;
 
 const PROBE_A2A_PORT: u16 = 18790;
 const PROBE_RUNTIME_PORT: &str = "18901";
@@ -37,9 +40,11 @@ async fn main() -> Result<()> {
     unsafe { std::env::set_var("HOLOIROH_AGENT_RUNTIME_PORT", PROBE_RUNTIME_PORT) };
 
     // 1. The auth-injecting loopback proxy.
-    let proxy = TinfoilProxy::spawn(DEFAULT_UPSTREAM, key.trim()).await?;
+    let tinfoil = Arc::new(TinfoilClient::new(key.trim().to_string()).await?);
+    let verified_upstream = tinfoil.base_url();
+    let proxy = TinfoilProxy::spawn(tinfoil.clone()).await?;
     let base_url = format!("{}/v1", proxy.local_url());
-    println!("proxy up: {base_url} -> {DEFAULT_UPSTREAM}");
+    println!("proxy up: {base_url} -> {verified_upstream}");
 
     // 2. holo serve pointed at it, with the tinfoil vision model. Resolve the binary the
     // same way the daemon does (HOLOIROH_HOLO_BIN, else ~/.holo/bin/holo, else PATH).
@@ -50,11 +55,19 @@ async fn main() -> Result<()> {
             _ => "holo".to_string(),
         }
     });
-    let process = HoloServeProcess::spawn(&holo_bin, PROBE_A2A_PORT, Some(&base_url), Some("kimi-k2-6"))
-        .await
-        .context("holo serve failed to start against the tinfoil proxy")?;
+    let process = HoloServeProcess::spawn(
+        &holo_bin,
+        PROBE_A2A_PORT,
+        Some(&base_url),
+        Some("kimi-k2-6"),
+    )
+    .await
+    .context("holo serve failed to start against the tinfoil proxy")?;
     let client = process.client();
-    client.probe_agent_card().await.context("agent card probe failed")?;
+    client
+        .probe_agent_card()
+        .await
+        .context("agent card probe failed")?;
     println!("holo serve healthy on port {PROBE_A2A_PORT}, agent card OK");
 
     // 3. One real task straight through the whole chain.
@@ -86,13 +99,21 @@ async fn main() -> Result<()> {
     // 127.0.0.1:<runtime-port>/api/v2/sessions (witnessed live, even after a 5s backoff). A
     // fresh runtime process sidesteps that limiter entirely instead of guessing its cooldown.
     unsafe { std::env::set_var("HOLOIROH_AGENT_RUNTIME_PORT", PROBE_RUNTIME_PORT_2) };
-    let proxy2 = TinfoilProxy::spawn(DEFAULT_UPSTREAM, key.trim()).await?;
+    let proxy2 = TinfoilProxy::spawn(tinfoil).await?;
     let base_url2 = format!("{}/v1", proxy2.local_url());
-    let process = HoloServeProcess::spawn(&holo_bin, PROBE_A2A_PORT, Some(&base_url2), Some("kimi-k2-6"))
-        .await
-        .context("holo serve failed to start (stage 2)")?;
+    let process = HoloServeProcess::spawn(
+        &holo_bin,
+        PROBE_A2A_PORT,
+        Some(&base_url2),
+        Some("kimi-k2-6"),
+    )
+    .await
+    .context("holo serve failed to start (stage 2)")?;
     let client = process.client();
-    client.probe_agent_card().await.context("agent card probe failed (stage 2)")?;
+    client
+        .probe_agent_card()
+        .await
+        .context("agent card probe failed (stage 2)")?;
     println!("holo serve (stage 2) healthy on port {PROBE_A2A_PORT}, agent card OK");
 
     // 4. The kimi-tuning regression witness: a genuinely complex multi-step SCENARIO that,
@@ -127,7 +148,11 @@ async fn main() -> Result<()> {
                 match &update {
                     holoiroh_daemon::holo_bridge::a2a_client::TaskUpdate::Answer { text } => {
                         saw_answer = !text.trim().is_empty();
-                        println!("answer ({} chars): {}", text.len(), &text[..text.len().min(200)]);
+                        println!(
+                            "answer ({} chars): {}",
+                            text.len(),
+                            &text[..text.len().min(200)]
+                        );
                     }
                     holoiroh_daemon::holo_bridge::a2a_client::TaskUpdate::Working { .. } => {
                         saw_working += 1;
@@ -151,6 +176,8 @@ async fn main() -> Result<()> {
              (result={complex_result:?}, saw_answer={saw_answer}) -- the pre-fix failure mode"
         );
     }
-    println!("KIMI TUNING WITNESS: OK (complex multi-step prompt answered in {elapsed:?}, no truncation)");
+    println!(
+        "KIMI TUNING WITNESS: OK (complex multi-step prompt answered in {elapsed:?}, no truncation)"
+    );
     Ok(())
 }

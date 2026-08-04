@@ -214,12 +214,10 @@ impl ApprovalToken {
         if self.issued_at.elapsed() >= self.ttl {
             return Err(ApprovalTokenError::Expired);
         }
-        match self.consumed.compare_exchange(
-            false,
-            true,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
+        match self
+            .consumed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        {
             Ok(_) => Ok(()),
             Err(_) => Err(ApprovalTokenError::AlreadyConsumed),
         }

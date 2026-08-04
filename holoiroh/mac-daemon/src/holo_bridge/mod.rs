@@ -2,9 +2,11 @@
 //!
 //! ## Summary of the approach (see submodules for full source citations)
 //!
-//! On daemon startup, [`HoloBridge::start`] spawns `holo serve --port <N>` as a managed
-//! `std::process`-family subprocess. It does this via `tokio::process::Command`, the async
-//! equivalent used throughout this async daemon -- see [`process`]. `holo serve` is H
+//! On daemon startup, [`HoloBridge::start`] binds the loopback A2A listener once, then spawns
+//! `holo serve --port <N>` as a managed `std::process`-family subprocess with that listener
+//! inherited at fixed child fd 198. The bridge keeps the only Rust listener owner across every
+//! child restart and backend switch. It uses `tokio::process::Command`, the async equivalent used
+//! throughout this daemon -- see [`process`]. `holo serve` is H
 //! Company's own A2A (Agent2Agent Protocol) HTTP server. It fronts the closed-source
 //! `hai-agent-runtime` binary, which actually runs the Holo3 desktop agent. The daemon does not
 //! talk to `hai-agent-runtime` or its Python `AgentApiClient` directly -- those stay internal to
@@ -78,6 +80,7 @@
 pub mod a2a_client;
 pub mod control;
 pub mod health;
+pub mod listener;
 pub mod process;
 pub mod secure_input_watchdog;
 pub mod stall_watchdog;
@@ -87,6 +90,7 @@ use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 pub use control::{ControlEvent, ControlMessage, DoneStatus, HoloControlBridge};
+pub use listener::HoloA2aListener;
 pub use process::HoloServeProcess;
 
 /// One place `holo serve`'s model inference can be pointed: an OpenAI-compatible base URL
@@ -125,8 +129,9 @@ pub struct HoloBridge {
     // across an `.await` (respawning the child, which itself awaits `/health`) -- a std Mutex
     // guard can't cross an await point.
     process: tokio::sync::Mutex<HoloServeProcess>,
+    // Declared after `process` so Rust drops/kills the child before closing the parent listener.
+    listener: HoloA2aListener,
     holo_bin: String,
-    port: u16,
     /// The A2A agent card's `protocolVersion`, captured at startup (and re-verified on
     /// `restart_process`). [`HoloBridge::protocol_version`] surfaces this value. A caller
     /// building an executor over this bridge can then report the real backend protocol version
@@ -179,17 +184,16 @@ pub struct HoloBridge {
 }
 
 impl HoloBridge {
-    /// This function does four things, in order:
-    /// 1. Spawns `holo serve` on `port`.
-    /// 2. Waits for it to become healthy.
-    /// 3. Verifies its agent card.
-    /// 4. Builds the control bridge on top of it.
+    /// This function does five things, in order:
+    /// 1. Binds the loopback A2A listener.
+    /// 2. Spawns `holo serve` with that listener inherited.
+    /// 3. Waits for it to become healthy.
+    /// 4. Verifies its agent card.
+    /// 5. Builds the control bridge on top of it.
     ///
-    /// `holo_bin` is the `holo` CLI executable (bare `"holo"` to resolve via `PATH`, or an
-    /// absolute path). `local_base_url` points `holo serve`'s inference at a local
-    /// OpenAI-compatible server (alpha's local `llama-server`) when `Some`. It leaves `holo
-    /// serve` on its configured backend when `None` -- see [`HoloServeProcess::build_command`].
-    /// This function sends translated [`ControlEvent`]s to `events_tx`. The caller must forward
+    /// `holo_bin` is the `holo` CLI launcher (bare `"holo"` to resolve via `PATH`, or an
+    /// absolute path). `primary` points inference at a local OpenAI-compatible server when set,
+    /// or leaves `holo serve` on its configured backend when absent. This function sends translated [`ControlEvent`]s to `events_tx`. The caller must forward
     /// those out over the (not-yet-implemented) iroh control stream to the iOS app.
     pub async fn start(
         holo_bin: impl Into<String>,
@@ -200,9 +204,10 @@ impl HoloBridge {
         events_tx: mpsc::UnboundedSender<ControlEvent>,
     ) -> Result<Self> {
         let holo_bin = holo_bin.into();
-        let process = HoloServeProcess::spawn(
+        let listener = HoloA2aListener::bind(port).context("failed to bind Holo A2A listener")?;
+        let process = HoloServeProcess::spawn_on_listener(
             &holo_bin,
-            port,
+            &listener,
             primary.as_ref().map(|t| t.base_url.as_str()),
             primary.as_ref().and_then(|t| t.model.as_deref()),
         )
@@ -225,8 +230,8 @@ impl HoloBridge {
 
         Ok(Self {
             process: tokio::sync::Mutex::new(process),
+            listener,
             holo_bin,
-            port,
             protocol_version,
             primary,
             fallback,
@@ -264,7 +269,12 @@ impl HoloBridge {
         // silent no-op at best and, if `switch_to` ever paired it with a spawn expressing
         // both base_url and model contradictorily, a P0-11 no-cloud-mode hazard at worst.
         if base_url.is_none() {
-            if let Some(routed) = self.routed_model.lock().expect("routed_model lock poisoned").clone() {
+            if let Some(routed) = self
+                .routed_model
+                .lock()
+                .expect("routed_model lock poisoned")
+                .clone()
+            {
                 model = Some(routed);
             }
         }
@@ -283,7 +293,10 @@ impl HoloBridge {
     /// `protocol_version` above). It stays as real public API for a future status/log surface.
     #[allow(dead_code)]
     pub fn routed_model(&self) -> Option<String> {
-        self.routed_model.lock().expect("routed_model lock poisoned").clone()
+        self.routed_model
+            .lock()
+            .expect("routed_model lock poisoned")
+            .clone()
     }
 
     /// Swap the running `holo serve` onto `(base_url, model)` (terminate live child -> spawn
@@ -307,15 +320,14 @@ impl HoloBridge {
     ) -> Result<()> {
         let mut slot = self.process.lock().await;
 
-        if let Err(err) = slot.terminate_in_place().await {
-            // Non-fatal: the spawn below is the real gate. A child that refused to die will
-            // make the port preflight fail with a clear message.
-            tracing::warn!(error = %format!("{err:#}"), "terminating holo serve for backend switch failed");
-        }
-
-        let new_process = HoloServeProcess::spawn(&self.holo_bin, self.port, base_url, model)
+        slot.terminate_in_place()
             .await
-            .context("failed to respawn holo serve on the new backend")?;
+            .context("failed to terminate holo serve before backend switch")?;
+
+        let new_process =
+            HoloServeProcess::spawn_on_listener(&self.holo_bin, &self.listener, base_url, model)
+                .await
+                .context("failed to respawn holo serve on the new backend")?;
         let client = new_process.client();
         client
             .probe_agent_card()
@@ -324,10 +336,16 @@ impl HoloBridge {
 
         let _old = std::mem::replace(&mut *slot, new_process);
         *self.on_fallback.lock().expect("on_fallback lock poisoned") = going_to_fallback;
-        *self.fallback_since.lock().expect("fallback_since lock poisoned") =
+        *self
+            .fallback_since
+            .lock()
+            .expect("fallback_since lock poisoned") =
             going_to_fallback.then(std::time::Instant::now);
         if let Some(routed) = new_routed_model {
-            *self.routed_model.lock().expect("routed_model lock poisoned") = routed;
+            *self
+                .routed_model
+                .lock()
+                .expect("routed_model lock poisoned") = routed;
         }
         drop(slot);
         self.control.replace_client(client);
@@ -385,7 +403,10 @@ impl HoloBridge {
                 // `switch_to`, after this spawn succeeds).
                 let base_url = self.primary.as_ref().map(|t| t.base_url.clone());
                 let model = if base_url.is_none() {
-                    self.routed_model.lock().expect("routed_model lock poisoned").clone()
+                    self.routed_model
+                        .lock()
+                        .expect("routed_model lock poisoned")
+                        .clone()
                 } else {
                     self.primary.as_ref().and_then(|t| t.model.clone())
                 };
@@ -431,7 +452,11 @@ impl HoloBridge {
         if self.is_on_fallback() {
             return Ok(());
         }
-        let active = self.routed_model.lock().expect("routed_model lock poisoned").clone();
+        let active = self
+            .routed_model
+            .lock()
+            .expect("routed_model lock poisoned")
+            .clone();
         let active_tier = active
             .as_deref()
             .and_then(crate::router::Tier::from_model_id)
@@ -446,8 +471,13 @@ impl HoloBridge {
             model = target_model,
             "intent router switching holo serve's model"
         );
-        self.switch_to(None, Some(target_model), false, Some(Some(target_model.to_string())))
-            .await
+        self.switch_to(
+            None,
+            Some(target_model),
+            false,
+            Some(Some(target_model.to_string())),
+        )
+        .await
     }
 
     /// Explicitly force `holo serve` onto `tier`, bypassing [`router::should_switch`]'s
@@ -478,8 +508,13 @@ impl HoloBridge {
         }
         let target_model = tier.model_id();
         tracing::info!(to = ?tier, model = target_model, "stall watchdog forcing a stronger model tier");
-        self.switch_to(None, Some(target_model), false, Some(Some(target_model.to_string())))
-            .await
+        self.switch_to(
+            None,
+            Some(target_model),
+            false,
+            Some(Some(target_model.to_string())),
+        )
+        .await
     }
 
     /// The A2A agent card's `protocolVersion` this bridge's `holo serve` advertised at startup,
@@ -531,9 +566,9 @@ impl HoloBridge {
         // process still in the slot -- the next health tick observes it exited and retries
         // this whole path (disarm is then a no-op).
         let (base_url, model) = self.current_target();
-        let new_process = HoloServeProcess::spawn(
+        let new_process = HoloServeProcess::spawn_on_listener(
             &self.holo_bin,
-            self.port,
+            &self.listener,
             base_url.as_deref(),
             model.as_deref(),
         )

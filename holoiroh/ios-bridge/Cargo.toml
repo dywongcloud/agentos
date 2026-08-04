@@ -71,12 +71,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # failed silently (zero frames, no error) on every platform. Not a
 # dependency of the shipped staticlib.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[build-dependencies]
-# Generates ios-bridge.h from this crate's `extern "C"` signatures at build
-# time. Not yet wired into build.rs (no build.rs exists yet) -- see this
-# crate's src/lib.rs module doc for the exact command; left as a documented
-# manual step for now rather than a build.rs that would silently do nothing
-# useful in this environment (no iOS SDK to actually validate the header
-# against).
-cbindgen = "0.27"
+# examples/generate_header.rs is the single source of truth for regenerating
+# the committed Swift-visible C header from the edition-2024 extern functions.
+cbindgen = "0.29.4"

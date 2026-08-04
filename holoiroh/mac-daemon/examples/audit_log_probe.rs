@@ -20,8 +20,8 @@
 use std::io::Read;
 
 use holoiroh_daemon::audit_log::{
-    ActionClass, AppCategory, AuditEntry, AuditLogger, ConnectionPath, FinalStatus,
-    InferenceMode, RemoteViewState, now_ms,
+    ActionClass, AppCategory, AuditEntry, AuditLogger, ConnectionPath, FinalStatus, InferenceMode,
+    RemoteViewState, now_ms,
 };
 
 fn temp_path(name: &str) -> std::path::PathBuf {
@@ -64,9 +64,16 @@ fn main() {
             .as_nanos()
     ));
     let nested_path = parent.join("audit.log");
-    assert!(!parent.exists(), "subdir must not exist yet for this to be a real test");
+    assert!(
+        !parent.exists(),
+        "subdir must not exist yet for this to be a real test"
+    );
     let logger = AuditLogger::new(&nested_path).expect("AuditLogger::new should create parent dir");
-    println!("AuditLogger::new({}) -> parent dir created: {}", nested_path.display(), parent.exists());
+    println!(
+        "AuditLogger::new({}) -> parent dir created: {}",
+        nested_path.display(),
+        parent.exists()
+    );
     assert!(parent.exists());
     assert_eq!(logger.path(), nested_path.as_path());
 
@@ -104,7 +111,9 @@ fn main() {
         latency_ms: 900,
         action_count: 2,
     };
-    logger.append(&entry2).expect("second append should succeed");
+    logger
+        .append(&entry2)
+        .expect("second append should succeed");
 
     let raw = read_raw(&path);
     let lines: Vec<&str> = raw.lines().collect();
@@ -112,10 +121,16 @@ fn main() {
     for line in &lines {
         println!("  {line}");
     }
-    assert_eq!(lines.len(), 2, "each append must produce exactly one new line, none overwritten");
+    assert_eq!(
+        lines.len(),
+        2,
+        "each append must produce exactly one new line, none overwritten"
+    );
 
-    let parsed1: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 must be valid JSON");
-    let parsed2: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 must be valid JSON");
+    let parsed1: serde_json::Value =
+        serde_json::from_str(lines[0]).expect("line 1 must be valid JSON");
+    let parsed2: serde_json::Value =
+        serde_json::from_str(lines[1]).expect("line 2 must be valid JSON");
     assert_eq!(parsed1["task_id"], "task-0001");
     assert_eq!(parsed1["action_class"], "prompt");
     assert_eq!(parsed1["connection_path"], "direct");
@@ -129,7 +144,9 @@ fn main() {
     println!("all fields round-trip correctly for both entries");
 
     println!();
-    println!("=== append is true append-only: a fresh AuditLogger on the same path does not truncate ===");
+    println!(
+        "=== append is true append-only: a fresh AuditLogger on the same path does not truncate ==="
+    );
     let logger_reopened = AuditLogger::new(&path).expect("re-opening the same path should succeed");
     let entry3 = AuditEntry {
         task_id: "task-0003".to_string(),
@@ -144,21 +161,34 @@ fn main() {
         latency_ms: 100,
         action_count: 0,
     };
-    logger_reopened.append(&entry3).expect("third append (new logger instance, same path) should succeed");
+    logger_reopened
+        .append(&entry3)
+        .expect("third append (new logger instance, same path) should succeed");
     let raw_after = read_raw(&path);
     let lines_after: Vec<&str> = raw_after.lines().collect();
-    println!("after re-opening AuditLogger on the same path and appending once more: {} line(s)", lines_after.len());
-    assert_eq!(lines_after.len(), 3, "a fresh AuditLogger instance on an existing path must APPEND, never truncate prior entries");
-    assert!(raw_after.starts_with(lines[0]), "the original first line must still be present, byte-for-byte, at the start of the file");
+    println!(
+        "after re-opening AuditLogger on the same path and appending once more: {} line(s)",
+        lines_after.len()
+    );
+    assert_eq!(
+        lines_after.len(),
+        3,
+        "a fresh AuditLogger instance on an existing path must APPEND, never truncate prior entries"
+    );
+    assert!(
+        raw_after.starts_with(lines[0]),
+        "the original first line must still be present, byte-for-byte, at the start of the file"
+    );
 
     println!();
-    println!("=== ACCEPTANCE TEST (Project Aro PRD row P0-12): no content ever reaches the audit log ===");
+    println!(
+        "=== ACCEPTANCE TEST (Project Aro PRD row P0-12): no content ever reaches the audit log ==="
+    );
     // A distinctive, realistic dictated-text string -- the exact shape of what a real
     // ClientMessage::VoiceTranscript.text would carry: a name, a sentence, punctuation. Chosen to
     // be maximally distinctive (a marker token no legitimate metadata field would ever coincidentally
     // contain) so its absence from the log is a strong, unambiguous signal, not a fluke.
-    const DICTATED_TEXT: &str =
-        "AUDITPROBE_MARKER_7f3e2a: tell Sarah Chen the quarterly report is in her inbox, then open Mail and reply to the thread about the Berlin trip";
+    const DICTATED_TEXT: &str = "AUDITPROBE_MARKER_7f3e2a: tell Sarah Chen the quarterly report is in her inbox, then open Mail and reply to the thread about the Berlin trip";
 
     let path = temp_path("acceptance");
     let logger = AuditLogger::new(&path).expect("AuditLogger::new should succeed");
@@ -196,7 +226,9 @@ fn main() {
         latency_ms: 4200,
         action_count: 6,
     };
-    logger.append(&entry).expect("acceptance-test append should succeed");
+    logger
+        .append(&entry)
+        .expect("acceptance-test append should succeed");
 
     // Read back the ACTUAL bytes on disk -- not the typed AuditEntry we just built, the literal
     // file content, exactly as a real operator inspecting ~/.holoiroh/audit.log would see it.
@@ -208,27 +240,65 @@ fn main() {
 
     let contains_marker = raw.contains("AUDITPROBE_MARKER");
     let contains_name = raw.contains("Sarah Chen");
-    let contains_sentence_fragment = raw.contains("quarterly report") || raw.contains("Berlin trip");
+    let contains_sentence_fragment =
+        raw.contains("quarterly report") || raw.contains("Berlin trip");
     println!();
     println!(
         "log file contains dictated-text marker: {contains_marker}, contains recipient name: {contains_name}, contains sentence fragment: {contains_sentence_fragment}"
     );
-    assert!(!contains_marker, "ACCEPTANCE TEST FAILED: the dictated-text marker leaked into the audit log");
-    assert!(!contains_name, "ACCEPTANCE TEST FAILED: a recipient name leaked into the audit log");
-    assert!(!contains_sentence_fragment, "ACCEPTANCE TEST FAILED: dictated sentence content leaked into the audit log");
+    assert!(
+        !contains_marker,
+        "ACCEPTANCE TEST FAILED: the dictated-text marker leaked into the audit log"
+    );
+    assert!(
+        !contains_name,
+        "ACCEPTANCE TEST FAILED: a recipient name leaked into the audit log"
+    );
+    assert!(
+        !contains_sentence_fragment,
+        "ACCEPTANCE TEST FAILED: dictated sentence content leaked into the audit log"
+    );
 
     // Also confirm the log is non-trivial (a passing "absence" check on an accidentally-empty file
     // would be a false positive) -- real metadata fields are present.
-    assert!(raw.contains("task-acceptance-0001"), "the real task_id metadata field must be present");
-    assert!(raw.contains("voice_transcript"), "the real action_class metadata field must be present");
-    assert!(raw.contains("desktop"), "the real app_category metadata field must be present");
-    assert!(raw.contains("cloud"), "the real inference_mode metadata field must be present");
-    assert!(raw.contains("streaming"), "the real remote_view_state metadata field must be present");
-    assert!(raw.contains("direct"), "the real connection_path metadata field must be present");
-    assert!(raw.contains("completed"), "the real final_status metadata field must be present");
-    assert!(raw.contains("4200"), "the real latency_ms metadata field must be present");
-    println!("all real metadata fields ARE present (this is not an accidentally-empty-file false pass)");
+    assert!(
+        raw.contains("task-acceptance-0001"),
+        "the real task_id metadata field must be present"
+    );
+    assert!(
+        raw.contains("voice_transcript"),
+        "the real action_class metadata field must be present"
+    );
+    assert!(
+        raw.contains("desktop"),
+        "the real app_category metadata field must be present"
+    );
+    assert!(
+        raw.contains("cloud"),
+        "the real inference_mode metadata field must be present"
+    );
+    assert!(
+        raw.contains("streaming"),
+        "the real remote_view_state metadata field must be present"
+    );
+    assert!(
+        raw.contains("direct"),
+        "the real connection_path metadata field must be present"
+    );
+    assert!(
+        raw.contains("completed"),
+        "the real final_status metadata field must be present"
+    );
+    assert!(
+        raw.contains("4200"),
+        "the real latency_ms metadata field must be present"
+    );
+    println!(
+        "all real metadata fields ARE present (this is not an accidentally-empty-file false pass)"
+    );
 
     println!();
-    println!("audit_log_probe: OK -- metadata logged, dictated-text content proven absent via real log-file inspection");
+    println!(
+        "audit_log_probe: OK -- metadata logged, dictated-text content proven absent via real log-file inspection"
+    );
 }

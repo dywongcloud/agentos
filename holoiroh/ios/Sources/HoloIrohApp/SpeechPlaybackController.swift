@@ -1,10 +1,8 @@
 import Foundation
 import AVFoundation
 
-/// Plays back WAV audio bytes returned by `ServerMessage.speechReady`
-/// (`ClientMessage.requestSpeech`, Tinfoil `qwen3-tts`). One small, focused wrapper around
-/// `AVAudioPlayer` rather than folding this into `VoiceTranscriber`/`TinfoilAudioRecorder` --
-/// playback is a distinct concern from either recording path.
+/// Plays Waveform Audio File Format (WAV) data from `ServerMessage.speechReady` through `AVAudioPlayer`.
+/// This controller keeps playback separate from both recording paths.
 @MainActor
 final class SpeechPlaybackController: NSObject, ObservableObject {
     @Published private(set) var isPlaying = false
@@ -12,7 +10,9 @@ final class SpeechPlaybackController: NSObject, ObservableObject {
 
     private var player: AVAudioPlayer?
 
-    /// Decodes `base64WavData` and plays it. Replaces any currently-playing audio.
+    /// Decodes and plays base64-encoded WAV data.
+    /// Replaces current playback.
+    /// Reports decoding, session, and playback failures through `lastError`.
     func play(base64WavData: String) {
         lastError = nil
         guard let data = Data(base64Encoded: base64WavData) else {

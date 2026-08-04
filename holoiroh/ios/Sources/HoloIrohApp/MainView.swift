@@ -1,129 +1,90 @@
 import SwiftUI
+#if canImport(UIKit)
 import UIKit
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
-/// Main screen shown once the app has paired (see `ContentView`'s navigation
-/// wiring). On appear it opens the real connection: one shared
-/// `holoiroh-ios-bridge` handle (`HoloConnection`) carrying both the
-/// `iroh-live` video subscription and the control-ALPN channel.
+/// Displays the task dashboard after pairing and opens the shared bridge connection.
 ///
-/// This screen is the **task dashboard** and drives the full Project Aro PRD
-/// section 6.1 user-visible state machine: it holds a single `SessionState`
-/// (`SessionState.swift`) and hosts a `SessionView` that renders exactly the
-/// content + controls PRD 6.1 specifies for whichever of the eight states is
-/// current. The eight states and their controls are:
+/// One `SessionState` controls the Product Requirements Document (PRD) 6.1 dashboard panel:
 ///
-/// - **Idle** — push-to-talk + paired-Mac availability; *Start*
-/// - **Reviewing** — transcript / destination / dictated-text; *Edit / Send / Discard*
-/// - **Connecting** — *Cancel*
-/// - **Working** — Remote View + app/status/last-action/next-action; *Pause / Cancel / TakeControl*
-/// - **Input needed** (P0-14) — what's needed / why / current-frame / response-options;
-///   *TakeControl / ResolveLocally / Choose / Cancel*
-/// - **Draft ready** — live target + verification; *Review / RequestSend / Cancel*
-/// - **Awaiting approval** — destination / text / frame / commitment; *Approve / Reject*
-/// - **Failed** — actionable cause + recovery; *Retry / TakeControl / Dismiss*
+/// - Idle provides task entry and Mac availability.
+/// - Reviewing confirms transcript, destination, and dictated text.
+/// - Connecting supports cancellation.
+/// - Working shows the media stream and task status.
+/// - Input needed collects required user input.
+/// - Draft ready supports review and send requests.
+/// - Awaiting approval confirms the final action.
+/// - Failed provides recovery controls.
 ///
-/// The persistent elements (the four README-called-out pieces) are preserved
-/// and placed where they belong:
-/// 1. The live **Remote View** — a real `VideoRenderView`
-///    (`AVSampleBufferDisplayLayer`-backed) bound to a `VideoFrameSource`. It
-///    is shown only in the states that need it (`SessionState.showsRemoteView`:
-///    Working and DraftReady), and the synthetic on-device source stands in
-///    for the not-yet-wired `iroh-live` network source.
-/// 2. The **prompt bar** (text field + mic + send), always available so a new
-///    request can be started from any state.
-/// 3. The **status/log panel**, now inside the hidden controls sheet.
-/// 4. The per-state **SessionView** panel, also inside the controls sheet
-///    (toggled by the command bar's sparkle button; hidden by default).
+/// The prompt bar remains available in all states.
+/// The controls sheet contains `SessionView`, status history, demo controls, and disconnection.
 ///
-/// ## Transport
-///
-/// When the app target links `HoloirohIosBridge.xcframework`, everything here
-/// is driven by the real transport: `HoloConnection` connects the ticket and
-/// PIN on appear, `frameSource` becomes the shared-bridge
-/// `IrohLiveFrameSource`, outbound messages go through
-/// `FFIControlChannelSender`, and inbound daemon `ServerMessage`s
-/// (`handleServerMessage`) drive `session` and the log panel.
-///
-/// In bridge-less builds (simulator/CI, `#if canImport` stub) the transport
-/// is unavailable: sends fall back to the `LoggingControlChannelSender`
-/// stand-in, the synthetic frame source keeps the render path live, and the
-/// "Demo" menu (now in the controls sheet) still jumps directly to any of
-/// the eight states so every state's controls remain reachable.
+/// When the bridge is linked, `HoloConnection` provides the media stream and control channel.
+/// Bridge-less builds use the synthetic frame source and logging sender.
 struct MainView: View {
-    /// The ticket this session paired with, shown in the header so the
-    /// user can confirm which daemon they connected to.
+    /// Provides the ticket for this paired session.
     let ticket: String
 
-    /// The pairing PIN captured on the pairing screen, used for the control
-    /// channel's pre-session PIN handshake (`control_connect`). Empty when
-    /// the daemon needs none (`--no-pin-auth` / already-allowlisted device).
+    /// Provides the pairing personal identification number (PIN) for the control-channel handshake.
+    /// An empty value supports a daemon that does not require a PIN.
     let pin: String
 
-    /// Returns to `PairingView`.
+    /// Returns the app to `PairingView`.
     let onDisconnect: () -> Void
 
-    /// App-wide profile store, so a `current_ticket` from the daemon can refresh
-    /// the saved "Dev Mac" default when the daemon's identity has rotated.
+    /// Provides the profile store that saves a rotated ticket received from the daemon.
     @EnvironmentObject private var profileStore: ConnectionProfileStore
+    @EnvironmentObject private var tinfoilVerificationStore: TinfoilVerificationStore
 
     // MARK: - Dashboard identity fields (PRD 6.1 dashboard row)
 
-    /// The paired Mac's name, shown in Idle availability + Connecting/Working.
+    /// Defines the paired Mac name shown in dashboard states.
     private let macName = "Studio Mac"
-    /// Availability of the paired Mac (drives the Idle Start control's enabled
-    /// state). Constant here -- a real presence signal arrives on the control
-    /// channel later.
+    /// Indicates paired Mac availability. This value is currently constant.
     private let macAvailable = true
-    /// The active inference mode badge (PRD P0-11 "Aro Private" local mode).
-    /// This build's daemon runs an on-device `llama-server` local model, so
-    /// the honest value is "Aro Private (local)".
+    /// Defines the active inference mode shown by the dashboard.
     private let inferenceMode = "Aro Private (local)"
 
     // MARK: - State
 
-    /// The single source of truth for which PRD 6.1 state the dashboard shows.
+    /// Stores the current PRD 6.1 dashboard state.
     @State private var session: SessionState = .idle
 
-    /// The shared-bridge connection owner: ONE `holoiroh-ios-bridge` handle
-    /// carrying both the video subscription and the control channel. Created
-    /// per screen; `onAppear` connects it with this session's ticket + PIN.
+    /// Owns one bridge connection for the media stream and control channel.
+    /// `onAppear` connects it with this session ticket and PIN.
     @StateObject private var connection = HoloConnection()
 
-    /// Orb reaction driver (`OrbEffects.swift`): every real send kicks the
-    /// blob's thinking pulse, and prompts that mention known apps put their
-    /// badges in orbit around it.
+    /// Drives the orb pulse and app badges after each real send.
     @StateObject private var orbEffects = OrbEffectsState()
 
-    /// The last task-committing message sent (`advanceFromReviewToWorking`),
-    /// kept so the Failed panel's Retry re-sends the same request.
+    /// Stores the last task message so the Failed panel can retry it.
     @State private var lastSentTask: ClientMessage?
 
-    /// Whether the user has paused the active task (wire `.pause` sent, no
-    /// `.resume` yet). Drives the task-control pill's Pause/Resume toggle and
-    /// keeps a pause-cancel `task_done(canceled)` from being mistaken for a
-    /// real end-of-task (see `applyTaskDone`).
+    /// Indicates whether the active task is paused.
+    /// Prevents a pause-related canceled status from ending the displayed task.
     @State private var isTaskPaused = false
 
-    /// The `request_id` of the daemon's outstanding `input_request` (today:
-    /// the sensitive-app consent ask), so the Choose control can echo it back
-    /// as `.inputResponse`. `nil` when nothing is outstanding.
+    /// Stores the daemon request identifier for the active input request.
     @State private var activeInputRequestID: String?
+    @State private var pendingApproval: ApprovalRequest?
+    @State private var presentedApprovalForCancellation: ApprovalRequest?
 
     @State private var promptText: String = ""
+    @State private var autonomousExecutionPermitted = false
+    @State private var executionMode = "restricted"
 
     // MARK: - Clarify (ad-hoc clarifying questions)
 
-    /// Ask the daemon to generate clarifying questions before running a
-    /// possibly-ambiguous prompt. Opt-out via Diagnostics; default on.
+    /// Controls whether the app requests clarification before a new ambiguous prompt. The default is `true`.
     @AppStorage("clarifyEnabled") private var clarifyEnabled = true
-    /// The prompt awaiting clarification -- set when a ClarifyRequest is sent,
-    /// cleared when the questions are answered, dismissed, come back empty, or
-    /// time out (fallback to a direct send).
+    /// Stores the prompt awaiting clarification. A response, cancellation, empty result, or timeout clears it.
     @State private var pendingClarifyPrompt: String?
-    /// The daemon's clarifying questions; non-empty shows the ClarifyPanel above
-    /// the command bar.
+    /// Stores daemon clarification questions. A nonempty array displays `ClarifyPanel`.
     @State private var clarifyQuestions: [ClarifyingQuestion] = []
-    /// True while the clarify inference is in flight (drives the thinking state).
+    /// Indicates that clarification inference is in progress.
     @State private var isClarifying = false
 
     // MARK: - Tinfoil-backed features (document/image/audio/planner)
@@ -139,6 +100,7 @@ struct MainView: View {
     @State private var showTinfoilRecordSheet = false
 
     @State private var tinfoilRequestID = UUID().uuidString
+    @State private var tinfoilVerificationSessionID = UUID()
     @State private var documentResult: String?
     @State private var documentError: String?
     @State private var imageResult: String?
@@ -148,187 +110,110 @@ struct MainView: View {
     @State private var planSteps: [String]?
     @State private var planError: String?
 
-    /// Guards `sendAutoPairPromptIfNeeded()` to at most once per process
-    /// launch -- `.connected` can re-fire after a reconnect, and this must
-    /// never re-send on that path.
+    /// Prevents the debug automatic-pairing prompt from sending more than once per process launch.
     @State private var didSendAutoPairPrompt = false
 
-    /// Whether the command bar's prompt field currently has keyboard focus.
-    /// Binding this (rather than leaving focus implicit) is what makes the
-    /// keyboard dismissible at all: SwiftUI has no built-in "tap outside to
-    /// dismiss" or "Done button closes the keyboard" behavior for a bare
-    /// `TextField` -- both are driven by setting this to `false`. Also
-    /// cleared on every send (`sendLivePrompt`) so hitting the paperplane
-    /// button or the keyboard's own Send key closes the keyboard instead of
-    /// leaving it open with an now-empty field beneath it.
+    /// Tracks focus for the main prompt field.
+    /// Clearing this value dismisses the keyboard.
+    /// Sends also clear it.
     @FocusState private var isPromptFocused: Bool
 
-    /// Live keyboard height, tracked via `UIResponder.keyboardWill{Show,Hide}Notification`
-    /// rather than derived from `isPromptFocused`/safe-area insets: this view's root backdrop
-    /// uses `ignoresSafeArea()`, so SwiftUI's automatic keyboard-avoidance (which relies on the
-    /// view responding to safe-area changes) never kicks in here, and `@FocusState` alone carries
-    /// no height information anyway. Read directly from the notification's own
-    /// `UIResponder.keyboardFrameEndUserInfoKey` so this always reflects the REAL animating
-    /// keyboard height for the device/orientation/keyboard-type in use, not a guessed constant.
-    /// Drives the command bar's full-height rise and the live-share box's
-    /// clear-the-bar shift in `body` (see the `barShift`/`boxShift` derivation there).
+    /// Tracks the keyboard height from UIKit keyboard notifications.
+    /// This value reflects the current keyboard frame for the device and orientation.
     @State private var keyboardHeight: CGFloat = 0
 
-    /// Real, live-measured height of the risen bottom stack (task pill + recent-
-    /// prompts strip + clarify thinking-row/panel + the command bar itself),
-    /// read via `ViewHeightKey` -- replaces a hardcoded `barClearance` constant
-    /// that silently went stale every time new content (the clarify panel, the
-    /// recent-prompts strip) was added above the command bar, since a fixed
-    /// number can never reflect a VStack whose content varies. Falls back to a
-    /// single command-bar-row's rough height (96) before the first real
-    /// measurement lands, so `boxShift` is never computed against zero.
+    /// Stores the measured height of the bottom command stack.
+    /// The initial 96-point value covers the interval before measurement.
     @State private var measuredBarStackHeight: CGFloat = 96
 
-    /// Real, live-measured height of `remoteTypeBar`, same `ViewHeightKey`
-    /// discipline as `measuredBarStackHeight` above -- used to compute exactly
-    /// how far the bar itself must rise to clear the keyboard, independent of
-    /// the (now-stationary-during-remote-typing) video box's own position. See
-    /// `remoteTypeBarShift(boxBottomY:screenHeight:)`.
+    /// Stores the measured height of `remoteTypeBar`.
+    /// The initial value is 56 points.
     @State private var measuredRemoteTypeBarHeight: CGFloat = 56
 
-    /// The real system keyboard-animation duration for the CURRENT show/hide,
-    /// captured from `keyboardWillShowNotification`'s own userInfo
-    /// (`UIResponder.keyboardAnimationDurationUserInfoKey`) instead of an
-    /// approximate spring -- eliminates the visible lag-during-rise class of
-    /// "the keyboard still overlaps the bar for a moment" bugs, since the bar's
-    /// motion is now driven by the SAME duration the keyboard itself animates
-    /// on. Falls back to a sane default (0.25s, iOS's typical keyboard
-    /// duration) if the notification ever omits the key.
+    /// Stores the current UIKit keyboard animation duration.
+    /// The default is 0.25 seconds when a notification omits the value.
     @State private var keyboardAnimationDuration: Double = 0.25
     @StateObject private var voice = VoiceTranscriberModel()
     @State private var logEntries: [LogEntry] = [
         LogEntry(message: .status(text: "paired -- control channel not yet connected"))
     ]
 
-    /// Whether the live-share surface is expanded to fullscreen (tap the
-    /// floating panel to expand; the close control collapses it back).
-    /// Layout-only state: the underlying `VideoRenderView` keeps ONE view
-    /// identity across the transition, so the frame source is never
-    /// stopped/restarted by going fullscreen.
+    /// Indicates whether the media stream is fullscreen.
+    /// Layout changes preserve one `VideoRenderView` identity.
     @State private var isVideoFullscreen = false
 
-    /// True once the user has manually collapsed fullscreen WHILE still
-    /// physically landscape -- suppresses the auto-landscape-fullscreen
-    /// re-trigger for the rest of that landscape session (never fight the
-    /// user, same pattern as the launch auto-connect suppression), and
-    /// resets the moment the device rotates back to portrait so the NEXT
-    /// landscape entry auto-expands again.
+    /// Prevents automatic fullscreen from overriding a manual collapse during the current landscape interval.
+    /// Portrait orientation clears this value.
     @State private var manuallyCollapsedWhileLandscape = false
 
-    /// True while the user has escalated to hands-on control: a touch surface
-    /// over the live view injects their taps/drags/scrolls as remote input, and
-    /// the daemon has paused any active agent turn. Entering sends `takeControl`
-    /// (and resets zoom so touches map 1:1 to the video); exiting sends
-    /// `releaseControl`. See `RemoteControl.swift`.
+    /// Indicates that the user controls the Mac through the media stream.
+    /// Entering this mode pauses the active daemon task.
     @State private var isControllingRemotely = false
 
-    /// True while the Mac's focused field is secure (password-class) -- the login window's
-    /// authentication UI, a screen-lock password prompt, or a `sudo`/Keychain dialog has
-    /// focus. Driven by `ServerMessage.secureInputState`, itself sourced from the daemon's
-    /// `secure_input_watchdog` polling macOS's own `IsSecureEventInputEnabled()` signal. Used
-    /// to explain the video's black region (ScreenCaptureKit excludes secure UI from every
-    /// captured frame -- an OS security boundary, not a holoiroh bug) instead of leaving a
-    /// user staring at an unexplained black rectangle.
+    /// Indicates that macOS secure input is active.
+    /// The app explains the resulting protected region in the media stream.
     @State private var isMacAtLockScreen = false
 
-    /// Whether the lightweight floating typing overlay (task 4) is shown over
-    /// the live-share surface. Only ever visible while `isControllingRemotely`
-    /// -- cleared automatically on releaseControl (see `toggleRemoteControl`)
-    /// so it never persists floating over a non-controlled video.
+    /// Controls the floating typing overlay during hands-on remote control.
     @State private var showRemoteTypeOverlay = false
-    /// Focus for the floating typing overlay's text field, so opening it
-    /// auto-raises the keyboard without the user needing a second tap.
+    /// Tracks focus for the floating remote-typing field.
     @FocusState private var isRemoteTypeFocused: Bool
 
-    /// Whether the hidden controls sheet (the per-state SessionView panel,
-    /// the status/log panel, and Disconnect) is presented. Toggled by the
-    /// command bar's sparkle button; hidden by default.
+    /// Controls the sheet that contains session controls, status history, and disconnection.
     @State private var showControls = false
 
-    /// App foreground/background state, driving the foreground video
-    /// recovery in `body` (see the `.onChange(of: scenePhase)` there).
+    /// Provides app lifecycle state for media-stream recovery.
     @Environment(\.scenePhase) private var scenePhase
 
     // MARK: Live-share zoom (pinch to zoom, drag to pan, double-tap resets)
 
-    /// Committed zoom factor for the live-share surface (1 = fit), passed
-    /// into `PanZoomVideoSurface` as a `Binding` -- the in-flight pinch
-    /// (`pinchScale`) and its clamping now live entirely inside that struct
-    /// (see its doc for why: keeping the live gesture state off `MainView`
-    /// itself is the actual performance fix).
+    /// Stores the committed media-stream zoom factor.
+    /// `PanZoomVideoSurface` owns the in-progress pinch state.
     @State private var zoomScale: CGFloat = 1
-    /// Committed pan offset of the zoomed content (points, post-scale),
-    /// passed into `PanZoomVideoSurface` as a `Binding`.
+    /// Stores the committed pan offset in post-scale points.
     @State private var panOffset: CGSize = .zero
 
-    /// Holds the running frame-timing witness (see `FrameTimingProbe.swift`)
-    /// so it isn't deallocated mid-measurement -- debug-only, see
-    /// `runFrameTimingProbeIfNeeded`.
-    #if DEBUG
+    /// Retains the debug frame-timing probe until measurement completes.
+    #if DEBUG && canImport(UIKit)
     @State private var frameTimingProbe: FrameTimingProbe?
     @State private var frameTimingDriveTimer: Timer?
+    #endif
+    #if DEBUG
+    @State private var didRunTakeControlWitness = false
     #endif
 
     // MARK: Auto-reconnect (app-switch/backgrounding recovery)
 
-    /// Consecutive automatic reconnect attempts since the last successful
-    /// `.connected`. Bounded (`Self.maxReconnectAttempts`) so a genuinely
-    /// dead daemon surfaces a real failure instead of silent retry forever.
+    /// Counts consecutive automatic reconnect attempts since the last connection.
+    /// `Self.maxReconnectAttempts` bounds retries.
     @State private var reconnectAttempts = 0
-    /// When the app last left the foreground, used to tell a real absence from a
-    /// Control Center / notification-banner blip when deciding whether to
-    /// replenish the reconnect budget.
+    /// Stores when the app last left the foreground.
     @State private var lastBackgroundedAt: Date?
-    /// How long the app must have been away before returning to it grants a
-    /// fresh reconnect budget.
+    /// Requires 30 seconds outside the foreground before restoring the reconnect budget.
     private static let reconnectBudgetRefreshAfter: TimeInterval = 30
-    /// True while a reconnect is scheduled/in flight, so overlapping
-    /// triggers (failure event + foreground return) collapse into one.
+    /// Prevents overlapping failure and foreground triggers from starting multiple reconnects.
     @State private var isReconnecting = false
-    /// Identity of the foreground liveness check in flight, so a stale
-    /// check (superseded by a newer app switch) is a no-op.
+    /// Identifies the current foreground liveness check. Superseded checks do nothing.
     @State private var livenessCheckID = UUID()
     private static let maxReconnectAttempts = 5
 
-    /// The frame producer bound to the video surface. Held with `@State`
-    /// so it keeps a stable identity across view updates (a fresh source
-    /// on every re-render would restart the display link each time).
-    /// Starts as the synthetic pre-connect placeholder and is swapped for
-    /// the real shared-bridge `IrohLiveFrameSource` the moment
-    /// `HoloConnection` reaches `.connected` (see `handleConnectionPhase`);
-    /// bridge-less builds keep the synthetic source for the whole session.
+    /// Provides frames to the media-stream view with stable source identity.
+    /// The synthetic source remains active until a bridge connection supplies the live source.
     @State private var frameSource: VideoFrameSource = SyntheticVideoFrameSource()
 
-    /// The control-channel send seam (`ControlChannelSender.swift`). This is
-    /// the **single injection site** for the outbound message path -- most
-    /// importantly the remote kill-switch `ClientMessage.stop` the Cancel
-    /// controls send (see `sendControlMessage` / `sessionActions.cancel`).
-    /// Once `HoloConnection` completes the control-ALPN PIN handshake this is
-    /// the real `FFIControlChannelSender` (every message goes over the wire
-    /// via `holoiroh_ios_bridge_control_send`); before that -- and in
-    /// bridge-less simulator/CI builds -- it falls back to the
-    /// `LoggingControlChannelSender` stand-in, which encodes the same wire
-    /// bytes and surfaces them in the log panel. Computed rather than stored
-    /// so the fallback's `report` closure can append to `logEntries` without
-    /// a stored-property initialization-order problem.
+    /// Provides the single outbound control-channel path.
+    /// Connected sessions use `FFIControlChannelSender`.
+    /// Other sessions use `LoggingControlChannelSender`.
     private var controlChannel: ControlChannelSending {
         if let real = connection.controlSender {
             return real
         }
         return LoggingControlChannelSender { message, wire in
-            // Surface the sent message in the same status/log panel every other
-            // event flows through. The trailing newline is trimmed for display
-            // (it is real on the wire, noise in the UI).
-            let trimmed = wire.trimmingCharacters(in: .whitespacesAndNewlines)
-            // Routed through `log` (not a direct append) so it is subject to the
-            // same ring cap; a disconnected remote-control drag would otherwise
-            // append at touch frequency with nothing trimming it.
-            log(.status(text: "→ sent (not connected) \(message.wireKindLabel): \(trimmed)"))
+            // Surface bounded metadata in the same status/log panel every other
+            // event flows through. Routed through `log` (not a direct append) so
+            // it is subject to the same ring cap; a disconnected remote-control
+            // drag would otherwise append at touch frequency with nothing trimming it.
+            log(.status(text: "→ sent (not connected) \(message.wireKindLabel): \(wire.utf8.count) bytes"))
         }
     }
 
@@ -527,6 +412,7 @@ struct MainView: View {
                 }
             }
         }
+        #if os(iOS)
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
             captureKeyboardAnimationDuration(from: note)
             guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
@@ -545,14 +431,28 @@ struct MainView: View {
             captureKeyboardAnimationDuration(from: note)
             keyboardHeight = 0
         }
+        #endif
+        #if os(iOS)
         .toolbar(.hidden, for: .navigationBar)
+        #endif
         // Hidden-by-default controls: the SessionView state panel, the
         // status/log panel, and Disconnect live in this sheet, toggled by
         // the command bar's sparkle button.
+        .sheet(
+            item: $pendingApproval,
+            onDismiss: { cancelPendingApprovalIfNeeded() }
+        ) { request in
+            ApprovalSheet(request: request) { decision in
+                respondToApproval(request, decision: decision)
+            }
+        }
         .sheet(isPresented: $showControls) {
             controlsSheet
         }
-        .sheet(isPresented: $showDocumentAttachSheet) {
+        .sheet(
+            isPresented: $showDocumentAttachSheet,
+            onDismiss: { invalidateTinfoilRequest() }
+        ) {
             TinfoilAttachSheet(
                 mode: .document,
                 onSend: { sendTinfoilMessage($0) },
@@ -561,7 +461,10 @@ struct MainView: View {
                 requestId: tinfoilRequestID
             )
         }
-        .sheet(isPresented: $showImageAttachSheet) {
+        .sheet(
+            isPresented: $showImageAttachSheet,
+            onDismiss: { invalidateTinfoilRequest() }
+        ) {
             TinfoilAttachSheet(
                 mode: .image,
                 onSend: { sendTinfoilMessage($0) },
@@ -570,25 +473,31 @@ struct MainView: View {
                 requestId: tinfoilRequestID
             )
         }
-        .sheet(isPresented: $showPlanSheet) {
+        .sheet(
+            isPresented: $showPlanSheet,
+            onDismiss: { invalidateTinfoilRequest() }
+        ) {
             PlanStepsSheet(
                 onSend: { sendTinfoilMessage($0) },
                 onRunStep: { dispatchPrompt($0) },
+                autonomousExecutionPermitted: autonomousExecutionPermitted,
                 steps: $planSteps,
                 planError: $planError,
                 requestId: tinfoilRequestID
             )
         }
-        .sheet(isPresented: $showTinfoilRecordSheet) {
+        .sheet(
+            isPresented: $showTinfoilRecordSheet,
+            onDismiss: { invalidateTinfoilRequest() }
+        ) {
             TinfoilRecordSheet(
                 recorder: tinfoilAudioRecorder,
-                onSend: { audioData in
+                onSend: { capture in
                     transcriptionResult = nil
                     transcriptionError = nil
                     sendTinfoilMessage(.transcribeAudio(
                         requestId: tinfoilRequestID,
-                        audioDataBase64: audioData.base64EncodedString(),
-                        format: "wav"
+                        capture: capture
                     ))
                 },
                 resultText: $transcriptionResult,
@@ -609,7 +518,12 @@ struct MainView: View {
         // reflect its phase changes, and tear it down when the screen goes.
         .onAppear(perform: configureConnectionIfNeeded)
         .onAppear(perform: autoFocusPromptIfNeeded)
-        .onDisappear { connection.shutdown() }
+        .onDisappear {
+            cancelPendingApprovalIfNeeded()
+            tinfoilVerificationStore.reset()
+            invalidateTinfoilRequest()
+            connection.shutdown()
+        }
         .onChange(of: connection.phase) { _, newPhase in
             handleConnectionPhase(newPhase)
         }
@@ -676,16 +590,9 @@ struct MainView: View {
 
     // MARK: - Keyboard shelf helpers
 
-    /// How far `remoteTypeBar` must rise (independent of the video box, which
-    /// stays put -- see `boxShift`'s doc) to clear the keyboard, when the
-    /// remote-typing field is what's focused. Pure function of already-known
-    /// geometry so it's directly probe-testable without a live keyboard.
-    ///
-    /// `boxBottomY` is the box's bottom edge in screen coordinates (its natural
-    /// resting position, since the box no longer shifts for this case);
-    /// `remoteTypeBar` sits `14`pt below that (its own `.padding(.bottom, 14)`)
-    /// plus its own real measured height. If that natural bottom edge is
-    /// already above the keyboard's top edge, no rise is needed.
+    /// Calculates how far the remote typing bar must rise above the keyboard.
+    /// The media-stream box remains stationary.
+    /// The result uses measured bar height and an 8-point gap.
     private func remoteTypeBarShift(boxBottomY: CGFloat, screenHeight: CGFloat) -> CGFloat {
         guard isRemoteTypeFocused, keyboardHeight > 0 else { return 0 }
         let naturalBottomY = boxBottomY + 14 + measuredRemoteTypeBarHeight
@@ -693,18 +600,15 @@ struct MainView: View {
         return max(0, naturalBottomY - keyboardTopY + 8)
     }
 
-    /// Reads the REAL keyboard-animation duration out of a keyboard
-    /// show/hide/change-frame notification's userInfo, so the command-bar's
-    /// rise/fall animation (see `keyboardAnimationDuration`) matches the
-    /// system's own timing instead of an approximate spring. Falls back to
-    /// the existing value (never resets to a guess) if a notification is ever
-    /// missing the key -- degrade gracefully, never regress to a worse guess.
+    /// Reads a positive animation duration from a UIKit keyboard notification. Missing values preserve the current duration.
+    #if os(iOS)
     private func captureKeyboardAnimationDuration(from note: Notification) {
         guard let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double,
               duration > 0
         else { return }
         keyboardAnimationDuration = duration
     }
+    #endif
 
     // MARK: - Live-share zoom helpers
 
@@ -715,10 +619,9 @@ struct MainView: View {
 
     // MARK: - Auto-reconnect
 
-    /// After a foreground frame-source restart, verify frames actually
-    /// resume; if none arrive within the window, the transport is dead and
-    /// only a full reconnect helps. Keyed by `livenessCheckID` so only the
-    /// LATEST app switch's check can fire.
+    /// Checks for a frame within 4 seconds after foreground restart.
+    /// If no frame arrives, the app starts a full reconnect.
+    /// Only the latest check can act.
     private func armForegroundLivenessCheck() {
         let checkID = UUID()
         livenessCheckID = checkID
@@ -734,16 +637,16 @@ struct MainView: View {
         }
     }
 
-    /// Bounded, backoff-spaced full reconnect: tear the dead session down
-    /// (`HoloConnection.reset`) and redo the whole connect (bridge + ticket
-    /// + PIN) with the credentials this screen was opened with. The peer
-    /// sees a status line, not an error, unless every attempt is exhausted.
+    /// Resets the failed session and reconnects with the current ticket and PIN.
+    /// Retries are bounded and use increasing delays.
     private func attemptReconnect(reason: String) {
         guard !isReconnecting else { return }
         guard reconnectAttempts < Self.maxReconnectAttempts else {
             log(.error(text: "reconnect failed after \(Self.maxReconnectAttempts) attempts -- use Disconnect and pair again"))
             return
         }
+        beginTinfoilVerificationSession()
+        invalidateTinfoilRequest()
         isReconnecting = true
         reconnectAttempts += 1
         let attempt = reconnectAttempts
@@ -761,11 +664,9 @@ struct MainView: View {
 
     // MARK: - Live-share box (chrome + placeholder)
 
-    /// The centered rounded live-screen-share box: black fill, thin light
-    /// border, corner radius 28. Shows the placeholder text until the
-    /// connection is up; once connected the persistent `videoOverlay`
-    /// surface renders the live video framed to exactly this box. Tapping
-    /// toggles fullscreen (only meaningful once connected).
+    /// Displays the rounded media-stream container with a 28-point corner radius.
+    /// Before connection, it shows status and retry controls.
+    /// After connection, `videoOverlay` supplies the media stream.
     private func liveShareBox(width: CGFloat, height: CGFloat) -> some View {
         let isConnected = connection.phase == .connected
         return RoundedRectangle(cornerRadius: 28)
@@ -852,9 +753,7 @@ struct MainView: View {
 
     // MARK: - Controls sheet (hidden by default)
 
-    /// The sheet the sparkle button toggles: the demo state-jump menu, the
-    /// per-state `SessionView` panel, the status/log panel, and Disconnect.
-    /// None of this is visible by default -- the main screen stays minimal.
+    /// Displays demo controls, `SessionView`, status history, and the Disconnect action. The sheet is hidden by default.
     private var controlsSheet: some View {
         ScrollView {
             VStack(spacing: 16) {
@@ -873,6 +772,8 @@ struct MainView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 12))
 
                 Button(role: .destructive) {
+                    tinfoilVerificationStore.reset()
+                    invalidateTinfoilRequest()
                     connection.shutdown()
                     onDisconnect()
                 } label: {
@@ -898,11 +799,7 @@ struct MainView: View {
 
     // MARK: - Demo control (local transition trigger stand-in)
 
-    /// A menu (in the controls sheet) that jumps to any of the eight PRD 6.1 states
-    /// with a representative payload. This is the "direct" half of making the
-    /// state machine demonstrably live without a wired control channel -- see
-    /// this type's doc comment. Each jump also drops a synthesized log entry
-    /// so the log panel reflects the jump.
+    /// Provides representative payloads for direct navigation to each PRD 6.1 state.
     private var demoMenu: some View {
         Menu {
             Button("Idle") { jump(to: .idle) }
@@ -925,10 +822,8 @@ struct MainView: View {
 
     // MARK: - Tinfoil attach menu
 
-    /// "+"-style menu offering the Tinfoil-backed document/image/audio/planner features
-    /// alongside the prompt composer. Each option presents its own sheet (see the `.sheet`
-    /// modifiers above); a fresh `tinfoilRequestID` is minted per-open so results correlate to
-    /// the request that produced them, not a stale one from a previous sheet visit.
+    /// Provides Tinfoil document, image, audio, and planner actions.
+    /// Each opening creates a new request identifier.
     private var tinfoilAttachMenu: some View {
         Menu {
             Button {
@@ -972,25 +867,23 @@ struct MainView: View {
         .accessibilityLabel("Attach or plan with Tinfoil")
     }
 
-    /// Sends a Tinfoil-backed `ClientMessage` (document/image/audio/plan/speech) over the
-    /// control channel. A thin named wrapper over `sendControlMessage` so call sites in the
-    /// attach/plan/record sheets read as "send a Tinfoil request", matching `dispatchPrompt`'s
-    /// own naming convention for the desktop-task path.
+    /// Sends a Tinfoil-backed message through the control channel and records its message kind.
     private func sendTinfoilMessage(_ message: ClientMessage) {
         sendControlMessage(message)
         log(.status(text: "→ \(message.wireKindLabel)"))
     }
 
+    private func invalidateTinfoilRequest() {
+        tinfoilRequestID = UUID().uuidString
+    }
+
     // MARK: - Session action wiring
 
-    /// The control callbacks handed to `SessionView`. The task-committing
-    /// legs are real: `send` commits the reviewed request over the control
-    /// channel (`advanceFromReviewToWorking`), `cancel` sends the kill-switch
-    /// `ClientMessage.stop`, and `retry` re-sends the last request; the
-    /// daemon's `ServerMessage` responses then drive `session`
-    /// (`handleServerMessage`). Actions with no wire message yet
-    /// (approve/choose/resolve-locally/take-control) remain local transitions
-    /// until the protocol grows their `ClientMessage` shapes.
+    /// Provides `SessionView` control callbacks.
+    ///
+    /// - Send, cancel, retry, and input responses use control-channel messages.
+    /// - Other callbacks update local presentation state.
+    /// - Daemon messages remain the source for task lifecycle changes.
     private var sessionActions: SessionActions {
         SessionActions(
             start: { beginReview(from: currentTranscriptOrDemo()) },
@@ -1072,12 +965,9 @@ struct MainView: View {
         )
     }
 
-    /// Pause/Resume over the REAL wire (the old version only toggled a local
-    /// flag -- the agent on the Mac kept acting). Pause sends `.pause` (the
-    /// daemon parks the turn); Resume sends `.resume` (the daemon re-dispatches
-    /// it on the same backend session). Local state mirrors optimistically;
-    /// the daemon's own status/`task_done` frames are the source of truth in
-    /// the log.
+    /// Sends pause or resume through the control channel.
+    /// Local state updates immediately.
+    /// Daemon status remains the task-state source of truth.
     private func togglePause() {
         if isTaskPaused {
             sendControlMessage(.resume)
@@ -1106,25 +996,32 @@ struct MainView: View {
 
     // MARK: - Real connection wiring
 
-    /// Wires the connection's decoded-event stream into this view and starts
-    /// the real connect (bridge create → ticket connect → control-ALPN PIN
-    /// handshake). Safe to call again on re-appear: `HoloConnection.connect`
-    /// is idempotent once past `.idle`.
+    private func beginTinfoilVerificationSession() {
+        let sessionID = UUID()
+        tinfoilVerificationSessionID = sessionID
+        tinfoilVerificationStore.beginSession(
+            id: sessionID,
+            profileIdentity: ticket
+        )
+    }
+
+    /// Assigns the daemon-message handler and starts the bridge connection.
+    /// Repeated calls do nothing after the connection leaves `.idle`.
     private func configureConnectionIfNeeded() {
+        beginTinfoilVerificationSession()
+        invalidateTinfoilRequest()
         connection.onServerMessage = { message in
             handleServerMessage(message)
         }
         connection.connect(ticket: ticket, pin: pin)
     }
 
-    /// Reacts to connection lifecycle changes: on `.connected`, swap the
-    /// synthetic placeholder for the shared-bridge live frame source; on
-    /// `.failed`, surface the reason (bridge-less builds land here too, and
-    /// keep the synthetic source + logging-sender fallbacks).
+    /// Applies connection phase changes to the media source and recovery state.
+    /// Bridge-less failures keep the synthetic source and logging sender.
     private func handleConnectionPhase(_ phase: HoloConnection.Phase) {
         switch phase {
         case .idle, .connecting:
-            break
+            autonomousExecutionPermitted = false
         case .connected:
             reconnectAttempts = 0
             isReconnecting = false
@@ -1133,10 +1030,17 @@ struct MainView: View {
                 frameSource.stop()
                 frameSource = live
             }
+            #if DEBUG
+            runTakeControlWitnessIfNeeded()
+            #endif
             Haptics.fire(.connect)
             ConnectionDiagnostics.shared.recordConnected(ticket: ticket)
             sendAutoPairPromptIfNeeded()
         case .failed(let reason):
+            cancelPendingApprovalIfNeeded()
+            autonomousExecutionPermitted = false
+            tinfoilVerificationStore.reset()
+            invalidateTinfoilRequest()
             ConnectionDiagnostics.shared.recordFailure(reason, ticket: ticket)
             // While the app is frontmost, a mid-session failure (daemon
             // restarted, network blipped, QUIC idle-out racing the
@@ -1153,17 +1057,21 @@ struct MainView: View {
 
     // MARK: - Real control-channel event handling
 
-    /// Projects one daemon `ServerMessage` onto the log panel and, where it
-    /// implies a lifecycle change, onto `session` -- the coarse PRD 6.1
-    /// projection (`SessionState`'s mapping table). The wire protocol's four
-    /// message kinds are coarse, so the projection is too: `task_progress`
-    /// advances/updates the active task, `error` fails it, `ack`/`status`
-    /// are log-only.
+    /// Applies one daemon message to status history and dashboard state.
+    /// Task progress, completion, input, and errors can change the dashboard.
+    /// Other message types update their dedicated state.
     private func handleServerMessage(_ message: ServerMessage) {
+        guard isCurrentTinfoilResponse(message) else { return }
         log(message)
         switch message {
-        case .ack, .status:
+        case .ack:
             break
+        case .status(_, let reportedExecutionMode, let capabilities):
+            if reportedExecutionMode != nil || capabilities != nil {
+                executionMode = reportedExecutionMode ?? "restricted"
+                autonomousExecutionPermitted = executionMode == "legacy_holo"
+                    && (capabilities ?? []).contains("autonomous_holo")
+            }
         case .taskProgress(let text):
             applyTaskProgress(text)
         case .error(let text):
@@ -1176,6 +1084,12 @@ struct MainView: View {
             failActiveTask(cause: text ?? "The daemon rejected this device's authentication.")
         case .currentTicket(let ticket):
             applyCurrentTicket(ticket)
+        case .tinfoilVerification(let verification):
+            tinfoilVerificationStore.update(
+                verification,
+                sessionID: tinfoilVerificationSessionID,
+                profileIdentity: ticket
+            )
         case .clarifyQuestions(let questions):
             applyClarifyQuestions(questions)
         case .inputRequest(let requestId, let kind, let context, let responseOptions, _):
@@ -1185,44 +1099,70 @@ struct MainView: View {
                 context: context,
                 responseOptions: responseOptions
             )
+        case .approvalRequest(let request):
+            presentApproval(request)
         case .secureInputState(let active):
             isMacAtLockScreen = active
-        case .documentProcessed(_, let markdown):
+        case .documentProcessed(let requestId, let markdown):
+            guard requestId == tinfoilRequestID else { return }
             documentError = nil
             documentResult = markdown
-        case .documentProcessFailed(_, let error):
+        case .documentProcessFailed(let requestId, let error):
+            guard requestId == tinfoilRequestID else { return }
             documentResult = nil
             documentError = error
-        case .imageAnalyzed(_, let text):
+        case .imageAnalyzed(let requestId, let text):
+            guard requestId == tinfoilRequestID else { return }
             imageError = nil
             imageResult = text
-        case .imageAnalysisFailed(_, let error):
+        case .imageAnalysisFailed(let requestId, let error):
+            guard requestId == tinfoilRequestID else { return }
             imageResult = nil
             imageError = error
-        case .audioTranscribed(_, let text):
+        case .audioTranscribed(let requestId, let text):
+            guard requestId == tinfoilRequestID else { return }
             transcriptionError = nil
             transcriptionResult = text
-        case .audioTranscriptionFailed(_, let error):
+        case .audioTranscriptionFailed(let requestId, let error):
+            guard requestId == tinfoilRequestID else { return }
             transcriptionResult = nil
             transcriptionError = error
-        case .speechReady(_, let audioDataBase64):
+        case .speechReady(let requestId, let audioDataBase64):
+            guard requestId == tinfoilRequestID else { return }
             speechPlayback.play(base64WavData: audioDataBase64)
-        case .speechFailed(_, let error):
+        case .speechFailed(let requestId, let error):
+            guard requestId == tinfoilRequestID else { return }
             log(.error(text: "speech synthesis failed: \(error)"))
-        case .planReady(_, let steps):
+        case .typedPlanReady(let requestId, let plan):
+            guard requestId == tinfoilRequestID else { return }
+            planError = nil
+            planSteps = plan.steps.map { step in
+                switch step {
+                case .action(let proposal): return "Typed action \(proposal.actionId)"
+                case .complete: return "Complete"
+                }
+            }
+        case .plannerStatus:
+            break
+        case .plannerReceipt:
+            break
+        case .planReady(let requestId, let steps):
+            guard requestId == tinfoilRequestID else { return }
             planError = nil
             planSteps = steps
-        case .planFailed(_, let error):
+        case .planFailed(let requestId, let error):
+            guard requestId == tinfoilRequestID else { return }
             planSteps = nil
             planError = error
         }
     }
 
-    /// `task_done` is the daemon's real end-of-task signal (completed /
-    /// failed / canceled). One subtlety: pausing a task IS a cancel on the
-    /// wire (the daemon parks the turn by canceling it -- see the daemon's
-    /// pause semantics), so a `canceled` arriving while `isTaskPaused` keeps
-    /// the paused pill up instead of dismissing the task.
+    private func isCurrentTinfoilResponse(_ message: ServerMessage) -> Bool {
+        message.tinfoilRequestId.map { $0 == tinfoilRequestID } ?? true
+    }
+
+    /// Applies the daemon task-completion status.
+    /// A canceled status does not end a task while the app marks it paused.
     private func applyTaskDone(status: String, text: String?) {
         switch status {
         case "failed":
@@ -1240,11 +1180,8 @@ struct MainView: View {
         }
     }
 
-    /// The daemon reported its current ticket over the authenticated channel.
-    /// If it differs from the saved default (the daemon's identity rotated),
-    /// refresh the "Dev Mac" default so future launches reach the rotated daemon
-    /// without a QR re-scan. Validated + no-op-on-same in the store, so a stale
-    /// or identical ticket never downgrades a working default.
+    /// Saves a changed current ticket from the authenticated control channel.
+    /// Validation and unchanged-ticket handling occur in the profile store.
     private func applyCurrentTicket(_ ticket: String) {
         let previous = profileStore.defaultProfile?.ticket ?? ""
         guard profileStore.refreshDefaultTicket(ticket) else { return }
@@ -1252,9 +1189,48 @@ struct MainView: View {
         log(.status(text: "saved Dev Mac ticket refreshed — daemon identity rotated"))
     }
 
-    /// Projects a daemon `input_request` (today: the sensitive-app consent
-    /// gate) onto the PRD 6.1 Input-needed state with its REAL payload, and
-    /// opens the controls sheet so the Choose buttons are actually on screen.
+    private func presentApproval(_ request: ApprovalRequest) {
+        let now = UInt64(Date().timeIntervalSince1970 * 1_000)
+        guard request.expiresAt > now else {
+            log(.error(text: "approval request expired before presentation"))
+            return
+        }
+        cancelPendingApprovalIfNeeded()
+        pendingApproval = request
+        presentedApprovalForCancellation = request
+    }
+
+    private func cancelPendingApprovalIfNeeded() {
+        guard let request = presentedApprovalForCancellation else { return }
+        respondToApproval(request, decision: .cancel)
+    }
+
+    private func respondToApproval(_ request: ApprovalRequest, decision: ApprovalDecision) {
+        guard presentedApprovalForCancellation?.approvalId == request.approvalId else { return }
+        let resolvedDecision: ApprovalDecision
+        if decision == .approve {
+            let now = UInt64(Date().timeIntervalSince1970 * 1_000)
+            resolvedDecision = request.expiresAt > now ? .approve : .cancel
+        } else {
+            resolvedDecision = decision
+        }
+        pendingApproval = nil
+        presentedApprovalForCancellation = nil
+        sendControlMessage(.approvalResponse(
+            approvalId: request.approvalId,
+            actionId: request.actionId,
+            proposalDigest: request.proposalDigest,
+            decision: resolvedDecision
+        ))
+        switch resolvedDecision {
+        case .approve: log(.status(text: "approval sent"))
+        case .deny: log(.status(text: "denial sent"))
+        case .cancel: log(.status(text: "approval canceled"))
+        }
+    }
+
+    /// Displays one daemon input request in the Input-needed state.
+    /// Also opens the controls sheet so response options are visible.
     private func presentInputRequest(
         requestId: String,
         kind: String,
@@ -1298,9 +1274,7 @@ struct MainView: View {
         #endif
     }
 
-    /// `task_progress` drives Connecting → Working (the daemon accepted the
-    /// task and is acting) and thereafter updates the Working dashboard
-    /// fields in place.
+    /// Moves Connecting to Working and applies later task-progress updates to the Working payload.
     private func applyTaskProgress(_ text: String?) {
         let line = text ?? "working"
         switch session {
@@ -1320,14 +1294,9 @@ struct MainView: View {
         }
     }
 
-    /// Reconnect restoration (issue-2): the daemon's `task_active` told us a task
-    /// from before the connection drop is still live, so bring the Pause/Stop
-    /// task-control pill back. A running task moves `session` to `.working`
-    /// (making `isTaskActive` true -> pill shows "Task running" + Pause/Stop); a
-    /// paused task sets `isTaskPaused` (pill shows "Paused" + Resume/Stop). Never
-    /// downgrades a fresher local state: the running branch only fires when we
-    /// aren't already showing an active task, so a live turn's own progress
-    /// isn't clobbered by a late reconnect notice.
+    /// Restores task controls from the daemon `task_active` message after reconnection.
+    /// Running and paused tasks restore different pill states.
+    /// Existing active state is not replaced.
     private func restoreTaskControls(paused: Bool) {
         if paused {
             // Reconnected to a paused task, OR auto-yield stepped the agent aside
@@ -1351,8 +1320,7 @@ struct MainView: View {
         }
     }
 
-    /// A daemon-reported `error` fails whatever task is active; outside a
-    /// task it is log-only (already appended by `handleServerMessage`).
+    /// Moves an active task to Failed after a daemon error. Errors outside active tasks remain in status history.
     private func failActiveTask(cause: String?) {
         switch session {
         case .connecting, .working, .inputNeeded, .draftReady, .awaitingApproval:
@@ -1367,15 +1335,13 @@ struct MainView: View {
 
     // MARK: - Organic transitions (prompt-send walk)
 
-    /// The current transcript to review: the live prompt text if present, else
-    /// a representative demo transcript so Start from an empty field still
-    /// demonstrates the flow.
+    /// Returns trimmed prompt text or the representative demo transcript when the prompt is empty.
     private func currentTranscriptOrDemo() -> String {
         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? Self.demoReview.transcript : trimmed
     }
 
-    /// Idle → Reviewing: a captured request is shown back for confirmation.
+    /// Moves Idle to Reviewing with a captured request.
     private func beginReview(from transcript: String) {
         let payload = ReviewPayload(
             transcript: transcript,
@@ -1387,13 +1353,14 @@ struct MainView: View {
         promptText = ""
     }
 
-    /// Reviewing → Connecting, the "Send" leg: commits the reviewed request
-    /// to the daemon over the control channel. There is no local timer any
-    /// more -- the transition out of `.connecting` is driven by the daemon's
-    /// real responses (`handleServerMessage`): a `task_progress` advances to
-    /// `.working`, an `error` fails the task.
+    /// Sends the reviewed request and moves Reviewing to Connecting.
+    /// Daemon progress or error messages determine the next state.
     private func advanceFromReviewToWorking() {
         guard case .reviewing(let payload) = session else { return }
+        if executionMode != "legacy_holo" {
+            dispatchPrompt(payload.transcript)
+            return
+        }
         // Voice-originated transcripts keep their `voice_transcript` wire tag
         // (PROTOCOL.md); typed prompts go out as `prompt`.
         let message: ClientMessage = payload.transcript == voice.liveText
@@ -1409,18 +1376,9 @@ struct MainView: View {
 
     // MARK: - Live-share surface (boxed <-> fullscreen)
 
-    /// The persistent live-share surface. Mounted the moment the connection
-    /// is up and NEVER unmounted by session-state changes or the fullscreen
-    /// toggle (the old `showsRemoteView`-gated slot tore the shared frame
-    /// source down on every state transition -- a live-witnessed
-    /// permanent-black-screen bug class). Boxed: framed to exactly the
-    /// center live-share box (chrome drawn by `liveShareBox`). Fullscreen
-    /// (tap to expand): fills the screen over a black backdrop with the live
-    /// chat feed + command bar overlaid, Twitch-style, so prompts can be
-    /// sent to the agent without leaving the mirror. ONE VideoRenderView
-    /// instance across both layouts: `.id` keys it to the SOURCE's identity
-    /// only (connect-time swap), never the fullscreen flag, so the
-    /// transition is a pure frame/layout change.
+    /// Displays one persistent media-stream view after connection.
+    /// Session-state and fullscreen changes do not recreate the frame source.
+    /// Fullscreen mode overlays task controls and the command bar.
     @ViewBuilder
     private func videoOverlay(
         in size: CGSize,
@@ -1495,6 +1453,7 @@ struct MainView: View {
                     // accidentally moves the cursor" bug). Pinch stays active
                     // unconditionally -- see its own doc below.
                     .overlay {
+                        #if canImport(UIKit)
                         if isControllingRemotely {
                             RemoteControlSurface(
                                 frameSize: frameSource.lastFrameSize,
@@ -1506,6 +1465,9 @@ struct MainView: View {
                             .frame(width: viewport.width, height: viewport.height)
                             .clipShape(RoundedRectangle(cornerRadius: isVideoFullscreen ? 0 : 28))
                         }
+                        #else
+                        EmptyView()
+                        #endif
                     }
                     .overlay(alignment: .topLeading) { remoteControlToggle }
                     .overlay(alignment: .topTrailing) { remoteTypeToggle }
@@ -1593,6 +1555,7 @@ struct MainView: View {
                         including: isControllingRemotely ? .none : .all
                     )
                     .accessibilityLabel("Live remote view of the Mac")
+                    .accessibilityValue(isControllingRemotely ? "Remote control active" : "View only")
                     .position(
                         x: size.width / 2,
                         y: isVideoFullscreen ? size.height / 2 : boxCenterY
@@ -1610,18 +1573,8 @@ struct MainView: View {
         }
     }
 
-    /// Fullscreen bottom overlay: the task-control pill (when relevant) and
-    /// the command bar, for sending prompts to the agent without leaving the
-    /// mirror. Fullscreen sends go DIRECTLY to the daemon (no Reviewing
-    /// detour): fullscreen is the live-driving mode.
-    ///
-    /// Deliberately does NOT show a log feed here: an earlier "Twitch-style"
-    /// stack of the last 5 log entries covered a large fraction of the
-    /// screen once a burst of status messages arrived (reconnects, ticket
-    /// refreshes, lock-state changes) -- live-reported as the live share
-    /// becoming "unviewable" behind piled-up log entries. Full history is
-    /// still reachable via the sparkle button's controls sheet
-    /// (`logPanel`); fullscreen stays reserved for the video itself.
+    /// Displays task controls and the command bar over the fullscreen media stream.
+    /// Status history remains in the controls sheet.
     private var fullscreenChatOverlay: some View {
         VStack(spacing: 8) {
             if isTaskActive || isTaskPaused {
@@ -1646,6 +1599,14 @@ struct MainView: View {
     }
 
     // MARK: - Status / log panel
+
+    private static var logBackground: Color {
+        #if os(iOS)
+        Color(uiColor: .secondarySystemBackground)
+        #else
+        Color(nsColor: .controlBackgroundColor)
+        #endif
+    }
 
     private var logPanel: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1682,7 +1643,7 @@ struct MainView: View {
             }
         }
         .frame(height: 140)
-        .background(Color(.secondarySystemBackground))
+        .background(Self.logBackground)
     }
 
     private func logRow(_ entry: LogEntry) -> some View {
@@ -1716,11 +1677,12 @@ struct MainView: View {
         case .error, .authRejected: return .red
         case .taskDone(let status, _):
             return status == "failed" ? .red : .green
-        case .inputRequest: return .yellow
-        case .currentTicket: return .blue
+        case .inputRequest, .approvalRequest: return .yellow
+        case .currentTicket, .tinfoilVerification: return .blue
         case .clarifyQuestions: return Self.orbAccent
         case .secureInputState: return .blue
-        case .documentProcessed, .imageAnalyzed, .audioTranscribed, .planReady: return .green
+        case .documentProcessed, .imageAnalyzed, .audioTranscribed, .planReady, .typedPlanReady, .plannerReceipt: return .green
+        case .plannerStatus: return .blue
         case .documentProcessFailed, .imageAnalysisFailed, .audioTranscriptionFailed, .planFailed:
             return .red
         case .speechReady: return .green
@@ -1730,10 +1692,7 @@ struct MainView: View {
 
     // MARK: - Task controls (stop / pause / redirect surface)
 
-    /// Whether a task is currently live from this screen's point of view --
-    /// the states in which the task-control pill (Pause/Stop) is shown and a
-    /// sent prompt becomes a REDIRECT of the running task rather than a new
-    /// one.
+    /// Indicates whether the current dashboard state represents an active task.
     private var isTaskActive: Bool {
         switch session {
         case .connecting, .working, .inputNeeded: return true
@@ -1741,11 +1700,7 @@ struct MainView: View {
         }
     }
 
-    /// The always-visible-while-active task control pill: live status label +
-    /// Pause/Resume toggle + Stop. This is the main-screen control surface
-    /// the PRD 6.1 Working panel's Pause/Cancel buttons used to be the only
-    /// home for -- but that panel lives inside the hidden controls sheet, so
-    /// mid-task control had no visible affordance at all.
+    /// Displays active-task status with Pause or Resume and Stop controls.
     private var taskControlBar: some View {
         HStack(spacing: 10) {
             HStack(spacing: 6) {
@@ -1793,9 +1748,9 @@ struct MainView: View {
         .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
     }
 
-    /// The Stop control: remote kill-switch plus local state reset, shared by
-    /// the pill and the SessionView Cancel actions.
+    /// Stops the daemon task and resets the local task state.
     private func stopActiveTask() {
+        cancelPendingApprovalIfNeeded()
         sendStop()
         isTaskPaused = false
         activeInputRequestID = nil
@@ -1805,24 +1760,23 @@ struct MainView: View {
 
     // MARK: - Command bar
 
-    /// The default (main-screen) command bar. Same input path as before --
-    /// prompts are STAGED into the Reviewing panel, not sent directly.
+    /// Provides the default main-screen command bar. Prompts send directly through `sendLivePrompt()`.
     private var commandBar: some View {
         commandBar(fullscreen: false)
     }
 
-    /// The single bottom command bar in one large dark rounded container:
-    /// sparkle (controls-sheet toggle) + prompt field + mic + send.
-    /// `fullscreen: true` (the live-mirror overlay) sends prompts DIRECTLY
-    /// to the daemon -- fullscreen is the live-driving mode, no Reviewing
-    /// detour -- while `false` keeps the existing stage-then-confirm flow.
-    /// Accent blue echoing the Spline orb's own coloring, used across the command bar / pairing
-    /// flow / saved-profile rows for a cohesive "glowing orb over deep space" look.
+    /// Defines the shared orb-blue accent used by the command bar and related flows.
     private static let orbAccent = Color(red: 0.30, green: 0.56, blue: 1.0)
 
     private func commandBar(fullscreen: Bool) -> some View {
         let hasPrompt = !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let promptInputPermitted = true
         return VStack(spacing: 8) {
+            if !autonomousExecutionPermitted, !isControllingRemotely {
+                Label("Safe typed mode — goals use reviewed typed plans", systemImage: "checkmark.shield.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
             if !clarifyQuestions.isEmpty {
                 ClarifyPanel(
                     questions: clarifyQuestions,
@@ -1896,7 +1850,11 @@ struct MainView: View {
                 // zero inbound prompts -- it was staged into a panel that is
                 // no longer visible). Staged review remains reachable via
                 // the sheet's SessionView for flows that enter it there.
-                .onSubmit { sendLivePrompt() }
+                .onSubmit {
+                    guard promptInputPermitted else { return }
+                    sendLivePrompt()
+                }
+                .disabled(!promptInputPermitted)
 
             Button {
                 toggleMicrophone()
@@ -1912,6 +1870,7 @@ struct MainView: View {
                     )
             }
             .buttonStyle(.plain)
+            .disabled(!promptInputPermitted)
             .sensoryFeedback(.impact(weight: .light), trigger: voice.isRecording)
             .accessibilityLabel(voice.isRecording ? "Stop recording" : "Start voice prompt")
 
@@ -1930,7 +1889,7 @@ struct MainView: View {
                     .animation(.easeOut(duration: 0.15), value: hasPrompt)
             }
             .buttonStyle(.plain)
-            .disabled(!hasPrompt)
+            .disabled(!hasPrompt || !promptInputPermitted)
             .accessibilityLabel("Send prompt")
         }
         .padding(12)
@@ -1953,8 +1912,7 @@ struct MainView: View {
         .animation(.easeInOut(duration: 0.22), value: clarifyQuestions.count)
     }
 
-    /// Compact "generating clarifying questions" indicator shown above the
-    /// command bar while the clarify inference is in flight.
+    /// Displays progress while the daemon generates clarification questions.
     private var clarifyThinkingRow: some View {
         HStack(spacing: 10) {
             ProgressView()
@@ -1972,14 +1930,9 @@ struct MainView: View {
         .transition(.opacity)
     }
 
-    /// Debug-only unattended witness: fires exactly once per process
-    /// launch, the moment the control channel reaches `.connected`, sending
-    /// a real prompt through the exact same `sendLivePrompt()` path a tap on
-    /// the send button uses. Exists for `holoiroh-redeploy-iphone-fix`'s
-    /// device-witness step (a real `devicectl` launch has no way to tap the
-    /// on-screen UI) and any future device-only regression check -- reads
-    /// `HOLOIROH_AUTOPAIR_PROMPT` (paired with `ContentView`'s
-    /// `HOLOIROH_AUTOPAIR_TICKET`/`_PIN`, same DEBUG-only gate and rationale).
+    /// Sends one debug prompt after the control channel connects.
+    /// `HOLOIROH_AUTOPAIR_PROMPT` provides the prompt.
+    /// This path uses `sendLivePrompt()`.
     private func sendAutoPairPromptIfNeeded() {
         #if DEBUG
         guard !didSendAutoPairPrompt,
@@ -1992,15 +1945,8 @@ struct MainView: View {
         #endif
     }
 
-    /// Debug-only unattended witness for keyboard-avoidance UI changes (the
-    /// live-share box/command bar shifting up as the keyboard opens):
-    /// `devicectl`/`simctl` have no real UI-input capability to simulate a
-    /// tap on the prompt field, so `HOLOIROH_AUTOFOCUS_PROMPT=1` focuses it
-    /// programmatically on appear -- the exact same `isPromptFocused = true`
-    /// a real tap would trigger, driving the real keyboard notifications and
-    /// therefore the real keyboard-avoidance animation in `body`. Independent of
-    /// pairing/connection state (unlike `sendAutoPairPromptIfNeeded`, which
-    /// needs `.connected`) since this only exercises the layout, not a send.
+    /// Enables debug witnesses for keyboard layout, orb reactions, frame timing, and disconnection.
+    /// `HOLOIROH_AUTOFOCUS_PROMPT=1` focuses the prompt field after appearance.
     private func autoFocusPromptIfNeeded() {
         #if DEBUG
         // Deterministic orb-reaction witness: trigger the full reaction
@@ -2024,11 +1970,13 @@ struct MainView: View {
             }
             return
         }
+        #if canImport(UIKit)
         if ProcessInfo.processInfo.environment["HOLOIROH_FRAME_TIMING_PROBE"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 runFrameTimingProbe()
             }
         }
+        #endif
         if ProcessInfo.processInfo.environment["HOLOIROH_WITNESS_DISCONNECT"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
                 NSLog("MainView: witness invoking disconnect")
@@ -2043,18 +1991,29 @@ struct MainView: View {
     }
 
     #if DEBUG
-    /// Empirical witness for the video pan/zoom performance investigation --
-    /// see `FrameTimingProbe.swift`'s doc for the full caveat: this drives
-    /// `zoomScale`/`panOffset` (the `MainView`-owned `@State` `PanZoomVideoSurface`
-    /// receives as a `Binding`), NOT `pinchScale`/`panDrag` (the `@GestureState`
-    /// that actually moved into that child and is what a real pinch/pan ticks),
-    /// so it does not isolate that specific optimization -- read its numbers
-    /// as raw data about a different code path, not as before/after proof.
-    /// Runs for `HOLOIROH_FRAME_TIMING_PROBE_SECONDS` seconds (default 4)
-    /// while a `CADisplayLink` measures actual per-frame cost. Zoom/pan are
-    /// restored to identity afterward so the probe never leaves the view
-    /// visibly altered. Triggered once per launch by
-    /// `HOLOIROH_FRAME_TIMING_PROBE=1`.
+    private func runTakeControlWitnessIfNeeded() {
+        guard !didRunTakeControlWitness,
+              ProcessInfo.processInfo.environment["HOLOIROH_WITNESS_TAKE_CONTROL"] == "1",
+              connection.phase == .connected,
+              connection.liveFrameSource != nil
+        else { return }
+        didRunTakeControlWitness = true
+        DispatchQueue.main.async {
+            guard connection.phase == .connected,
+                  connection.liveFrameSource != nil,
+                  !isControllingRemotely
+            else { return }
+            toggleRemoteControl()
+            assert(isControllingRemotely, "take-control witness must enter remote-control state")
+        }
+    }
+
+    #if canImport(UIKit)
+    /// Measures frame timing while changing committed zoom and pan state.
+    /// This probe does not measure in-progress gesture state.
+    /// The duration defaults to 4 seconds.
+    /// `HOLOIROH_FRAME_TIMING_PROBE_SECONDS` can override the duration.
+    /// Zoom and pan return to identity after measurement.
     private func runFrameTimingProbe() {
         let seconds = Double(ProcessInfo.processInfo.environment["HOLOIROH_FRAME_TIMING_PROBE_SECONDS"] ?? "") ?? 4.0
         let probe = FrameTimingProbe(label: "video-pan-zoom") { _ in }
@@ -2090,15 +2049,9 @@ struct MainView: View {
         frameTimingDriveTimer = timer
     }
     #endif
+    #endif
 
-    /// Live send: straight to the daemon, straight into the feed -- no
-    /// Reviewing stage. While a task is ACTIVE, a sent prompt REDIRECTS it
-    /// (the daemon cancels the running turn, keeps its session history, and
-    /// runs the new instruction) rather than queueing a second task behind
-    /// it; from idle it starts a fresh task. Either way the session enters
-    /// `.connecting` so the task controls appear and the daemon's own
-    /// `task_progress`/`task_done` frames drive it from there.
-    /// The Take-control / Release-control toggle shown on the live view.
+    /// Displays the control-mode toggle over the media stream.
     private var remoteControlToggle: some View {
         Button {
             toggleRemoteControl()
@@ -2123,9 +2076,7 @@ struct MainView: View {
         .accessibilityLabel(isControllingRemotely ? "Release control" : "Take control of the Mac")
     }
 
-    /// Floating toggle (task 4) for the lightweight typing overlay -- only
-    /// ever shown while `isControllingRemotely`, paired top-trailing against
-    /// `remoteControlToggle`'s top-leading position.
+    /// Displays the remote-typing toggle while hands-on control is active.
     @ViewBuilder
     private var remoteTypeToggle: some View {
         if isControllingRemotely {
@@ -2153,26 +2104,10 @@ struct MainView: View {
         }
     }
 
-    /// The lightweight, translucent, non-blocking floating text-entry bar
-    /// (task 4): shown while controlling remotely AND `showRemoteTypeOverlay`
-    /// is on. Bound to the SAME `promptText`/`sendLivePrompt()` path the
-    /// regular command bar uses -- `sendLivePrompt`'s existing
-    /// `isControllingRemotely` branch already routes typed text as
-    /// `.remoteControl(.text(...))`, so this overlay is purely an
-    /// alternative, more-discoverable UI surface over that one mechanism,
-    /// never a duplicate send path. Bounded height (a single-line field, not
-    /// the multi-line command-bar editor) so it only ever covers a small
-    /// strip of the live view.
-    ///
-    /// Deliberately styled in the SAME orange this app already uses for every
-    /// other "you are actively remote-controlling" signal (the toggle icon,
-    /// the "You're in control" banner) -- a leading cursor glyph plus an
-    /// orange-tinted border, instead of the command bar's neutral white/gray
-    /// chrome -- so a glance distinguishes "typing into the remote screen"
-    /// from "composing a new agent task" even before reading the placeholder
-    /// text. Its keyboard-rise is ALSO independently animated from the
-    /// command bar's (see `remoteTypeBarShift`'s doc) -- the two typing
-    /// interactions look and move differently on purpose.
+    /// Displays a single-line typing bar over the media stream during hands-on control.
+    /// Text uses the existing remote-control send path.
+    /// Orange styling distinguishes remote typing from agent prompts.
+    /// Only the bar moves above the keyboard.
     private var remoteTypeBar: some View {
         HStack(spacing: 10) {
             Image(systemName: "cursorarrow.rays")
@@ -2227,9 +2162,9 @@ struct MainView: View {
         .shadow(color: .black.opacity(0.4), radius: 14, y: 4)
     }
 
-    /// Enter/exit hands-on control: send `takeControl`/`releaseControl`, and on
-    /// entry reset zoom/pan so touch coordinates map 1:1 to the video (the
-    /// daemon pauses any active agent turn on `takeControl`).
+    /// Enters or leaves hands-on remote control.
+    /// Entry resets zoom and pan before it sends `takeControl`.
+    /// Exit sends `releaseControl` and closes the typing overlay.
     private func toggleRemoteControl() {
         isControllingRemotely.toggle()
         if isControllingRemotely {
@@ -2280,29 +2215,39 @@ struct MainView: View {
         dispatchPrompt(trimmed)
     }
 
-    /// Sends `trimmed` as the real prompt/redirect (the original send path).
+    /// Sends a new prompt or redirects the active task.
     private func dispatchPrompt(_ trimmed: String) {
-        lastSentTask = .prompt(text: trimmed)
-        // Best-effort recent-prompts history (SwiftData); never blocks the send.
         RecentPromptsRepository().record(trimmed)
-        // The orb visibly reacts to every send; apps named in the prompt
-        // orbit it while it "thinks" (OrbEffects.swift).
         orbEffects.react(to: trimmed)
-        if isTaskActive || isTaskPaused {
-            sendControlMessage(.redirect(text: trimmed))
-            log(.status(text: "→ redirect: \(trimmed)"))
-        } else {
-            sendControlMessage(.prompt(text: trimmed))
-            log(.status(text: "→ live prompt: \(trimmed)"))
+        if executionMode == "legacy_holo" {
+            let legacyMessage: ClientMessage = (isTaskActive || isTaskPaused)
+                ? .redirect(text: trimmed)
+                : .prompt(text: trimmed)
+            lastSentTask = legacyMessage
+            sendControlMessage(legacyMessage)
+            log(.status(text: isTaskActive || isTaskPaused
+                ? "→ legacy Holo redirect: \(trimmed)"
+                : "→ legacy Holo prompt: \(trimmed)"))
+            isTaskPaused = false
+            activeInputRequestID = nil
+            session = .connecting
+            return
         }
+
+        let typed = ClientMessage.typedPrompt(TypedPrompt(
+            goalId: "goal-\(UUID().uuidString.lowercased())",
+            instruction: trimmed
+        ))
+        lastSentTask = typed
+        sendControlMessage(typed)
+        log(.status(text: "→ safe typed goal: \(trimmed)"))
         isTaskPaused = false
         activeInputRequestID = nil
         session = .connecting
     }
 
-    /// Kicks off clarification for `prompt`: sends a ClarifyRequest, shows the
-    /// thinking state, and starts a timeout that falls back to a direct send so
-    /// a prompt is never lost if the daemon never answers.
+    /// Requests clarification and displays progress.
+    /// After 25 seconds without questions, sends the original prompt directly.
     private func beginClarify(_ prompt: String) {
         pendingClarifyPrompt = prompt
         clarifyQuestions = []
@@ -2319,8 +2264,8 @@ struct MainView: View {
         }
     }
 
-    /// The daemon answered a ClarifyRequest. Empty -> the prompt was clear, send
-    /// it directly. Non-empty -> present the panel for the user to answer.
+    /// Applies clarification questions from the daemon.
+    /// An empty array sends the original prompt directly.
     private func applyClarifyQuestions(_ questions: [ClarifyingQuestion]) {
         guard let prompt = pendingClarifyPrompt else { return }
         isClarifying = false
@@ -2332,7 +2277,7 @@ struct MainView: View {
         }
     }
 
-    /// Continue tapped in the panel: compose the clarified prompt + send it.
+    /// Combines clarification answers with the original prompt and sends the result.
     private func submitClarification(_ answers: [(question: String, answer: String)]) {
         guard let prompt = pendingClarifyPrompt else { return }
         let clarified = ClarifyComposer.compose(original: prompt, answers: answers)
@@ -2341,8 +2286,7 @@ struct MainView: View {
         dispatchPrompt(clarified)
     }
 
-    /// Dismiss the panel without running anything (the original prompt is
-    /// dropped; the user can retype).
+    /// Cancels clarification and discards the pending prompt.
     private func cancelClarification() {
         pendingClarifyPrompt = nil
         clarifyQuestions = []
@@ -2363,37 +2307,26 @@ struct MainView: View {
 
     // MARK: - Control-channel send helpers
 
-    /// Sends one `ClientMessage` to the daemon through the control-channel seam
-    /// (`controlChannel`). The seam encodes it to its `PROTOCOL.md` NDJSON wire
-    /// form and (today) surfaces it in the log panel; the real `iroh` transport
-    /// drops in behind this same call later. This is the single place the UI
-    /// hands a message to the transport, so every outbound message -- the
-    /// kill-switch `.stop`, prompts, transcripts -- goes through one path.
+    /// Sends one message through the selected control-channel sender.
+    /// Connected sessions use the bridge.
+    /// Bridge-less or disconnected sessions record bounded metadata locally.
     private func sendControlMessage(_ message: ClientMessage) {
+        guard !message.requiresAutonomousHolo || autonomousExecutionPermitted else {
+            log(.status(text: "restricted mode: autonomous execution unavailable"))
+            return
+        }
         controlChannel.send(message)
     }
 
-    /// Sends the remote kill-switch `ClientMessage.stop`. Wired to every Cancel
-    /// control (Working/Connecting/Input-needed/Draft-ready) -- see
-    /// `sessionActions.cancel`. The nil contextId is the global form: the daemon
-    /// first scoped-cancels the running turn via its own resolved A2A ids, then
-    /// drains the queue and engages the `holo stop` kill switch
-    /// (`mac-daemon`'s `HoloControlBridge::handle_stop`).
+    /// Sends the global daemon stop message with no context identifier.
+    /// All task Cancel controls use this method.
     private func sendStop() {
         sendControlMessage(.stop(contextId: nil))
     }
 
     // MARK: - Log helper
 
-    /// Newest-N ring cap for the status log.
-    ///
-    /// `logEntries` had five append sites and no removals, so it grew for the
-    /// entire life of a session — which on this product is the steady state, not
-    /// an edge case: people leave the mirror open. Every append also re-evaluates
-    /// this view's body, so an ever-longer array made that steadily more
-    /// expensive. 200 is far more history than the UI ever shows (the controls
-    /// sheet scrolls, the removed fullscreen feed showed 5) while making the cost
-    /// constant instead of unbounded.
+    /// Limits status history to the newest 200 entries.
     private static let maxLogEntries = 200
 
     private func log(_ message: ServerMessage) {

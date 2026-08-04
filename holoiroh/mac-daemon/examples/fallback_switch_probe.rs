@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use holoiroh_daemon::holo_bridge::{ControlEvent, ControlMessage, HoloBridge, InferenceTarget};
-use holoiroh_daemon::tinfoil_proxy::{DEFAULT_UPSTREAM, TinfoilProxy};
+use holoiroh_daemon::tinfoil_client::TinfoilClient;
+use holoiroh_daemon::tinfoil_proxy::TinfoilProxy;
 use tokio::sync::mpsc;
 
 const PROBE_A2A_PORT: u16 = 18791;
@@ -35,7 +36,8 @@ async fn main() -> Result<()> {
         .context("TINFOIL_API_KEY missing -- put it in mac-daemon/.env")?;
     unsafe { std::env::set_var("HOLOIROH_AGENT_RUNTIME_PORT", PROBE_RUNTIME_PORT) };
 
-    let proxy = TinfoilProxy::spawn(DEFAULT_UPSTREAM, key.trim()).await?;
+    let client = Arc::new(TinfoilClient::new(key.trim().to_string()).await?);
+    let proxy = TinfoilProxy::spawn(client).await?;
     let primary = InferenceTarget {
         // Dead on arrival by construction: port 9 (discard) is never listening on loopback.
         base_url: "http://127.0.0.1:9/v1".to_string(),
@@ -111,9 +113,13 @@ async fn main() -> Result<()> {
     }
 
     if !saw_switch_note || !bridge_answered_ping(answer.as_deref()) {
-        bail!("FAILOVER CHAIN NOT WITNESSED (switch_note={saw_switch_note}, answer={answer:?}, failure={failure:?})");
+        bail!(
+            "FAILOVER CHAIN NOT WITNESSED (switch_note={saw_switch_note}, answer={answer:?}, failure={failure:?})"
+        );
     }
-    println!("LIVE FAILOVER CHAIN: WITNESSED OK (failed turn -> tinfoil switch -> same turn answered)");
+    println!(
+        "LIVE FAILOVER CHAIN: WITNESSED OK (failed turn -> tinfoil switch -> same turn answered)"
+    );
     Ok(())
 }
 

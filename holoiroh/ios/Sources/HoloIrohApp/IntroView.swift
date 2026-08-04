@@ -1,43 +1,28 @@
 import SwiftUI
 
-/// First-launch brand intro: the Aro orb blooms out of a black void with
-/// concentric energy rings and drifting light particles, the "Aro" wordmark
-/// materializes letter by letter, and a tagline settles beneath it -- then it
-/// hands off to the pairing screen (`ContentView` gates and reveals it).
-///
-/// ## Architecture: progress-driven, so it is deterministic and renderable
-/// The visuals are a *pure function* of a single `progress: Double` in `0...1`
-/// (`IntroContent`). The outer `IntroView` is the only thing that turns wall
-/// time into `progress` (a `TimelineView(.animation)`). Splitting it this way
-/// means every visual state is reproducible at any `t` with no timers or
-/// randomness -- which is exactly how the headless `ImageRenderer` witness
-/// renders frames at t = 0.2 / 0.5 / 0.8 / 1.0 off-device.
-///
-/// Considerate by default: a `Skip` affordance (and a tap anywhere) ends it
-/// early, and `accessibilityReduceMotion` collapses the particle/ring motion
-/// into a calm fade so the intro is compelling without being an obstacle.
-
 // MARK: - Easing / segment helpers
 
-/// Fraction of the window `[a, b]` completed at `t`, clamped to `0...1`.
+/// Returns the completed fraction of `[a, b]` at `t`, clamped to `0...1`.
 private func seg(_ t: Double, _ a: Double, _ b: Double) -> Double {
     guard b > a else { return t >= b ? 1 : 0 }
     return min(max((t - a) / (b - a), 0), 1)
 }
 
-/// Cubic ease-out -- fast start, gentle settle.
+/// Applies cubic ease-out with a fast start and a gradual stop.
 private func easeOut(_ x: Double) -> Double { 1 - pow(1 - x, 3) }
 
-/// Fractional part, for deterministic per-particle variance from its index.
+/// Returns the fractional part for deterministic particle variation.
 private func frac(_ x: Double) -> Double { x - floor(x) }
 
 // MARK: - Pure visual content
 
-/// The intro rendered at a fixed `progress` -- no state, no timers, no random.
+/// Renders the intro at a fixed progress value without timers or random state.
+/// All visual state derives from `progress` in `0...1`.
+/// This design supports deterministic off-device rendering.
 struct IntroContent: View {
-    /// 0 = pure void, 1 = fully assembled resting state.
+    /// Sets progress from `0` for an empty scene to `1` for the resting scene.
     var progress: Double
-    /// Calm variant: no particles, no expanding rings, gentle fades only.
+    /// Disables particles and expanding rings when Reduce Motion is enabled.
     var reduceMotion: Bool = false
 
     var body: some View {
@@ -193,8 +178,9 @@ struct IntroContent: View {
 
 // MARK: - Driver
 
-/// Turns wall time into `progress` and drives `IntroContent`, then calls
-/// `onFinished`. A tap anywhere or the Skip button ends it early.
+/// Displays the first-launch Aro animation before pairing.
+/// Converts wall time to intro progress and calls `onFinished` at completion.
+/// A tap or the Skip button calls `onFinished` early.
 struct IntroView: View {
     var onFinished: () -> Void
 
@@ -203,7 +189,7 @@ struct IntroView: View {
     @State private var finished = false
     @State private var showSkip = false
 
-    /// Reduce-motion gets a shorter, calmer run.
+    /// Uses a 1.7-second duration with Reduce Motion and 3.3 seconds otherwise.
     private var duration: Double { reduceMotion ? 1.7 : 3.3 }
 
     var body: some View {

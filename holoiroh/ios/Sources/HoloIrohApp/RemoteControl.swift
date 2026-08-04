@@ -1,15 +1,14 @@
 import CoreGraphics
 import Foundation
 
-/// Swift mirror of `holoiroh-wire`'s `RemoteControlEvent` -- the nested action
-/// of `ClientMessage.remoteControl`, sent when the user escalates and touches
-/// the live-share view to drive the Mac directly. Serializes as
-/// `{"action": ..., ...}` with NORMALIZED `0..1` coordinates; the daemon maps
-/// them to real display points (see `PROTOCOL.md` / `mac-daemon/src/remote_input.rs`).
+/// Mirrors the wire-format remote-control action.
+/// The app sends this value inside `ClientMessage.remoteControl`.
+/// Coordinate fields use normalized values from `0` through `1`.
+/// The daemon maps normalized coordinates to display points.
 enum RemoteControlEvent: Codable, Equatable {
-    /// Escalate to hands-on control (the daemon pauses any active agent turn).
+    /// Takes hands-on control and pauses the active agent turn.
     case takeControl
-    /// Release control (the daemon resumes the paused turn).
+    /// Releases hands-on control and resumes the paused agent turn.
     case releaseControl
     case move(x: Double, y: Double)
     case button(x: Double, y: Double, button: MouseButton, down: Bool)
@@ -84,15 +83,10 @@ enum RemoteControlEvent: Codable, Equatable {
     }
 }
 
-/// Map a touch point in the live-view's coordinate space to a NORMALIZED
-/// (`0..1`) point in the video frame, accounting for `AVLayerVideoGravity`
-/// `.resizeAspect` letterboxing: the video is aspect-fit, so there are bars on
-/// the axis where the view aspect differs from the frame aspect, and a touch in
-/// a bar is outside the video. Returns `nil` for a bar touch (or bad sizes) so
-/// the caller can ignore it rather than send a wildly-off coordinate.
-///
-/// Pure and self-contained so it is exercised directly by the app's own
-/// build-time sanity checks -- no view or device needed.
+/// Maps a viewport touch to normalized media-stream coordinates.
+/// The function accounts for aspect-fit letterboxing.
+/// It returns `nil` for touches outside the video image.
+/// It also returns `nil` when a size is not positive.
 func normalizedInVideo(touch: CGPoint, viewSize: CGSize, frameSize: CGSize) -> CGPoint? {
     guard let n = videoRelativePoint(touch: touch, viewSize: viewSize, frameSize: frameSize) else {
         return nil
@@ -103,14 +97,9 @@ func normalizedInVideo(touch: CGPoint, viewSize: CGSize, frameSize: CGSize) -> C
     return n
 }
 
-/// The same mapping, except a touch that strays into the letterbox slides along the nearest
-/// video edge instead of vanishing.
-///
-/// Dropping those touches froze the cursor mid-drag: the aspect-fit bars sit exactly where a
-/// thumb travels on a phone, and a wide desktop letterboxed into a short viewport puts them
-/// within easy reach of any vertical drag. Sliding along the edge is also what a real trackpad
-/// does when the pointer reaches the side of the screen, so it reads as continuous rather than
-/// stuck. Returns `nil` only for degenerate sizes, where there is no video rect at all.
+/// Maps a viewport touch to normalized media-stream coordinates.
+/// The function clamps letterbox touches to the nearest video edge.
+/// It returns `nil` when a size is not positive.
 func normalizedInVideoClampedToEdges(touch: CGPoint, viewSize: CGSize, frameSize: CGSize) -> CGPoint? {
     guard let n = videoRelativePoint(touch: touch, viewSize: viewSize, frameSize: frameSize) else {
         return nil
@@ -118,9 +107,9 @@ func normalizedInVideoClampedToEdges(touch: CGPoint, viewSize: CGSize, frameSize
     return CGPoint(x: min(max(n.x, 0), 1), y: min(max(n.y, 0), 1))
 }
 
-/// The touch's position relative to the aspect-fit video rect, in `0..1` units of that rect --
-/// outside `0..1` when the touch is in a letterbox bar. The one place the aspect-fit geometry
-/// is computed, so the strict and clamped mappings can never disagree about where the image is.
+/// Calculates a touch position relative to the aspect-fit video rectangle.
+/// Values outside `0...1` identify touches in letterbox bars.
+/// It returns `nil` when a size is not positive.
 func videoRelativePoint(touch: CGPoint, viewSize: CGSize, frameSize: CGSize) -> CGPoint? {
     guard viewSize.width > 0, viewSize.height > 0, frameSize.width > 0, frameSize.height > 0 else {
         return nil
@@ -147,25 +136,26 @@ func videoRelativePoint(touch: CGPoint, viewSize: CGSize, frameSize: CGSize) -> 
 import SwiftUI
 import UIKit
 
-/// A transparent touch surface laid over the live-share video while the user is
-/// in hands-on control. Translates gestures into `RemoteControlEvent`s with
-/// letterbox-correct normalized coordinates (via `normalizedInVideo`):
-/// - a tap -> a click at that point,
-/// - a one-finger drag -> button-down, moves, button-up (pointer/drag),
-/// - a two-finger drag -> scroll by the pan delta.
+/// Converts gestures over the media stream into remote-control actions.
 ///
-/// UIKit-backed (a `UIViewRepresentable`) because SwiftUI gestures can't cleanly
-/// distinguish finger count, which is exactly what separates "move the pointer"
-/// from "scroll".
+/// The surface supports these gestures:
+///
+/// - A tap sends a primary click.
+/// - A one-finger drag sends a primary-button drag.
+/// - A two-finger tap sends a secondary click.
+/// - A two-finger drag sends scroll deltas.
+/// - Pointer hover sends cursor movement.
+///
+/// UIKit distinguishes the required touch counts and pointer input sources.
 struct RemoteControlSurface: UIViewRepresentable {
-    /// The most recent video frame's pixel size, for the aspect-fit mapping.
-    /// `nil` falls back to filling the view (no letterbox correction).
+    /// Provides the latest video-frame size for aspect-fit mapping.
+    /// A `nil` value uses the viewport size.
     var frameSize: CGSize?
-    /// The live pinch-zoom the video underneath is rendered at.
+    /// Provides the current video zoom scale.
     var zoom: CGFloat = 1
-    /// The live pan the video underneath is rendered at.
+    /// Provides the current video pan offset.
     var pan: CGSize = .zero
-    /// Sends one remote-control action over the control channel.
+    /// Sends one action over the control channel.
     var onEvent: (RemoteControlEvent) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -287,36 +277,20 @@ struct RemoteControlSurface: UIViewRepresentable {
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var parent: RemoteControlSurface
         private var oneFingerDown = false
-        /// Last touch point that was actually over the video image, in
-        /// normalized coordinates. Used to release the mouse button when a drag
-        /// ends out in the letterbox, where there is no valid current point —
-        /// see `onPan1`.
+        /// Stores the last normalized point for a primary-button release.
+        /// The drag can end where no current point is valid.
         private var lastInVideo: CGPoint?
-        /// The silent pinch detector, consulted by `onPan2` to suppress scroll
-        /// while a pinch is in flight. Held weakly: the recognizer is owned by
-        /// the view, which owns the coordinator.
+        /// Detects an active pinch before `onPan2` emits scroll events.
+        /// The view owns this recognizer.
         weak var pinch: UIPinchGestureRecognizer?
-        /// The one pair that must NOT recognize together -- see
-        /// `shouldRecognizeSimultaneouslyWith`. Weak for the same reason as `pinch`.
+        /// Identifies the two-finger tap recognizer used in gesture arbitration.
         weak var rightTap: UITapGestureRecognizer?
         weak var pan2: UIPanGestureRecognizer?
         init(_ parent: RemoteControlSurface) { self.parent = parent }
 
-        /// Simultaneous recognition is allowed for every pair EXCEPT two-finger-tap against
-        /// two-finger-scroll.
-        ///
-        /// The permissive default exists for a real reason -- see the doc on
-        /// `[tap, rightTap, pan1, pan2, pinch].forEach { $0.delegate = ... }` in `makeUIView`:
-        /// without it, UIKit treats these as mutually exclusive with recognizers on OTHER views
-        /// and silently kills the SwiftUI `MagnificationGesture` this surface floats over. It is
-        /// also what lets `onPan2` consult a live `pinch` state to suppress stray scroll, which
-        /// only works because both recognize at once.
-        ///
-        /// But "allow everything" was too broad for the pair added with right-click. A two-finger
-        /// tap that drifts past the pan threshold satisfies BOTH recognizers, and with simultaneous
-        /// recognition enabled that is not an arbitration UIKit resolves -- both fire, sending a
-        /// `.scroll` and a right `.click` for one gesture. Excluding exactly this pair leaves every
-        /// other pairing, and the cross-view case, untouched.
+        /// Allows simultaneous gesture recognition except between two-finger tap and scroll.
+        /// This exception prevents one gesture from sending both actions.
+        /// Cross-view recognition remains enabled for the SwiftUI magnification gesture.
         func gestureRecognizer(
             _ gestureRecognizer: UIGestureRecognizer,
             shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
@@ -332,16 +306,15 @@ struct RemoteControlSurface: UIViewRepresentable {
             return (a === rightTap && b === pan2) || (a === pan2 && b === rightTap)
         }
 
-        /// This surface is laid over the pan/zoom view but is NOT inside its scaled subtree, so
-        /// UIKit hands us raw viewport coordinates while the video underneath is scaled and
-        /// offset. Undoing that transform first is what makes aiming while zoomed land where the
-        /// user is looking -- and what turns a zoomed view into finer cursor control.
+        /// Converts a viewport point to strict normalized video coordinates.
+        /// The remote-control surface remains outside the transformed video subtree.
+        /// This function first removes the current video transform.
         private func normalized(_ p: CGPoint, in view: UIView) -> CGPoint? {
             mapped(p, in: view, clampingToEdges: false)
         }
 
-        /// The mapping used by the drag gestures, where a touch straying into the letterbox
-        /// should slide the cursor along the video edge rather than freeze it.
+        /// Converts a drag point to normalized video coordinates.
+        /// The function clamps letterbox touches to the nearest video edge.
         private func normalizedClamped(_ p: CGPoint, in view: UIView) -> CGPoint? {
             mapped(p, in: view, clampingToEdges: true)
         }
@@ -363,10 +336,8 @@ struct RemoteControlSurface: UIViewRepresentable {
         // MagnificationGesture elsewhere in the view hierarchy.
         @objc func onPinchNoop(_ g: UIPinchGestureRecognizer) {}
 
-        /// The remote cursor is the only signal that a tap registered, and it is a few hundred
-        /// milliseconds of network and video encoding away. A tap that seems to do nothing gets
-        /// tapped again, which is how a laggy link turns into accidental double-clicks. The
-        /// haptic confirms locally and immediately that the tap was accepted and sent.
+        /// Provides immediate local confirmation after the app sends a click.
+        /// Remote visual feedback can arrive later through the media stream.
         private let clickHaptics = UIImpactFeedbackGenerator(style: .light)
 
         func prepareHaptics() {
@@ -384,34 +355,26 @@ struct RemoteControlSurface: UIViewRepresentable {
             confirmSent()
         }
 
-        /// Sends `count: 1`; the daemon derives the real click state from how soon and how near
-        /// the previous click was, exactly as the window server does for a real mouse. Waiting
-        /// out the double-click window here instead would put half a second of dead time on
-        /// every single tap.
+        /// Sends a secondary click with `count` set to `1`.
+        /// The daemon derives repeated-click state from timing and position.
         @objc func onTwoFingerTap(_ g: UITapGestureRecognizer) {
             guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
             parent.onEvent(.click(x: Double(n.x), y: Double(n.y), button: .right, count: 1))
             confirmSent()
         }
 
-        /// A real mouse/trackpad's secondary button, via `buttonMaskRequired = .secondary` on
-        /// `pointerRightClick`. Separate handler from `onTwoFingerTap` (not a shared one) even
-        /// though both ultimately send the same `.click(button: .right)`, so each recognizer's
-        /// own input-source guarantee (finger vs. pointer device) stays explicit at the call
-        /// site rather than folded into one function two different gestures happen to reach.
+        /// Handles a secondary click from a physical pointer device.
+        /// `pointerRightClick` restricts this handler to the secondary button.
+        /// Two-finger touch taps use `onTwoFingerTap`.
         @objc func onPointerRightClick(_ g: UITapGestureRecognizer) {
             guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
             parent.onEvent(.click(x: Double(n.x), y: Double(n.y), button: .right, count: 1))
             confirmSent()
         }
 
-        /// Pure pointer movement from an attached trackpad/mouse -- no button involved, so this
-        /// only ever sends `.move`, never `.button`. `UIHoverGestureRecognizer` fires
-        /// continuously while an indirect pointer device moves over the view with nothing
-        /// pressed; `onPan1` remains the only path that presses/releases the left button (a
-        /// pointer device's actual click still arrives as a touch through `onPan1`/`onTap`, same
-        /// as today -- iPadOS delivers a pointer click as a normal `.direct`-equivalent touch
-        /// sequence, hover is purely the "aiming" motion in between).
+        /// Sends pointer movement without a button action.
+        /// `UIHoverGestureRecognizer` supplies events from an indirect pointer device.
+        /// Primary-button actions remain in the tap and one-finger pan handlers.
         @objc func onHover(_ g: UIHoverGestureRecognizer) {
             guard let v = g.view, let n = normalized(g.location(in: v), in: v) else { return }
             switch g.state {
@@ -489,11 +452,9 @@ struct RemoteControlSurface: UIViewRepresentable {
             }
         }
 
-        /// Translates one physical key press/release into a remote-control event, if this key
-        /// is one this app forwards at all. Returns whether it was handled, so
-        /// `RemoteControlInputView` can fall through to `super` for anything it doesn't
-        /// recognize (an unhandled key should behave as if this view weren't intercepting
-        /// presses at all, not silently vanish).
+        /// Converts one physical key transition to a remote-control event.
+        /// It returns `true` when the app forwards the key.
+        /// It returns `false` when normal responder handling must continue.
         @discardableResult
         func handleKeyPress(_ key: UIKey, down: Bool) -> Bool {
             if let modifierName = RemoteControlInputView.modifierName(for: key.keyCode) {
@@ -527,11 +488,9 @@ struct RemoteControlSurface: UIViewRepresentable {
     }
 }
 
-/// Backs `RemoteControlSurface`'s view: a plain `UIView` cannot become first responder or
-/// receive `UIPress` events, and hardware-keyboard input only ever arrives at the first
-/// responder. Becomes first responder as soon as it's placed in a window (remote control is
-/// only ever shown while actively controlling, so there is no "sometimes wired up" state to
-/// track) and forwards every `UIKey` press to the coordinator via `handleKeyPress`.
+/// Receives hardware-keyboard presses for `RemoteControlSurface`.
+/// The view becomes first responder when it enters a window.
+/// It forwards supported keys through `Coordinator.handleKeyPress`.
 final class RemoteControlInputView: UIView {
     weak var coordinator: RemoteControlSurface.Coordinator?
 
@@ -542,6 +501,11 @@ final class RemoteControlInputView: UIView {
         if window != nil {
             becomeFirstResponder()
         }
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        becomeFirstResponder()
+        super.touchesBegan(touches, with: event)
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -570,10 +534,9 @@ final class RemoteControlInputView: UIView {
         super.pressesCancelled(presses, with: event)
     }
 
-    /// Maps a modifier key's own `UIKeyboardHIDUsage` to the daemon's held-modifier name
-    /// (`remote_input.rs::key`'s `"cmd"`/`"ctrl"`/`"opt"`/`"shift"`), or `nil` for a non-modifier
-    /// key. Left/right variants are folded together -- the daemon (and macOS shortcut handling
-    /// generally) treats either side identically.
+    /// Maps a modifier usage to the daemon's held-modifier name.
+    /// It combines left and right variants.
+    /// It returns `nil` for other keys.
     static func modifierName(for keyCode: UIKeyboardHIDUsage) -> String? {
         switch keyCode {
         case .keyboardLeftGUI, .keyboardRightGUI: return "cmd"
@@ -584,10 +547,8 @@ final class RemoteControlInputView: UIView {
         }
     }
 
-    /// Maps a non-printable special key's `UIKeyboardHIDUsage` to the daemon's key name (the
-    /// same table `remote_input.rs::keycode` accepts), or `nil` for anything with a printable
-    /// character representation (those go through `charactersIgnoringModifiers`/`characters`
-    /// instead, in `Coordinator.handleKeyPress`).
+    /// Maps a nonprinting key usage to the daemon's key name.
+    /// It returns `nil` for keys that use a character representation.
     static func specialKeyName(for keyCode: UIKeyboardHIDUsage) -> String? {
         switch keyCode {
         case .keyboardEscape: return "escape"

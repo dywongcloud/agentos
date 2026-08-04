@@ -1,13 +1,15 @@
-//! Spawns and supervises `holo serve` as a managed child process. It also recovers the bearer
-//! token it prints to stderr on startup.
+//! Spawns and supervises `holo serve` as a managed child process. It supplies the bearer token
+//! and the bridge-owned inherited A2A listener.
 //!
 //! ## Source grounding
 //!
-//! Verified directly against `hcompai/holo-desktop-cli` source
-//! (`src/holo_desktop/cli/serve.py`, commit reachable from `main` as of 2026-07-17):
+//! Verified directly against the installed `holo-desktop-cli==0.0.2` source
+//! (`holo_desktop/cli/serve.py`) and its installed `uvicorn==0.51.0`:
 //!
-//! - `holo serve` binds `127.0.0.1:<port>` (default port 18794, `A2A_DEFAULT_PORT` in
-//!   `serve.py`). It serves both the A2A JSON-RPC surface and a plain `/health` route.
+//! - `holo serve` serves `127.0.0.1:<port>` (default port 18794, `A2A_DEFAULT_PORT`).
+//!   Version 0.0.2 performs a plain preliminary bind probe before `uvicorn.run`. That probe is
+//!   the EADDRINUSE restart bug. Uvicorn itself supports `fd=` and duplicates the inherited
+//!   listener with `socket.fromfd`; it is not the source of the SO_REUSEADDR mismatch.
 //! - Every route except `/health` requires `Authorization: Bearer <token>`
 //!   (`BearerAuthMiddleware` in `serve.py`).
 //! - The token comes from the `HOLO_AUTH_TOKEN` env var if set (`ServeSettings.auth_token`
@@ -24,14 +26,12 @@
 //!   module instead **always sets `HOLO_AUTH_TOKEN` itself** before spawning, generating a
 //!   fresh random token daemon-side. This sidesteps stderr-scraping entirely and is strictly
 //!   more robust than depending on the printed line's format not changing across releases.
-//!   (This module keeps the stderr-parsing fallback path, gated off by default. It exists only
-//!   for the case where an operator points this daemon at a `holo serve` invocation it did not
-//!   itself launch.)
 //! - Health check: `GET /health` (no auth) returns
 //!   `{"service": "holo-desktop", "status": "ok", "version": "<semver>"}`. This happens once
 //!   `HoloExecutor.startup()` spawns or attaches the underlying `hai-agent-runtime` binary, and
-//!   the Starlette app finishes its lifespan startup. Before that, connections are simply
-//!   refused (nothing is bound yet).
+//!   the Starlette app finishes its lifespan startup. The Rust parent is already listening while
+//!   the child starts. Connections can therefore wait in the kernel accept queue. Each health
+//!   request is bounded to two seconds and total startup is bounded to 90 seconds.
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +43,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
 use crate::holo_bridge::a2a_client::A2aClient;
+use crate::holo_bridge::listener::{HoloA2aListener, inherited_holo_command};
 
 /// This process-wide guard ensures at most one `holo serve` child is ever tracked as running by
 /// this daemon at a time. [`HoloServeProcess::spawn`] refuses to spawn a second child while this
@@ -205,23 +206,21 @@ pub const HOLO_SERVE_DEFAULT_PORT: u16 = 18794;
 /// itself may need to download on first run (`runtime_install.py`), so this is generous. It is
 /// longer than the ~45s `SPAWN_TIMEOUT_S` the CLI's own inner spawn uses for the runtime
 /// binary. This leaves room for the outer `holo serve` process startup, on top of that.
-pub const SPAWN_RETRY_BACKOFF: Duration = Duration::from_millis(2000);
-
-pub const LONGEST_OBSERVED_PORT_HOLD_AFTER_KILL: Duration = Duration::from_secs(30);
-
-pub const MAX_SPAWN_ATTEMPTS: u32 = 2
-    * (LONGEST_OBSERVED_PORT_HOLD_AFTER_KILL.as_millis() / SPAWN_RETRY_BACKOFF.as_millis()) as u32;
-
-pub const fn total_spawn_retry_budget() -> Duration {
-    Duration::from_millis(SPAWN_RETRY_BACKOFF.as_millis() as u64 * MAX_SPAWN_ATTEMPTS as u64)
-}
-
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
+const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+#[derive(serde::Deserialize)]
+struct HealthResponse {
+    service: String,
+    status: String,
+    version: String,
+}
 
 /// A running `holo serve` child process plus everything needed to talk to it.
 pub struct HoloServeProcess {
     child: Child,
+    _standalone_listener: Option<HoloA2aListener>,
     /// This field is not read internally today (`base_url` already embeds it). It stays as a
     /// plain field for diagnostics/logging call sites that want the bare port number, without
     /// re-parsing it out of `base_url`.
@@ -238,12 +237,10 @@ pub struct HoloServeProcess {
 }
 
 impl HoloServeProcess {
-    /// Build the exact [`Command`] the daemon would spawn for `holo serve`, **without spawning
-    /// it** and without generating a token (the token is generated per-spawn inside
-    /// [`Self::spawn`]). This is the single source of truth for the `holo serve` invocation so the
-    /// argument list and inference-redirect env can be inspected on their own -- see
-    /// `examples/local_model_probe.rs`, which calls this to witness that `--base-url` is present
-    /// and `HAI_AGENT_RUNTIME_BASE_URL` (not `HAI_BASE_URL`) is set for the local path.
+    /// Build the equivalent upstream `holo serve` command without spawning it. This inspection
+    /// helper preserves the existing example-probe API. Production child creation runs the
+    /// repository shim through [`inherited_holo_command`], while both paths share
+    /// [`Self::configure_serve_command`] for every serve argument and inference environment value.
     ///
     /// `local_base_url` is `Some(url)` when inference should go to a local OpenAI-compatible server
     /// (alpha's local `llama-server`, or the loopback tinfoil fallback proxy -- see
@@ -268,7 +265,19 @@ impl HoloServeProcess {
         auth_token: &str,
     ) -> Command {
         let mut cmd = Command::new(holo_bin);
-        cmd.arg("serve").arg("--port").arg(port.to_string());
+        cmd.arg("serve");
+        Self::configure_serve_command(&mut cmd, port, local_base_url, model_override, auth_token);
+        cmd
+    }
+
+    fn configure_serve_command(
+        cmd: &mut Command,
+        port: u16,
+        local_base_url: Option<&str>,
+        model_override: Option<&str>,
+        auth_token: &str,
+    ) {
+        cmd.arg("--port").arg(port.to_string());
         if let Some(url) = local_base_url {
             // `holo serve`'s `serve()` accepts `--base-url` as a real tyro CLI arg (cli/serve.py),
             // threaded to the agent runtime as HAI_AGENT_RUNTIME_BASE_URL.
@@ -291,134 +300,94 @@ impl HoloServeProcess {
         // `holo` sessions silently discards every backend setting above.
         cmd.env(HAI_RUNTIME_PORT_ENV, daemon_runtime_port().to_string());
         cmd.env(HOLO_AUTH_TOKEN_ENV, auth_token);
-        cmd
     }
 
     /// Spawn `holo serve --port <port>` as a managed subprocess, generating our own bearer
     /// token and exporting it via `HOLO_AUTH_TOKEN` so no stderr-scraping is needed. Waits for
     /// `/health` to report ok before returning.
     ///
-    /// `holo_bin` is the path to (or bare name of) the `holo` CLI executable; resolved via
-    /// `PATH` by `tokio::process::Command` when it's a bare name like `"holo"`. `local_base_url`
-    /// points inference at a local OpenAI-compatible server when `Some` (alpha's local path);
-    /// see [`Self::build_command`].
+    /// `holo_bin` is the path to (or bare name of) the `holo` CLI launcher. The inherited-listener
+    /// helper resolves its Python shebang so the embedded compatibility shim runs inside the same
+    /// installed environment. `local_base_url` points inference at a local OpenAI-compatible server
+    /// when `Some` (alpha's local path); see [`Self::build_command`].
+    /// Standalone compatibility entry point for examples that manage one process directly. It
+    /// owns its listener in the returned process. [`crate::holo_bridge::HoloBridge`] instead calls
+    /// [`Self::spawn_on_listener`] so one bridge-owned listener survives child replacement.
     pub async fn spawn(
         holo_bin: &str,
         port: u16,
         local_base_url: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Self> {
-        // Refuse to double-spawn: at most one `holo serve` child may be tracked as running by
-        // this daemon at a time (see `HOLO_SERVE_RUNNING` / `GuardClaim` docs). The claim is an
-        // owned token: any early `?`/`bail!` below drops it, releasing the guard automatically --
-        // no manual store-on-error path to forget.
+        let listener = HoloA2aListener::bind(port)?;
+        let mut process =
+            Self::spawn_on_listener(holo_bin, &listener, local_base_url, model_override).await?;
+        process._standalone_listener = Some(listener);
+        Ok(process)
+    }
+
+    /// Spawn one managed child against a listener owned by its caller.
+    pub async fn spawn_on_listener(
+        holo_bin: &str,
+        listener: &HoloA2aListener,
+        local_base_url: Option<&str>,
+        model_override: Option<&str>,
+    ) -> Result<Self> {
         let Some(guard) = GuardClaim::try_acquire() else {
             bail!(
                 "holo serve is already running (tracked child process exists); refusing to spawn a second instance"
             );
         };
 
-        let mut process = Self::spawn_inner(holo_bin, port, local_base_url, model_override).await?;
+        let mut process =
+            Self::spawn_inner(holo_bin, listener, local_base_url, model_override).await?;
         process.guard = Some(guard);
         Ok(process)
     }
 
     async fn spawn_inner(
         holo_bin: &str,
-        port: u16,
+        listener: &HoloA2aListener,
         local_base_url: Option<&str>,
         model_override: Option<&str>,
     ) -> Result<Self> {
         let auth_token = generate_token();
+        let port = listener.port();
         let base_url = format!("http://127.0.0.1:{port}");
-
-        // Retried up to 8 times over ~8s: witnessed live that a daemon RESTART shortly after a
-        // clean SIGTERM shutdown of a PRIOR daemon can hit this port transiently unbindable --
-        // not by our own Rust-side preflight (a bare `TcpListener::bind` succeeds fine, since
-        // Rust sets SO_REUSEADDR by default), but by `holo serve`'s own Python HTTP server underneath
-        // it, which does NOT set SO_REUSEADDR and so refuses to bind while the just-killed prior
-        // `holo serve`'s connections are still draining through TCP TIME_WAIT (witnessed: up to
-        // ~6s for TIME_WAIT to clear on this port after a graceful shutdown). A single-shot spawn
-        // attempt turned an ordinary quick restart into a hard failure ("holo serve exited during
-        // startup" with the process's own "[Errno 48] Address already in use" on stderr), control
-        // channel never mounted, every phone connection then rejected at the QUIC ALPN level
-        // (error 120: peer doesn't support any known protocol) since CONTROL_ALPN was never
-        // registered on the router. Retrying the WHOLE spawn+health-wait (not just a Rust-side
-        // bind preflight, which cannot see holo serve's own SO_REUSEADDR-less bind failure) is
-        // the only retry shape that actually closes this race. A port genuinely held by an
-        // unrelated long-lived process still fails after the retry budget, with the real
-        // holo-serve-reported reason surfaced.
-        let mut last_spawn_err = None;
-        for attempt in 1..=MAX_SPAWN_ATTEMPTS {
-            match Self::spawn_attempt(holo_bin, port, local_base_url, model_override, &auth_token, &base_url).await
-            {
-                Ok(child) => return Ok(child),
-                Err(err) => {
-                    tracing::warn!(
-                        attempt,
-                        max_attempts = MAX_SPAWN_ATTEMPTS,
-                        error = %format!("{err:#}"),
-                        "holo serve spawn attempt failed, retrying after backoff"
-                    );
-                    last_spawn_err = Some(err);
-                    if attempt < MAX_SPAWN_ATTEMPTS {
-                        tokio::time::sleep(SPAWN_RETRY_BACKOFF).await;
-                    }
-                }
-            }
-        }
-        let exhausted = last_spawn_err
-            .expect("loop runs at least once, so an error is always recorded on exhaustion");
-        Err(exhausted.context(format!(
-            "holo serve did not come up within {}s of retries ({} attempts)",
-            total_spawn_retry_budget().as_secs(),
-            MAX_SPAWN_ATTEMPTS
-        )))
+        Self::spawn_attempt(
+            holo_bin,
+            listener,
+            local_base_url,
+            model_override,
+            &auth_token,
+            &base_url,
+        )
+        .await
     }
 
-    /// One attempt to spawn `holo serve` and wait for it to report healthy. Split out of
-    /// [`Self::spawn_inner`] so the caller can retry the WHOLE attempt (fresh process, fresh
-    /// port bind) on failure -- see that function's doc for why a bind-preflight-only retry is
-    /// insufficient.
+    /// Spawns one child against the listener that the bridge already owns, then waits for the
+    /// existing startup health gate. Holo 0.0.2's preliminary bind probe is bypassed by the
+    /// repository compatibility shim; Uvicorn receives the inherited descriptor directly.
     async fn spawn_attempt(
         holo_bin: &str,
-        port: u16,
+        listener: &HoloA2aListener,
         local_base_url: Option<&str>,
         model_override: Option<&str>,
         auth_token: &str,
         base_url: &str,
     ) -> Result<Self> {
-        // Port preflight: if something else is already listening on the port, `holo serve` will
-        // die on bind -- worse, the health probe below polls `http://127.0.0.1:{port}/...`,
-        // which the SQUATTER answers, so without this check the daemon can conclude "healthy"
-        // while its own child is already dead (witnessed live: a stale test stub on 8765 made
-        // the daemon report a healthy bridge, then the health loop found the real child dead
-        // and spun on restarts). Bind-and-release has a small TOCTOU window (holo serve's own
-        // bind is the authoritative check right after this), and a bare Rust bind can succeed
-        // in a SO_REUSEADDR-shaped TIME_WAIT window `holo serve` itself still cannot use -- this
-        // preflight catches the common "genuinely unrelated squatter" case with a fast, clear
-        // error; the TIME_WAIT-vs-holo-serve race is instead closed by `spawn_inner`'s
-        // whole-attempt retry loop around this function.
-        if let Err(err) = std::net::TcpListener::bind(("127.0.0.1", port)) {
-            bail!(
-                "port {port} is already in use by another process ({err}); `holo serve` cannot bind it. \
-                 Find the squatter with `lsof -nP -iTCP:{port} -sTCP:LISTEN`, kill it, or pick a \
-                 different port via HOLOIROH_HOLO_PORT"
-            );
-        }
-
+        let port = listener.port();
         // A stale runtime on the daemon's private port would be silently ATTACHED (backend
         // config discarded) -- reap it so this spawn's config actually applies.
         reap_stale_runtime(daemon_runtime_port());
 
-        // Build the exact command via the shared builder (also used by the verification example),
-        // then add only the stdio/kill-on-drop settings that don't affect the argv/env contract.
-        let mut cmd = Self::build_command(holo_bin, port, local_base_url, model_override, auth_token);
+        let mut cmd = inherited_holo_command(holo_bin, listener)?;
+        Self::configure_serve_command(&mut cmd, port, local_base_url, model_override, auth_token);
         cmd
             // Inherit the parent's env otherwise (HAI_API_KEY when NOT local, etc. from
             // mac-daemon/.env / the launching shell) so `holo serve`'s own settings loader
             // (settings.py) sees the same auth/gateway config the operator configured. When
-            // `local_base_url` is Some, `build_command` has already removed HAI_API_KEY.
+            // `local_base_url` is `Some`, `configure_serve_command` has already removed HAI_API_KEY.
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -449,12 +418,11 @@ impl HoloServeProcess {
 
         Ok(Self {
             child,
+            _standalone_listener: None,
             port,
             base_url: base_url.to_string(),
             auth_token: auth_token.to_string(),
-            // The single-instance claim is attached by `spawn` (the only caller) after this
-            // returns -- `spawn_inner` itself never owns it, so its `?` error paths can't
-            // affect the guard.
+            // The single-instance claim is attached by `spawn_on_listener` after this returns.
             guard: None,
         })
     }
@@ -500,15 +468,13 @@ impl HoloServeProcess {
     /// guard claim, without consuming `self`. This is the backend-switch primitive
     /// (`HoloBridge::switch_backend`): unlike the crash-restart path -- where the child is
     /// already dead and `disarm_guard` alone suffices -- switching inference backends must
-    /// first stop a healthy running `holo serve` so its replacement can bind the same port
-    /// and acquire the guard. The dead process object stays in its slot afterwards; the
-    /// caller swaps in the replacement (exactly the `restart_process` slot discipline).
+    /// first stop a healthy running `holo serve` so only its replacement accepts from the
+    /// inherited listener and acquires the guard. The dead process object stays in its slot
+    /// afterwards; the caller swaps in the replacement.
     pub async fn terminate_in_place(&mut self) -> Result<()> {
-        let result = self.terminate_and_wait().await;
-        // Dropping the claim is the release (same rationale as `shutdown`): the replacement's
-        // `GuardClaim::try_acquire` must not be refused by this now-dead process's claim.
+        self.terminate_and_wait().await?;
         self.guard.take();
-        result
+        Ok(())
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
@@ -543,7 +509,10 @@ impl HoloServeProcess {
             }
             _ => {
                 tracing::warn!("holo serve did not exit within 5s of SIGTERM; killing");
-                self.child.kill().await.context("failed to kill holo serve")?;
+                self.child
+                    .kill()
+                    .await
+                    .context("failed to kill holo serve")?;
                 Ok(())
             }
         }
@@ -567,7 +536,10 @@ impl Drop for HoloServeProcess {
         #[cfg(unix)]
         {
             if let Some(pid) = self.child.id() {
-                tracing::warn!(pid, "HoloServeProcess dropped without shutdown(); sending SIGTERM as a safety net (kill_on_drop will SIGKILL if this doesn't land in time)");
+                tracing::warn!(
+                    pid,
+                    "HoloServeProcess dropped without shutdown(); sending SIGTERM as a safety net (kill_on_drop will SIGKILL if this doesn't land in time)"
+                );
                 // SAFETY: same as in `terminate_and_wait` -- valid pid, well-defined syscall,
                 // ESRCH-on-already-exited is a harmless no-op.
                 unsafe {
@@ -587,37 +559,46 @@ fn generate_token() -> String {
     // the entropy of the CLI's own `secrets.token_urlsafe(32)` generated tokens. This is our own
     // token (see module doc) -- its format has no contract with the CLI beyond "opaque bearer
     // string", so any sufficiently random string is fine.
-    format!(
-        "{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    )
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
 async fn wait_for_health(base_url: &str, child: &mut Child) -> Result<()> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(HEALTH_REQUEST_TIMEOUT)
         .build()
         .context("failed to build health-check HTTP client")?;
     let deadline = Instant::now() + HEALTH_TIMEOUT;
     let health_url = format!("{base_url}/health");
 
     loop {
-        if let Some(status) = child.try_wait().context("failed to poll holo serve child status")? {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to poll holo serve child status")?
+        {
             bail!("holo serve exited during startup with status {status}");
         }
 
-        match client.get(&health_url).send().await {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
-            _ => {}
+        if let Ok(resp) = client.get(&health_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(health) = resp.json::<HealthResponse>().await {
+                    if health.service == "holo-desktop"
+                        && health.status == "ok"
+                        && !health.version.trim().is_empty()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         if Instant::now() >= deadline {
             let _ = child.kill().await;
+            let _ = child.wait().await;
             bail!(
-                "holo serve did not become healthy within {:?} (GET {} never returned 2xx)",
+                "holo serve did not become healthy within {:?} (GET {} never returned the expected JSON within {:?} per request)",
                 HEALTH_TIMEOUT,
-                health_url
+                health_url,
+                HEALTH_REQUEST_TIMEOUT
             );
         }
         sleep(HEALTH_POLL_INTERVAL).await;
@@ -635,7 +616,9 @@ where
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => match level {
-                    tracing::Level::DEBUG => tracing::debug!(target: "holo_bridge::child", "{label}: {line}"),
+                    tracing::Level::DEBUG => {
+                        tracing::debug!(target: "holo_bridge::child", "{label}: {line}")
+                    }
                     _ => tracing::info!(target: "holo_bridge::child", "{label}: {line}"),
                 },
                 Ok(None) => break,

@@ -1,13 +1,11 @@
 import Foundation
 
-/// Combines the user's original instruction with the answers they gave to the
-/// daemon's clarifying questions into a single, clearer instruction that is sent
-/// as the real `ClientMessage.prompt`. Pure + deterministic so it can be
-/// exercised by a standalone harness without any UI.
+/// Combines an instruction with answers to the daemon's clarifying questions.
+/// The operation is deterministic and has no user-interface dependency.
 enum ClarifyComposer {
-    /// `answers` pairs each clarifying question with the user's chosen (or typed
-    /// "something else") answer. Blank answers are dropped. With no usable
-    /// answers the original instruction is returned unchanged.
+    /// Appends each nonblank answer to the trimmed instruction.
+    /// Returns only the trimmed instruction when no usable answer exists.
+    /// A blank question produces a list item that contains only its answer.
     static func compose(original: String, answers: [(question: String, answer: String)]) -> String {
         let resolved = answers.compactMap { pair -> String? in
             let q = pair.question.trimmingCharacters(in: .whitespacesAndNewlines)

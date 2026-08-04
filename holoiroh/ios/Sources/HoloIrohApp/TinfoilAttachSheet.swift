@@ -2,19 +2,18 @@ import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
 
-/// Which Tinfoil-backed attachment flow this sheet is running.
+/// Selects the confidential-inference attachment flow.
 enum TinfoilAttachMode {
     case document
     case image
 }
 
-/// Attach-a-document or attach-an-image sheet: pick a file/photo, optionally add a
-/// prompt/question (image only), send it, and show the result inline. One shared sheet for
-/// both flows since their shape (pick -> send -> show result) is identical; `mode` only changes
-/// which picker and wire message is used.
+/// Selects and sends a document or image for confidential inference.
+/// Image requests can include a question.
+/// The sheet displays the matching result or failure.
 struct TinfoilAttachSheet: View {
     let mode: TinfoilAttachMode
-    /// Sends the composed `ClientMessage` to the daemon.
+    /// Sends the request to the daemon.
     let onSend: (ClientMessage) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -27,8 +26,8 @@ struct TinfoilAttachSheet: View {
     @State private var showFileImporter = false
     @State private var isSending = false
 
-    /// The daemon's reply, set by the caller once `ServerMessage.documentProcessed`/
-    /// `imageAnalyzed` (or their `*Failed` counterparts) arrives for this sheet's `requestId`.
+    /// Contains the daemon result for this `requestId`.
+    /// The caller sets either the success or failure binding.
     @Binding var resultText: String?
     @Binding var resultError: String?
     let requestId: String
@@ -72,7 +71,7 @@ struct TinfoilAttachSheet: View {
                 }
 
                 Section {
-                    Text("This is sent to Tinfoil's confidential-computing cloud for processing. Images are redacted for detected PII on-device before upload.")
+                    Text("This is sent to Tinfoil's confidential-computing cloud for processing. Images are redacted for detected PII on-device before upload. Inspect this connection's cryptographic proof in Diagnostics → Verification Center.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -83,7 +82,10 @@ struct TinfoilAttachSheet: View {
             #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
+                    Button("Cancel") {
+                        isSending = false
+                        dismiss()
+                    }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(isSending ? "Sending…" : "Send") {
@@ -106,6 +108,13 @@ struct TinfoilAttachSheet: View {
                 guard let pickedPhoto else { return }
                 pickedImageData = try? await pickedPhoto.loadTransferable(type: Data.self)
             }
+            .onChange(of: resultText) { _, result in
+                if result != nil { isSending = false }
+            }
+            .onChange(of: resultError) { _, error in
+                if error != nil { isSending = false }
+            }
+            .onDisappear { isSending = false }
         }
     }
 
@@ -144,7 +153,10 @@ struct TinfoilAttachSheet: View {
         isSending = true
         switch mode {
         case .document:
-            guard let url = pickedDocumentURL else { return }
+            guard let url = pickedDocumentURL else {
+                isSending = false
+                return
+            }
             let didAccess = url.startAccessingSecurityScopedResource()
             defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
             guard let data = try? Data(contentsOf: url) else {
@@ -159,7 +171,10 @@ struct TinfoilAttachSheet: View {
                 mode: "text"
             ))
         case .image:
-            guard let pickedImageData else { return }
+            guard let pickedImageData else {
+                isSending = false
+                return
+            }
             onSend(.analyzeImage(
                 requestId: requestId,
                 imageDataBase64: pickedImageData.base64EncodedString(),
@@ -169,9 +184,7 @@ struct TinfoilAttachSheet: View {
     }
 }
 
-/// Tiny cross-platform image wrapper so this file compiles on both the real iOS target and the
-/// macOS `swift build` stub-compile path this package supports (see `Package.swift`'s doc
-/// comment on why a headless macOS build must still compile).
+/// Wraps platform image decoding for iOS and macOS package builds.
 private struct PlatformImage {
     let swiftUIImage: Image
 

@@ -17,7 +17,7 @@ use std::env;
 use std::time::Duration;
 
 use holoiroh_daemon::control_channel::{
-    write_line, ClientMessage, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+    CONTROL_ALPN, ClientMessage, ServerMessage, TaskEnvelope, write_line,
 };
 use iroh::Endpoint;
 use iroh_live::ticket::LiveTicket;
@@ -91,22 +91,32 @@ fn is_progress(env: &TaskEnvelope<ServerMessage>) -> bool {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let mut args = env::args().skip(1);
-    let ticket_str = args.next().expect("usage: holo_crash_epoch_probe <ticket> <pin>");
-    let pin = args.next().expect("usage: holo_crash_epoch_probe <ticket> <pin>");
+    let ticket_str = args
+        .next()
+        .expect("usage: holo_crash_epoch_probe <ticket> <pin>");
+    let pin = args
+        .next()
+        .expect("usage: holo_crash_epoch_probe <ticket> <pin>");
     let ticket: LiveTicket = ticket_str.parse()?;
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     println!("connected: remote={}", conn.remote_id().fmt_short());
 
     let (mut send, recv) = conn.open_bi().await?;
-    let mut wire = Wire { lines: BufReader::new(recv).lines() };
+    let mut wire = Wire {
+        lines: BufReader::new(recv).lines(),
+    };
 
     write_line(&mut send, &ClientMessage::Pin { pin }).await?;
 
     let greeting = wire
         .wait_for(Duration::from_secs(30), |env| {
-            matches!(&env.payload, ServerMessage::Status { text: Some(t) } if t.contains("control channel ready"))
+            matches!(&env.payload, ServerMessage::Status { text: Some(t), .. } if t.contains("control channel ready"))
         })
         .await
         .expect("no greeting within 30s");
@@ -124,7 +134,9 @@ async fn main() -> anyhow::Result<()> {
         session_id.clone(),
         Some(task_id.clone()),
         next_seq(),
-        ClientMessage::Prompt { text: PLANNING_ONLY.into() },
+        ClientMessage::Prompt {
+            text: PLANNING_ONLY.into(),
+        },
     );
     write_line(&mut send, &env).await?;
     println!("-> prompt ({task_id})");
@@ -147,7 +159,10 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     match outcome {
-        Some(env) => println!("OUTCOME: daemon reached a terminal state -- {:?}", env.payload),
+        Some(env) => println!(
+            "OUTCOME: daemon reached a terminal state -- {:?}",
+            env.payload
+        ),
         None => println!(
             "OUTCOME: no Error/TaskDone within 180s of the crash -- turn appears to have hung \
              (this is the failure mode the fix targets; check daemon log for what happened)"

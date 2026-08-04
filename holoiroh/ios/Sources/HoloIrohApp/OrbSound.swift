@@ -1,12 +1,12 @@
 import AVFoundation
 import Foundation
 
-/// Plays the short, script-generated orb-reaction cue when the orb reacts to a
-/// send. Opt-in behind `@AppStorage("soundEnabled")` (default OFF), and routed
-/// through the AMBIENT audio session so it honors the ringer/silent switch and
-/// never interrupts other audio. Entirely best-effort: a missing asset, session
-/// error, or player failure is silently ignored -- the cue is pure polish and
-/// must never affect (or block) the visual reaction.
+/// Plays the optional orb-reaction cue after a send.
+///
+/// - Reads `soundEnabled`, which defaults to `false`.
+/// - Uses the ambient audio session and mixes with other audio.
+/// - Honors the device silent-mode setting.
+/// - Ignores missing assets, session errors, and player failures.
 enum OrbSound {
     private static let player: AVAudioPlayer? = {
         guard let url = Bundle.module.url(
@@ -21,9 +21,9 @@ enum OrbSound {
 
     private static var sessionConfigured = false
 
-    /// Plays the cue if the user enabled sound. Resets to the start so rapid
-    /// back-to-back reactions each retrigger it. No-op when disabled or the
-    /// asset/player is unavailable.
+    /// Plays the cue when the user enables sound.
+    /// Restarts the cue for each reaction.
+    /// Does nothing when the asset or player is unavailable.
     static func playReaction() {
         guard UserDefaults.standard.object(forKey: "soundEnabled") as? Bool ?? false else { return }
         configureSessionIfNeeded()

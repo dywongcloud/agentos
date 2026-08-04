@@ -125,7 +125,9 @@ pub fn screen_recording_granted() -> bool {
 
 #[cfg(not(target_os = "macos"))]
 pub fn screen_recording_granted() -> bool {
-    compile_error!("holoiroh-daemon is macOS-only; screen_recording_granted() has no non-macOS implementation");
+    compile_error!(
+        "holoiroh-daemon is macOS-only; screen_recording_granted() has no non-macOS implementation"
+    );
 }
 
 /// `AXIsProcessTrusted()` -- returns whether this process is trusted for
@@ -139,7 +141,9 @@ pub fn accessibility_granted() -> bool {
 
 #[cfg(not(target_os = "macos"))]
 pub fn accessibility_granted() -> bool {
-    compile_error!("holoiroh-daemon is macOS-only; accessibility_granted() has no non-macOS implementation");
+    compile_error!(
+        "holoiroh-daemon is macOS-only; accessibility_granted() has no non-macOS implementation"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -194,5 +198,7 @@ pub fn secure_input_active() -> bool {
 
 #[cfg(not(target_os = "macos"))]
 pub fn secure_input_active() -> bool {
-    compile_error!("holoiroh-daemon is macOS-only; secure_input_active() has no non-macOS implementation");
+    compile_error!(
+        "holoiroh-daemon is macOS-only; secure_input_active() has no non-macOS implementation"
+    );
 }

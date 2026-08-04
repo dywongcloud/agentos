@@ -120,7 +120,9 @@ struct PairingView: View {
             VStack(spacing: 6) {
                 AroWordmark(size: 46)
                     .onLongPressGesture(minimumDuration: 1.0) {
+                        #if canImport(UIKit)
                         NotificationCenter.default.post(name: UIDevice.deviceDidShakeNotification, object: nil)
+                        #endif
                     }
                 Text("Pair with the Mac running the Aro daemon")
                     .font(.footnote)
@@ -182,7 +184,9 @@ struct PairingView: View {
             .font(.system(.body, design: .monospaced))
             .foregroundStyle(.white)
             .tint(Color.aroAccentBright)
+            #if os(iOS)
             .keyboardType(.numberPad)
+            #endif
             .focused($focusedField, equals: .pin)
             .padding(12)
             .background(

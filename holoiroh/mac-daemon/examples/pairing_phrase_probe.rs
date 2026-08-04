@@ -47,7 +47,10 @@ fn main() {
     let a2 = pairing_phrase(VECTORS[0].0);
     let b = pairing_phrase(VECTORS[1].0);
     assert_eq!(a, a2, "same ticket must always give the same phrase");
-    assert_ne!(a, b, "different tickets must give different phrases (MITM protection)");
+    assert_ne!(
+        a, b,
+        "different tickets must give different phrases (MITM protection)"
+    );
 
     assert!(all_ok);
     println!(

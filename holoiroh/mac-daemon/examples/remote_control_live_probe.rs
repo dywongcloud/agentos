@@ -13,7 +13,7 @@ use std::env;
 use std::time::Duration;
 
 use holoiroh_daemon::control_channel::{
-    write_line, ClientMessage, RemoteControlEvent, ServerMessage, TaskEnvelope, CONTROL_ALPN,
+    CONTROL_ALPN, ClientMessage, RemoteControlEvent, ServerMessage, TaskEnvelope, write_line,
 };
 use iroh::Endpoint;
 use iroh_live::ticket::LiveTicket;
@@ -40,7 +40,7 @@ async fn await_paused(
                     println!("  <- task_active {{ paused: {paused} }}");
                     return true;
                 }
-                ServerMessage::Status { text: Some(t) } => println!("  <- status: {t}"),
+                ServerMessage::Status { text: Some(t), .. } => println!("  <- status: {t}"),
                 _ => {}
             }
         }
@@ -52,12 +52,18 @@ async fn await_paused(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let mut args = env::args().skip(1);
-    let ticket_str = args.next().expect("usage: remote_control_live_probe <ticket> <pin>");
+    let ticket_str = args
+        .next()
+        .expect("usage: remote_control_live_probe <ticket> <pin>");
     let pin = args.next().expect("usage: <pin>");
     let ticket: LiveTicket = ticket_str.parse()?;
 
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0).bind().await?;
-    let conn = endpoint.connect(ticket.endpoint.clone(), CONTROL_ALPN).await?;
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+        .bind()
+        .await?;
+    let conn = endpoint
+        .connect(ticket.endpoint.clone(), CONTROL_ALPN)
+        .await?;
     let (mut send, recv) = conn.open_bi().await?;
     let mut lines = BufReader::new(recv).lines();
     write_line(&mut send, &ClientMessage::Pin { pin }).await?;
@@ -65,9 +71,12 @@ async fn main() -> anyhow::Result<()> {
     let mut session_id: Option<String> = None;
     let start = tokio::time::Instant::now();
     while session_id.is_none() && start.elapsed() < Duration::from_secs(30) {
-        if let Ok(Ok(Some(line))) = tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await {
+        if let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(30), lines.next_line()).await
+        {
             if let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) {
-                if matches!(&env.payload, ServerMessage::Status { text: Some(t) } if t.contains("control channel ready")) {
+                if matches!(&env.payload, ServerMessage::Status { text: Some(t), .. } if t.contains("control channel ready"))
+                {
                     session_id = Some(env.session_id);
                 }
             }
@@ -78,12 +87,25 @@ async fn main() -> anyhow::Result<()> {
 
     // Start a long text-only turn and wait until it streams.
     let task_id = uuid::Uuid::new_v4().to_string();
-    write_line(&mut send, &TaskEnvelope::<ClientMessage>::wrap(session_id.clone(), Some(task_id), 0, ClientMessage::Prompt { text: LONG_TEXT_PROMPT.into() })).await?;
+    write_line(
+        &mut send,
+        &TaskEnvelope::<ClientMessage>::wrap(
+            session_id.clone(),
+            Some(task_id),
+            0,
+            ClientMessage::Prompt {
+                text: LONG_TEXT_PROMPT.into(),
+            },
+        ),
+    )
+    .await?;
     println!("-> long text prompt; waiting for it to stream...");
     let live_start = tokio::time::Instant::now();
     let mut streaming = false;
     while !streaming && live_start.elapsed() < Duration::from_secs(120) {
-        if let Ok(Ok(Some(line))) = tokio::time::timeout(Duration::from_secs(120), lines.next_line()).await {
+        if let Ok(Ok(Some(line))) =
+            tokio::time::timeout(Duration::from_secs(120), lines.next_line()).await
+        {
             if let Ok(env) = serde_json::from_str::<TaskEnvelope<ServerMessage>>(&line) {
                 if matches!(env.payload, ServerMessage::TaskProgress { .. }) {
                     streaming = true;
@@ -99,16 +121,37 @@ async fn main() -> anyhow::Result<()> {
     // drops it. (This bit an earlier version of this probe.)
     let mut seq: u64 = 1;
     let rc = |ev: RemoteControlEvent, s: u64| {
-        TaskEnvelope::<ClientMessage>::wrap(session_id.clone(), None, s, ClientMessage::RemoteControl { event: ev })
+        TaskEnvelope::<ClientMessage>::wrap(
+            session_id.clone(),
+            None,
+            s,
+            ClientMessage::RemoteControl { event: ev },
+        )
     };
     write_line(&mut send, &rc(RemoteControlEvent::TakeControl, seq)).await?;
     seq += 1;
     let paused = await_paused(&mut lines, true, Duration::from_secs(10)).await;
 
     // While in control, send a couple of input actions (injected on the Mac).
-    write_line(&mut send, &rc(RemoteControlEvent::Move { x: 0.5, y: 0.5 }, seq)).await?;
+    write_line(
+        &mut send,
+        &rc(RemoteControlEvent::Move { x: 0.5, y: 0.5 }, seq),
+    )
+    .await?;
     seq += 1;
-    write_line(&mut send, &rc(RemoteControlEvent::Click { x: 0.5, y: 0.5, button: holoiroh_daemon::control_channel::MouseButton::Left, count: 1 }, seq)).await?;
+    write_line(
+        &mut send,
+        &rc(
+            RemoteControlEvent::Click {
+                x: 0.5,
+                y: 0.5,
+                button: holoiroh_daemon::control_channel::MouseButton::Left,
+                count: 1,
+            },
+            seq,
+        ),
+    )
+    .await?;
     seq += 1;
     println!("(sent move + click while in control)");
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -120,7 +163,9 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!("=== RESULT ===");
     if paused && resumed {
-        println!("VERDICT: OK -- take_control paused the agent, release_control resumed it (input actions sent in between).");
+        println!(
+            "VERDICT: OK -- take_control paused the agent, release_control resumed it (input actions sent in between)."
+        );
     } else {
         println!("VERDICT: BROKEN -- pause_seen={paused} resume_seen={resumed}");
         std::process::exit(1);

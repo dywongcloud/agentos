@@ -34,7 +34,11 @@ fn run_turn(busy: &Mutex<bool>, panics: bool, guarded: bool) {
         let mut b = busy.lock().unwrap_or_else(|e| e.into_inner());
         *b = true;
     }
-    let _g = if guarded { Some(BusyGuard { busy }) } else { None };
+    let _g = if guarded {
+        Some(BusyGuard { busy })
+    } else {
+        None
+    };
     if panics {
         panic!("simulated failure inside run_prompt");
     }
@@ -56,9 +60,7 @@ fn main() {
 
     println!("=== WITH the guard (current behaviour) ===");
     let busy = Mutex::new(false);
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_turn(&busy, true, true)
-    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_turn(&busy, true, true)));
     let after_panic = *busy.lock().unwrap_or_else(|e| e.into_inner());
     println!("  busy after a panicking turn: {after_panic}");
 

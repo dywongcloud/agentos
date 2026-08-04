@@ -17,15 +17,24 @@ fn main() {
     println!("=== MissingPermission::instruction() names the exact Settings path ===");
     let sr = MissingPermission::ScreenRecording.instruction();
     let ax = MissingPermission::Accessibility.instruction();
-    println!("ScreenRecording.instruction() contains \"Screen Recording\": {}", sr.contains("Screen Recording"));
-    println!("Accessibility.instruction() contains \"Accessibility\": {}", ax.contains("Accessibility"));
+    println!(
+        "ScreenRecording.instruction() contains \"Screen Recording\": {}",
+        sr.contains("Screen Recording")
+    );
+    println!(
+        "Accessibility.instruction() contains \"Accessibility\": {}",
+        ax.contains("Accessibility")
+    );
     assert!(sr.contains("Screen Recording"));
     assert!(ax.contains("Accessibility"));
 
     println!();
     println!("=== PreflightResult::is_ok() when empty ===");
     let result = PreflightResult { missing: vec![] };
-    println!("PreflightResult{{missing: []}}.is_ok() -> {}", result.is_ok());
+    println!(
+        "PreflightResult{{missing: []}}.is_ok() -> {}",
+        result.is_ok()
+    );
     assert!(result.is_ok());
 
     println!();
@@ -53,5 +62,7 @@ fn main() {
     result.report();
 
     println!();
-    println!("permissions_probe: OK -- all PreflightResult/MissingPermission cases witnessed via real execution");
+    println!(
+        "permissions_probe: OK -- all PreflightResult/MissingPermission cases witnessed via real execution"
+    );
 }

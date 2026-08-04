@@ -1,18 +1,15 @@
 import SwiftData
 import SwiftUI
 
-/// A compact, horizontally-scrolling strip of recently-sent prompts shown just
-/// above the command bar. Tapping one refills the prompt field so the user can
-/// re-send (or tweak first). `@Query`-driven, so it live-updates the instant a
-/// new prompt is recorded; renders nothing when there's no history yet.
-///
-/// Only ever placed inside a view tree that has the `RecentPrompt` container in
-/// its environment (MainView gates it on `RecentPromptStore.container != nil`),
-/// so `@Query` always has a context to read.
+/// Shows up to 12 recently sent prompts in a horizontal strip.
+/// Tapping a prompt sends its text to `onPick`.
+/// The strip updates from `RecentPrompt` query changes.
+/// It does not render when no prompts exist.
+/// `MainView` supplies the required `RecentPrompt` model context.
 struct RecentPromptsStrip: View {
     @Query(sort: \RecentPrompt.createdAt, order: .reverse) private var prompts: [RecentPrompt]
 
-    /// Called with the tapped prompt's text (the caller refills the field).
+    /// Receives the selected prompt text.
     let onPick: (String) -> Void
 
     var body: some View {

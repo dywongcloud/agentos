@@ -3,6 +3,7 @@ import SwiftUI
 struct DiagnosticsView: View {
     @EnvironmentObject private var profileStore: ConnectionProfileStore
     @EnvironmentObject private var reachability: ReachabilityMonitor
+    @EnvironmentObject private var tinfoilVerificationStore: TinfoilVerificationStore
     @ObservedObject private var diagnostics = ConnectionDiagnostics.shared
 
     @AppStorage("hapticsEnabled") private var hapticsEnabled = true
@@ -47,7 +48,7 @@ struct DiagnosticsView: View {
                 }
             }
             .sheet(isPresented: $showVerificationCenter) {
-                VerificationCenterView()
+                VerificationCenterView(verification: tinfoilVerificationStore.verification)
             }
         }
     }
@@ -201,4 +202,5 @@ struct DiagnosticsView: View {
     DiagnosticsView()
         .environmentObject(ConnectionProfileStore())
         .environmentObject(ReachabilityMonitor(ticket: ""))
+        .environmentObject(TinfoilVerificationStore())
 }

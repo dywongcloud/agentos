@@ -1,40 +1,47 @@
-# Required Info.plist keys for the eventual Xcode app target
+# Required `Info.plist` keys for the app target
 
-`ios/` is a bare Swift Package Manager **library** package (see
-`Package.swift` -- `products: [.library(...)]`). It cannot itself carry an
-`Info.plist` or produce an installable `.app` bundle. Per `README.md`'s
-"Setup" section, a thin Xcode app target that depends on this package must
-wrap `ios/`.
+`ios/Package.swift` defines the `HoloIrohApp` Swift Package Manager library.
+A library package cannot contain an `Info.plist` or produce an installable `.app` bundle.
 
-`VoiceTranscriber.swift` requests Speech-recognition and microphone
-authorization at runtime (`SFSpeechRecognizer.requestAuthorization`,
-`AVAudioApplication.requestRecordPermission` / `AVAudioSession
-.requestRecordPermission`). `QRScannerView.swift` requests **camera**
-authorization at runtime (`AVCaptureDevice.requestAccess(for: .video)`,
-reached from `PairingView`'s "Scan QR" button). If the corresponding
-usage-description key is missing from the *app's* `Info.plist`, iOS
-hard-crashes the process the moment any of these authorization prompts
-triggers. Library code cannot work around this crash. This SPM package has
-nowhere to put the key today.
+`ios/App` provides the Xcode app target that wraps this package.
+`ios/App/project.yml` generates `ios/App/Info.plist` and configures the required usage descriptions.
+Regenerate the Xcode project after changing these values.
 
-README's "Setup (once implemented)" section describes how to create the
-wrapping Xcode app target. Whoever creates that target must add all of the
-following keys to its `Info.plist`. Add the keys before the corresponding
-feature can run on a real device or simulator:
+## Permission use
 
-| Key                                    | Needed by | Suggested value                                                    |
-|-----------------------------------------|-----------|---------------------------------------------------------------------|
-| `NSCameraUsageDescription`              | `QRScannerView` (Scan QR pairing) | "HoloIroh uses the camera to scan the pairing QR code your Mac displays." |
-| `NSMicrophoneUsageDescription`          | `VoiceTranscriber` (mic button)   | "HoloIroh uses the microphone to let you speak prompts instead of typing them." |
-| `NSSpeechRecognitionUsageDescription`   | `VoiceTranscriber` (mic button)   | "HoloIroh transcribes your speech on-device (when supported) to turn it into a text prompt." |
+`VoiceTranscriber.swift` requests speech-recognition and microphone authorization at runtime.
+It calls `SFSpeechRecognizer.requestAuthorization`.
+It also calls `AVAudioApplication.requestRecordPermission` or `AVAudioSession.requestRecordPermission`.
 
-Without these keys, tapping the corresponding control will not show a
-permission dialog. Instead, the process hard-crashes immediately when the
-code calls into the authorization API:
+`HoloIrohMicrophoneCapture` installs a separate `AVAudioEngine.inputNode` tap.
+It installs this tap only when the user enables optional Tinfoil transcription.
+Its opaque `CapturedMicrophoneAudio` value has no public initializer.
+The app cannot construct `TranscribeAudio` from arbitrary bytes.
+`HoloIrohMicrophoneCapture` requests no digital system-audio or speaker-output mix.
+The microphone can still capture nearby speakers acoustically.
+`VoiceTranscriber` requests on-device recognition when the platform supports it.
+Otherwise, Speech can use its default recognition path.
 
-- `AVCaptureDevice.requestAccess` for the camera
-- `SFSpeechRecognizer.requestAuthorization` or the mic-permission API for voice
+`QRScannerView.swift` requests camera authorization with `AVCaptureDevice.requestAccess(for: .video)`.
+`PairingView` reaches this request through its **Scan QR code** button.
+The app presents a live `QRScannerView` capture session after authorization.
 
-The camera key is the newest addition. A user needs it as soon as they tap
-**Scan QR** in `PairingView`, since that action presents the live
-`QRScannerView` capture session.
+## Required keys
+
+`ios/App/project.yml` configures these keys in the app target:
+
+| Key | Needed by | Configured value |
+|---|---|---|
+| `NSCameraUsageDescription` | `QRScannerView` for QR pairing | "Aro uses the camera to scan the pairing QR code your Mac displays." |
+| `NSMicrophoneUsageDescription` | `VoiceTranscriber` and optional Tinfoil transcription | "Aro uses the microphone to let you speak prompts instead of typing them, and (only if you enable Tinfoil audio transcription) to send your own voice to Tinfoil's confidential-computing cloud." |
+| `NSSpeechRecognitionUsageDescription` | `VoiceTranscriber` | "Aro transcribes your speech on-device (when supported) to turn it into a text prompt." |
+
+Keep each key in the generated app's `Info.plist` before using its related feature.
+If a key is missing, iOS terminates the app when code requests that permission.
+The app cannot replace a missing usage description at runtime.
+
+These calls require the keys:
+
+- `AVCaptureDevice.requestAccess` requires `NSCameraUsageDescription`.
+- The microphone-permission API requires `NSMicrophoneUsageDescription`.
+- `SFSpeechRecognizer.requestAuthorization` requires `NSSpeechRecognitionUsageDescription`.

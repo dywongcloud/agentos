@@ -4,7 +4,8 @@ import PackageDescription
 let package = Package(
     name: "HoloIrohApp",
     platforms: [
-        .iOS(.v17)
+        .iOS(.v17),
+        .macOS(.v14)
     ],
     products: [
         .library(
@@ -39,8 +40,13 @@ let package = Package(
             path: "Artifacts/HoloirohIosBridge.xcframework"
         ),
         .target(
+            name: "HoloIrohMicrophoneCapture",
+            path: "Sources/HoloIrohMicrophoneCapture"
+        ),
+        .target(
             name: "HoloIrohApp",
             dependencies: [
+                "HoloIrohMicrophoneCapture",
                 // iOS-only: the xcframework carries only an ios-arm64 slice, and
                 // IrohLiveFrameSource's `#if canImport(HoloirohIosBridge)` gate
                 // falls back to an explanatory stub wherever the module is absent

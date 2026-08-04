@@ -36,7 +36,9 @@ pub fn parse_rotate_duration(s: &str) -> Result<Duration, String> {
             'h' => 3600,
             'd' => 86_400,
             other => {
-                return Err(format!("unknown duration unit '{other}' in {s:?} (use s/m/h/d)"));
+                return Err(format!(
+                    "unknown duration unit '{other}' in {s:?} (use s/m/h/d)"
+                ));
             }
         };
         total_secs = total_secs

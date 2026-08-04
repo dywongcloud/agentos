@@ -1,36 +1,36 @@
-//! Remote-control input injection: turns the user's iOS touch gestures (moves,
-//! clicks, drags, scrolls, typed text) into real `CGEvent`s on the Mac, so the
-//! user can escalate and drive the computer directly from the live-share view
-//! (see the `RemoteControl` control-channel path in `crate::holo_bridge::control`).
+//! Injects remote-control input from the app as synthetic macOS `CGEvent`s.
 //!
-//! Normalized coordinates (`0.0..=1.0` within the captured display) arrive over
-//! the wire and are mapped to real global display points here, so the phone
-//! never needs to know the Mac's resolution.
+//! Input includes moves, clicks, drags, scrolls, and typed text from iOS touch gestures.
+//! This input lets the user control the Mac directly from the live-share view.
+//! See the `RemoteControl` control-channel path in `crate::holo_bridge::control`.
 //!
-//! Posting `CGEvent`s requires Accessibility (`AXIsProcessTrusted`), so callers
-//! check [`is_permitted`] and surface a one-time grant hint rather than silently
-//! doing nothing. All injected events are synthetic (a nonzero source pid), so
-//! `crate::user_activity`'s physical-input tap correctly ignores them -- these
-//! are the user's REMOTE inputs, not local hardware activity.
+//! The control channel supplies normalized coordinates within `0.0..=1.0` of the captured display.
+//! This module maps them to global display points.
+//! The app does not need the Mac display resolution.
 //!
-//! ## Reaching the login/lock screen's password field
+//! Posting `CGEvent`s requires Accessibility permission through `AXIsProcessTrusted`.
+//! Callers check [`is_permitted`] and show a one-time grant hint when permission is absent.
+//! `HOLOIROH_INPUT_DRY_RUN` permits event construction but suppresses posting.
 //!
-//! [`text`] and [`key`] post through `CGEventTapLocation::HIDEventTap`, the
-//! lowest-level system-wide injection point (the same level real hardware
-//! keystrokes arrive at) -- the correct mechanism, and nothing in this file
-//! gates it to a particular session. Whether the OS actually *delivers* those
-//! synthetic events to a focused secure field is a separate question this
-//! file cannot answer by inspection alone: `crate::permissions::secure_input_active`
-//! reports when the login window, lock screen, or a `sudo`/Keychain prompt has
-//! focus, and Apple's own documented purpose for that state (`SecureEventInput`)
-//! is specifically to block synthetic keystroke delivery to such fields --
-//! the same protection that stops password-harvesting malware would, by
-//! design, equally block a legitimate remote-typing feature. This has not
-//! been live-tested against the user's own lock screen (deliberately -- a
-//! failed synthetic-unlock attempt risks tripping password-attempt lockout on
-//! their real account); confirming it one way or the other needs a disposable
-//! test machine, or the account owner's explicit, informed consent to try it
-//! on their own Mac.
+//! All injected events are synthetic and have a nonzero source process identifier (PID).
+//! Therefore, the physical-input tap in `crate::user_activity` ignores them.
+//! They represent remote user input, not local hardware activity.
+//!
+//! ## Secure fields
+//!
+//! [`text`] and [`key`] post through `CGEventTapLocation::HIDEventTap`.
+//! This is the lowest-level system-wide injection point where hardware keystrokes arrive.
+//! This file does not restrict posting to a particular session.
+//!
+//! Delivery to a focused secure field remains unverified.
+//! `crate::permissions::secure_input_active` reports secure input focus.
+//! Such focus includes the login window, lock screen, and `sudo` or Keychain prompts.
+//! Apple documents `SecureEventInput` as protection against synthetic keystroke delivery to secure fields.
+//! This protection applies to password-harvesting malware and legitimate remote typing.
+//!
+//! Testing did not use the user's lock screen.
+//! A failed synthetic unlock could trigger password-attempt lockout on the user's account.
+//! Verification requires a disposable test machine or the account owner's explicit, informed consent.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -40,25 +40,24 @@ use objc2_core_graphics::{
     CGMainDisplayID, CGMouseButton, CGScrollEventUnit,
 };
 
-/// Tracks whether a mouse button is currently held, so a `Move` while held is
-/// emitted as a DRAG (the only way a click-and-drag registers in AppKit).
+/// Tracks whether a mouse button is held.
+/// A `Move` while held becomes a drag, which AppKit requires for click-and-drag input.
 static LEFT_DOWN: AtomicBool = AtomicBool::new(false);
 static RIGHT_DOWN: AtomicBool = AtomicBool::new(false);
 
-/// Tracks which modifier keys the remote client currently reports held, so a plain letter/digit
-/// `key()` press posted while e.g. Cmd is held actually reads as a real shortcut (Cmd+C, not the
-/// literal character `c`) -- see [`current_modifier_flags`] and `key()`'s doc for why this has to
-/// be a keycode-based combo rather than [`text`], which bypasses shortcut interpretation
-/// entirely. Named for the physical key, not the OS concept, to match [`keycode`]'s naming and
-/// what an iOS `UIKeyModifierFlags` reader most naturally maps onto.
+/// Tracks the modifier keys that the remote client reports as held.
+/// [`current_modifier_flags`] applies this state to plain letter and digit events from [`key`].
+/// This combination produces shortcuts such as Cmd+C instead of the literal character `c`.
+/// [`text`] bypasses held modifiers and shortcut interpretation.
+/// Names identify physical keys to match [`keycode`] and iOS `UIKeyModifierFlags`.
 static CMD_DOWN: AtomicBool = AtomicBool::new(false);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static OPT_DOWN: AtomicBool = AtomicBool::new(false);
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 
-/// The combined flags for whichever modifiers are currently held, applied to every keyboard AND
-/// mouse event this module posts (not just keyboard: a real trackpad's Cmd+click / Shift+click
-/// carry the same flags, and AppKit reads modifier state off mouse events too).
+/// Returns the combined flags for held modifiers.
+/// This module applies these flags to every keyboard and mouse event.
+/// AppKit reads modifier state from mouse events for combinations such as Cmd+click and Shift+click.
 fn current_modifier_flags() -> CGEventFlags {
     let mut flags = CGEventFlags::empty();
     if CMD_DOWN.load(Ordering::Relaxed) {
@@ -76,25 +75,26 @@ fn current_modifier_flags() -> CGEventFlags {
     flags
 }
 
-/// Whether the daemon may inject input right now (Accessibility granted).
+/// Reports whether the daemon can construct input events.
+/// Accessibility permission allows posting.
+/// `HOLOIROH_INPUT_DRY_RUN=1` permits event construction but suppresses posting.
 pub fn is_permitted() -> bool {
-    crate::permissions::accessibility_granted()
+    injection_is_dry_run() || crate::permissions::accessibility_granted()
 }
 
-/// Releases any mouse button this module still believes is held, at wherever
-/// the cursor currently is.
+/// Releases each held mouse button at the current cursor location.
+/// This function also clears all held modifier state.
 ///
-/// `LEFT_DOWN`/`RIGHT_DOWN` were only ever cleared as a side effect of
-/// [`button`] receiving a matching up, or of [`click`]. Nothing cleared them
-/// when the *client* went away mid-drag — a phone that loses its connection,
-/// gets swiped away, or lifts a finger over the letterbox. The Mac was then left
-/// inside a live drag/selection session, unattended, with no touch anywhere to
-/// end it: the pointer keeps dragging whatever it crosses until someone
-/// physically uses the machine.
+/// A client can disconnect during a drag before [`button`] receives the matching release.
+/// This can happen when the app loses its connection or the user swipes it away.
+/// It can also happen when the user lifts a finger over the letterbox.
+/// The Mac then continues dragging or selecting until another input ends the operation.
+/// The pointer drags anything it crosses until someone physically uses the Mac.
+/// [`click`] also clears held mouse-button state.
 ///
-/// Safe to call unconditionally and repeatedly — a synthetic button-up with
-/// nothing held is a no-op as far as AppKit is concerned, and this only posts
-/// for flags it actually observes set.
+/// Call this function safely and repeatedly.
+/// It posts button-up events only for state that was set.
+/// AppKit treats a synthetic button-up without a held button as a no-op.
 pub fn release_all() {
     let p = cursor_location().unwrap_or(CGPoint { x: 0.0, y: 0.0 });
     if LEFT_DOWN.swap(false, Ordering::Relaxed) {
@@ -124,9 +124,10 @@ pub fn release_all() {
     SHIFT_DOWN.store(false, Ordering::Relaxed);
 }
 
-/// Map a normalized point (`0..=1` within the captured display) to a global CG
-/// point. Uses the PRIMARY display (the daemon captures primary by default -- a
-/// captured non-primary display is a documented refinement, not wired here).
+/// Maps a normalized captured-display point to a global Core Graphics point.
+/// Each input coordinate uses the inclusive range `0..=1` and is clamped to that range.
+/// The daemon captures the primary display by default, so this function uses the primary display.
+/// Support for a captured non-primary display is documented but not connected here.
 pub fn map_normalized(nx: f64, ny: f64) -> CGPoint {
     let bounds = cached_display_bounds();
     let cx = nx.clamp(0.0, 1.0);
@@ -137,19 +138,23 @@ pub fn map_normalized(nx: f64, ny: f64) -> CGPoint {
     }
 }
 
-/// How long a cached display geometry is trusted. Long enough that a drag never pays for the
-/// lookup twice, short enough that a resolution or display change corrects itself before the
-/// user could act on a misplaced cursor.
+/// Sets the display-bounds cache lifetime to 500 ms.
+/// This duration avoids repeated lookups during a drag.
+/// It also updates geometry after a resolution or display change.
 const DISPLAY_BOUNDS_TTL: std::time::Duration = std::time::Duration::from_millis(500);
 
 static DISPLAY_BOUNDS: std::sync::Mutex<Option<(std::time::Instant, CGRect)>> =
     std::sync::Mutex::new(None);
 
-/// `CGDisplayBounds(CGMainDisplayID())` is a system call, and a drag makes it 120 times a second
-/// on the read loop's inline path, where every microsecond delays reading the next control
-/// message. Measured at p50 20us but with 5ms outliers -- a third of a display frame of jitter
-/// landing directly in the cursor path -- against 167ns for a key event, which is the same code
-/// without the lookup. The geometry it returns changes only when the user changes displays.
+/// Returns cached primary-display bounds when the cache age is less than 500 ms.
+/// At 500 ms or more, this function refreshes the bounds.
+/// `CGDisplayBounds(CGMainDisplayID())` is a system call.
+/// A drag can call this function 120 times each second on the inline read path.
+/// Each call delays reading the next control message.
+/// Measurement showed a 20 us p50 with 5 ms outliers.
+/// A 5 ms outlier is one-third of a display frame of cursor-path jitter.
+/// A key event without this lookup measured 167 ns.
+/// The returned geometry changes only when the user changes displays.
 fn cached_display_bounds() -> CGRect {
     let now = std::time::Instant::now();
     let mut cached = DISPLAY_BOUNDS.lock().unwrap_or_else(|e| e.into_inner());
@@ -170,24 +175,22 @@ fn injection_is_dry_run() -> bool {
     *DRY_RUN.get_or_init(|| std::env::var("HOLOIROH_INPUT_DRY_RUN").as_deref() == Ok("1"))
 }
 
-/// Drains the moves recorded under `HOLOIROH_INPUT_DRY_RUN`.
+/// Removes and returns all moves recorded under `HOLOIROH_INPUT_DRY_RUN`.
 ///
-/// `allow(dead_code)`: the daemon binary compiles this module directly and never calls this, but
-/// `remote_input_ordering_probe` and `input_latency_probe` do, through the lib target. Without
-/// the allow, every binary build warns about a function that is genuinely used.
+/// The daemon binary does not call this function.
+/// The probes call it through the library target.
+/// These probes are `remote_input_ordering_probe` and `input_latency_probe`.
+/// Therefore, `allow(dead_code)` prevents an incorrect warning during each binary build.
 #[allow(dead_code)]
 pub fn take_applied_moves() -> Vec<(f64, f64)> {
-    std::mem::take(
-        &mut *APPLIED_MOVES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()),
-    )
+    std::mem::take(&mut *APPLIED_MOVES.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 static APPLIED_CLICK_STATES: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 
-/// Drains the click states recorded under `HOLOIROH_INPUT_DRY_RUN`. Same lib-vs-bin situation as
-/// [`take_applied_moves`]; consumed by `click_state_probe`.
+/// Removes and returns all click states recorded under `HOLOIROH_INPUT_DRY_RUN`.
+/// The `click_state_probe` binary consumes these states through the library target.
+/// See [`take_applied_moves`] for the library-versus-binary warning rationale.
 #[allow(dead_code)]
 pub fn take_applied_click_states() -> Vec<i64> {
     std::mem::take(
@@ -197,7 +200,7 @@ pub fn take_applied_click_states() -> Vec<i64> {
     )
 }
 
-fn record_applied_click(states: &[i64]) {
+fn record_applied_click(states: &[i64], right: bool) {
     if !injection_is_dry_run() {
         return;
     }
@@ -205,17 +208,23 @@ fn record_applied_click(states: &[i64]) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .extend_from_slice(states);
+    tracing::info!(
+        input_kind = if right { "right_click" } else { "left_click" },
+        click_count = states.len(),
+        "remote input dry-run applied"
+    );
 }
 
-/// One resolved key event: `(virtual keycode, down, modifier flags applied)`. Recorded under
-/// `HOLOIROH_INPUT_DRY_RUN` so `remote_input_key_probe` can verify the keycode table and the
-/// held-modifier state machine WITHOUT posting a real CGEvent -- an unrecognized key name
-/// records nothing at all (matching `key()`'s real behavior of silently ignoring it), which is
-/// itself something a probe needs to be able to observe.
+/// Stores resolved key events as `(virtual keycode, down, applied modifier flags)`.
+/// `HOLOIROH_INPUT_DRY_RUN` records these events without posting a `CGEvent`.
+/// The `remote_input_key_probe` verifies the keycode table from these records.
+/// It also verifies the held-modifier state machine.
+/// An unknown key name records nothing because [`key`] posts nothing for unknown names.
 static APPLIED_KEYS: std::sync::Mutex<Vec<(u16, bool, u64)>> = std::sync::Mutex::new(Vec::new());
 
-/// Drains the key events recorded under `HOLOIROH_INPUT_DRY_RUN`. Same lib-vs-bin situation as
-/// [`take_applied_moves`]; consumed by `remote_input_key_probe`.
+/// Removes and returns all key events recorded under `HOLOIROH_INPUT_DRY_RUN`.
+/// The `remote_input_key_probe` binary consumes these events through the library target.
+/// See [`take_applied_moves`] for the library-versus-binary warning rationale.
 #[allow(dead_code)]
 pub fn take_applied_keys() -> Vec<(u16, bool, u64)> {
     std::mem::take(&mut *APPLIED_KEYS.lock().unwrap_or_else(|e| e.into_inner()))
@@ -229,6 +238,13 @@ fn record_applied_key(code: u16, down: bool, flags: CGEventFlags) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((code, down, flags.0));
+    tracing::info!(
+        input_kind = "key",
+        keycode = code,
+        down,
+        modifier_flags = flags.0,
+        "remote input dry-run applied"
+    );
 }
 
 fn record_applied_move(nx: f64, ny: f64) {
@@ -239,6 +255,12 @@ fn record_applied_move(nx: f64, ny: f64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((nx, ny));
+    tracing::info!(
+        input_kind = "move",
+        x = nx,
+        y = ny,
+        "remote input dry-run applied"
+    );
 }
 
 fn post(event: &CGEvent) {
@@ -248,13 +270,16 @@ fn post(event: &CGEvent) {
     CGEvent::post(CGEventTapLocation::HIDEventTap, Some(event));
 }
 
-/// Current cursor location in global CG points (for witnesses / diagnostics).
+/// Returns the current cursor location in global Core Graphics points.
+/// Witnesses and diagnostics use this value.
+/// Returns `None` when Core Graphics cannot create an event.
 pub fn cursor_location() -> Option<CGPoint> {
     let ev = CGEvent::new(None)?;
     Some(CGEvent::location(Some(&ev)))
 }
 
-/// Move the cursor to the normalized point (a drag if a button is held).
+/// Moves the cursor to a normalized point.
+/// If a mouse button is held, the movement becomes a drag.
 pub fn move_cursor(nx: f64, ny: f64) {
     record_applied_move(nx, ny);
     let p = map_normalized(nx, ny);
@@ -271,7 +296,8 @@ pub fn move_cursor(nx: f64, ny: f64) {
     }
 }
 
-/// Press (`down: true`) or release a mouse button at the normalized point.
+/// Presses or releases a mouse button at a normalized point.
+/// Set `right` for the right button and `down` for a press.
 pub fn button(nx: f64, ny: f64, right: bool, down: bool) {
     let p = map_normalized(nx, ny);
     let (ty, cgbtn) = match (right, down) {
@@ -285,33 +311,46 @@ pub fn button(nx: f64, ny: f64, right: bool, down: bool) {
     } else {
         LEFT_DOWN.store(down, Ordering::Relaxed);
     }
+    if injection_is_dry_run() {
+        tracing::info!(
+            input_kind = if right { "right_button" } else { "left_button" },
+            x = nx,
+            y = ny,
+            down,
+            "remote input dry-run applied"
+        );
+    }
     if let Some(ev) = CGEvent::new_mouse_event(None, ty, p, cgbtn) {
         CGEvent::set_flags(Some(&ev), current_modifier_flags());
         post(&ev);
     }
 }
 
-/// How close together in time two clicks must be to form a double-click. macOS's own default
-/// for `com.apple.mouse.doubleClickThreshold`; deliberately not read from the user's prefs,
-/// since doing that from the injection path means spawning a process mid-click.
+/// Sets the fixed double-click window to 500 ms.
+/// This value matches the macOS default for `com.apple.mouse.doubleClickThreshold`.
+/// The injection path does not read the user's preference.
+/// Reading it would spawn a process during a click.
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// How far the pointer may drift between two clicks and still count as the same spot. Generous
-/// because the phone maps a whole desktop onto a few hundred points, so one touch-point of
-/// wobble is several desktop pixels.
+/// Sets the movement slop to 6 display points on each axis.
+/// The app maps a complete desktop onto a few hundred points.
+/// Therefore, one touch-point of movement can span several desktop pixels.
 const DOUBLE_CLICK_SLOP: f64 = 6.0;
 
 static LAST_CLICK: std::sync::Mutex<Option<(std::time::Instant, CGPoint, bool, i64)>> =
     std::sync::Mutex::new(None);
 
-/// The click state (1 = single, 2 = double, 3 = triple) this click should carry, derived the
-/// way the window server derives it for real hardware: from how soon and how near the previous
-/// click was.
+/// Derives the click state from the previous click, as the window server does for hardware.
+/// State `1` means single, `2` means double, and `3` means triple.
+/// Consecutive clicks must use the same button.
+/// They must occur no more than 500 ms apart.
+/// Their movement must not exceed 6 display points on either axis.
+/// Both limits include their boundary values.
 ///
-/// The phone cannot send this itself without waiting out the double-click window on EVERY tap
-/// before it knows whether a second one is coming -- half a second of dead time on the most
-/// common interaction, in a feature whose whole point is feeling immediate. Deriving it here
-/// costs nothing and makes a fast double-tap open a folder, as it would with a real mouse.
+/// The app cannot derive this state without delaying every tap for the double-click window.
+/// That delay would add half a second to the most common interaction.
+/// Local derivation does not add a wait.
+/// It lets a fast double-tap open a folder like a hardware mouse.
 fn next_click_state(p: CGPoint, right: bool) -> i64 {
     let now = std::time::Instant::now();
     let mut last = LAST_CLICK.lock().unwrap_or_else(|e| e.into_inner());
@@ -330,12 +369,18 @@ fn next_click_state(p: CGPoint, right: bool) -> i64 {
     state
 }
 
-/// A full click (down+up) at the point. `count > 1` forces a multi-click; `count == 1` lets
-/// [`next_click_state`] decide, so consecutive taps become a real double-click.
+/// Posts a complete mouse click at a normalized point.
+/// A `count` greater than `1` forces that many click states.
+/// A `count` of `1` lets [`next_click_state`] detect consecutive taps.
+/// A `count` of `0` becomes `1`.
 pub fn click(nx: f64, ny: f64, right: bool, count: u32) {
     let count = count.max(1);
     let p = map_normalized(nx, ny);
-    let cgbtn = if right { CGMouseButton::Right } else { CGMouseButton::Left };
+    let cgbtn = if right {
+        CGMouseButton::Right
+    } else {
+        CGMouseButton::Left
+    };
     let (dty, uty) = if right {
         (CGEventType::RightMouseDown, CGEventType::RightMouseUp)
     } else {
@@ -346,11 +391,15 @@ pub fn click(nx: f64, ny: f64, right: bool, count: u32) {
     } else {
         vec![next_click_state(p, right)]
     };
-    record_applied_click(&states);
+    record_applied_click(&states, right);
     let flags = current_modifier_flags();
     for state in states {
         if let Some(down) = CGEvent::new_mouse_event(None, dty, p, cgbtn) {
-            CGEvent::set_integer_value_field(Some(&down), CGEventField::MouseEventClickState, state);
+            CGEvent::set_integer_value_field(
+                Some(&down),
+                CGEventField::MouseEventClickState,
+                state,
+            );
             CGEvent::set_flags(Some(&down), flags);
             post(&down);
         }
@@ -365,12 +414,55 @@ pub fn click(nx: f64, ny: f64, right: bool, count: u32) {
     RIGHT_DOWN.store(false, Ordering::Relaxed);
 }
 
-/// Scroll at the point by wheel deltas (line units; negative `dy` scrolls the
-/// content up, matching a natural upward swipe).
+pub fn click_absolute(x: f64, y: f64, right: bool, count: u8) {
+    if !x.is_finite() || !y.is_finite() {
+        return;
+    }
+    let bounds = cached_display_bounds();
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        return;
+    }
+    let nx = (x - bounds.origin.x) / bounds.size.width;
+    let ny = (y - bounds.origin.y) / bounds.size.height;
+    if !(0.0..=1.0).contains(&nx) || !(0.0..=1.0).contains(&ny) {
+        return;
+    }
+    click(nx, ny, right, u32::from(count));
+}
+
+pub fn scroll_absolute(x: f64, y: f64, dx: f64, dy: f64) {
+    if ![x, y, dx, dy].iter().all(|value| value.is_finite()) {
+        return;
+    }
+    let bounds = cached_display_bounds();
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        return;
+    }
+    let nx = (x - bounds.origin.x) / bounds.size.width;
+    let ny = (y - bounds.origin.y) / bounds.size.height;
+    if !(0.0..=1.0).contains(&nx) || !(0.0..=1.0).contains(&ny) {
+        return;
+    }
+    scroll(nx, ny, dx, dy);
+}
+
+/// Scrolls at a normalized point with line-unit wheel deltas.
+/// A negative `dy` scrolls content upward, matching a natural upward swipe.
 pub fn scroll(nx: f64, ny: f64, dx: f64, dy: f64) {
+    if injection_is_dry_run() {
+        tracing::info!(
+            input_kind = "scroll",
+            x = nx,
+            y = ny,
+            dx,
+            dy,
+            "remote input dry-run applied"
+        );
+    }
     // Move the cursor to the point first so the scroll targets that spot.
     let p = map_normalized(nx, ny);
-    if let Some(mv) = CGEvent::new_mouse_event(None, CGEventType::MouseMoved, p, CGMouseButton::Left)
+    if let Some(mv) =
+        CGEvent::new_mouse_event(None, CGEventType::MouseMoved, p, CGMouseButton::Left)
     {
         post(&mv);
     }
@@ -390,9 +482,18 @@ pub fn scroll(nx: f64, ny: f64, dx: f64, dy: f64) {
     }
 }
 
-/// Type a string of text at the current keyboard focus (verbatim unicode).
+/// Types a verbatim Unicode string at the current keyboard focus.
+/// This function bypasses held modifiers and macOS shortcut interpretation.
+/// An empty string posts nothing.
 pub fn text(s: &str) {
     let utf16: Vec<u16> = s.encode_utf16().collect();
+    if injection_is_dry_run() {
+        tracing::info!(
+            input_kind = "text",
+            character_count = s.chars().count(),
+            "remote input dry-run applied"
+        );
+    }
     if utf16.is_empty() {
         return;
     }
@@ -410,17 +511,18 @@ pub fn text(s: &str) {
     }
 }
 
-/// Press or release a named key -- either a plain special key (arrows, escape, ...) or a
-/// modifier (cmd/ctrl/option/shift), which additionally updates the held-modifier state
-/// [`current_modifier_flags`] applies to every subsequent key/click/move this module posts.
+/// Presses or releases a named key.
+/// Supported names include special keys, modifiers, letters, digits, and punctuation.
+/// A modifier updates the held state for subsequent keyboard and mouse events.
+/// [`current_modifier_flags`] provides that state.
+/// Unknown special keys post nothing.
 ///
-/// This is the ONLY path a real keyboard shortcut (Cmd+C, Cmd+Tab, Ctrl+A, ...) can take. A
-/// plain `text()` call injects a literal unicode string via `keyboard_set_unicode_string`,
-/// bypassing macOS's keycode+modifier-flag shortcut interpretation entirely -- typing "c" that
-/// way while Cmd is virtually held does not copy anything, it just types the letter c. A real
-/// shortcut needs a REAL keycode-based keyboard event (this function) with the right
-/// `CGEventFlags` set, which is why [`keycode`] covers every letter/digit/punctuation key, not
-/// only the handful of non-printable special keys this function used to be limited to.
+/// Use this function for shortcuts such as Cmd+C, Cmd+Tab, and Ctrl+A.
+/// It posts keycode-based keyboard events with the applicable `CGEventFlags`.
+/// In contrast, [`text`] injects literal Unicode through `keyboard_set_unicode_string`.
+/// It bypasses held modifiers and shortcut interpretation.
+/// Therefore, [`keycode`] includes printable keys and non-printable special keys.
+/// Earlier versions limited this function to a small set of non-printable special keys.
 pub fn key(name: &str, down: bool) {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
@@ -449,23 +551,52 @@ pub fn key(name: &str, down: bool) {
     }
 }
 
-/// Map a named key to its macOS virtual keycode (the well-known, stable HIToolbox
-/// `kVK_*` constants). Returns `None` for unknown names (the caller then ignores the key
-/// event rather than posting a wrong keystroke). Covers every key an iOS `UIKey.keyCode`
-/// (`UIKeyboardHIDUsage`) can report while a hardware keyboard shortcut is held, plus the
-/// modifiers themselves (posted as real key events too, in addition to updating the held
-/// state in [`key`], since some apps read raw modifier keycodes rather than only flags).
+/// Maps a supported key name to its stable macOS HIToolbox `kVK_*` virtual keycode.
+/// Returns `None` for unknown names, so [`key`] posts nothing.
+/// Supports every key that iOS `UIKey.keyCode` can report during a hardware shortcut.
+/// `UIKey.keyCode` uses `UIKeyboardHIDUsage`.
+/// Also supports modifiers as key events because some apps read raw modifier keycodes instead of flags.
 fn keycode(name: &str) -> Option<u16> {
     Some(match name {
         // Letters (kVK_ANSI_*), keyboard row order, not alphabetical -- copied directly from
         // the HIToolbox table, easiest to verify against Apple's own reference that way.
-        "a" => 0, "s" => 1, "d" => 2, "f" => 3, "h" => 4, "g" => 5, "z" => 6, "x" => 7,
-        "c" => 8, "v" => 9, "b" => 11, "q" => 12, "w" => 13, "e" => 14, "r" => 15, "y" => 16,
-        "t" => 17, "o" => 31, "u" => 32, "i" => 34, "p" => 35, "l" => 37, "j" => 38, "k" => 40,
-        "n" => 45, "m" => 46,
+        "a" => 0,
+        "s" => 1,
+        "d" => 2,
+        "f" => 3,
+        "h" => 4,
+        "g" => 5,
+        "z" => 6,
+        "x" => 7,
+        "c" => 8,
+        "v" => 9,
+        "b" => 11,
+        "q" => 12,
+        "w" => 13,
+        "e" => 14,
+        "r" => 15,
+        "y" => 16,
+        "t" => 17,
+        "o" => 31,
+        "u" => 32,
+        "i" => 34,
+        "p" => 35,
+        "l" => 37,
+        "j" => 38,
+        "k" => 40,
+        "n" => 45,
+        "m" => 46,
         // Digits.
-        "1" => 18, "2" => 19, "3" => 20, "4" => 21, "6" => 22, "5" => 23, "9" => 25, "7" => 26,
-        "8" => 28, "0" => 29,
+        "1" => 18,
+        "2" => 19,
+        "3" => 20,
+        "4" => 21,
+        "6" => 22,
+        "5" => 23,
+        "9" => 25,
+        "7" => 26,
+        "8" => 28,
+        "0" => 29,
         // Punctuation.
         "=" | "equal" => 24,
         "-" | "minus" => 27,
@@ -496,8 +627,18 @@ fn keycode(name: &str) -> Option<u16> {
         "pageup" => 116,
         "pagedown" => 121,
         // Function keys.
-        "f1" => 122, "f2" => 120, "f3" => 99, "f4" => 118, "f5" => 96, "f6" => 97, "f7" => 98,
-        "f8" => 100, "f9" => 101, "f10" => 109, "f11" => 103, "f12" => 111,
+        "f1" => 122,
+        "f2" => 120,
+        "f3" => 99,
+        "f4" => 118,
+        "f5" => 96,
+        "f6" => 97,
+        "f7" => 98,
+        "f8" => 100,
+        "f9" => 101,
+        "f10" => 109,
+        "f11" => 103,
+        "f12" => 111,
         // Modifiers (left-hand variants -- iOS reports left/right the same way to us either
         // side is pressed, and macOS treats either side identically for shortcut purposes).
         "cmd" | "command" | "meta" => 55,

@@ -118,11 +118,15 @@ fn main() {
     );
     checks.check(
         "command args carry --port 9001",
-        cfg.command_args().windows(2).any(|w| w[0] == "--port" && w[1] == "9001"),
+        cfg.command_args()
+            .windows(2)
+            .any(|w| w[0] == "--port" && w[1] == "9001"),
     );
     checks.check(
         "command args still bind loopback only after a custom port",
-        cfg.command_args().windows(2).any(|w| w[0] == "--host" && w[1] == "127.0.0.1"),
+        cfg.command_args()
+            .windows(2)
+            .any(|w| w[0] == "--host" && w[1] == "127.0.0.1"),
     );
     println!();
 
@@ -161,14 +165,17 @@ fn main() {
     );
     checks.check(
         "custom repo is the -hf value",
-        args.windows(2).any(|w| w[0] == "-hf" && w[1] == "Some/Other-Model:Q5_K_M"),
+        args.windows(2)
+            .any(|w| w[0] == "-hf" && w[1] == "Some/Other-Model:Q5_K_M"),
     );
     println!();
 
     clear_env();
     println!("=== summary ===");
     if checks.failed == 0 {
-        println!("All edge-case checks PASSED (empty/blank env, bad/zero/out-of-range/boundary ports, custom overrides).");
+        println!(
+            "All edge-case checks PASSED (empty/blank env, bad/zero/out-of-range/boundary ports, custom overrides)."
+        );
     } else {
         eprintln!("{} edge-case check(s) FAILED.", checks.failed);
         std::process::exit(1);

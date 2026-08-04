@@ -1,10 +1,8 @@
 import SwiftUI
 
-/// The clarifying-questions panel shown ABOVE the command bar when the daemon
-/// returns questions for an ambiguous instruction. Each question is answered by
-/// picking one of its concrete options or the final "Something else…" option
-/// (which reveals a free-text field). The Continue button — enabled once every
-/// question is answered — proceeds with the clarified task.
+/// Shows questions that clarify an ambiguous instruction.
+/// Each question provides predefined options and a custom-answer option.
+/// Continue becomes available after the user answers every question.
 struct ClarifyPanel: View {
     let questions: [ClarifyingQuestion]
     let onCancel: () -> Void
@@ -12,9 +10,9 @@ struct ClarifyPanel: View {
 
     static let somethingElseLabel = "Something else…"
 
-    /// questionId -> the chosen option label (may be `somethingElseLabel`).
+    /// Maps each question identifier to its selected option.
     @State private var choice: [String: String] = [:]
-    /// questionId -> the typed free-text answer (only when "Something else…" is chosen).
+    /// Maps each question identifier to its custom answer.
     @State private var customText: [String: String] = [:]
 
     private func resolvedAnswer(_ q: ClarifyingQuestion) -> String? {

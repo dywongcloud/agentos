@@ -34,5 +34,7 @@ async fn main() {
         "recovered {} extra characters of causal chain that the old log line threw away",
         what_the_log_shows_now.len() - what_the_log_used_to_show.len()
     );
-    println!("VERDICT: OK -- the failure log now carries the underlying cause, not just the context");
+    println!(
+        "VERDICT: OK -- the failure log now carries the underlying cause, not just the context"
+    );
 }

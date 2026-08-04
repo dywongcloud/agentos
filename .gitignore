@@ -43,7 +43,13 @@ encrypted_secrets.json
 .agentplug-kv/
 # gm's own embed-model-version marker, rewritten whenever the code-index embed generation
 # changes -- same class as .gm-continue-count above (no human edits this file).
-.gm/.embed-generation
+# The wildcard also covers the per-scope markers (.embed-generation.code_chunks and
+# similar) that the current runner writes beside the base marker.
+.gm/.embed-generation*
+# The agentplug runner's machine checkout and its per-project dispatch cache at the
+# repo root. Tooling state, not source. The nested holoiroh copy is covered below.
+agentplug/
+.agentplug/
 .claude/
 .turbo/
 coverage/

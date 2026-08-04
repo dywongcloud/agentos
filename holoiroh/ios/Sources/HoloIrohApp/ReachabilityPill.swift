@@ -1,9 +1,7 @@
 import SwiftUI
 
-/// Compact live status dot + label for a profile's daemon reachability, driven
-/// by `ReachabilityMonitor.Reachability`. Green "reachable", red "offline",
-/// a pulsing dot while "checking", and a neutral gray when unknown (bridge-less
-/// build or not-yet-probed) so it never makes a false claim either way.
+/// Shows a profile's daemon reachability with a status dot and optional label.
+/// Unknown state uses a neutral color and does not report availability.
 struct ReachabilityPill: View {
     let state: ReachabilityMonitor.Reachability
     var showsLabel: Bool = true

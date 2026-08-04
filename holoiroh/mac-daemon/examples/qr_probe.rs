@@ -49,9 +49,17 @@ fn main() {
 
     // Structural witnesses: well-formed grid, non-empty, and the half-block render is at most
     // ~half the row count of the old one-row-per-module render (that halving is the whole fix).
-    let uniform: std::collections::HashSet<usize> = lines.iter().map(|l| l.chars().count()).collect();
-    assert_eq!(uniform.len(), 1, "every QR row must be the same width; got {uniform:?}");
-    assert!(rows > 10 && cols > 10, "render must be a real grid; got {cols}x{rows}");
+    let uniform: std::collections::HashSet<usize> =
+        lines.iter().map(|l| l.chars().count()).collect();
+    assert_eq!(
+        uniform.len(),
+        1,
+        "every QR row must be the same width; got {uniform:?}"
+    );
+    assert!(
+        rows > 10 && cols > 10,
+        "render must be a real grid; got {cols}x{rows}"
+    );
     assert!(
         rows <= old_side / 2 + 2,
         "Dense1x2 must roughly halve the height vs the old {old_side}-row char render; got {rows} rows"

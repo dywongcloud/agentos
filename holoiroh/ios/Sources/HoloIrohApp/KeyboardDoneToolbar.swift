@@ -1,27 +1,12 @@
 import SwiftUI
 
-/// The single, canonical "Done" bar that rides above the software keyboard on
-/// every text-input surface in the app (the pairing ticket editor + PIN pad in
-/// `PairingView`, and the prompt field in `MainView`).
-///
-/// It exists because iOS gives some keyboards no built-in way off: a multi-line
-/// `TextEditor` / `axis: .vertical` `TextField` treats Return as a newline, and
-/// the `.numberPad` keyboard has no Return key at all — the classic case from
-/// the canonical Stack Overflow answer on adding a Done button to the keyboard
-/// (https://stackoverflow.com/questions/10077155). The modern SwiftUI
-/// equivalent of the old UIKit `inputAccessoryView` + `UIToolbar` + Done
-/// `UIBarButtonItem` recipe is a `ToolbarItemGroup(placement: .keyboard)`.
-///
-/// Centralizing it here means every keyboard shows an IDENTICAL, accessible,
-/// emphasized Done — tuned in ONE place instead of hand-rolled per view, so the
-/// experience can never drift between surfaces.
+/// Provides the standard Done toolbar above app software keyboards.
+/// The toolbar supports multiline fields and number pads that have no dismissal key.
+/// All callers use the same action, styling, and accessibility metadata.
 extension View {
-    /// Attach the standard app keyboard Done bar.
+    /// Attaches the standard keyboard Done toolbar.
     ///
-    /// - Parameter dismiss: the caller's own focus-clearing action (e.g.
-    ///   `focusedField = nil` or `isPromptFocused = false`). Keeping the focus
-    ///   model with the caller lets this modifier wrap any `@FocusState` shape
-    ///   without owning it — the reason it can be shared across every view.
+    /// - Parameter dismiss: Clears the caller-owned focus state.
     func keyboardDoneToolbar(dismiss: @escaping () -> Void) -> some View {
         toolbar {
             ToolbarItemGroup(placement: .keyboard) {
@@ -45,10 +30,8 @@ extension View {
     }
 }
 
-/// Shared styling for the keyboard Done bar, kept out of the `View` extension so
-/// the modifier (and any future caller) references one accent value.
+/// Provides shared styling for the keyboard Done toolbar.
 enum KeyboardDoneToolbar {
-    /// The app's orb-blue brand accent, matched to `PairingView`/`MainView`'s
-    /// local `orbAccent` so Done is on-brand and identical on every keyboard.
+    /// Defines the shared orb-blue accent for the Done action.
     static let accent = Color(red: 0.30, green: 0.56, blue: 1.0)
 }

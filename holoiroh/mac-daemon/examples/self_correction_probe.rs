@@ -23,7 +23,9 @@ fn main() {
         "guidance must explicitly forbid freezing/stalling on a detected mistake"
     );
     assert!(
-        block.to_lowercase().contains("do not restart the whole task"),
+        block
+            .to_lowercase()
+            .contains("do not restart the whole task"),
         "guidance must forbid restarting the entire task over a one-step mistake"
     );
     assert!(

@@ -1,107 +1,45 @@
 import Foundation
 
-/// The eight user-visible session states from Project Aro PRD section 6.1's
-/// "states table". This is the *coarse* projection of a task's lifecycle that
-/// the iOS app actually shows the user -- deliberately far fewer states than
-/// the Mac daemon's fine-grained 30-variant `TaskState`
-/// (`holoiroh/mac-daemon/src/task_state.rs`), because the phone's job is to
-/// present a small number of decision points with clear controls, not to
-/// mirror every internal step of the agent's pipeline.
+/// Defines the app's eight user-visible session states from Project Aro PRD section 6.1.
 ///
-/// Associated values carry the payload each state needs to render its
-/// PRD-specified content: `reviewing` carries the transcript/destination/
-/// dictated-text under review, `inputNeeded` carries the P0-14 request
-/// (what's needed, why, response options), `draftReady`/`awaitingApproval`
-/// carry the target + commitment being confirmed, and `failed` carries the
-/// actionable cause + recovery guidance.
-///
-/// ## Mapping: this 8-state iOS `SessionState` projection ⇄ the Rust
-/// `task_state.rs` 30-state `TaskState` lifecycle
-///
-/// The Mac daemon's `TaskState` enum (16 flow + 4 interactive-waiting + 10
-/// terminal = 30 variants) is the authoritative, fine-grained lifecycle. This
-/// iOS `SessionState` is a coarser 8-bucket *view-model* projection of it:
-/// each fine Rust state maps onto exactly one coarse UI state below. When the
-/// control channel is eventually wired to carry a real `TaskState` (today it
-/// cannot -- see `task_state.rs`'s "Relationship to `holo_bridge::control`"
-/// doc: the live `holo serve` A2A stream reports only three coarse outcomes
-/// plus free-text, with no per-`TaskState` granularity), this table is the
-/// spec for the projection function that would collapse the 30 daemon states
-/// into these 8 UI states:
-///
-/// | iOS `SessionState`      | Rust `TaskState` variants that project onto it                                   |
-/// | ----------------------- | -------------------------------------------------------------------------------- |
-/// | `.idle`                 | (pre-task: no `TaskState` yet) + `Created`                                       |
-/// | `.reviewing`            | (pre-task: transcript captured on-device, not yet a daemon task) + `Queued`     |
-/// | `.connecting`           | `Connecting`, `Authenticated`, `RemoteViewStarting`, `NeedsLogin`, `NeedsMfa`   |
-/// | `.working`              | `RemoteViewActive`, `PolicyChecking`, `LaunchingApp`, `FindingTarget`,          |
-/// |                         | `Navigating`, `TypingDraft`, `Verifying`, `Committing`                          |
-/// | `.inputNeeded`          | `NeedsConfirmation`, `SensitiveAccessRequested`                                  |
-/// |                         | (the P0-14 interactive-request states surfaced to the user)                     |
-/// | `.draftReady`           | `DraftReady`                                                                      |
-/// | `.awaitingApproval`     | `AwaitingConfirmation`                                                            |
-/// | `.failed`               | All 7 real terminal alternatives + generic failure: `UserCancelled`,            |
-/// |                         | `PermissionDenied`, `AmbiguousTarget`, `TargetNotFound`,                         |
-/// |                         | `SensitiveAccessRejected`, `AgentTimeout`, `Failed`. (`Completed` is the        |
-/// |                         | success terminal -- the UI returns to `.idle` on it rather than showing         |
-/// |                         | `.failed`.) The 3 Confidential-Cloud/Tinfoil terminals are unreachable in       |
-/// |                         | the alpha build and so never project onto any UI state here.                    |
-///
-/// Notes on the projection's shape:
-/// - `NeedsLogin`/`NeedsMfa` interrupt `Connecting` in the Rust machine, so
-///   they project to `.connecting` (the connection is still being brought up),
-///   *not* `.inputNeeded` -- `.inputNeeded` is reserved for the P0-14
-///   in-task confirmation/sensitive-access requests that occur once the
-///   session is already `.working`.
-/// - `Completed` deliberately has no `.completed` UI state: PRD 6.1 lists
-///   eight states and success returns the dashboard to `.idle` (ready for the
-///   next request), with the terminal result surfaced in the log, rather than
-///   parking on a dead-end "done" screen.
+/// The daemon uses a finer task lifecycle.
+/// This enum presents only the states that require distinct app content or controls.
+/// Completed tasks return to `idle`.
+/// Other terminal results use `failed`.
 enum SessionState: Equatable {
-    /// Nothing running. The user can push-to-talk / type a new request. The
-    /// dashboard shows paired-Mac availability. Control: **Start**.
+    /// Indicates that no task is running.
+    /// The user can start a new request.
     case idle
 
-    /// A captured request (voice transcript or typed text) is shown back to
-    /// the user for confirmation before it becomes a signed task. Shows the
-    /// transcript, the resolved destination, and the dictated text.
-    /// Controls: **Edit / Send / Discard**.
+    /// Presents a captured request for confirmation before submission.
+    /// The user can edit, send, or discard it.
     case reviewing(ReviewPayload)
 
-    /// The `iroh` remote-view/control connection to the paired Mac is being
-    /// established (covers connect → authenticate → remote-view-starting, and
-    /// the login/MFA interrupts that block the connection). Control: **Cancel**.
+    /// Indicates that the app is establishing and authenticating the Mac connection.
+    /// Login and multi-factor authentication interruptions remain in this state.
     case connecting
 
-    /// The agent is actively driving the Mac. Shows the Remote View plus the
-    /// active app, status, last completed action, and next intended action.
-    /// Controls: **Pause / Cancel / TakeControl**.
+    /// Indicates that the agent is actively driving the Mac.
+    /// The app shows live video and task controls.
     case working(WorkingPayload)
 
-    /// The P0-14 input-request UI: the agent paused the turn to ask the user
-    /// a structured question. Shows what's needed, why, the current frame
-    /// context, and the response options. Controls: **TakeControl /
-    /// ResolveLocally / Choose / Cancel**.
+    /// Presents a structured question after the daemon pauses the task.
+    /// The user can choose an option, take control, resolve locally, or cancel.
     case inputNeeded(InputRequestPayload)
 
-    /// A draft has passed verification and is ready for the user to inspect
-    /// before anything is committed/sent. Shows the live target and the
-    /// verification result. Controls: **Review / RequestSend / Cancel**.
+    /// Presents a verified draft before any external commitment.
+    /// The user can review, request sending, or cancel.
     case draftReady(DraftPayload)
 
-    /// The final confirmation gate before a committing action (e.g. clicking
-    /// Send). Shows the destination, the text, the current frame, and a
-    /// plain-language description of the commitment. Controls: **Approve /
-    /// Reject**.
+    /// Presents the final confirmation before an external commitment.
+    /// The user can approve or reject the action.
     case awaitingApproval(ApprovalPayload)
 
-    /// The task ended in a failure the user can act on. Shows an actionable
-    /// cause and a recovery suggestion. Controls: **Retry / TakeControl /
-    /// Dismiss**.
+    /// Presents an actionable task failure.
+    /// The user can retry, take control, or dismiss it.
     case failed(FailurePayload)
 
-    /// Short label for the current state, shown in the dashboard header so the
-    /// user always knows which of the eight PRD 6.1 states they're in.
+    /// Returns the session-state label shown in the dashboard header.
     var displayName: String {
         switch self {
         case .idle: return "Idle"
@@ -115,19 +53,9 @@ enum SessionState: Equatable {
         }
     }
 
-    /// Whether this state shows the live Remote View. Working and DraftReady
-    /// show the video (the user is watching the agent act / inspecting a
-    /// live draft). Failed also shows it: `FailurePayload`'s whole point is
-    /// "actionable cause + recovery" (e.g. "take control to pick the channel
-    /// manually") -- the user needs to see the Mac's actual screen to act on
-    /// that, and hiding the video here previously tore down the entire live
-    /// connection (see `VideoRenderView.dismantleUIView`'s doc: removing the
-    /// view stops the shared `IrohLiveFrameSource`), not just a UI panel --
-    /// live-witnessed as a single failed backend task (a 429 from the
-    /// hosted inference API) silently killing screen mirroring for the rest
-    /// of the session. Idle/Reviewing/Connecting don't need it (no live task
-    /// or draft to watch yet). InputNeeded and AwaitingApproval embed their
-    /// own frame snapshot in their payload rather than the full live surface.
+    /// Reports whether the state shows live video.
+    /// `working`, `draftReady`, and `failed` return `true`.
+    /// Other states return `false`.
     var showsRemoteView: Bool {
         switch self {
         case .working, .draftReady, .failed: return true
@@ -138,41 +66,34 @@ enum SessionState: Equatable {
 
 // MARK: - Per-state payloads
 
-/// Payload for `.reviewing`: what the user is confirming before it becomes a
-/// signed task. Mirrors PRD 6.1's "transcript / destination / dictated-text".
+/// Contains the request that the user reviews before submission.
 struct ReviewPayload: Equatable {
-    /// The raw transcript as recognized (or typed).
+    /// Contains the recognized or typed instruction.
     var transcript: String
-    /// The resolved destination the task will target (e.g. "Slack › #design").
+    /// Identifies the resolved task destination.
     var destination: String
-    /// The dictated text/content the task will enter (distinct from the
-    /// transcript: the transcript is the *instruction*, this is the *payload*
-    /// the instruction produces -- e.g. the message body to be typed).
+    /// Contains the content that the task will enter.
+    /// This value is separate from the instruction transcript.
     var dictatedText: String
 }
 
-/// Payload for `.working`: the live task dashboard fields from PRD 6.1 /
-/// the dashboard row (app/status/last-action/next-action).
+/// Contains the fields shown by the live task dashboard.
 struct WorkingPayload: Equatable {
-    /// The app the agent is currently operating in (e.g. "Slack").
+    /// Identifies the app that the agent is operating.
     var app: String
-    /// A short human-readable status line (e.g. "navigating to #design").
+    /// Describes the task's current status.
     var status: String
-    /// The last action the agent completed (e.g. "clicked the compose field").
+    /// Describes the agent's most recently completed action.
     var lastAction: String
-    /// The next action the agent intends to take (e.g. "type the message").
+    /// Describes the agent's next intended action.
     var nextAction: String
-    /// Whether the agent is currently paused (Pause toggles this). Paused
-    /// still shows the Remote View but the agent takes no further action.
+    /// Reports whether the task is paused.
+    /// Paused tasks keep live video visible and perform no further agent action.
     var isPaused: Bool = false
 }
 
-/// The five kinds of P0-14 input request, mirroring the Rust daemon's
-/// `input_request` `InputRequestKind` (see `mac-daemon`'s `control_channel.rs`
-/// / `input_request_probe.rs`): the agent pauses a turn to ask for one of
-/// these. Credentials/MFA codes themselves never travel on the control
-/// channel -- only the *request* for them does (see PROTOCOL.md's
-/// "Credentials never travel on this channel").
+/// Identifies the five supported structured input-request categories.
+/// Credentials and multi-factor codes never travel through the control channel.
 enum InputRequestKind: String, Equatable {
     case credentialNeeded = "Credential needed"
     case mfaNeeded = "Multi-factor code needed"
@@ -181,60 +102,47 @@ enum InputRequestKind: String, Equatable {
     case sensitiveAccess = "Sensitive-access consent"
 }
 
-/// Payload for `.inputNeeded`: the P0-14 request UI. Mirrors PRD 6.1's
-/// "what's needed / why / current-frame / response-options".
+/// Contains one structured input request shown by `inputNeeded`.
 struct InputRequestPayload: Equatable {
-    /// Which kind of input the agent is asking for.
+    /// Identifies the requested input category.
     var kind: InputRequestKind
-    /// What is needed, in plain language (the "what's needed" field).
+    /// Describes the input that the agent needs.
     var whatIsNeeded: String
-    /// Why the agent needs it (the "why" field) -- gives the user the context
-    /// to decide whether to answer, resolve locally, or cancel.
+    /// Explains why the agent needs the input.
     var why: String
-    /// A short description of the current on-screen frame/context the request
-    /// is about (the "current-frame" field) -- e.g. "Slack login wall".
+    /// Describes the on-screen context for the request.
     var currentFrame: String
-    /// The response options the user can Choose between (the
-    /// "response-options" field). Empty for free-form kinds like
-    /// credential/MFA, where the resolution is TakeControl / ResolveLocally.
+    /// Lists the choices that the user can select.
+    /// Credential and multi-factor requests can leave this list empty.
     var responseOptions: [String]
 }
 
-/// Payload for `.draftReady`: mirrors PRD 6.1's "live target + verification".
+/// Contains the target and verification details for a ready draft.
 struct DraftPayload: Equatable {
-    /// The live target the draft was entered into (e.g. "Slack › #design ›
-    /// message composer").
+    /// Identifies the target that contains the draft.
     var target: String
-    /// A summary of the drafted content the user is about to review.
+    /// Summarizes the drafted content for review.
     var draftSummary: String
-    /// The verification result: what the daemon checked the draft against the
-    /// original instruction and found (e.g. "matches request: mentions the
-    /// launch date and the design review").
+    /// Describes how the daemon verified the draft against the instruction.
     var verification: String
 }
 
-/// Payload for `.awaitingApproval`: mirrors PRD 6.1's "destination / text /
-/// frame / commitment description".
+/// Contains the details required for final commitment approval.
 struct ApprovalPayload: Equatable {
-    /// Where the commitment will land (e.g. "Slack › #design").
+    /// Identifies where the commitment will occur.
     var destination: String
-    /// The exact text that will be committed/sent.
+    /// Contains the exact text for the commitment.
     var text: String
-    /// A short description of the on-screen frame the commitment acts on.
+    /// Describes the on-screen context for the commitment.
     var frame: String
-    /// A plain-language description of the irreversible commitment being
-    /// approved (e.g. "Send this message to #design"). This is the sentence
-    /// the Approve button acts on.
+    /// Describes the irreversible action that approval authorizes.
     var commitmentDescription: String
 }
 
-/// Payload for `.failed`: mirrors PRD 6.1's "actionable cause + recovery".
+/// Contains an actionable failure and its recovery guidance.
 struct FailurePayload: Equatable {
-    /// The actionable cause of the failure, phrased so the user can do
-    /// something about it (e.g. "Couldn't find the #design channel -- it may
-    /// have been renamed or archived").
+    /// Describes the failure cause in actionable terms.
     var cause: String
-    /// A concrete recovery suggestion (e.g. "Retry, or take control to pick
-    /// the channel manually").
+    /// Describes a concrete recovery action.
     var recovery: String
 }

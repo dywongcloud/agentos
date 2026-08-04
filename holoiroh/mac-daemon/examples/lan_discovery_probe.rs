@@ -212,7 +212,10 @@ async fn main() -> anyhow::Result<()> {
     let with_mdns = dial_by_id_only(true, false).await?;
     describe("N0 + mDNS", &with_mdns);
 
-    match (stock.as_ref().and_then(|s| s.direct_after), with_mdns.direct_after) {
+    match (
+        stock.as_ref().and_then(|s| s.direct_after),
+        with_mdns.direct_after,
+    ) {
         (Some(a), Some(b)) if b < a => println!(
             "\nmDNS reached a direct path {:.2?} sooner ({a:.2?} -> {b:.2?})",
             a - b

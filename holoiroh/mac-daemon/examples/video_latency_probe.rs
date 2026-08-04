@@ -18,12 +18,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio_util::bytes::Bytes;
+use iroh_live::Live;
 use iroh_live::media::codec::VideoCodec;
 use iroh_live::media::format::{PixelFormat, VideoFormat, VideoFrame, VideoPreset};
 use iroh_live::media::publish::LocalBroadcast;
 use iroh_live::media::traits::VideoSource;
-use iroh_live::Live;
+use tokio_util::bytes::Bytes;
 
 const BROADCAST_NAME: &str = "video-latency-probe";
 const WIDTH: u32 = 1280;
@@ -123,7 +123,8 @@ impl VideoSource for PacedProbeSource {
 /// The playout budget the bridge actually ships, parsed from its source so this check can never
 /// assert against a number the product has moved on from.
 fn bridge_playout_budget() -> anyhow::Result<Duration> {
-    let marker = "const PLAYOUT_MAX_LATENCY: std::time::Duration = std::time::Duration::from_millis(";
+    let marker =
+        "const PLAYOUT_MAX_LATENCY: std::time::Duration = std::time::Duration::from_millis(";
     let rest = BRIDGE_SOURCE
         .split_once(marker)
         .map(|(_, rest)| rest)
@@ -181,7 +182,8 @@ async fn measure_pixel_passes() -> anyhow::Result<Option<(Duration, Duration, us
     let mut frames = 0usize;
     let deadline = Instant::now() + Duration::from_secs(4);
     while Instant::now() < deadline {
-        let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(500), track.next_frame()).await
+        let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(500), track.next_frame()).await
         else {
             continue;
         };
@@ -203,7 +205,11 @@ async fn measure_pixel_passes() -> anyhow::Result<Option<(Duration, Duration, us
     if frames == 0 {
         return Ok(None);
     }
-    Ok(Some((to_rgba / frames as u32, swizzle / frames as u32, frames)))
+    Ok(Some((
+        to_rgba / frames as u32,
+        swizzle / frames as u32,
+        frames,
+    )))
 }
 
 /// Time from subscribing to the first decoded frame arriving.
@@ -426,7 +432,9 @@ async fn main() -> anyhow::Result<()> {
     // (`video_decode.rs` sets waiting_for_keyframe and discards until the next IDR). It is
     // therefore the real cost of the encoder's 1-second keyframe interval, and the reason
     // lowering playout max_latency against that GOP could make freezes longer rather than shorter.
-    println!("\nhow long until a subscriber sees its FIRST frame? (bounded by the keyframe interval)");
+    println!(
+        "\nhow long until a subscriber sees its FIRST frame? (bounded by the keyframe interval)"
+    );
     let mut joins = Vec::new();
     for _ in 0..5 {
         joins.push(measure_join().await?);
@@ -551,6 +559,8 @@ fn check_the_product_opts_in(median_join: Option<Duration>) -> anyhow::Result<()
          group ({median_join:.2?}); above it, waiting is strictly worse than skipping and the \
          budget needs re-deriving from this run rather than kept out of habit"
     );
-    println!("  ok   playout budget {budget:.2?} stays under the {median_join:.2?} it costs to skip a group");
+    println!(
+        "  ok   playout budget {budget:.2?} stays under the {median_join:.2?} it costs to skip a group"
+    );
     Ok(())
 }

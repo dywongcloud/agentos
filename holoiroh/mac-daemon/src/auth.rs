@@ -24,7 +24,10 @@ pub enum AuthCheckError {
     /// `~/.holo/.env` exists, but the daemon could not read it (a
     /// permissions error or I/O error, for example). This case is distinct
     /// from "missing", so the remediation message stays accurate.
-    UnreadableTokenFile { path: PathBuf, source: std::io::Error },
+    UnreadableTokenFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// `~/.holo/.env` exists and the daemon can read it. The file is empty,
     /// or the file does not contain a `HAI_API_KEY=` line. Either the login
     /// started but never finished, or the file became truncated or

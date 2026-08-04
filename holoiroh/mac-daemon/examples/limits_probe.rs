@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use holoiroh_daemon::limits::{
-    clamp_task_runtime, ActionCounter, ApprovalToken, ApprovalTokenError, SessionTimer,
-    AGENT_ACTION_CAP_DEFAULT, TASK_RUNTIME_DEFAULT_SECS, TASK_RUNTIME_MAX_SECS,
+    AGENT_ACTION_CAP_DEFAULT, ActionCounter, ApprovalToken, ApprovalTokenError, SessionTimer,
+    TASK_RUNTIME_DEFAULT_SECS, TASK_RUNTIME_MAX_SECS, clamp_task_runtime,
 };
 
 fn main() {
@@ -56,12 +56,17 @@ fn main() {
         // Refusal must not have incremented the count -- calling again should refuse identically.
         let result_102 = counter.try_record();
         if result_102 == result_101 {
-            println!("  OK -- repeated refusal is stable ({result_102:?}), count did not drift past cap");
+            println!(
+                "  OK -- repeated refusal is stable ({result_102:?}), count did not drift past cap"
+            );
         } else {
             println!("  FAIL -- repeated refusal drifted: {result_101:?} then {result_102:?}");
             failures += 1;
         }
-        println!("  final count() = {} (expected {AGENT_ACTION_CAP_DEFAULT})", counter.count());
+        println!(
+            "  final count() = {} (expected {AGENT_ACTION_CAP_DEFAULT})",
+            counter.count()
+        );
         if counter.count() != AGENT_ACTION_CAP_DEFAULT {
             failures += 1;
         }
@@ -73,7 +78,9 @@ fn main() {
         let short_max = Duration::from_millis(50);
         let timer = SessionTimer::start_with_max(short_max);
         let expired_immediately = timer.is_expired();
-        println!("  is_expired() immediately after start -> {expired_immediately} (expected false)");
+        println!(
+            "  is_expired() immediately after start -> {expired_immediately} (expected false)"
+        );
         if expired_immediately {
             println!("  FAIL -- timer reported expired before any time passed");
             failures += 1;
@@ -93,7 +100,9 @@ fn main() {
         let remaining_after = timer.remaining();
         println!("  remaining() after expiry -> {remaining_after:?} (expected Duration::ZERO)");
         if !remaining_after.is_zero() {
-            println!("  FAIL -- remaining() should saturate to zero after expiry, not go negative/wrap");
+            println!(
+                "  FAIL -- remaining() should saturate to zero after expiry, not go negative/wrap"
+            );
             failures += 1;
         }
     }
@@ -119,7 +128,9 @@ fn main() {
         }
 
         let second_consume = token.consume("task-abc");
-        println!("  second consume(\"task-abc\") on the same token -> {second_consume:?} (expected AlreadyConsumed)");
+        println!(
+            "  second consume(\"task-abc\") on the same token -> {second_consume:?} (expected AlreadyConsumed)"
+        );
         if second_consume != Err(ApprovalTokenError::AlreadyConsumed) {
             println!("  FAIL -- expected AlreadyConsumed on reuse");
             failures += 1;
@@ -153,7 +164,9 @@ fn main() {
     println!("=== clamp_task_runtime clamps over-max requests, applies default when unset ===");
     {
         let no_override = clamp_task_runtime(None);
-        println!("  clamp_task_runtime(None) -> {no_override:?} (expected {TASK_RUNTIME_DEFAULT_SECS}s)");
+        println!(
+            "  clamp_task_runtime(None) -> {no_override:?} (expected {TASK_RUNTIME_DEFAULT_SECS}s)"
+        );
         if no_override != Duration::from_secs(TASK_RUNTIME_DEFAULT_SECS) {
             println!("  FAIL -- default runtime mismatch");
             failures += 1;
@@ -167,20 +180,34 @@ fn main() {
         }
 
         let over_max = clamp_task_runtime(Some(Duration::from_secs(999)));
-        println!("  clamp_task_runtime(Some(999s)) -> {over_max:?} (expected clamped to {TASK_RUNTIME_MAX_SECS}s)");
+        println!(
+            "  clamp_task_runtime(Some(999s)) -> {over_max:?} (expected clamped to {TASK_RUNTIME_MAX_SECS}s)"
+        );
         if over_max != Duration::from_secs(TASK_RUNTIME_MAX_SECS) {
-            println!("  FAIL -- an over-max request must be clamped to TASK_RUNTIME_MAX_SECS, not passed through");
+            println!(
+                "  FAIL -- an over-max request must be clamped to TASK_RUNTIME_MAX_SECS, not passed through"
+            );
             failures += 1;
         }
     }
 
     println!();
     println!("=== action-cap latch: no update (of any kind) escapes after the cap is hit ===");
-    println!("    (reproduces the exact suppress-everything-once-capped shape HoloControlBridge::run_prompt");
-    println!("     uses, against the real ActionCounter + AtomicBool latch primitives, to witness the fix");
-    println!("     for a bug found during this task's own VERIFY pass: an Answer/Terminal-shaped update");
-    println!("     arriving right after the capped Working update used to skip the try_record guard entirely");
-    println!("     -- since it isn't Working -- and get emitted anyway, racing ahead of the capped-turn error.)");
+    println!(
+        "    (reproduces the exact suppress-everything-once-capped shape HoloControlBridge::run_prompt"
+    );
+    println!(
+        "     uses, against the real ActionCounter + AtomicBool latch primitives, to witness the fix"
+    );
+    println!(
+        "     for a bug found during this task's own VERIFY pass: an Answer/Terminal-shaped update"
+    );
+    println!(
+        "     arriving right after the capped Working update used to skip the try_record guard entirely"
+    );
+    println!(
+        "     -- since it isn't Working -- and get emitted anyway, racing ahead of the capped-turn error.)"
+    );
     {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         enum FakeUpdate {
@@ -218,19 +245,31 @@ fn main() {
             emitted.push(update);
         }
 
-        println!("  emitted updates -> {emitted:?} (expected exactly 3x Working, Answer suppressed)");
-        let expected = vec![FakeUpdate::Working, FakeUpdate::Working, FakeUpdate::Working];
+        println!(
+            "  emitted updates -> {emitted:?} (expected exactly 3x Working, Answer suppressed)"
+        );
+        let expected = vec![
+            FakeUpdate::Working,
+            FakeUpdate::Working,
+            FakeUpdate::Working,
+        ];
         if emitted == expected {
-            println!("  OK -- Answer arriving after the cap-breaching Working was correctly suppressed by the latch");
+            println!(
+                "  OK -- Answer arriving after the cap-breaching Working was correctly suppressed by the latch"
+            );
         } else {
-            println!("  FAIL -- expected {expected:?}, got {emitted:?} (the post-cap update leaked through)");
+            println!(
+                "  FAIL -- expected {expected:?}, got {emitted:?} (the post-cap update leaked through)"
+            );
             failures += 1;
         }
     }
 
     println!();
     if failures == 0 {
-        println!("limits_probe: OK -- all PRD 10.4 enforcement helpers behaved correctly under real execution.");
+        println!(
+            "limits_probe: OK -- all PRD 10.4 enforcement helpers behaved correctly under real execution."
+        );
     } else {
         println!("limits_probe: FAILED -- {failures} check(s) did not behave as expected.");
         std::process::exit(1);

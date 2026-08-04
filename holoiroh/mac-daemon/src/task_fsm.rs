@@ -191,7 +191,10 @@ impl TaskFsm {
         if self.phase.is_terminal() {
             return false;
         }
-        let Some(kind) = raw_event.and_then(|e| e.get("kind")).and_then(|k| k.as_str()) else {
+        let Some(kind) = raw_event
+            .and_then(|e| e.get("kind"))
+            .and_then(|k| k.as_str())
+        else {
             return false;
         };
         if kind == "tool_result" {
@@ -348,7 +351,13 @@ impl TaskFsm {
         // dir via path traversal even if a future caller passes untrusted input.
         let safe: String = request_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         Ok(Self::tasks_dir()?.join(format!("{safe}.json")))
     }
@@ -371,7 +380,8 @@ impl TaskFsm {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
         };
-        let fsm = serde_json::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
+        let fsm = serde_json::from_str(&contents)
+            .with_context(|| format!("parsing {}", path.display()))?;
         Ok(Some(fsm))
     }
 

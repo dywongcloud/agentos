@@ -55,6 +55,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # (POST /v1/audio/transcriptions), both of which upload raw file bytes as multipart/form-data
 # per docs.tinfoil.sh's documented request shape for those two endpoints.
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "multipart"] }
+tinfoil = { path = "../../holoiroh-vendor/tinfoil-rs-patched" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Config-file format for sensitive_categories.rs (~/.holoiroh/sensitive_categories.toml),
@@ -194,8 +195,8 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = ["
 # (CFMachPortCreateRunLoopSource for the tap's run-loop source). CGGeometry: the
 # CGPoint/CGRect used by remote_input.rs's coordinate mapping. Already in the graph
 # transitively via objc2-core-graphics; promoted to a direct dep since it's named here.
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFRunLoop", "CFMachPort", "CFCGTypes"] }
-objc2-application-services = { version = "0.3", default-features = false, features = ["HIServices", "AXUIElement"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFRunLoop", "CFMachPort", "CFCGTypes", "CFString", "CFNumber"] }
+objc2-application-services = { version = "0.3", default-features = false, features = ["HIServices", "AXError", "AXUIElement", "AXValue"] }
 # src/privacy.rs: on-device OCR for the browser/screenshot privacy-redaction layer, via
 # Apple's Vision framework (VNImageRequestHandler + VNRecognizeTextRequest). Verified directly
 # against the crate's own generated source + doc pages (docs.rs/objc2-vision 0.3.2): the raw-

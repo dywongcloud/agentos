@@ -26,8 +26,7 @@ use holoiroh_ios_bridge::holoiroh_ios_bridge_probe_reachable;
 const DEFAULT_DAEMON_TICKET: &str =
     "iroh-live:nhWuOUavJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwA/holoiroh";
 
-const DEAD_NODE_TICKET: &str =
-    "iroh-live:AAAAAAAAJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwA/holoiroh";
+const DEAD_NODE_TICKET: &str = "iroh-live:AAAAAAAAJaTyFA2AXzWPTiUUg38hFs6cOjKHKJu9pXwA/holoiroh";
 
 const MALFORMED_TICKET: &str = "not-a-valid-ticket";
 
@@ -39,14 +38,22 @@ fn probe(label: &str, ticket: &str, timeout_ms: u64) -> bool {
 }
 
 fn main() {
-    let daemon_ticket = std::env::args().nth(1).unwrap_or_else(|| DEFAULT_DAEMON_TICKET.to_string());
+    let daemon_ticket = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_DAEMON_TICKET.to_string());
 
     let daemon = probe("default daemon ticket", &daemon_ticket, 8000);
     let dead = probe("dead node ticket", DEAD_NODE_TICKET, 6000);
     let malformed = probe("malformed ticket", MALFORMED_TICKET, 2000);
 
-    assert!(!dead, "a well-formed ticket to a nonexistent node must be unreachable");
-    assert!(!malformed, "a malformed ticket must be unreachable (parse failure)");
+    assert!(
+        !dead,
+        "a well-formed ticket to a nonexistent node must be unreachable"
+    );
+    assert!(
+        !malformed,
+        "a malformed ticket must be unreachable (parse failure)"
+    );
 
     if daemon {
         println!("PROBE OK: daemon reachable=true; dead + malformed reachable=false");

@@ -1,37 +1,44 @@
 import SwiftUI
+#if canImport(UIKit)
 import UIKit
+private typealias PlatformImage = UIImage
+#elseif canImport(AppKit)
+import AppKit
+private typealias PlatformImage = NSImage
+#endif
 
-/// The orb's "thinking" reaction: state + overlay effects layered over the
-/// Spline blob when a message is sent, plus small app badges orbiting the
-/// orb when the prompt mentions known tools/apps.
+/// Renders the orb reaction after the app sends a message.
 ///
-/// Everything here is a pure SwiftUI overlay positioned with the SAME
-/// layout math as `SplineOrbBackground` (top-centered square canvas,
-/// `side = min(width * 1.275, 630)`, center at `(width/2, side/2 + 24)`),
-/// so it works identically over all three orb backends (native
-/// SplineRuntime, the WKWebView fallback, and the offline gradient) --
-/// nothing reaches into the Spline scene itself, which is opaque to the
-/// app. Hit-testing is disabled throughout: the effects are decorative and
-/// must never eat a tap meant for the controls layered above.
+/// The overlay can show these effects:
+/// - A pulse.
+/// - A glow.
+/// - Badges for apps that the prompt names.
+///
+/// The overlay uses these `SplineOrbBackground` layout values:
+/// - A top-centered square canvas.
+/// - `side = min(width * 1.275, 630)`.
+/// - A center at `(width / 2, side / 2 + 24)`.
+///
+/// This layout supports the native runtime, web fallback, and offline fallback.
+/// The overlay does not access the opaque Spline scene.
+/// Hit testing is disabled so the overlay does not intercept control taps.
 
 // MARK: - App catalog
 
-/// One recognizable app/tool the orbit effect can represent: match
-/// keywords (word-boundary, case-insensitive, against the sent prompt).
-/// Apps with a bundled REAL icon (`iconAsset` -> Resources/AppIcons/<name>.png,
-/// 128px, user-supplied artwork) render it directly; the rest fall back to
-/// a brand-colored rounded square + SF Symbol glyph.
+/// Describes an app badge and its prompt-matching keywords.
+/// Matching ignores case and requires word boundaries.
+/// Bundled icons are 128-pixel Portable Network Graphics (PNG) files under `Resources/AppIcons`.
+/// Other apps use a colored square and an SF Symbol.
 struct OrbitApp: Identifiable, Equatable {
     let id: String
     let displayName: String
     let symbol: String
     let color: Color
     let keywords: [String]
-    /// Filename (sans extension) of a bundled real icon in
-    /// `Resources/AppIcons`, when one exists.
+    /// Names a bundled icon in `Resources/AppIcons` without the extension.
     var iconAsset: String? = nil
 
-    /// The catalog of recognizable apps, in match-priority order.
+    /// Lists recognizable apps in match-priority order.
     static let catalog: [OrbitApp] = [
         OrbitApp(id: "slack", displayName: "Slack", symbol: "number",
                  color: Color(red: 0.29, green: 0.08, blue: 0.29),
@@ -80,9 +87,9 @@ struct OrbitApp: Identifiable, Equatable {
                  keywords: ["spotify", "apple music", "music"]),
     ]
 
-    /// Apps mentioned in `prompt`, catalog order, de-duplicated. Matching is
-    /// word-boundary and case-insensitive so "slack" matches but "slacking"
-    /// or a random substring does not.
+    /// Returns catalog apps named in `prompt`.
+    /// Results preserve catalog order and contain no duplicates.
+    /// Matching ignores case and requires word boundaries.
     static func matches(in prompt: String) -> [OrbitApp] {
         let lowered = prompt.lowercased()
         return catalog.filter { app in
@@ -98,21 +105,19 @@ struct OrbitApp: Identifiable, Equatable {
 
 // MARK: - Reaction state
 
-/// Drives the orb reaction: `react(to:)` is called on every real send
-/// (`MainView.sendLivePrompt`), retriggering the pulse/glow and populating
-/// the orbiting-app set from the prompt text, then clearing itself after
-/// `duration`.
+/// Manages reaction state for sent prompts.
+/// `react(to:)` restarts the effects and selects badges from prompt text.
+/// The state clears after the configured duration.
 @MainActor
 final class OrbEffectsState: ObservableObject {
-    /// Increments per reaction so ring views restart their one-shot
-    /// animations even when two sends land back to back.
+    /// Changes for each reaction so one-shot ring animations restart.
     @Published private(set) var reactionID = 0
     @Published private(set) var isReacting = false
     @Published private(set) var orbitingApps: [OrbitApp] = []
 
     private var clearTask: Task<Void, Never>?
 
-    /// Kick off (or re-kick) the reaction for a just-sent prompt.
+    /// Starts or restarts the reaction for a sent prompt.
     func react(to prompt: String, duration: TimeInterval = 2.8) {
         reactionID += 1
         orbitingApps = OrbitApp.matches(in: prompt)
@@ -131,9 +136,7 @@ final class OrbEffectsState: ObservableObject {
 
 // MARK: - Overlay
 
-/// The visual layer: expanding pulse rings + a breathing glow centered on
-/// the orb, and the orbiting app badges. Mounted directly above
-/// `SplineOrbBackground` in `MainView`'s ZStack.
+/// Renders pulse rings, a glow, and app badges above `SplineOrbBackground`.
 struct OrbReactionOverlay: View {
     @ObservedObject var state: OrbEffectsState
 
@@ -183,7 +186,7 @@ struct OrbReactionOverlay: View {
     }
 }
 
-/// Soft radial glow that breathes (scale + opacity) while the orb "thinks".
+/// Renders a radial glow that changes scale and opacity during a reaction.
 private struct BreathingGlow: View {
     let radius: CGFloat
     @State private var swelled = false
@@ -213,9 +216,7 @@ private struct BreathingGlow: View {
     }
 }
 
-/// Three staggered rings expanding out from the blob's edge -- the "I heard
-/// you" beat of the reaction. Each ring animates once; the whole view is
-/// re-created per reaction (`.id(reactionID)`), restarting them.
+/// Renders three staggered rings that expand once for each reaction.
 private struct PulseRings: View {
     let startRadius: CGFloat
 
@@ -249,24 +250,22 @@ private struct PulseRing: View {
     }
 }
 
-/// The app badges circling the orb in a 3D HORIZONTAL ring. A
-/// `TimelineView(.animation)` advances the ring phase from wall-clock every
-/// frame (pausing itself when inactive so nothing burns battery once the badges
-/// have faded out); the actual per-badge placement is the pure
-/// `orbitBadgePlacement`, so the same geometry renders identically off-device.
+/// Animates app badges around a horizontal three-dimensional ring.
+/// `TimelineView` pauses when the reaction is inactive.
+/// `orbitBadgePlacement` provides deterministic geometry for each frame.
 private struct OrbitingBadges: View {
     let apps: [OrbitApp]
-    /// Horizontal half-width of the ring (its wide axis).
+    /// Sets the horizontal half-width of the ring.
     let radiusX: CGFloat
-    /// Vertical half-height (small -> shallow, 3D-looking tilt).
+    /// Sets the vertical half-height of the ring.
     let tiltY: CGFloat
-    /// The orb's on-screen radius, for back-of-ring occlusion.
+    /// Sets the orb radius used for rear-ring occlusion.
     let blobRadius: CGFloat
-    /// Size of each badge tile.
+    /// Sets the badge edge length in points.
     let badgeSize: CGFloat
     let active: Bool
 
-    /// Radians per second the constellation sweeps.
+    /// Sets the angular speed in radians per second.
     private let angularSpeed = 1.0
 
     var body: some View {
@@ -286,9 +285,9 @@ private struct OrbitingBadges: View {
     }
 }
 
-/// One frame of the orbit at a fixed `phase` -- the placement comes from the
-/// pure `orbitBadgePlacement`, so front badges are drawn over back ones
-/// (`zIndex`), and back-center badges fade behind the blob.
+/// Renders one orbit frame at a fixed `phase`.
+/// Front badges draw above rear badges.
+/// Rear-center badges fade behind the orb.
 private struct OrbitingBadgesRing: View {
     let apps: [OrbitApp]
     let radiusX: CGFloat
@@ -319,28 +318,26 @@ private struct OrbitingBadgesRing: View {
     }
 }
 
-/// One 28pt app tile: the REAL bundled icon when the catalog entry carries
-/// one (Resources/AppIcons/<asset>.png), else the brand-color + SF-glyph
-/// stand-in. Icons are cached per asset name so the orbit's per-frame
-/// re-render never re-reads the file from disk.
+/// Renders a bundled app icon or a symbol fallback.
+/// Bundled icons are cached by asset name.
 private struct AppBadge: View {
     let app: OrbitApp
-    /// Tile edge length in points (the orbit passes this in; bigger than the
-    /// old fixed 28pt so the icons read clearly as they circle).
+    /// Sets the tile edge length in points.
     var size: CGFloat = 44
 
-    /// Loaded once per asset name for the process lifetime -- badge views
-    /// are recreated every TimelineView frame, so caching here is what
-    /// keeps real-icon rendering as cheap as the old vector stand-ins.
-    private static var iconCache: [String: UIImage] = [:]
+    /// Caches bundled icons by asset name for the process lifetime.
+    private static var iconCache: [String: PlatformImage] = [:]
 
-    private static func bundledIcon(named asset: String) -> UIImage? {
+    private static func bundledIcon(named asset: String) -> PlatformImage? {
         if let cached = iconCache[asset] { return cached }
-        guard
-            let url = Bundle.module.url(
-                forResource: asset, withExtension: "png", subdirectory: "AppIcons"),
-            let image = UIImage(contentsOfFile: url.path)
-        else { return nil }
+        guard let url = Bundle.module.url(
+            forResource: asset, withExtension: "png", subdirectory: "AppIcons"
+        ) else { return nil }
+        #if canImport(UIKit)
+        guard let image = UIImage(contentsOfFile: url.path) else { return nil }
+        #else
+        guard let image = NSImage(contentsOf: url) else { return nil }
+        #endif
         iconCache[asset] = image
         return image
     }
@@ -348,11 +345,19 @@ private struct AppBadge: View {
     var body: some View {
         Group {
             if let asset = app.iconAsset, let icon = Self.bundledIcon(named: asset) {
+                #if canImport(UIKit)
                 Image(uiImage: icon)
                     .resizable()
                     .scaledToFit()
                     .frame(width: size, height: size)
                     .clipShape(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
+                #else
+                Image(nsImage: icon)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: size, height: size)
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.25, style: .continuous))
+                #endif
             } else {
                 RoundedRectangle(cornerRadius: size * 0.25, style: .continuous)
                     .fill(app.color)

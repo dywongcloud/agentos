@@ -18,7 +18,7 @@
 use std::time::{Duration, Instant};
 
 use holoiroh_daemon::remote_input;
-use holoiroh_wire::{ClientMessage, RemoteControlEvent, TaskEnvelope, CONTROL_ALPN};
+use holoiroh_wire::{CONTROL_ALPN, ClientMessage, RemoteControlEvent, TaskEnvelope};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 const MOVES: usize = 240;
@@ -178,7 +178,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-
     assert_eq!(
         latencies.len(),
         MOVES,
@@ -217,20 +216,20 @@ async fn main() -> anyhow::Result<()> {
 
     let steady: Vec<Duration>;
     {
-    let mut steady_tmp: Vec<Duration> = in_order
-        .iter()
-        .filter(|(i, _)| *i >= WARMUP_MOVES)
-        .map(|(_, d)| *d)
-        .collect();
-    steady_tmp.sort();
-    steady = steady_tmp;
-    println!(
-        "\nexcluding the first {WARMUP_MOVES} moves (connection warmup):\n  p50 {:.2?}   p90 {:.2?}   p99 {:.2?}   max {:.2?}",
-        percentile(&steady, 0.50),
-        percentile(&steady, 0.90),
-        percentile(&steady, 0.99),
-        steady.last().copied().unwrap_or_default(),
-    );
+        let mut steady_tmp: Vec<Duration> = in_order
+            .iter()
+            .filter(|(i, _)| *i >= WARMUP_MOVES)
+            .map(|(_, d)| *d)
+            .collect();
+        steady_tmp.sort();
+        steady = steady_tmp;
+        println!(
+            "\nexcluding the first {WARMUP_MOVES} moves (connection warmup):\n  p50 {:.2?}   p90 {:.2?}   p99 {:.2?}   max {:.2?}",
+            percentile(&steady, 0.50),
+            percentile(&steady, 0.90),
+            percentile(&steady, 0.99),
+            steady.last().copied().unwrap_or_default(),
+        );
     }
 
     latencies.sort();

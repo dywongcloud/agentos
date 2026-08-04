@@ -11,11 +11,11 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use holoiroh_wire::ClarifyingQuestion;
 use serde::Deserialize;
 
-const TINFOIL_ENDPOINT: &str = "https://inference.tinfoil.sh/v1/chat/completions";
+use crate::tinfoil_client::{JSON_SUCCESS_BODY_LIMIT_BYTES, collect_tinfoil_response};
 
 /// Default clarification model. Tinfoil's catalog has no DeepSeek model as of this writing.
 /// Witnessed model ids: kimi-k2-6, glm-5-2, gemma4-31b, llama3-3-70b, gpt-oss-120b, and others.
@@ -32,19 +32,19 @@ const CLARIFY_SYSTEM_PROMPT: &str = "You are a clarification assistant for a com
 /// request. Cheaply cloned into every accepted control connection.
 #[derive(Clone)]
 pub struct ClarifyConfig {
-    api_key: String,
+    transport: std::sync::Arc<crate::tinfoil_client::TinfoilClient>,
     model: String,
 }
 
 impl ClarifyConfig {
     /// Builds a config from the Tinfoil key, resolving the model from
     /// `HOLOIROH_CLARIFY_MODEL` (falling back to [`DEFAULT_CLARIFY_MODEL`]).
-    pub fn new(api_key: String) -> Self {
+    pub fn new(transport: std::sync::Arc<crate::tinfoil_client::TinfoilClient>) -> Self {
         let model = std::env::var("HOLOIROH_CLARIFY_MODEL")
             .ok()
             .filter(|m| !m.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_CLARIFY_MODEL.to_string());
-        Self { api_key, model }
+        Self { transport, model }
     }
 
     pub fn model(&self) -> &str {
@@ -59,6 +59,13 @@ pub async fn generate_clarifying_questions(
     prompt: &str,
     config: &ClarifyConfig,
 ) -> Vec<ClarifyingQuestion> {
+    generate_clarifying_questions_if_configured(prompt, Some(config)).await
+}
+
+pub async fn generate_clarifying_questions_if_configured(
+    prompt: &str,
+    config: Option<&ClarifyConfig>,
+) -> Vec<ClarifyingQuestion> {
     match try_generate(prompt, config).await {
         Ok(questions) => questions,
         Err(err) => {
@@ -68,11 +75,15 @@ pub async fn generate_clarifying_questions(
     }
 }
 
-async fn try_generate(prompt: &str, config: &ClarifyConfig) -> Result<Vec<ClarifyingQuestion>> {
+async fn try_generate(
+    prompt: &str,
+    config: Option<&ClarifyConfig>,
+) -> Result<Vec<ClarifyingQuestion>> {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
+    let config = config.context("clarification is not configured")?;
     let capped: String = trimmed.chars().take(4000).collect();
 
     let body = serde_json::json!({
@@ -86,31 +97,40 @@ async fn try_generate(prompt: &str, config: &ClarifyConfig) -> Result<Vec<Clarif
         "temperature": 0.2,
     });
 
-    let client = reqwest::Client::new();
-    let response = tokio::time::timeout(
-        Duration::from_secs(20),
-        client
-            .post(TINFOIL_ENDPOINT)
-            .header("authorization", format!("Bearer {}", config.api_key))
+    let client = config.transport.client().http_client()?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let response = client
+            .post(format!(
+                "{}{}",
+                config.transport.base_url(),
+                "/v1/chat/completions"
+            ))
+            .header("authorization", config.transport.bearer())
             .header("content-type", "application/json")
             .json(&body)
-            .send(),
-    )
-    .await??;
+            .send()
+            .await
+            .context("clarify request failed")?;
 
-    if !response.status().is_success() {
-        anyhow::bail!("clarify upstream returned {}", response.status());
-    }
+        let raw =
+            collect_tinfoil_response(response, JSON_SUCCESS_BODY_LIMIT_BYTES, "clarify upstream")
+                .await?;
+        parse_clarify_response(&raw)
+    })
+    .await
+    .context("clarify operation timed out")?
+}
 
-    let value: serde_json::Value = response.json().await?;
+pub fn parse_clarify_response(raw: &[u8]) -> Result<Vec<ClarifyingQuestion>> {
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).context("failed to decode clarify response")?;
     let content = value
         .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
         .unwrap_or_default();
-
     Ok(parse_questions(content))
 }
 

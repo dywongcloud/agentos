@@ -103,7 +103,10 @@ fn main() {
     println!();
     println!("=== malformed / unknown input: real deserialize errors, not panics ===");
     let malformed: Result<ClientMessage, _> = serde_json::from_str("not json");
-    println!("serde_json::from_str(\"not json\") -> is_err={}", malformed.is_err());
+    println!(
+        "serde_json::from_str(\"not json\") -> is_err={}",
+        malformed.is_err()
+    );
     assert!(malformed.is_err());
     let unknown: Result<ClientMessage, _> = serde_json::from_str(r#"{"type":"unknown_variant"}"#);
     println!(
@@ -129,12 +132,22 @@ fn main() {
     assert!(json.contains(r#""task_id":"task-xyz789""#));
     assert!(json.contains(r#""message_type":"prompt""#));
     assert!(json.contains(r#""sequence_number":0"#));
-    assert!(json.contains(r#""payload":{"type":"prompt","text":"open safari and check my calendar"}"#));
-    assert!(!json.contains("\"signature\":"), "signature must be omitted when None, not emitted as null");
+    assert!(
+        json.contains(r#""payload":{"type":"prompt","text":"open safari and check my calendar"}"#)
+    );
+    assert!(
+        !json.contains("\"signature\":"),
+        "signature must be omitted when None, not emitted as null"
+    );
     let back: TaskEnvelope<ClientMessage> = serde_json::from_str(&json).unwrap();
     println!("deserialize -> {back:?}");
     assert_eq!(back, client_envelope, "envelope round-trip mismatch");
-    assert_eq!(back.payload, ClientMessage::Prompt { text: "open safari and check my calendar".to_string() });
+    assert_eq!(
+        back.payload,
+        ClientMessage::Prompt {
+            text: "open safari and check my calendar".to_string()
+        }
+    );
 
     println!();
     println!("=== TaskEnvelope<ServerMessage> round-trip (post-session wire shape) ===");
@@ -162,8 +175,14 @@ fn main() {
     );
     let json = serde_json::to_string(&no_task_id_envelope).unwrap();
     println!("serialize -> {json}");
-    assert!(!json.contains("\"task_id\":"), "task_id must be omitted when None, not emitted as null");
-    assert!(!json.contains("\"signature\":"), "signature must be omitted when None, not emitted as null");
+    assert!(
+        !json.contains("\"task_id\":"),
+        "task_id must be omitted when None, not emitted as null"
+    );
+    assert!(
+        !json.contains("\"signature\":"),
+        "signature must be omitted when None, not emitted as null"
+    );
 
     println!();
     println!("=== TaskEnvelope::is_expired_at ===");
@@ -177,10 +196,23 @@ fn main() {
         "sent_at={} expires_at={} (default 30s window)",
         envelope.sent_at, envelope.expires_at
     );
-    assert_eq!(envelope.expires_at - envelope.sent_at, 30_000, "default expiry window must be 30s");
-    assert!(!envelope.is_expired_at(envelope.sent_at), "must not be expired at sent_at");
-    assert!(!envelope.is_expired_at(envelope.expires_at), "must not be expired exactly at expires_at (only strictly after)");
-    assert!(envelope.is_expired_at(envelope.expires_at + 1), "must be expired 1ms past expires_at");
+    assert_eq!(
+        envelope.expires_at - envelope.sent_at,
+        30_000,
+        "default expiry window must be 30s"
+    );
+    assert!(
+        !envelope.is_expired_at(envelope.sent_at),
+        "must not be expired at sent_at"
+    );
+    assert!(
+        !envelope.is_expired_at(envelope.expires_at),
+        "must not be expired exactly at expires_at (only strictly after)"
+    );
+    assert!(
+        envelope.is_expired_at(envelope.expires_at + 1),
+        "must be expired 1ms past expires_at"
+    );
     println!("is_expired_at checks: OK");
 
     println!();

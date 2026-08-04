@@ -1,5 +1,5 @@
 use holoiroh_daemon::tmux::{
-    ensure_session, session_state, terminal_work_guidance, SessionState, SESSION_NAME,
+    SESSION_NAME, SessionState, ensure_session, session_state, terminal_work_guidance,
 };
 
 fn main() {
@@ -21,8 +21,12 @@ fn main() {
         "ensure_session is not idempotent: a second call changed state from {first:?} to {second:?}"
     );
     if let (
-        SessionState::RunningWithAttachedWindow { attached_clients: a },
-        SessionState::RunningWithAttachedWindow { attached_clients: b },
+        SessionState::RunningWithAttachedWindow {
+            attached_clients: a,
+        },
+        SessionState::RunningWithAttachedWindow {
+            attached_clients: b,
+        },
     ) = (&first, &second)
     {
         assert_eq!(
@@ -41,7 +45,13 @@ fn main() {
 
     let tmux = holoiroh_daemon::tmux::tmux_binary().expect("tmux is installed here");
     let title = std::process::Command::new(&tmux)
-        .args(["show-options", "-t", SESSION_NAME, "-v", "set-titles-string"])
+        .args([
+            "show-options",
+            "-t",
+            SESSION_NAME,
+            "-v",
+            "set-titles-string",
+        ])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
@@ -71,5 +81,7 @@ fn main() {
     );
     println!("env fact present: {}", tmux_fact.0);
 
-    println!("\nVERDICT: OK -- one visible session, idempotent ensure, and both guidance layers agree");
+    println!(
+        "\nVERDICT: OK -- one visible session, idempotent ensure, and both guidance layers agree"
+    );
 }
